@@ -747,9 +747,17 @@ function requireCompletedTurn(
 function observedToolCalls(
   events: TrueForgeApi.TurnStreamingEvent[],
 ): Array<{ id: string; name: string; arguments: unknown }> {
-  const calls: Array<{ id: string; name: string; arguments: unknown }> = [];
+  interface MutableToolCall {
+    id: string;
+    name: string;
+    argumentText: string;
+    argumentValue?: unknown;
+  }
+
+  const callsById = new Map<string, MutableToolCall>();
+  const callIdsByIndex = new Map<number, string>();
   for (const event of events) {
-    if (event.type !== "model.message") {
+    if (event.type !== "model.message" && event.type !== "model.message.delta") {
       continue;
     }
     const record = recordValue(event);
@@ -761,18 +769,40 @@ function observedToolCalls(
         continue;
       }
       const functionValue = isRecord(rawCall.function) ? rawCall.function : rawCall;
-      const id = stringOrNull(rawCall.id);
-      const name = stringOrNull(functionValue.name);
-      if (id !== null && name !== null) {
-        calls.push({
-          id,
-          name,
-          arguments: parseMaybeJson(functionValue.arguments ?? rawCall.arguments ?? {}),
-        });
+      const index = typeof rawCall.index === "number" ? rawCall.index : null;
+      const explicitId = stringOrNull(rawCall.id);
+      if (explicitId !== null && index !== null) {
+        callIdsByIndex.set(index, explicitId);
       }
+      const id = explicitId ?? (index === null ? null : callIdsByIndex.get(index) ?? null);
+      if (id === null) {
+        continue;
+      }
+      const existing = callsById.get(id);
+      const name = stringOrNull(functionValue.name) ?? existing?.name ?? null;
+      if (name === null) {
+        continue;
+      }
+      const call = existing ?? { id, name, argumentText: "" };
+      call.name = name;
+      const rawArguments = functionValue.arguments ?? rawCall.arguments;
+      if (typeof rawArguments === "string") {
+        call.argumentText = event.type === "model.message.delta"
+          ? `${call.argumentText}${rawArguments}`
+          : rawArguments;
+      } else if (rawArguments !== undefined) {
+        call.argumentValue = rawArguments;
+      }
+      callsById.set(id, call);
     }
   }
-  return calls;
+  return [...callsById.values()].map((call) => ({
+    id: call.id,
+    name: call.name,
+    arguments: call.argumentValue !== undefined
+      ? call.argumentValue
+      : parseMaybeJson(call.argumentText.length === 0 ? {} : call.argumentText),
+  }));
 }
 
 function expectedRepositoryArguments(

@@ -64,6 +64,13 @@ function repositoryEvents(
   ref = "main",
   resourceRef = "refs/heads/main",
 ) {
+  const repositoryArguments = JSON.stringify({
+    owner: "owner",
+    repo: "repo",
+    path: "package.json",
+    ref,
+  });
+  const argumentSplit = Math.ceil(repositoryArguments.length / 2);
   return [
     {
       type: "turn.created",
@@ -81,20 +88,28 @@ function repositoryEvents(
       mcpServers: [{ name: "github" }],
     },
     {
-      type: "model.message",
+      type: "model.message.delta",
       id: "event-model",
       createdAt: "2026-08-26T16:00:02.000Z",
       threadId: "thread-1",
       toolCalls: [{
+        index: 0,
         id: "call-mcp",
         function: {
           name: "get_file_contents",
-          arguments: JSON.stringify({
-            owner: "owner",
-            repo: "repo",
-            path: "package.json",
-            ref,
-          }),
+          arguments: repositoryArguments.slice(0, argumentSplit),
+        },
+      }],
+    },
+    {
+      type: "model.message.delta",
+      id: "event-model-arguments",
+      createdAt: "2026-08-26T16:00:02.500Z",
+      threadId: "thread-1",
+      toolCalls: [{
+        index: 0,
+        function: {
+          arguments: repositoryArguments.slice(argumentSplit),
         },
       }],
     },
@@ -412,6 +427,36 @@ test("repository inspection does not double-prefix canonical Git refs", async ()
   assert.equal(
     inspection.resourceUri,
     "repo://owner/repo/refs/heads/main/contents/package.json",
+  );
+});
+
+test("repository inspection rejects a text-only MCP response without resource provenance", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client } = fakeClient((turnId) => {
+    const events = repositoryEvents(turnId);
+    events.find((event) => event.type === "tool.response").content =
+      "successfully downloaded text file (SHA: fixture-blob-sha)";
+    return events;
+  });
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "google-gemini/test-model",
+    mcpServers: [{ name: "github", enableTools: ["get_file_contents"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-mcp-text-only-response",
+    objective: "Reject repository content without a structured provenance resource",
+    repository: { owner: "owner", name: "repo", ref: "main" },
+  });
+
+  await assert.rejects(
+    runner.inspectRepository({ missionId: mission.id, path: "package.json" }),
+    /get_file_contents MCP response was not a JSON object/,
+  );
+  const state = await missions.getState();
+  assert.equal(state.missions[0].status, "blocked");
+  assert.equal(
+    state.evidence.some((item) => item.source === "mcp" && item.result === "passed"),
+    false,
   );
 });
 
