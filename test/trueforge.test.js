@@ -190,6 +190,8 @@ function lockedCommitEvents(
     },
     sha = LOCKED_FIXTURE_SHA,
     patches = LOCKED_FIXTURE_PATCHES,
+    responseContent,
+    responseCallId = "call-commit",
   } = {},
 ) {
   const commitArguments = JSON.stringify(argumentsValue);
@@ -245,11 +247,8 @@ function lockedCommitEvents(
       id: "event-tool-response",
       createdAt: "2026-08-26T16:00:03.000Z",
       threadId: "thread-1",
-      toolCallId: "call-commit",
-      content: JSON.stringify({
-        isError: false,
-        content: [{ type: "text", text: JSON.stringify(commitPayload) }],
-      }),
+      toolCallId: responseCallId,
+      content: responseContent ?? JSON.stringify(commitPayload),
     },
     {
       type: "turn.done",
@@ -492,7 +491,7 @@ test("repository inspection proves the MCP call and returned file resource", asy
   assert.equal(state.missions[0].status, "draft");
 });
 
-test("locked fixture inspection proves the exact get_commit result and expected patches", async () => {
+test("locked fixture inspection proves direct TrueForge get_commit content and expected patches", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client, calls } = fakeClient(lockedCommitEvents);
   const runner = new TrueForgeMissionRunner(missions, client, {
@@ -604,6 +603,62 @@ test("locked fixture inspection rejects a wrong SHA or expected patch", async ()
     state.evidence.some((item) => item.source === "mcp" && item.result === "passed"),
     false,
   );
+});
+
+test("locked fixture inspection rejects malformed, error, and uncorrelated responses", async () => {
+  const cases = [
+    {
+      label: "malformed",
+      options: { responseContent: "not-json" },
+      error: /get_commit MCP response was not a JSON object/,
+    },
+    {
+      label: "non-object",
+      options: { responseContent: JSON.stringify(["not a commit"]) },
+      error: /get_commit MCP response was not a JSON object/,
+    },
+    {
+      label: "error",
+      options: { responseContent: JSON.stringify({ isError: true }) },
+      error: /get_commit MCP returned an error result/,
+    },
+    {
+      label: "uncorrelated",
+      options: { responseCallId: "different-call" },
+      error: /get_commit MCP call has no structured response/,
+    },
+  ];
+
+  for (const fixture of cases) {
+    const missions = new MissionService(new InMemoryMissionRepository());
+    const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, fixture.options));
+    const runner = new TrueForgeMissionRunner(missions, client, {
+      model: "google-gemini/test-model",
+      mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+    });
+    const mission = await runner.createMission({
+      id: `mission-mcp-pinned-${fixture.label}-failure`,
+      objective: "Reject an invalid locked fixture response",
+      repository: {
+        owner: "mtamburrano",
+        name: "trueforge-proofboard",
+        ref: LOCKED_FIXTURE_SHA,
+      },
+    });
+
+    await assert.rejects(
+      runner.inspectRepository({ missionId: mission.id }),
+      fixture.error,
+      fixture.label,
+    );
+    const state = await missions.getState();
+    assert.equal(state.missions[0].status, "blocked", fixture.label);
+    assert.equal(
+      state.evidence.some((item) => item.source === "mcp" && item.result === "passed"),
+      false,
+      fixture.label,
+    );
+  }
 });
 
 test("repository inspection does not double-prefix canonical Git refs", async () => {

@@ -1076,11 +1076,7 @@ function verifyLockedFixtureInspection(
   if (responseValue.isError === true) {
     return inspectionFailure("get_commit MCP returned an error result.");
   }
-  const textParts = mcpTextParts(responseValue);
-  if (textParts.length === 0) {
-    return inspectionFailure("get_commit MCP response did not contain textual structured data.");
-  }
-  const verifiedPayload = parseLockedFixturePayload(textParts);
+  const verifiedPayload = parseLockedFixtureObject(responseValue);
   if (verifiedPayload === null) {
     return inspectionFailure(
       "get_commit MCP response did not contain the pinned SHA and expected file patches.",
@@ -1117,62 +1113,9 @@ function argumentsExactlyMatch(
   );
 }
 
-function mcpTextParts(response: Record<string, unknown>): string[] {
-  if (!Array.isArray(response.content)) {
-    return [];
-  }
-  return response.content.flatMap((part) => {
-    if (!isRecord(part) || part.type !== "text" || typeof part.text !== "string") {
-      return [];
-    }
-    return [part.text];
-  });
-}
-
-interface ParsedLockedFixturePayload {
-  commitSha: string;
-  patches: Readonly<Record<string, string>>;
-}
-
-function parseLockedFixturePayload(textParts: string[]): ParsedLockedFixturePayload | null {
-  const candidates: unknown[] = [];
-  for (const text of textParts) {
-    const parsed = parseMaybeJson(text);
-    if (isRecord(parsed)) {
-      candidates.push(parsed);
-      if (isRecord(parsed.result)) {
-        candidates.push(parsed.result);
-      }
-      if (isRecord(parsed.data)) {
-        candidates.push(parsed.data);
-      }
-      if (isRecord(parsed.commit)) {
-        candidates.push({
-          ...parsed.commit,
-          files: parsed.commit.files ?? parsed.files,
-        });
-      }
-    }
-  }
-  const combined = textParts.join("\n");
-  const combinedValue = parseMaybeJson(combined);
-  if (isRecord(combinedValue)) {
-    candidates.push(combinedValue);
-  }
-  for (const candidate of candidates) {
-    if (!isRecord(candidate)) {
-      continue;
-    }
-    const payload = parseLockedFixtureObject(candidate);
-    if (payload !== null) {
-      return payload;
-    }
-  }
-
-  return parseLockedFixtureText(combined);
-}
-
-function parseLockedFixtureObject(value: Record<string, unknown>): ParsedLockedFixturePayload | null {
+function parseLockedFixtureObject(
+  value: Record<string, unknown>,
+): { commitSha: string; patches: Readonly<Record<string, string>> } | null {
   const commitSha = stringOrNull(value.sha);
   const files = commitFileEntries(value.files);
   if (commitSha === null || files === null) {
@@ -1218,21 +1161,6 @@ function commitFileEntries(value: unknown): CommitFileEntry[] | null {
     filename,
     patch: isRecord(file) ? file.patch : file,
   }));
-}
-
-function parseLockedFixtureText(text: string): ParsedLockedFixturePayload | null {
-  if (!text.includes(LOCKED_FIXTURE_SHA)) {
-    return null;
-  }
-  const patches: Record<string, string> = {};
-  for (const filename of LOCKED_FIXTURE_FILES) {
-    const expectedPatch = LOCKED_FIXTURE_PATCHES[filename];
-    if (!text.includes(filename) || !text.includes(expectedPatch)) {
-      return null;
-    }
-    patches[filename] = expectedPatch;
-  }
-  return { commitSha: LOCKED_FIXTURE_SHA, patches };
 }
 
 function normalizeCommitPatch(value: string): string {
