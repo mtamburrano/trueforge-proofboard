@@ -44,7 +44,7 @@ export function agentSpec(config) {
       "Run a deterministic infrastructure smoke test and do not claim success from narration alone.",
       `Use the attached GitHub MCP server to call get_file_contents exactly once with ${repositoryRequest}.`,
       "Wait for and retain the structured MCP result.",
-      `Then use the configured Daytona-backed sandbox shell tool to execute exactly: ${config.command}`,
+      `Then use the configured Daytona-backed sandbox exec tool named exec to execute exactly: ${config.command}`,
       "Do not execute the command on the host and do not access credentials.",
       "Finish only after both tool calls return.",
     ].join(" "),
@@ -75,6 +75,10 @@ function parseMaybeJson(value) {
   }
 }
 
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 function normalizedToolArguments(call) {
   return parseMaybeJson(call?.function?.arguments ?? call?.arguments ?? {});
 }
@@ -101,37 +105,6 @@ function toolResponseFor(events, call) {
   );
 }
 
-function serialized(value) {
-  return typeof value === "string" ? value : JSON.stringify(value);
-}
-
-function findNestedValue(value, keys) {
-  const parsed = parseMaybeJson(value);
-
-  if (parsed && typeof parsed === "object") {
-    for (const key of keys) {
-      if (key in parsed) return parseMaybeJson(parsed[key]);
-    }
-
-    for (const child of Object.values(parsed)) {
-      const found = findNestedValue(child, keys);
-      if (found !== undefined) return found;
-    }
-  }
-
-  return undefined;
-}
-
-function textFrom(value) {
-  const parsed = parseMaybeJson(value);
-  if (typeof parsed === "string") return parsed;
-  if (Array.isArray(parsed)) return parsed.map(textFrom).filter(Boolean).join("\n");
-  if (parsed && typeof parsed === "object") {
-    return Object.values(parsed).map(textFrom).filter(Boolean).join("\n");
-  }
-  return "";
-}
-
 function shortHash(value) {
   let hash = 2166136261;
   for (const character of value) {
@@ -141,27 +114,118 @@ function shortHash(value) {
   return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
-function responseSummary(content) {
-  const parsed = parseMaybeJson(content);
-  const text = textFrom(parsed);
-  const metadata = {};
+function requireEvent(condition, message) {
+  if (!condition) throw new Error(message);
+}
 
-  for (const key of ["name", "path", "sha", "size", "url"]) {
-    const value = findNestedValue(parsed, [key]);
-    if (value !== undefined && (typeof value === "string" || typeof value === "number")) {
-      metadata[key] = value;
-    }
+function parseToolResponseContent(toolResponse, label) {
+  requireEvent(
+    typeof toolResponse?.content === "string",
+    `${label} response content was not a JSON string.`,
+  );
+  const result = parseMaybeJson(toolResponse.content);
+  requireEvent(isRecord(result), `${label} response content was not a JSON object.`);
+  return result;
+}
+
+function requireExactGithubArguments(argumentsValue, config) {
+  requireEvent(
+    isRecord(argumentsValue),
+    "The get_file_contents MCP call arguments were not a JSON object.",
+  );
+
+  for (const [key, expected] of Object.entries(githubArguments(config))) {
+    requireEvent(
+      Object.prototype.hasOwnProperty.call(argumentsValue, key) && argumentsValue[key] === expected,
+      `The get_file_contents MCP argument ${key} did not exactly match the configured value.`,
+    );
   }
+}
+
+function matchesRepositoryFileUri(uri, config) {
+  const prefix = `repo://${config.githubOwner}/${config.githubRepo}/`;
+  const expectedPath = config.githubPath.replace(/^\/+/, "");
+
+  try {
+    const decodedUri = decodeURIComponent(uri);
+    return decodedUri.startsWith(prefix) && decodedUri.endsWith(`/contents/${expectedPath}`);
+  } catch {
+    return false;
+  }
+}
+
+function parseGithubFileResult(toolResponse, config) {
+  const result = parseToolResponseContent(toolResponse, "GitHub MCP");
+  requireEvent(result.isError !== true, "GitHub MCP returned an error result.");
+  requireEvent(
+    Array.isArray(result.content) && result.content.length > 0,
+    "GitHub MCP returned no structured content.",
+  );
+
+  const resourcePart = result.content.find(
+    (part) => isRecord(part) && part.type === "resource",
+  );
+  requireEvent(
+    resourcePart && isRecord(resourcePart.resource),
+    "GitHub MCP did not return a structured file resource.",
+  );
+
+  const resource = resourcePart.resource;
+  requireEvent(
+    typeof resource.uri === "string" && matchesRepositoryFileUri(resource.uri, config),
+    "GitHub MCP returned a resource for an unexpected repository path.",
+  );
+  requireEvent(
+    typeof resource.text === "string",
+    "GitHub MCP file resource did not contain text content.",
+  );
+
+  return { result, resource };
+}
+
+function parseSandboxExecResult(toolResponse) {
+  const result = parseToolResponseContent(toolResponse, "Daytona sandbox");
+  requireEvent(
+    result.success === true,
+    "Daytona sandbox execution did not return success: true.",
+  );
+  requireEvent(
+    isRecord(result.response),
+    "Daytona sandbox execution did not return a response object.",
+  );
+
+  const response = result.response;
+  requireEvent(
+    typeof response.exitCode === "number" && Number.isFinite(response.exitCode),
+    "Daytona sandbox execution returned a non-numeric exitCode.",
+  );
+  requireEvent(
+    response.exitCode === 0,
+    `Daytona exit code was ${response.exitCode}, not 0.`,
+  );
+  requireEvent(
+    typeof response.result === "string",
+    "Daytona sandbox execution did not return a string response.result.",
+  );
+  requireEvent(
+    response.result.includes(EXPECTED_MARKER),
+    "Daytona stdout did not contain the smoke marker in response.result.",
+  );
+
+  return { result, response };
+}
+
+function responseSummary(content) {
+  const { resource } = content;
+  const metadata = { uri: resource.uri };
+  const mimeType = resource.mimeType ?? resource.mime_type;
+  if (typeof mimeType === "string") metadata.mime_type = mimeType;
 
   return {
     metadata,
-    content_bytes: text.length,
-    content_hash: shortHash(text),
+    content_bytes: resource.text.length,
+    content_hash: shortHash(resource.text),
   };
-}
-
-function requireEvent(condition, message) {
-  if (!condition) throw new Error(message);
 }
 
 export async function readConfiguredSandboxProvider(client) {
@@ -209,43 +273,32 @@ export function collectEvidence(events, config, sessionId, turnId, sandboxProvid
   requireEvent(mcpInitialization, "No mcp.initialize event was recorded.");
 
   const calls = toolCalls(events);
-  const githubCalls = calls.filter((call) => call.name.endsWith("get_file_contents"));
+  const githubCalls = calls.filter((call) => call.name === "get_file_contents");
   requireEvent(githubCalls.length === 1, `Expected one get_file_contents MCP call, found ${githubCalls.length}.`);
   const githubCall = githubCalls[0];
   requireEvent(githubCall, "No structured get_file_contents MCP tool call was recorded.");
 
   const githubResponse = toolResponseFor(events, githubCall);
   requireEvent(githubResponse, "The get_file_contents MCP call has no structured tool response.");
-
-  const githubArgs = githubCall.arguments;
-  const githubArgsText = serialized(githubArgs);
-  for (const expected of Object.values(githubArguments(config))) {
-    requireEvent(
-      githubArgsText.includes(String(expected)),
-      `The MCP call arguments did not include expected repository value ${expected}.`,
-    );
-  }
+  requireExactGithubArguments(githubCall.arguments, config);
+  const githubResult = parseGithubFileResult(githubResponse, config);
 
   const sandboxCreated = events.find((event) => event.type === "sandbox.created");
   requireEvent(sandboxCreated, "No sandbox.created event was recorded; Daytona was not proven.");
 
-  const sandboxCall = calls.find(
-    (call) =>
-      call.id !== githubCall.id &&
-      serialized(call.arguments).includes(EXPECTED_MARKER),
+  const sandboxCalls = calls.filter(
+    (call) => call.id !== githubCall.id && call.name === "exec",
   );
-  requireEvent(sandboxCall, "No structured sandbox command call contained the smoke marker.");
+  requireEvent(sandboxCalls.length === 1, `Expected one Daytona exec call, found ${sandboxCalls.length}.`);
+  const sandboxCall = sandboxCalls[0];
+  requireEvent(
+    isRecord(sandboxCall.arguments) && sandboxCall.arguments.command === config.command,
+    "The Daytona exec command did not exactly match the configured command.",
+  );
 
   const sandboxResponse = toolResponseFor(events, sandboxCall);
   requireEvent(sandboxResponse, "The sandbox command has no structured tool response.");
-
-  const sandboxContent = sandboxResponse.content ?? sandboxResponse.result ?? "";
-  const sandboxText = textFrom(sandboxContent);
-  const stdout = findNestedValue(sandboxContent, ["stdout", "standardOutput"]);
-  const exitCode = findNestedValue(sandboxContent, ["exit_code", "exitCode"]);
-  const output = typeof stdout === "string" ? stdout : sandboxText;
-  requireEvent(output.includes(EXPECTED_MARKER), "Daytona stdout did not contain the smoke marker.");
-  requireEvent(Number(exitCode) === 0, `Daytona exit code was ${exitCode ?? "missing"}, not 0.`);
+  const sandboxResult = parseSandboxExecResult(sandboxResponse);
 
   const initializedServers = mcpInitialization.mcpServers ?? mcpInitialization.mcp_servers ?? [];
 
@@ -269,7 +322,7 @@ export function collectEvidence(events, config, sessionId, turnId, sandboxProvid
       tool_response: {
         event_id: githubResponse.id,
         tool_call_id: githubResponse.toolCallId ?? githubResponse.tool_call_id,
-        ...responseSummary(githubResponse.content ?? githubResponse.result ?? ""),
+        ...responseSummary(githubResult),
       },
     },
     sandbox: {
@@ -286,8 +339,9 @@ export function collectEvidence(events, config, sessionId, turnId, sandboxProvid
       tool_response: {
         event_id: sandboxResponse.id,
         tool_call_id: sandboxResponse.toolCallId ?? sandboxResponse.tool_call_id,
-        stdout: output,
-        exit_code: Number(exitCode),
+        success: sandboxResult.result.success,
+        stdout: sandboxResult.response.result,
+        exit_code: sandboxResult.response.exitCode,
       },
     },
   };

@@ -15,7 +15,7 @@ This repository deliberately starts with only the TypeScript/Node foundation nee
 
 ## Development
 
-Requires Node.js 20 or newer.
+Requires Node.js 22.14 or newer.
 
 ```sh
 npm install

@@ -78,7 +78,7 @@ The runner creates an inline TrueForge session and requests exactly two useful
 operations:
 
 1. `get_file_contents` on the configured public repository path.
-2. `printf 'TRUEFORGE_DAYTONA_OK\\n'` through the configured sandbox tool.
+2. `printf 'TRUEFORGE_DAYTONA_OK\\n'` through the configured sandbox `exec` tool.
 
 The command is harmless and does not mutate the repository or remote GitHub.
 TrueForge provisions and manages the Daytona sandbox according to its provider
@@ -93,10 +93,11 @@ On success, stdout is a JSON evidence packet containing:
 - the TrueForge base URL, model, session, and turn;
 - the configured sandbox provider type/status returned by TrueForge settings;
 - the MCP initialization event, structured `get_file_contents` call arguments,
-  matching tool-response ID, and response metadata/hash;
+  matching tool-response ID, and the structured repository file resource
+  URI/content hash;
 - the `sandbox.created` event and sandbox ID;
-- the structured sandbox command call and matching response with stdout and
-  numeric exit code `0`.
+- the structured `exec` command call and matching
+  `{ success: true, response: { exitCode: 0, result } }` response.
 
 The runner exits non-zero if any of those records is missing, if GitHub MCP
 authentication is pending, if the repository arguments differ, or if the
