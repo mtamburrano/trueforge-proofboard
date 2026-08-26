@@ -15,7 +15,7 @@ This repository deliberately starts with only the TypeScript/Node foundation nee
 
 ## Development
 
-Requires Node.js 20 or newer.
+Requires Node.js 22.14 or newer.
 
 ```sh
 npm install
@@ -24,6 +24,23 @@ npm run check
 
 `npm run check` type-checks the source, builds it into `dist/`, and runs the Node test suite.
 
+## TrueForge smoke path
+
+The reproducible TrueForge + GitHub MCP + Daytona validation path is documented in
+[`docs/trueforge-smoke.md`](docs/trueforge-smoke.md). After configuring the local
+TrueForge server, run the harmless local validation with:
+
+```sh
+npm run smoke:trueforge -- --dry-run
+```
+
+Run the live, opt-in smoke only when the external provider, GitHub MCP connector,
+and Daytona sandbox are configured:
+
+```sh
+npm run smoke:trueforge
+```
+
 ## Repository safety
 
-Local credentials, environment files, MCP configuration, MCPlanner metadata, dependencies, and generated output are ignored by default. Do not commit secrets or machine-specific configuration.
+Local credentials, environment files, MCP configuration, dependencies, and generated output are ignored by default. Do not commit secrets or machine-specific configuration.
