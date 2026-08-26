@@ -951,13 +951,24 @@ function matchesRepositoryFileUri(
   repository: NonNullable<Mission["repository"]>,
   path: string,
 ): boolean {
+  const resourceRef = repositoryResourceRef(repository.ref);
   const expected =
-    `repo://${repository.owner}/${repository.name}/refs/heads/${repository.ref}/contents/${path.replace(/^\/+/, "")}`;
+    `repo://${repository.owner}/${repository.name}/${resourceRef}/contents/${path.replace(/^\/+/, "")}`;
   try {
     return decodeURIComponent(uri) === expected;
   } catch {
     return false;
   }
+}
+
+function repositoryResourceRef(ref: string): string {
+  const normalizedRef = ref.replace(/^\/+/, "");
+  if (normalizedRef.startsWith("refs/") || normalizedRef.startsWith("sha/")) {
+    return normalizedRef;
+  }
+  return /^[0-9a-f]{40}$/i.test(normalizedRef)
+    ? `sha/${normalizedRef}`
+    : `refs/heads/${normalizedRef}`;
 }
 
 function shortHash(value: string): string {

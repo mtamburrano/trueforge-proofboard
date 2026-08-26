@@ -7,6 +7,8 @@ import {
   TrueForgeMissionRunner,
 } from "../dist/index.js";
 
+const LOCKED_FIXTURE_SHA = "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b";
+
 function fakeEvents(turnId = "turn-1") {
   return [
     {
@@ -57,7 +59,11 @@ function fakeEvents(turnId = "turn-1") {
   ];
 }
 
-function repositoryEvents(turnId = "turn-1") {
+function repositoryEvents(
+  turnId = "turn-1",
+  ref = "main",
+  resourceRef = "refs/heads/main",
+) {
   return [
     {
       type: "turn.created",
@@ -87,7 +93,7 @@ function repositoryEvents(turnId = "turn-1") {
             owner: "owner",
             repo: "repo",
             path: "package.json",
-            ref: "main",
+            ref,
           }),
         },
       }],
@@ -103,7 +109,7 @@ function repositoryEvents(turnId = "turn-1") {
         content: [{
           type: "resource",
           resource: {
-            uri: "repo://owner/repo/refs/heads/main/contents/package.json",
+            uri: `repo://owner/repo/${resourceRef}/contents/package.json`,
             mimeType: "application/json",
             text: JSON.stringify({ name: "fixture" }),
           },
@@ -349,6 +355,64 @@ test("repository inspection proves the MCP call and returned file resource", asy
   assert.equal(proof.source, "mcp");
   assert.equal(proof.result, "passed");
   assert.equal(state.missions[0].status, "draft");
+});
+
+test("repository inspection accepts the locked commit resource URI", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client, calls } = fakeClient((turnId) => repositoryEvents(
+    turnId,
+    LOCKED_FIXTURE_SHA,
+    `sha/${LOCKED_FIXTURE_SHA}`,
+  ));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "google-gemini/test-model",
+    mcpServers: [{ name: "github", enableTools: ["get_file_contents"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-mcp-pinned-fixture",
+    objective: "Inspect the locked repository fixture by commit",
+    repository: { owner: "owner", name: "repo", ref: LOCKED_FIXTURE_SHA },
+  });
+
+  const inspection = await runner.inspectRepository({
+    missionId: mission.id,
+    path: "package.json",
+  });
+
+  assert.equal(
+    inspection.resourceUri,
+    `repo://owner/repo/sha/${LOCKED_FIXTURE_SHA}/contents/package.json`,
+  );
+  assert.match(calls.turns[0].request.input[0].content, new RegExp(LOCKED_FIXTURE_SHA));
+});
+
+test("repository inspection does not double-prefix canonical Git refs", async () => {
+  const canonicalRef = "refs/heads/main";
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client } = fakeClient((turnId) => repositoryEvents(
+    turnId,
+    canonicalRef,
+    canonicalRef,
+  ));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "google-gemini/test-model",
+    mcpServers: [{ name: "github", enableTools: ["get_file_contents"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-mcp-canonical-ref",
+    objective: "Inspect a repository with a canonical branch ref",
+    repository: { owner: "owner", name: "repo", ref: canonicalRef },
+  });
+
+  const inspection = await runner.inspectRepository({
+    missionId: mission.id,
+    path: "package.json",
+  });
+
+  assert.equal(
+    inspection.resourceUri,
+    "repo://owner/repo/refs/heads/main/contents/package.json",
+  );
 });
 
 test("failed MCP verification is durable and blocks the mission", async () => {
