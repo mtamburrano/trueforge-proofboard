@@ -57,6 +57,13 @@ never replaced with canned repository content. `runSandboxVerification` applies 
 same proof boundary to the canonical sandbox `exec` tool, recording the exact
 command, exit code, and bounded output summary.
 
+For the deterministic public fixture (`mtamburrano/trueforge-proofboard` at commit
+`590aa8a6d72c580f61fc1b19d33e9876bc0feb9b`), `inspectRepository` uses the GitHub MCP
+`get_commit` tool with `detail: "full_patch"` and accepts evidence only when the
+returned commit contains the expected `src/index.ts` and `test/index.test.js`
+patches. The regular `get_file_contents` resource contract remains fail-closed for
+other repository targets.
+
 Configure the TrueForge model, GitHub MCP connector, and sandbox provider in the
 local TrueForge UI as described in [`docs/trueforge-smoke.md`](docs/trueforge-smoke.md).
 Only the SDK client receives connection credentials; mission persistence stores

@@ -8,6 +8,44 @@ import {
 } from "../dist/index.js";
 
 const LOCKED_FIXTURE_SHA = "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b";
+const LOCKED_FIXTURE_PATCHES = {
+  "src/index.ts": [
+    "@@ -0,0 +1,11 @@",
+    "+export const productName = \"TrueForge Proof Board\" as const;",
+    "+",
+    "+export const productThesis = \"Verified autonomous software delivery\" as const;",
+    "+",
+    "+export const deliveryStages = [\"Plan\", \"Execute\", \"Prove\", \"Approve\"] as const;",
+    "+",
+    "+export type DeliveryStage = (typeof deliveryStages)[number];",
+    "+",
+    "+export function getProductSummary(): string {",
+    "+  return `${productName}: ${productThesis} — ${deliveryStages.join(\" → \")}`;",
+    "+}",
+  ].join("\n"),
+  "test/index.test.js": [
+    "@@ -0,0 +1,19 @@",
+    "+import assert from \"node:assert/strict\";",
+    "+import test from \"node:test\";",
+    "+",
+    "+import {",
+    "+  deliveryStages,",
+    "+  getProductSummary,",
+    "+  productName,",
+    "+  productThesis,",
+    "+} from \"../dist/index.js\";",
+    "+",
+    "+test(\"exports the product identity and delivery thesis\", () => {",
+    "+  assert.equal(productName, \"TrueForge Proof Board\");",
+    "+  assert.equal(productThesis, \"Verified autonomous software delivery\");",
+    "+  assert.deepEqual(deliveryStages, [\"Plan\", \"Execute\", \"Prove\", \"Approve\"]);",
+    "+  assert.equal(",
+    "+    getProductSummary(),",
+    "+    \"TrueForge Proof Board: Verified autonomous software delivery — Plan → Execute → Prove → Approve\",",
+    "+  );",
+    "+});",
+  ].join("\n"),
+};
 
 function fakeEvents(turnId = "turn-1") {
   return [
@@ -129,6 +167,88 @@ function repositoryEvents(
             text: JSON.stringify({ name: "fixture" }),
           },
         }],
+      }),
+    },
+    {
+      type: "turn.done",
+      id: "event-turn-done",
+      createdAt: "2026-08-26T16:00:04.000Z",
+      threadId: null,
+      state: { status: "done", requiredActions: [] },
+    },
+  ];
+}
+
+function lockedCommitEvents(
+  turnId = "turn-1",
+  {
+    argumentsValue = {
+      owner: "mtamburrano",
+      repo: "trueforge-proofboard",
+      sha: LOCKED_FIXTURE_SHA,
+      detail: "full_patch",
+    },
+    sha = LOCKED_FIXTURE_SHA,
+    patches = LOCKED_FIXTURE_PATCHES,
+  } = {},
+) {
+  const commitArguments = JSON.stringify(argumentsValue);
+  const argumentSplit = Math.ceil(commitArguments.length / 2);
+  const commitPayload = {
+    sha,
+    files: Object.entries(patches).map(([filename, patch]) => ({ filename, patch })),
+  };
+  return [
+    {
+      type: "turn.created",
+      id: "event-turn-created",
+      createdAt: "2026-08-26T16:00:00.000Z",
+      threadId: null,
+      turnId,
+      state: { status: "running" },
+    },
+    {
+      type: "mcp.initialize",
+      id: "event-mcp",
+      createdAt: "2026-08-26T16:00:01.000Z",
+      threadId: "thread-1",
+      mcpServers: [{ name: "github" }],
+    },
+    {
+      type: "model.message.delta",
+      id: "event-model",
+      createdAt: "2026-08-26T16:00:02.000Z",
+      threadId: "thread-1",
+      toolCalls: [{
+        index: 0,
+        id: "call-commit",
+        function: {
+          name: "get_commit",
+          arguments: commitArguments.slice(0, argumentSplit),
+        },
+      }],
+    },
+    {
+      type: "model.message.delta",
+      id: "event-model-arguments",
+      createdAt: "2026-08-26T16:00:02.500Z",
+      threadId: "thread-1",
+      toolCalls: [{
+        index: 0,
+        function: {
+          arguments: commitArguments.slice(argumentSplit),
+        },
+      }],
+    },
+    {
+      type: "tool.response",
+      id: "event-tool-response",
+      createdAt: "2026-08-26T16:00:03.000Z",
+      threadId: "thread-1",
+      toolCallId: "call-commit",
+      content: JSON.stringify({
+        isError: false,
+        content: [{ type: "text", text: JSON.stringify(commitPayload) }],
       }),
     },
     {
@@ -372,33 +492,118 @@ test("repository inspection proves the MCP call and returned file resource", asy
   assert.equal(state.missions[0].status, "draft");
 });
 
-test("repository inspection accepts the locked commit resource URI", async () => {
+test("locked fixture inspection proves the exact get_commit result and expected patches", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
-  const { client, calls } = fakeClient((turnId) => repositoryEvents(
-    turnId,
-    LOCKED_FIXTURE_SHA,
-    `sha/${LOCKED_FIXTURE_SHA}`,
-  ));
+  const { client, calls } = fakeClient(lockedCommitEvents);
   const runner = new TrueForgeMissionRunner(missions, client, {
     model: "google-gemini/test-model",
-    mcpServers: [{ name: "github", enableTools: ["get_file_contents"] }],
+    mcpServers: [{ name: "github", enableTools: ["get_file_contents", "get_commit"] }],
   });
   const mission = await runner.createMission({
     id: "mission-mcp-pinned-fixture",
     objective: "Inspect the locked repository fixture by commit",
-    repository: { owner: "owner", name: "repo", ref: LOCKED_FIXTURE_SHA },
+    repository: {
+      owner: "mtamburrano",
+      name: "trueforge-proofboard",
+      ref: LOCKED_FIXTURE_SHA,
+    },
   });
 
   const inspection = await runner.inspectRepository({
     missionId: mission.id,
-    path: "package.json",
   });
 
-  assert.equal(
-    inspection.resourceUri,
-    `repo://owner/repo/sha/${LOCKED_FIXTURE_SHA}/contents/package.json`,
-  );
+  assert.equal(inspection.toolName, "get_commit");
+  assert.equal(inspection.commitSha, LOCKED_FIXTURE_SHA);
+  assert.deepEqual(inspection.patches, LOCKED_FIXTURE_PATCHES);
+  assert.match(calls.turns[0].request.input[0].content, /get_commit exactly once/);
+  assert.match(calls.turns[0].request.input[0].content, /"owner":"mtamburrano"/);
+  assert.match(calls.turns[0].request.input[0].content, /"repo":"trueforge-proofboard"/);
   assert.match(calls.turns[0].request.input[0].content, new RegExp(LOCKED_FIXTURE_SHA));
+  assert.match(calls.turns[0].request.input[0].content, /"detail":"full_patch"/);
+
+  const state = await missions.getState();
+  const proof = state.evidence.find((item) => item.id === inspection.evidenceId);
+  const details = JSON.parse(proof.details);
+  assert.deepEqual(details.arguments, {
+    owner: "mtamburrano",
+    repo: "trueforge-proofboard",
+    sha: LOCKED_FIXTURE_SHA,
+    detail: "full_patch",
+  });
+  assert.equal(details.commit_sha, LOCKED_FIXTURE_SHA);
+  assert.deepEqual(details.patches, LOCKED_FIXTURE_PATCHES);
+});
+
+test("locked fixture inspection rejects a non-canonical get_commit call", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, {
+    argumentsValue: {
+      owner: "mtamburrano",
+      repo: "trueforge-proofboard",
+      sha: LOCKED_FIXTURE_SHA,
+      detail: "metadata",
+    },
+  }));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "google-gemini/test-model",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-mcp-pinned-arguments-failure",
+    objective: "Reject a non-canonical locked fixture inspection",
+    repository: {
+      owner: "mtamburrano",
+      name: "trueforge-proofboard",
+      ref: LOCKED_FIXTURE_SHA,
+    },
+  });
+
+  await assert.rejects(
+    runner.inspectRepository({ missionId: mission.id }),
+    /get_commit MCP arguments did not match the locked fixture/,
+  );
+  const state = await missions.getState();
+  assert.equal(state.missions[0].status, "blocked");
+  assert.equal(
+    state.evidence.some((item) => item.source === "mcp" && item.result === "passed"),
+    false,
+  );
+});
+
+test("locked fixture inspection rejects a wrong SHA or expected patch", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, {
+    sha: "0000000000000000000000000000000000000000",
+    patches: {
+      ...LOCKED_FIXTURE_PATCHES,
+      "src/index.ts": `${LOCKED_FIXTURE_PATCHES["src/index.ts"]}\n+tampered`,
+    },
+  }));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "google-gemini/test-model",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-mcp-pinned-result-failure",
+    objective: "Reject an unverified locked fixture result",
+    repository: {
+      owner: "mtamburrano",
+      name: "trueforge-proofboard",
+      ref: LOCKED_FIXTURE_SHA,
+    },
+  });
+
+  await assert.rejects(
+    runner.inspectRepository({ missionId: mission.id }),
+    /get_commit MCP response did not contain the pinned SHA and expected file patches/,
+  );
+  const state = await missions.getState();
+  assert.equal(state.missions[0].status, "blocked");
+  assert.equal(
+    state.evidence.some((item) => item.source === "mcp" && item.result === "passed"),
+    false,
+  );
 });
 
 test("repository inspection does not double-prefix canonical Git refs", async () => {

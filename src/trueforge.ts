@@ -33,6 +33,49 @@ export interface TrueForgeEventStream extends AsyncIterable<TrueForgeApi.TurnStr
   withMetadata?: () => AsyncIterable<{ data: TrueForgeApi.TurnStreamingEvent }>;
 }
 
+const LOCKED_FIXTURE_OWNER = "mtamburrano";
+const LOCKED_FIXTURE_REPO = "trueforge-proofboard";
+const LOCKED_FIXTURE_SHA = "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b";
+const LOCKED_FIXTURE_FILES = ["src/index.ts", "test/index.test.js"] as const;
+const LOCKED_FIXTURE_PATCHES = {
+  "src/index.ts": [
+    "@@ -0,0 +1,11 @@",
+    "+export const productName = \"TrueForge Proof Board\" as const;",
+    "+",
+    "+export const productThesis = \"Verified autonomous software delivery\" as const;",
+    "+",
+    "+export const deliveryStages = [\"Plan\", \"Execute\", \"Prove\", \"Approve\"] as const;",
+    "+",
+    "+export type DeliveryStage = (typeof deliveryStages)[number];",
+    "+",
+    "+export function getProductSummary(): string {",
+    "+  return `${productName}: ${productThesis} — ${deliveryStages.join(\" → \")}`;",
+    "+}",
+  ].join("\n"),
+  "test/index.test.js": [
+    "@@ -0,0 +1,19 @@",
+    "+import assert from \"node:assert/strict\";",
+    "+import test from \"node:test\";",
+    "+",
+    "+import {",
+    "+  deliveryStages,",
+    "+  getProductSummary,",
+    "+  productName,",
+    "+  productThesis,",
+    "+} from \"../dist/index.js\";",
+    "+",
+    "+test(\"exports the product identity and delivery thesis\", () => {",
+    "+  assert.equal(productName, \"TrueForge Proof Board\");",
+    "+  assert.equal(productThesis, \"Verified autonomous software delivery\");",
+    "+  assert.deepEqual(deliveryStages, [\"Plan\", \"Execute\", \"Prove\", \"Approve\"]);",
+    "+  assert.equal(",
+    "+    getProductSummary(),",
+    "+    \"TrueForge Proof Board: Verified autonomous software delivery — Plan → Execute → Prove → Approve\",",
+    "+  );",
+    "+});",
+  ].join("\n"),
+} as const;
+
 export interface TrueForgeClientLike {
   sessions: {
     create(request: TrueForgeApi.CreateSessionRequest): Promise<TrueForgeApi.GetSessionResponse>;
@@ -56,7 +99,7 @@ export interface RunTurnOptions {
 
 export interface RepositoryInspectionInput {
   missionId: string;
-  path: string;
+  path?: string;
   workItemId?: string;
   mcpServerName?: string;
   toolName?: string;
@@ -71,6 +114,8 @@ export interface RepositoryInspectionResult {
   content: string;
   contentBytes: number;
   contentHash: string;
+  commitSha?: string;
+  patches?: Readonly<Record<string, string>>;
   evidenceId: string;
   mission: Mission;
 }
@@ -124,6 +169,20 @@ interface VerifiedRepositoryFile {
   resourceUri: string;
   content: string;
   contentHash: string;
+}
+
+interface VerifiedRepositoryCommit {
+  resourceUri: string;
+  content: string;
+  contentHash: string;
+  commitSha: string;
+  patches: Readonly<Record<string, string>>;
+}
+
+function isVerifiedRepositoryCommit(
+  value: VerifiedRepositoryFile | VerifiedRepositoryCommit,
+): value is VerifiedRepositoryCommit {
+  return "commitSha" in value && "patches" in value;
 }
 
 interface VerifiedSandboxExecution {
@@ -186,10 +245,11 @@ function defaultRepositoryMcpServer(
   config: TrueForgeMissionConfig,
 ): TrueForgeApi.McpServer {
   const toolName = config.repositoryToolName ?? "get_file_contents";
+  const toolNames = [...new Set([toolName, "get_file_contents", "get_commit"])];
   return {
     name: config.mcpServerName ?? "github",
-    enableTools: [toolName],
-    preloadTools: [toolName],
+    enableTools: toolNames,
+    preloadTools: toolNames,
   };
 }
 
@@ -255,15 +315,27 @@ export class TrueForgeMissionRunner {
           `Mission ${mission.id} has no repository target.`,
         );
       }
-      const path = requiredInspectionString(input.path, "repository path");
+      const lockedFixture = isLockedFixtureRepository(mission.repository);
+      const path = input.path === undefined
+        ? undefined
+        : requiredInspectionString(input.path, "repository path");
       const mcpServerName = requiredInspectionString(
         input.mcpServerName ?? this.config.mcpServerName ?? "github",
         "MCP server name",
       );
-      const toolName = requiredInspectionString(
-        input.toolName ?? this.config.repositoryToolName ?? "get_file_contents",
-        "MCP tool name",
-      );
+      const requestedToolName = input.toolName ?? this.config.repositoryToolName;
+      if (lockedFixture && requestedToolName !== undefined && requestedToolName !== "get_commit") {
+        throw new TrueForgeIntegrationError(
+          "inspect repository",
+          "The locked fixture requires the canonical GitHub MCP get_commit tool.",
+        );
+      }
+      const toolName = lockedFixture
+        ? "get_commit"
+        : requiredInspectionString(requestedToolName ?? "get_file_contents", "MCP tool name");
+      if (!lockedFixture && path === undefined) {
+        throw new TrueForgeIntegrationError("inspect repository", "repository path must not be empty.");
+      }
       ensureRepositoryMcpConfigured(this.config, mcpServerName, toolName);
       const inspectionOptions: RunTurnOptions = {};
       if (input.workItemId !== undefined) {
@@ -271,33 +343,44 @@ export class TrueForgeMissionRunner {
       }
       const execution = await this.executeTurn(
         mission.id,
-        buildRepositoryInspectionInstruction(
-          mission,
-          path,
-          mcpServerName,
-          toolName,
-        ),
+        lockedFixture
+          ? buildLockedFixtureInspectionInstruction(mission, mcpServerName)
+          : buildRepositoryInspectionInstruction(mission, path as string, mcpServerName, toolName),
         inspectionOptions,
       );
-      const verified = verifyRepositoryInspection(
-        execution.rawEvents,
-        mission.repository,
-        path,
-        mcpServerName,
-        toolName,
-      );
+      const verified: VerifiedRepositoryFile | VerifiedRepositoryCommit = lockedFixture
+        ? verifyLockedFixtureInspection(execution.rawEvents, mission.repository, mcpServerName)
+        : verifyRepositoryInspection(
+            execution.rawEvents,
+            mission.repository,
+            path as string,
+            mcpServerName,
+            toolName,
+          );
+      const isCommit = isVerifiedRepositoryCommit(verified);
       const evidenceInput = {
         kind: "tool_result" as const,
         result: "passed" as const,
         source: "mcp" as const,
-        summary: `MCP verified repository file ${verified.resourceUri}.`,
-        details: JSON.stringify({
-          server: mcpServerName,
-          tool: toolName,
-          uri: verified.resourceUri,
-          content_bytes: verified.content.length,
-          content_hash: verified.contentHash,
-        }),
+        summary: isCommit
+          ? `MCP verified locked repository commit ${verified.commitSha}.`
+          : `MCP verified repository file ${verified.resourceUri}.`,
+        details: isCommit
+          ? JSON.stringify({
+              server: mcpServerName,
+              tool: toolName,
+              arguments: lockedFixtureArguments(),
+              commit_sha: verified.commitSha,
+              patches: verified.patches,
+              content_hash: verified.contentHash,
+            })
+          : JSON.stringify({
+              server: mcpServerName,
+              tool: toolName,
+              uri: verified.resourceUri,
+              content_bytes: verified.content.length,
+              content_hash: verified.contentHash,
+            }),
       };
       const evidence = input.workItemId === undefined
         ? await this.missions.addEvidence(mission.id, evidenceInput)
@@ -305,7 +388,7 @@ export class TrueForgeMissionRunner {
             ...evidenceInput,
             workItemId: input.workItemId,
           });
-      return {
+      const result: RepositoryInspectionResult = {
         sessionId: execution.sessionId,
         turnId: execution.turnId,
         mcpServerName,
@@ -317,6 +400,11 @@ export class TrueForgeMissionRunner {
         evidenceId: evidence.id,
         mission: await this.missions.getMission(mission.id),
       };
+      if (isCommit) {
+        result.commitSha = verified.commitSha;
+        result.patches = verified.patches;
+      }
+      return result;
     } catch (error) {
       await this.recordInspectionFailure(mission.id, input.workItemId, error);
       if (error instanceof TrueForgeIntegrationError) {
@@ -588,7 +676,7 @@ function buildTurnInstruction(
   ].join("\n");
 }
 
-function requiredInspectionString(value: string, label: string): string {
+function requiredInspectionString(value: string | undefined, label: string): string {
   return requiredString(value, label, "inspect repository");
 }
 
@@ -596,8 +684,8 @@ function requiredSandboxString(value: string, label: string): string {
   return requiredString(value, label, "run sandbox verification");
 }
 
-function requiredString(value: string, label: string, operation: string): string {
-  if (value.trim().length === 0) {
+function requiredString(value: string | undefined, label: string, operation: string): string {
+  if (value === undefined || value.trim().length === 0) {
     throw new TrueForgeIntegrationError(operation, `${label} must not be empty.`);
   }
   return value.trim();
@@ -662,6 +750,25 @@ function buildRepositoryInspectionInstruction(
     `Call ${toolName} exactly once with this JSON object: ${JSON.stringify(argumentsValue)}.`,
     "Use the MCP response as the only source of repository contents; do not use the host filesystem or canned data.",
     "Report the returned file facts and stop after the read.",
+  ].join(" ");
+}
+
+function buildLockedFixtureInspectionInstruction(
+  mission: Mission,
+  serverName: string,
+): string {
+  if (mission.repository === undefined || !isLockedFixtureRepository(mission.repository)) {
+    throw new TrueForgeIntegrationError(
+      "inspect repository",
+      "The locked fixture inspection requires the pinned repository target.",
+    );
+  }
+  return [
+    `Use the configured MCP server ${serverName}.`,
+    `Call get_commit exactly once with this JSON object: ${JSON.stringify(lockedFixtureArguments())}.`,
+    `The returned commit must include the exact patches for ${LOCKED_FIXTURE_FILES.join(" and ")}.`,
+    "Use the MCP response as the only source of repository facts; do not use the host filesystem, canned data, or final-answer narration.",
+    "Stop after the read.",
   ].join(" ");
 }
 
@@ -817,6 +924,25 @@ function expectedRepositoryArguments(
   };
 }
 
+function isLockedFixtureRepository(
+  repository: NonNullable<Mission["repository"]>,
+): boolean {
+  return (
+    repository.owner === LOCKED_FIXTURE_OWNER &&
+    repository.name === LOCKED_FIXTURE_REPO &&
+    (repository.ref === LOCKED_FIXTURE_SHA || repository.ref === `sha/${LOCKED_FIXTURE_SHA}`)
+  );
+}
+
+function lockedFixtureArguments(): Record<string, string> {
+  return {
+    owner: LOCKED_FIXTURE_OWNER,
+    repo: LOCKED_FIXTURE_REPO,
+    sha: LOCKED_FIXTURE_SHA,
+    detail: "full_patch",
+  };
+}
+
 function verifyRepositoryInspection(
   events: TrueForgeApi.TurnStreamingEvent[],
   repository: NonNullable<Mission["repository"]>,
@@ -904,6 +1030,215 @@ function verifyRepositoryInspection(
     content: fileContent,
     contentHash: shortHash(fileContent),
   };
+}
+
+function verifyLockedFixtureInspection(
+  events: TrueForgeApi.TurnStreamingEvent[],
+  repository: NonNullable<Mission["repository"]>,
+  serverName: string,
+): VerifiedRepositoryCommit {
+  const initialization = events.find((event) => event.type === "mcp.initialize");
+  if (initialization === undefined) {
+    return inspectionFailure("TrueForge did not record MCP initialization.");
+  }
+  const initializedServers = recordValue(initialization).mcpServers;
+  if (
+    !Array.isArray(initializedServers) ||
+    !initializedServers.some((server) => isRecord(server) && server.name === serverName)
+  ) {
+    return inspectionFailure(`MCP server ${serverName} was not initialized.`);
+  }
+
+  const calls = observedToolCalls(events).filter((call) => call.name === "get_commit");
+  if (calls.length !== 1) {
+    return inspectionFailure(`Expected exactly one get_commit MCP call, found ${calls.length}.`);
+  }
+  const call = calls[0];
+  if (call === undefined || !isRecord(call.arguments)) {
+    return inspectionFailure("get_commit MCP arguments were not a JSON object.");
+  }
+  if (!argumentsExactlyMatch(call.arguments, lockedFixtureArguments())) {
+    return inspectionFailure("get_commit MCP arguments did not match the locked fixture.");
+  }
+
+  const response = events.find(
+    (event) =>
+      event.type === "tool.response" &&
+      recordValue(event).toolCallId === call.id,
+  );
+  if (response === undefined) {
+    return inspectionFailure("get_commit MCP call has no structured response.");
+  }
+  const responseValue = parseMaybeJson(recordValue(response).content);
+  if (!isRecord(responseValue)) {
+    return inspectionFailure("get_commit MCP response was not a JSON object.");
+  }
+  if (responseValue.isError === true) {
+    return inspectionFailure("get_commit MCP returned an error result.");
+  }
+  const textParts = mcpTextParts(responseValue);
+  if (textParts.length === 0) {
+    return inspectionFailure("get_commit MCP response did not contain textual structured data.");
+  }
+  const verifiedPayload = parseLockedFixturePayload(textParts);
+  if (verifiedPayload === null) {
+    return inspectionFailure(
+      "get_commit MCP response did not contain the pinned SHA and expected file patches.",
+    );
+  }
+
+  requireCompletedTurn(events, "inspect repository", "inspection");
+  const content = JSON.stringify({
+    sha: verifiedPayload.commitSha,
+    files: LOCKED_FIXTURE_FILES.map((filename) => ({
+      filename,
+      patch: verifiedPayload.patches[filename],
+    })),
+  });
+  return {
+    resourceUri: `repo://${repository.owner}/${repository.name}/${repositoryResourceRef(LOCKED_FIXTURE_SHA)}`,
+    content,
+    contentHash: shortHash(content),
+    commitSha: verifiedPayload.commitSha,
+    patches: verifiedPayload.patches,
+  };
+}
+
+function argumentsExactlyMatch(
+  actual: Record<string, unknown>,
+  expected: Record<string, string>,
+): boolean {
+  const actualKeys = Object.keys(actual).sort();
+  const expectedKeys = Object.keys(expected).sort();
+  return (
+    actualKeys.length === expectedKeys.length &&
+    actualKeys.every((key, index) => key === expectedKeys[index]) &&
+    Object.entries(expected).every(([key, value]) => actual[key] === value)
+  );
+}
+
+function mcpTextParts(response: Record<string, unknown>): string[] {
+  if (!Array.isArray(response.content)) {
+    return [];
+  }
+  return response.content.flatMap((part) => {
+    if (!isRecord(part) || part.type !== "text" || typeof part.text !== "string") {
+      return [];
+    }
+    return [part.text];
+  });
+}
+
+interface ParsedLockedFixturePayload {
+  commitSha: string;
+  patches: Readonly<Record<string, string>>;
+}
+
+function parseLockedFixturePayload(textParts: string[]): ParsedLockedFixturePayload | null {
+  const candidates: unknown[] = [];
+  for (const text of textParts) {
+    const parsed = parseMaybeJson(text);
+    if (isRecord(parsed)) {
+      candidates.push(parsed);
+      if (isRecord(parsed.result)) {
+        candidates.push(parsed.result);
+      }
+      if (isRecord(parsed.data)) {
+        candidates.push(parsed.data);
+      }
+      if (isRecord(parsed.commit)) {
+        candidates.push({
+          ...parsed.commit,
+          files: parsed.commit.files ?? parsed.files,
+        });
+      }
+    }
+  }
+  const combined = textParts.join("\n");
+  const combinedValue = parseMaybeJson(combined);
+  if (isRecord(combinedValue)) {
+    candidates.push(combinedValue);
+  }
+  for (const candidate of candidates) {
+    if (!isRecord(candidate)) {
+      continue;
+    }
+    const payload = parseLockedFixtureObject(candidate);
+    if (payload !== null) {
+      return payload;
+    }
+  }
+
+  return parseLockedFixtureText(combined);
+}
+
+function parseLockedFixtureObject(value: Record<string, unknown>): ParsedLockedFixturePayload | null {
+  const commitSha = stringOrNull(value.sha);
+  const files = commitFileEntries(value.files);
+  if (commitSha === null || files === null) {
+    return null;
+  }
+  const patches: Record<string, string> = {};
+  for (const filename of LOCKED_FIXTURE_FILES) {
+    const matchingFiles = files.filter((file) => file.filename === filename);
+    if (matchingFiles.length !== 1) {
+      return null;
+    }
+    const patch = matchingFiles[0]?.patch;
+    if (typeof patch !== "string" || normalizeCommitPatch(patch) !== LOCKED_FIXTURE_PATCHES[filename]) {
+      return null;
+    }
+    patches[filename] = normalizeCommitPatch(patch);
+  }
+  if (commitSha !== LOCKED_FIXTURE_SHA) {
+    return null;
+  }
+  return { commitSha, patches };
+}
+
+interface CommitFileEntry {
+  filename: string;
+  patch: unknown;
+}
+
+function commitFileEntries(value: unknown): CommitFileEntry[] | null {
+  if (Array.isArray(value)) {
+    return value.flatMap((file) => {
+      if (!isRecord(file)) {
+        return [];
+      }
+      const filename = stringOrNull(file.filename) ?? stringOrNull(file.path);
+      return filename === null ? [] : [{ filename, patch: file.patch }];
+    });
+  }
+  if (!isRecord(value)) {
+    return null;
+  }
+  return Object.entries(value).map(([filename, file]) => ({
+    filename,
+    patch: isRecord(file) ? file.patch : file,
+  }));
+}
+
+function parseLockedFixtureText(text: string): ParsedLockedFixturePayload | null {
+  if (!text.includes(LOCKED_FIXTURE_SHA)) {
+    return null;
+  }
+  const patches: Record<string, string> = {};
+  for (const filename of LOCKED_FIXTURE_FILES) {
+    const expectedPatch = LOCKED_FIXTURE_PATCHES[filename];
+    if (!text.includes(filename) || !text.includes(expectedPatch)) {
+      return null;
+    }
+    patches[filename] = expectedPatch;
+  }
+  return { commitSha: LOCKED_FIXTURE_SHA, patches };
+}
+
+function normalizeCommitPatch(value: string): string {
+  const normalized = value.replace(/\r\n/g, "\n").replace(/\n+$/g, "");
+  const hunkStart = normalized.indexOf("@@");
+  return hunkStart === -1 ? normalized : normalized.slice(hunkStart);
 }
 
 function verifySandboxExecution(
