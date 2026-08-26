@@ -44,3 +44,20 @@ npm run smoke:trueforge
 ## Repository safety
 
 Local credentials, environment files, MCP configuration, dependencies, and generated output are ignored by default. Do not commit secrets or machine-specific configuration.
+
+## Mission runtime integration
+
+The exported mission runtime uses the official TrueForge SDK for session creation,
+turn execution, and reconnects. Create a `JsonMissionRepository` for the mission
+state file and pass it to `MissionService` and `TrueForgeMissionRunner`. A mission
+repository target is inspected with `inspectRepository`, which accepts a result only
+when the configured MCP server made the exact file request and returned a matching
+structured resource. Failed or incomplete MCP evidence blocks the mission; it is
+never replaced with canned repository content. `runSandboxVerification` applies the
+same proof boundary to the canonical sandbox `exec` tool, recording the exact
+command, exit code, and bounded output summary.
+
+Configure the TrueForge model, GitHub MCP connector, and sandbox provider in the
+local TrueForge UI as described in [`docs/trueforge-smoke.md`](docs/trueforge-smoke.md).
+Only the SDK client receives connection credentials; mission persistence stores
+session and turn identifiers, not tokens or provider secrets.
