@@ -192,14 +192,63 @@ function lockedCommitEvents(
     patches = LOCKED_FIXTURE_PATCHES,
     responseContent,
     responseCallId = "call-commit",
+    attempts,
   } = {},
 ) {
-  const commitArguments = JSON.stringify(argumentsValue);
-  const argumentSplit = Math.ceil(commitArguments.length / 2);
-  const commitPayload = {
+  const commitAttempts = attempts ?? [{
+    callId: "call-commit",
+    argumentsValue,
     sha,
-    files: Object.entries(patches).map(([filename, patch]) => ({ filename, patch })),
-  };
+    patches,
+    responseContent,
+    responseCallId,
+  }];
+  const attemptEvents = commitAttempts.flatMap((attempt, index) => {
+    const commitArguments = JSON.stringify(attempt.argumentsValue);
+    const argumentSplit = Math.ceil(commitArguments.length / 2);
+    const commitPayload = {
+      sha: attempt.sha,
+      files: Object.entries(attempt.patches).map(([filename, patch]) => ({ filename, patch })),
+    };
+    const callId = attempt.callId ?? `call-commit-${index + 1}`;
+    const responseCallIdForAttempt = attempt.responseCallId ?? callId;
+    return [
+      {
+        type: "model.message.delta",
+        id: `event-model-${index + 1}`,
+        createdAt: "2026-08-26T16:00:02.000Z",
+        threadId: "thread-1",
+        toolCalls: [{
+          index,
+          id: callId,
+          function: {
+            name: "get_commit",
+            arguments: commitArguments.slice(0, argumentSplit),
+          },
+        }],
+      },
+      {
+        type: "model.message.delta",
+        id: `event-model-${index + 1}-arguments`,
+        createdAt: "2026-08-26T16:00:02.500Z",
+        threadId: "thread-1",
+        toolCalls: [{
+          index,
+          function: {
+            arguments: commitArguments.slice(argumentSplit),
+          },
+        }],
+      },
+      {
+        type: "tool.response",
+        id: `event-tool-response-${index + 1}`,
+        createdAt: "2026-08-26T16:00:03.000Z",
+        threadId: "thread-1",
+        toolCallId: responseCallIdForAttempt,
+        content: attempt.responseContent ?? JSON.stringify(commitPayload),
+      },
+    ];
+  });
   return [
     {
       type: "turn.created",
@@ -216,40 +265,7 @@ function lockedCommitEvents(
       threadId: "thread-1",
       mcpServers: [{ name: "github" }],
     },
-    {
-      type: "model.message.delta",
-      id: "event-model",
-      createdAt: "2026-08-26T16:00:02.000Z",
-      threadId: "thread-1",
-      toolCalls: [{
-        index: 0,
-        id: "call-commit",
-        function: {
-          name: "get_commit",
-          arguments: commitArguments.slice(0, argumentSplit),
-        },
-      }],
-    },
-    {
-      type: "model.message.delta",
-      id: "event-model-arguments",
-      createdAt: "2026-08-26T16:00:02.500Z",
-      threadId: "thread-1",
-      toolCalls: [{
-        index: 0,
-        function: {
-          arguments: commitArguments.slice(argumentSplit),
-        },
-      }],
-    },
-    {
-      type: "tool.response",
-      id: "event-tool-response",
-      createdAt: "2026-08-26T16:00:03.000Z",
-      threadId: "thread-1",
-      toolCallId: responseCallId,
-      content: responseContent ?? JSON.stringify(commitPayload),
-    },
+    ...attemptEvents,
     {
       type: "turn.done",
       id: "event-turn-done",
@@ -515,7 +531,7 @@ test("locked fixture inspection proves direct TrueForge get_commit content and e
   assert.equal(inspection.toolName, "get_commit");
   assert.equal(inspection.commitSha, LOCKED_FIXTURE_SHA);
   assert.deepEqual(inspection.patches, LOCKED_FIXTURE_PATCHES);
-  assert.match(calls.turns[0].request.input[0].content, /get_commit exactly once/);
+  assert.match(calls.turns[0].request.input[0].content, /get_commit with this exact JSON object/);
   assert.match(calls.turns[0].request.input[0].content, /"owner":"mtamburrano"/);
   assert.match(calls.turns[0].request.input[0].content, /"repo":"trueforge-proofboard"/);
   assert.match(calls.turns[0].request.input[0].content, new RegExp(LOCKED_FIXTURE_SHA));
@@ -534,15 +550,75 @@ test("locked fixture inspection proves direct TrueForge get_commit content and e
   assert.deepEqual(details.patches, LOCKED_FIXTURE_PATCHES);
 });
 
-test("locked fixture inspection rejects a non-canonical get_commit call", async () => {
+test("locked fixture inspection ignores a non-canonical attempt before a canonical call", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, {
-    argumentsValue: {
+    attempts: [
+      {
+        callId: "call-non-canonical",
+        argumentsValue: {
+          owner: "mtambuarano",
+          repo: "trueforge-proofboard",
+          sha: LOCKED_FIXTURE_SHA,
+          detail: "full_patch",
+        },
+        responseContent: "not-json",
+        sha: "0000000000000000000000000000000000000000",
+        patches: LOCKED_FIXTURE_PATCHES,
+      },
+      {
+        callId: "call-canonical",
+        argumentsValue: {
+          owner: "mtamburrano",
+          repo: "trueforge-proofboard",
+          sha: LOCKED_FIXTURE_SHA,
+          detail: "full_patch",
+        },
+        sha: LOCKED_FIXTURE_SHA,
+        patches: LOCKED_FIXTURE_PATCHES,
+      },
+    ],
+  }));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "google-gemini/test-model",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-mcp-pinned-retry-success",
+    objective: "Ignore a rejected read-only attempt and accept canonical provenance",
+    repository: {
       owner: "mtamburrano",
-      repo: "trueforge-proofboard",
-      sha: LOCKED_FIXTURE_SHA,
-      detail: "metadata",
+      name: "trueforge-proofboard",
+      ref: LOCKED_FIXTURE_SHA,
     },
+  });
+
+  const inspection = await runner.inspectRepository({ missionId: mission.id });
+
+  assert.equal(inspection.commitSha, LOCKED_FIXTURE_SHA);
+  assert.deepEqual(inspection.patches, LOCKED_FIXTURE_PATCHES);
+  const state = await missions.getState();
+  const proof = state.evidence.find((item) => item.id === inspection.evidenceId);
+  assert.equal(proof.source, "mcp");
+  assert.equal(proof.result, "passed");
+});
+
+test("locked fixture inspection rejects when no canonical get_commit call exists", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, {
+    attempts: [
+      {
+        callId: "call-non-canonical",
+        argumentsValue: {
+          owner: "mtambuarano",
+          repo: "trueforge-proofboard",
+          sha: LOCKED_FIXTURE_SHA,
+          detail: "full_patch",
+        },
+        sha: LOCKED_FIXTURE_SHA,
+        patches: LOCKED_FIXTURE_PATCHES,
+      },
+    ],
   }));
   const runner = new TrueForgeMissionRunner(missions, client, {
     model: "google-gemini/test-model",
@@ -560,7 +636,57 @@ test("locked fixture inspection rejects a non-canonical get_commit call", async 
 
   await assert.rejects(
     runner.inspectRepository({ missionId: mission.id }),
-    /get_commit MCP arguments did not match the locked fixture/,
+    /Expected exactly one canonical get_commit MCP call, found 0/,
+  );
+  const state = await missions.getState();
+  assert.equal(state.missions[0].status, "blocked");
+  assert.equal(
+    state.evidence.some((item) => item.source === "mcp" && item.result === "passed"),
+    false,
+  );
+});
+
+test("locked fixture inspection rejects multiple canonical get_commit calls", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const canonicalArguments = {
+    owner: "mtamburrano",
+    repo: "trueforge-proofboard",
+    sha: LOCKED_FIXTURE_SHA,
+    detail: "full_patch",
+  };
+  const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, {
+    attempts: [
+      {
+        callId: "call-canonical-1",
+        argumentsValue: canonicalArguments,
+        sha: LOCKED_FIXTURE_SHA,
+        patches: LOCKED_FIXTURE_PATCHES,
+      },
+      {
+        callId: "call-canonical-2",
+        argumentsValue: canonicalArguments,
+        sha: LOCKED_FIXTURE_SHA,
+        patches: LOCKED_FIXTURE_PATCHES,
+      },
+    ],
+  }));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "google-gemini/test-model",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-mcp-pinned-multiple-canonical-failure",
+    objective: "Reject ambiguous canonical repository provenance",
+    repository: {
+      owner: "mtamburrano",
+      name: "trueforge-proofboard",
+      ref: LOCKED_FIXTURE_SHA,
+    },
+  });
+
+  await assert.rejects(
+    runner.inspectRepository({ missionId: mission.id }),
+    /Expected exactly one canonical get_commit MCP call, found 2/,
   );
   const state = await missions.getState();
   assert.equal(state.missions[0].status, "blocked");

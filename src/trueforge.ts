@@ -765,8 +765,9 @@ function buildLockedFixtureInspectionInstruction(
   }
   return [
     `Use the configured MCP server ${serverName}.`,
-    `Call get_commit exactly once with this JSON object: ${JSON.stringify(lockedFixtureArguments())}.`,
+    `Use get_commit with this exact JSON object: ${JSON.stringify(lockedFixtureArguments())}.`,
     `The returned commit must include the exact patches for ${LOCKED_FIXTURE_FILES.join(" and ")}.`,
+    "Ignore any non-canonical read-only attempts; only a correlated response to the exact arguments above is valid provenance.",
     "Use the MCP response as the only source of repository facts; do not use the host filesystem, canned data, or final-answer narration.",
     "Stop after the read.",
   ].join(" ");
@@ -1049,16 +1050,19 @@ function verifyLockedFixtureInspection(
     return inspectionFailure(`MCP server ${serverName} was not initialized.`);
   }
 
-  const calls = observedToolCalls(events).filter((call) => call.name === "get_commit");
-  if (calls.length !== 1) {
-    return inspectionFailure(`Expected exactly one get_commit MCP call, found ${calls.length}.`);
+  const canonicalArguments = lockedFixtureArguments();
+  const canonicalCalls = observedToolCalls(events).filter(
+    (call) => call.name === "get_commit" && isRecord(call.arguments) &&
+      argumentsExactlyMatch(call.arguments, canonicalArguments),
+  );
+  if (canonicalCalls.length !== 1) {
+    return inspectionFailure(
+      `Expected exactly one canonical get_commit MCP call, found ${canonicalCalls.length}.`,
+    );
   }
-  const call = calls[0];
+  const call = canonicalCalls[0];
   if (call === undefined || !isRecord(call.arguments)) {
     return inspectionFailure("get_commit MCP arguments were not a JSON object.");
-  }
-  if (!argumentsExactlyMatch(call.arguments, lockedFixtureArguments())) {
-    return inspectionFailure("get_commit MCP arguments did not match the locked fixture.");
   }
 
   const response = events.find(
