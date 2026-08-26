@@ -82,13 +82,16 @@ operations:
 
 The command is harmless and does not mutate the repository or remote GitHub.
 TrueForge provisions and manages the Daytona sandbox according to its provider
-lifecycle settings.
+lifecycle settings. Before creating the session, the runner reads
+`settings.sandboxProviders.get()` and fails closed unless the configured provider
+manifest reports `type: "daytona"`.
 
 ## Evidence and fail-closed checks
 
 On success, stdout is a JSON evidence packet containing:
 
 - the TrueForge base URL, model, session, and turn;
+- the configured sandbox provider type/status returned by TrueForge settings;
 - the MCP initialization event, structured `get_file_contents` call arguments,
   matching tool-response ID, and response metadata/hash;
 - the `sandbox.created` event and sandbox ID;

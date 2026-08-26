@@ -1,4 +1,6 @@
-const DEFAULTS = Object.freeze({
+import { pathToFileURL } from "node:url";
+
+export const DEFAULTS = Object.freeze({
   baseUrl: "http://localhost:8790",
   model: "google-gemini/gemini-3.6-flash",
   githubServer: "github",
@@ -11,7 +13,7 @@ const DEFAULTS = Object.freeze({
 
 const EXPECTED_MARKER = "TRUEFORGE_DAYTONA_OK";
 
-function configFromEnvironment() {
+export function configFromEnvironment() {
   return {
     baseUrl: process.env.TRUEFORGE_BASE_URL || DEFAULTS.baseUrl,
     model: process.env.TRUEFORGE_MODEL || DEFAULTS.model,
@@ -24,7 +26,7 @@ function configFromEnvironment() {
   };
 }
 
-function githubArguments(config) {
+export function githubArguments(config) {
   return {
     owner: config.githubOwner,
     repo: config.githubRepo,
@@ -33,7 +35,7 @@ function githubArguments(config) {
   };
 }
 
-function agentSpec(config) {
+export function agentSpec(config) {
   const repositoryRequest = JSON.stringify(githubArguments(config));
 
   return {
@@ -162,7 +164,36 @@ function requireEvent(condition, message) {
   if (!condition) throw new Error(message);
 }
 
-function collectEvidence(events, config) {
+export async function readConfiguredSandboxProvider(client) {
+  let response;
+  try {
+    response = await client.settings.sandboxProviders.get();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Unable to read TrueForge sandbox provider settings: ${message}`);
+  }
+
+  const payload = response.data?.data ?? response.data;
+  const manifest = payload?.manifest;
+  const providerType = manifest?.type;
+  requireEvent(
+    typeof providerType === "string",
+    "TrueForge sandbox provider settings did not return a provider type.",
+  );
+  requireEvent(
+    providerType.toLowerCase() === "daytona",
+    `TrueForge is configured with sandbox provider ${providerType}, not Daytona.`,
+  );
+
+  return {
+    type: providerType,
+    status: payload.status ?? null,
+    status_reason: payload.statusReason ?? payload.status_reason ?? null,
+    source: "settings.sandboxProviders.get",
+  };
+}
+
+export function collectEvidence(events, config, sessionId, turnId, sandboxProvider) {
   const done = [...events].reverse().find((event) => event.type === "turn.done");
   requireEvent(done, "TrueForge did not return a turn.done event.");
   requireEvent(
@@ -223,8 +254,8 @@ function collectEvidence(events, config) {
     trueforge: {
       base_url: config.baseUrl,
       model: config.model,
-      session_id: sandboxCreated.sessionId ?? sandboxCreated.session_id ?? undefined,
-      turn_id: done.turnId ?? done.turn_id ?? undefined,
+      session_id: sessionId,
+      turn_id: turnId,
     },
     mcp: {
       configured_server: config.githubServer,
@@ -242,6 +273,7 @@ function collectEvidence(events, config) {
       },
     },
     sandbox: {
+      provider: sandboxProvider,
       provider_evidence: "sandbox.created",
       sandbox_id: sandboxCreated.sandboxId ?? sandboxCreated.sandbox_id,
       creation_event_id: sandboxCreated.id,
@@ -272,7 +304,12 @@ function printDryRun(config) {
           tool: "get_file_contents",
           arguments: githubArguments(config),
         },
-        sandbox: { command: config.command, expected_stdout: EXPECTED_MARKER, expected_exit_code: 0 },
+        sandbox: {
+          configured_provider: "daytona (checked from TrueForge settings during live run)",
+          command: config.command,
+          expected_stdout: EXPECTED_MARKER,
+          expected_exit_code: 0,
+        },
         external_calls: false,
       },
       null,
@@ -286,7 +323,7 @@ function printUsage() {
   console.log("Set up TrueForge first; see docs/trueforge-smoke.md.");
 }
 
-async function run() {
+export async function run() {
   const args = new Set(process.argv.slice(2));
   if (args.has("--help")) {
     printUsage();
@@ -306,6 +343,7 @@ async function run() {
     ...(process.env.TRUEFORGE_TOKEN ? { token: process.env.TRUEFORGE_TOKEN } : {}),
   });
 
+  const sandboxProvider = await readConfiguredSandboxProvider(client);
   const { data: session } = await client.sessions.create({ agent: { spec: agentSpec(config) } });
   const stream = await client.sessions.createTurnStream(session.id, {
     input: [{ type: "user.message", content: "Run the configured TrueForge smoke test now." }],
@@ -326,10 +364,12 @@ async function run() {
     events.push(event);
   }
 
-  console.log(JSON.stringify(collectEvidence(events, config), null, 2));
+  console.log(JSON.stringify(collectEvidence(events, config, session.id, turnId, sandboxProvider), null, 2));
 }
 
-run().catch((error) => {
-  console.error(`TrueForge smoke failed: ${error instanceof Error ? error.message : String(error)}`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  run().catch((error) => {
+    console.error(`TrueForge smoke failed: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
+  });
+}
