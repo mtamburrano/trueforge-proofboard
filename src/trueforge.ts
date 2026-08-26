@@ -35,8 +35,8 @@ export interface TrueForgeEventStream extends AsyncIterable<TrueForgeApi.TurnStr
 
 export interface TrueForgeClientLike {
   sessions: {
-    create(request: TrueForgeApi.CreateSessionRequest): Promise<TrueForgeApi.Session>;
-    get(sessionId: string): Promise<TrueForgeApi.Session>;
+    create(request: TrueForgeApi.CreateSessionRequest): Promise<TrueForgeApi.GetSessionResponse>;
+    get(sessionId: string): Promise<TrueForgeApi.GetSessionResponse>;
     createTurnStream(
       sessionId: string,
       request: TrueForgeApi.CreateTurnSessionsStreamRequest,
@@ -334,11 +334,8 @@ export class TrueForgeMissionRunner {
   ): Promise<SandboxVerificationResult> {
     const mission = await this.missions.getMission(input.missionId);
     try {
-      const command = requiredInspectionString(input.command, "sandbox command");
-      const toolName = requiredInspectionString(
-        input.toolName ?? this.config.sandboxToolName ?? "exec",
-        "sandbox tool name",
-      );
+      const command = requiredSandboxString(input.command, "sandbox command");
+      const toolName = canonicalSandboxToolName(input.toolName, this.config.sandboxToolName);
       const verificationOptions: RunTurnOptions = {};
       if (input.workItemId !== undefined) {
         verificationOptions.workItemId = input.workItemId;
@@ -507,11 +504,12 @@ export class TrueForgeMissionRunner {
   }
 
   private requireSessionId(
-    session: TrueForgeApi.Session,
+    response: TrueForgeApi.GetSessionResponse,
     expectedId: string | null,
     operation: string,
   ): string {
-    if (typeof session.id !== "string" || session.id.trim().length === 0) {
+    const session = isRecord(response) && isRecord(response.data) ? response.data : null;
+    if (session === null || typeof session.id !== "string" || session.id.trim().length === 0) {
       throw new TrueForgeIntegrationError(operation, "TrueForge returned a session without an id.");
     }
     if (expectedId !== null && session.id !== expectedId) {
@@ -591,10 +589,35 @@ function buildTurnInstruction(
 }
 
 function requiredInspectionString(value: string, label: string): string {
+  return requiredString(value, label, "inspect repository");
+}
+
+function requiredSandboxString(value: string, label: string): string {
+  return requiredString(value, label, "run sandbox verification");
+}
+
+function requiredString(value: string, label: string, operation: string): string {
   if (value.trim().length === 0) {
-    throw new TrueForgeIntegrationError("inspect repository", `${label} must not be empty.`);
+    throw new TrueForgeIntegrationError(operation, `${label} must not be empty.`);
   }
   return value.trim();
+}
+
+function canonicalSandboxToolName(
+  inputToolName: string | undefined,
+  configuredToolName: string | undefined,
+): "exec" {
+  const requestedToolName = inputToolName ?? configuredToolName;
+  if (requestedToolName !== undefined) {
+    const toolName = requiredSandboxString(requestedToolName, "sandbox tool name");
+    if (toolName !== "exec") {
+      throw new TrueForgeIntegrationError(
+        "run sandbox verification",
+        "Sandbox verification requires the canonical TrueForge exec tool.",
+      );
+    }
+  }
+  return "exec";
 }
 
 function ensureRepositoryMcpConfigured(
@@ -670,8 +693,55 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function verificationFailure(operation: string, message: string): never {
+  throw new TrueForgeIntegrationError(operation, message);
+}
+
 function inspectionFailure(message: string): never {
-  throw new TrueForgeIntegrationError("inspect repository", message);
+  return verificationFailure("inspect repository", message);
+}
+
+function sandboxFailure(message: string): never {
+  return verificationFailure("run sandbox verification", message);
+}
+
+interface TurnCompletion {
+  status: string | null;
+  requiredActions: unknown[] | null;
+}
+
+function turnCompletion(event: TrueForgeApi.TurnStreamingEvent): TurnCompletion {
+  const state = recordValue(event).state;
+  if (!isRecord(state)) {
+    return { status: null, requiredActions: null };
+  }
+  const rawRequiredActions = state.requiredActions ?? state.required_actions;
+  return {
+    status: stringOrNull(state.status),
+    requiredActions: Array.isArray(rawRequiredActions) ? rawRequiredActions : null,
+  };
+}
+
+function requireCompletedTurn(
+  events: TrueForgeApi.TurnStreamingEvent[],
+  operation: string,
+  subject: string,
+): void {
+  const doneEvents = events.filter((event) => event.type === "turn.done");
+  const done = doneEvents[doneEvents.length - 1];
+  if (done === undefined) {
+    return verificationFailure(operation, `TrueForge did not record a completed ${subject} turn.`);
+  }
+  const completion = turnCompletion(done);
+  if (completion.status !== "done") {
+    return verificationFailure(operation, `TrueForge ${subject} turn did not finish successfully.`);
+  }
+  if (completion.requiredActions === null) {
+    return verificationFailure(operation, `TrueForge ${subject} turn did not include required actions.`);
+  }
+  if (completion.requiredActions.length > 0) {
+    return verificationFailure(operation, `TrueForge ${subject} paused with required actions.`);
+  }
 }
 
 function observedToolCalls(
@@ -798,19 +868,7 @@ function verifyRepositoryInspection(
     return inspectionFailure(`${toolName} MCP returned an unexpected repository path.`);
   }
 
-  const doneEvents = events.filter((event) => event.type === "turn.done");
-  const done = doneEvents[doneEvents.length - 1];
-  if (done === undefined) {
-    return inspectionFailure("TrueForge did not record a completed inspection turn.");
-  }
-  const doneState = recordValue(done).state;
-  if (!isRecord(doneState) || doneState.status !== "done") {
-    return inspectionFailure("TrueForge inspection turn did not finish successfully.");
-  }
-  const requiredActions = doneState.requiredActions ?? doneState.required_actions;
-  if (Array.isArray(requiredActions) && requiredActions.length > 0) {
-    return inspectionFailure("TrueForge inspection paused with required actions.");
-  }
+  requireCompletedTurn(events, "inspect repository", "inspection");
   return {
     resourceUri,
     content: fileContent,
@@ -823,22 +881,25 @@ function verifySandboxExecution(
   command: string,
   toolName: string,
 ): VerifiedSandboxExecution {
+  if (toolName !== "exec") {
+    return sandboxFailure("Sandbox verification requires the canonical TrueForge exec tool.");
+  }
   const sandboxCreated = events.find((event) => event.type === "sandbox.created");
   if (sandboxCreated === undefined) {
-    return inspectionFailure("TrueForge did not record sandbox creation.");
+    return sandboxFailure("TrueForge did not record sandbox creation.");
   }
   const calls = observedToolCalls(events).filter((call) => call.name === toolName);
   if (calls.length !== 1) {
-    return inspectionFailure(
+    return sandboxFailure(
       `Expected exactly one ${toolName} sandbox call, found ${calls.length}.`,
     );
   }
   const call = calls[0];
   if (call === undefined || !isRecord(call.arguments)) {
-    return inspectionFailure(`${toolName} sandbox arguments were not a JSON object.`);
+    return sandboxFailure(`${toolName} sandbox arguments were not a JSON object.`);
   }
   if (call.arguments.command !== command) {
-    return inspectionFailure(`${toolName} sandbox command did not exactly match the requested command.`);
+    return sandboxFailure(`${toolName} sandbox command did not exactly match the requested command.`);
   }
   const response = events.find(
     (event) =>
@@ -846,39 +907,31 @@ function verifySandboxExecution(
       recordValue(event).toolCallId === call.id,
   );
   if (response === undefined) {
-    return inspectionFailure(`${toolName} sandbox call has no structured response.`);
+    return sandboxFailure(`${toolName} sandbox call has no structured response.`);
   }
   const responseValue = parseMaybeJson(recordValue(response).content);
   if (!isRecord(responseValue)) {
-    return inspectionFailure(`${toolName} sandbox response was not a JSON object.`);
+    return sandboxFailure(`${toolName} sandbox response was not a JSON object.`);
   }
   if (responseValue.success !== true) {
-    return inspectionFailure(`${toolName} sandbox execution did not return success: true.`);
+    return sandboxFailure(`${toolName} sandbox execution did not return success: true.`);
   }
   const sandboxResponse = responseValue.response;
   if (!isRecord(sandboxResponse)) {
-    return inspectionFailure(`${toolName} sandbox response did not include a response object.`);
+    return sandboxFailure(`${toolName} sandbox response did not include a response object.`);
   }
   const exitCode = sandboxResponse.exitCode;
   if (typeof exitCode !== "number" || !Number.isFinite(exitCode)) {
-    return inspectionFailure(`${toolName} sandbox response returned a non-numeric exit code.`);
+    return sandboxFailure(`${toolName} sandbox response returned a non-numeric exit code.`);
   }
   const stdout = sandboxResponse.result;
   if (typeof stdout !== "string") {
-    return inspectionFailure(`${toolName} sandbox response did not include string output.`);
+    return sandboxFailure(`${toolName} sandbox response did not include string output.`);
   }
   if (exitCode !== 0) {
-    return inspectionFailure(`${toolName} sandbox command exited with code ${exitCode}.`);
+    return sandboxFailure(`${toolName} sandbox command exited with code ${exitCode}.`);
   }
-  const doneEvents = events.filter((event) => event.type === "turn.done");
-  const done = doneEvents[doneEvents.length - 1];
-  if (done === undefined) {
-    return inspectionFailure("TrueForge did not record a completed sandbox turn.");
-  }
-  const doneState = recordValue(done).state;
-  if (!isRecord(doneState) || doneState.status !== "done") {
-    return inspectionFailure("TrueForge sandbox turn did not finish successfully.");
-  }
+  requireCompletedTurn(events, "run sandbox verification", "sandbox");
   return {
     exitCode,
     stdout,
@@ -988,12 +1041,22 @@ function runtimeEvidence(event: TrueForgeApi.TurnStreamingEvent): RuntimeEvidenc
         details,
       };
     case "turn.done": {
-      const status = stringOrNull(recordValue(event).state &&
-        (recordValue(event).state as Record<string, unknown>).status) ?? "unknown";
+      const state = recordValue(event).state;
+      const status = isRecord(state) ? stringOrNull(state.status) ?? "unknown" : "unknown";
+      const rawRequiredActions = isRecord(state)
+        ? state.requiredActions ?? state.required_actions
+        : undefined;
+      const requiredActions = Array.isArray(rawRequiredActions) ? rawRequiredActions : null;
+      const isComplete = status === "done" && requiredActions !== null && requiredActions.length === 0;
+      const summary = requiredActions === null
+        ? `TrueForge turn finished with status ${status}; required actions were not provided.`
+        : requiredActions.length === 0
+        ? `TrueForge turn finished with status ${status}.`
+        : `TrueForge turn finished with status ${status} and ${requiredActions.length} required action${requiredActions.length === 1 ? "" : "s"}.`;
       return {
         kind: "tool_result",
-        result: status === "done" ? "passed" : "failed",
-        summary: `TrueForge turn finished with status ${status}.`,
+        result: isComplete ? "passed" : "failed",
+        summary,
         details,
       };
     }

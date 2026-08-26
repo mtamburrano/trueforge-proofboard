@@ -52,7 +52,7 @@ function fakeEvents(turnId = "turn-1") {
       id: "event-turn-done",
       createdAt: "2026-08-26T16:00:05.000Z",
       threadId: null,
-      state: { status: "done" },
+      state: { status: "done", requiredActions: [] },
     },
   ];
 }
@@ -120,7 +120,7 @@ function repositoryEvents(turnId = "turn-1") {
   ];
 }
 
-function sandboxEvents(turnId = "turn-1", exitCode = 0) {
+function sandboxEvents(turnId = "turn-1", exitCode = 0, requiredActions = []) {
   return [
     {
       type: "turn.created",
@@ -169,7 +169,7 @@ function sandboxEvents(turnId = "turn-1", exitCode = 0) {
       id: "event-turn-done",
       createdAt: "2026-08-26T16:00:04.000Z",
       threadId: null,
-      state: { status: "done", requiredActions: [] },
+      state: { status: "done", requiredActions },
     },
   ];
 }
@@ -193,11 +193,11 @@ function fakeClient(eventFactory = fakeEvents) {
     sessions: {
       async create(request) {
         calls.create.push(request);
-        return { id: "session-created" };
+        return { data: { id: "session-created" } };
       },
       async get(sessionId) {
         calls.get.push(sessionId);
-        return { id: sessionId };
+        return { data: { id: sessionId } };
       },
       async createTurnStream(sessionId, request) {
         calls.turns.push({ sessionId, request });
@@ -246,6 +246,32 @@ test("runner creates a TrueForge session and maps safe runtime evidence", async 
   assert.equal(state.evidence.every((item) => item.workItemId === workItem.id), true);
   const serializedState = JSON.stringify(state);
   assert.doesNotMatch(serializedState, /do-not-persist|This content should not be persisted/);
+});
+
+test("runner does not mark a done turn as passed while required actions remain", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client } = fakeClient((turnId) => {
+    const events = fakeEvents(turnId);
+    events[events.length - 1].state = {
+      status: "done",
+      requiredActions: [{ type: "tool.approval_required" }],
+    };
+    return events;
+  });
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "google-gemini/test-model",
+  });
+  const mission = await runner.createMission({
+    id: "mission-pending-required-action",
+    objective: "Keep pending TrueForge actions visible as unresolved",
+  });
+
+  await runner.runTurn(mission.id, "Continue the bounded turn.");
+
+  const state = await missions.getState();
+  const completion = state.evidence.find((item) => item.summary.startsWith("TrueForge turn finished"));
+  assert.equal(completion.result, "failed");
+  assert.match(completion.summary, /required action/);
 });
 
 test("runner resumes the persisted session after a reconnect", async () => {
@@ -394,7 +420,11 @@ test("nonzero sandbox execution is recorded as failure and blocks the mission", 
       missionId: mission.id,
       command: "node --test",
     }),
-    /exited with code 1/,
+    (error) => {
+      assert.equal(error.operation, "run sandbox verification");
+      assert.match(error.message, /exited with code 1/);
+      return true;
+    },
   );
   const state = await missions.getState();
   assert.equal(state.missions[0].status, "blocked");
@@ -406,4 +436,77 @@ test("nonzero sandbox execution is recorded as failure and blocks the mission", 
     state.evidence.some((item) => item.source === "sandbox" && item.result === "passed"),
     false,
   );
+});
+
+test("sandbox verification rejects a done turn with pending required actions", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client } = fakeClient((turnId) => sandboxEvents(
+    turnId,
+    0,
+    [{ type: "tool.approval_required" }],
+  ));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "google-gemini/test-model",
+  });
+  const mission = await runner.createMission({
+    id: "mission-sandbox-pending-action",
+    objective: "Reject sandbox proof while approval remains pending",
+  });
+
+  await assert.rejects(
+    runner.runSandboxVerification({ missionId: mission.id, command: "node --test" }),
+    (error) => {
+      assert.equal(error.operation, "run sandbox verification");
+      assert.match(error.message, /paused with required actions/);
+      return true;
+    },
+  );
+  const state = await missions.getState();
+  assert.equal(state.missions[0].status, "blocked");
+  assert.equal(
+    state.evidence.some((item) => item.source === "sandbox" && item.result === "passed"),
+    false,
+  );
+});
+
+test("sandbox verification requires the canonical exec tool", async () => {
+  const cases = [
+    {
+      id: "mission-sandbox-configured-tool",
+      config: { sandboxToolName: "sandbox_exec" },
+      input: {},
+    },
+    {
+      id: "mission-sandbox-input-tool",
+      config: {},
+      input: { toolName: "sandbox_exec" },
+    },
+  ];
+
+  for (const fixture of cases) {
+    const missions = new MissionService(new InMemoryMissionRepository());
+    const { client, calls } = fakeClient(sandboxEvents);
+    const runner = new TrueForgeMissionRunner(missions, client, {
+      model: "google-gemini/test-model",
+      ...fixture.config,
+    });
+    const mission = await runner.createMission({
+      id: fixture.id,
+      objective: "Reject a non-canonical sandbox execution tool",
+    });
+
+    await assert.rejects(
+      runner.runSandboxVerification({
+        missionId: mission.id,
+        command: "node --test",
+        ...fixture.input,
+      }),
+      (error) => {
+        assert.equal(error.operation, "run sandbox verification");
+        assert.match(error.message, /canonical TrueForge exec tool/);
+        return true;
+      },
+    );
+    assert.equal(calls.turns.length, 0);
+  }
 });
