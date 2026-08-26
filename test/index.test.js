@@ -9,8 +9,10 @@ import {
   productThesis,
 } from "../dist/index.js";
 import {
+  agentSpec,
   collectEvidence,
   readConfiguredSandboxProvider,
+  sandboxArguments,
 } from "../scripts/trueforge-smoke.mjs";
 
 test("exports the product identity and delivery thesis", () => {
@@ -37,7 +39,16 @@ test("TrueForge smoke dry-run is local and contains the expected evidence contra
   assert.match(result.stdout, /"external_calls": false/);
   assert.match(result.stdout, /"tool": "get_file_contents"/);
   assert.match(result.stdout, /daytona \(checked from TrueForge settings during live run\)/);
+  assert.match(result.stdout, /Run the requested verification command in the sandbox/);
   assert.match(result.stdout, /TRUEFORGE_DAYTONA_OK/);
+});
+
+test("TrueForge smoke agent instructions use the pinned exec argument pair", () => {
+  const config = smokeConfig();
+  const requests = [...agentSpec(config).instructions.matchAll(/exactly once with (\{[^}]+\})\./g)]
+    .map((match) => JSON.parse(match[1]));
+
+  assert.deepEqual(requests[1], sandboxArguments(config));
 });
 
 function smokeConfig() {
@@ -90,7 +101,7 @@ function evidenceFixture(options = {}) {
     },
     githubResult = githubFileResult(config),
     sandboxToolName = "exec",
-    sandboxArguments = { command: config.command },
+    sandboxArguments: sandboxCallArguments = sandboxArguments(config),
     sandboxResult = sandboxExecResult(),
   } = options;
 
@@ -121,7 +132,7 @@ function evidenceFixture(options = {}) {
           id: "call-sandbox",
           function: {
             name: sandboxToolName,
-            arguments: JSON.stringify(sandboxArguments),
+            arguments: JSON.stringify(sandboxCallArguments),
           },
         }],
       },
@@ -165,6 +176,7 @@ test("TrueForge smoke evidence preserves IDs and proves the configured Daytona p
   assert.equal(evidence.trueforge.turn_id, "turn-fixture");
   assert.equal(evidence.sandbox.provider.type, "daytona");
   assert.equal(evidence.sandbox.tool_call.name, "exec");
+  assert.deepEqual(evidence.sandbox.tool_call.arguments, sandboxArguments(config));
   assert.equal(evidence.sandbox.tool_response.exit_code, 0);
   assert.match(evidence.sandbox.tool_response.stdout, /TRUEFORGE_DAYTONA_OK/);
   assert.equal(
@@ -236,12 +248,15 @@ test("TrueForge smoke requires the canonical exec tool and exact command", () =>
     {
       label: "non-canonical sandbox tool",
       sandboxToolName: "sandbox_exec",
-      error: /Daytona exec call/,
+      error: /canonical Daytona exec call/,
     },
     {
       label: "modified command",
-      sandboxArguments: { command: "printf 'TRUEFORGE_DAYTONA_OK\\n' && echo extra" },
-      error: /did not exactly match the configured command/,
+      sandboxArguments: {
+        ...sandboxArguments(smokeConfig()),
+        command: "printf 'TRUEFORGE_DAYTONA_OK\\n' && echo extra",
+      },
+      error: /canonical Daytona exec call/,
     },
   ];
 
@@ -253,6 +268,16 @@ test("TrueForge smoke requires the canonical exec tool and exact command", () =>
       fixture.label,
     );
   }
+});
+
+test("TrueForge smoke requires required actions to be present on the terminal turn", () => {
+  const { config, events } = evidenceFixture();
+  events[0].state = { status: "done" };
+
+  assert.throws(
+    () => collectEvidence(events, config, "session-fixture", "turn-fixture", daytonaProvider),
+    /turn\.done did not include required actions/,
+  );
 });
 
 test("TrueForge smoke rejects malformed sandbox execution results", () => {

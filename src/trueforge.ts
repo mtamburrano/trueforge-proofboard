@@ -76,6 +76,8 @@ const LOCKED_FIXTURE_PATCHES = {
   ].join("\n"),
 } as const;
 
+const SANDBOX_VERIFICATION_INTENT = "Run the requested verification command in the sandbox.";
+
 export interface TrueForgeClientLike {
   sessions: {
     create(request: TrueForgeApi.CreateSessionRequest): Promise<TrueForgeApi.GetSessionResponse>;
@@ -424,16 +426,17 @@ export class TrueForgeMissionRunner {
     try {
       const command = requiredSandboxString(input.command, "sandbox command");
       const toolName = canonicalSandboxToolName(input.toolName, this.config.sandboxToolName);
+      const intent = buildSandboxVerificationIntent();
       const verificationOptions: RunTurnOptions = {};
       if (input.workItemId !== undefined) {
         verificationOptions.workItemId = input.workItemId;
       }
       const execution = await this.executeTurn(
         mission.id,
-        buildSandboxVerificationInstruction(mission, command, toolName),
+        buildSandboxVerificationInstruction(mission, command, toolName, intent),
         verificationOptions,
       );
-      const verified = verifySandboxExecution(execution.rawEvents, command, toolName);
+      const verified = verifySandboxExecution(execution.rawEvents, intent, command, toolName);
       const evidenceInput = {
         kind: "test_result" as const,
         result: "passed" as const,
@@ -441,6 +444,7 @@ export class TrueForgeMissionRunner {
         summary: `Sandbox ${toolName} completed the verification command with exit code 0.`,
         details: JSON.stringify({
           tool: toolName,
+          intent,
           command,
           exit_code: verified.exitCode,
           output: verified.outputSummary,
@@ -777,13 +781,19 @@ function buildSandboxVerificationInstruction(
   mission: Mission,
   command: string,
   toolName: string,
+  intent: string,
 ): string {
+  const argumentsValue = { intent, command };
   return [
     `Use the configured sandbox for mission ${mission.id}.`,
-    `Call the sandbox tool ${toolName} exactly once with this JSON object: ${JSON.stringify({ command })}.`,
+    `Call the sandbox tool ${toolName} exactly once with this JSON object: ${JSON.stringify(argumentsValue)}.`,
     "Do not run the command on the host, do not use a different execution tool, and do not fabricate the result.",
     "Return the structured sandbox response after the command completes.",
   ].join(" ");
+}
+
+function buildSandboxVerificationIntent(): string {
+  return SANDBOX_VERIFICATION_INTENT;
 }
 
 function parseMaybeJson(value: unknown): unknown {
@@ -1175,6 +1185,7 @@ function normalizeCommitPatch(value: string): string {
 
 function verifySandboxExecution(
   events: TrueForgeApi.TurnStreamingEvent[],
+  intent: string,
   command: string,
   toolName: string,
 ): VerifiedSandboxExecution {
@@ -1185,18 +1196,19 @@ function verifySandboxExecution(
   if (sandboxCreated === undefined) {
     return sandboxFailure("TrueForge did not record sandbox creation.");
   }
-  const calls = observedToolCalls(events).filter((call) => call.name === toolName);
-  if (calls.length !== 1) {
+  const expectedArguments = { intent, command };
+  const canonicalCalls = observedToolCalls(events).filter(
+    (call) => call.name === toolName && isRecord(call.arguments) &&
+      argumentsExactlyMatch(call.arguments, expectedArguments),
+  );
+  if (canonicalCalls.length !== 1) {
     return sandboxFailure(
-      `Expected exactly one ${toolName} sandbox call, found ${calls.length}.`,
+      `Expected exactly one canonical ${toolName} sandbox call, found ${canonicalCalls.length}.`,
     );
   }
-  const call = calls[0];
+  const call = canonicalCalls[0];
   if (call === undefined || !isRecord(call.arguments)) {
     return sandboxFailure(`${toolName} sandbox arguments were not a JSON object.`);
-  }
-  if (call.arguments.command !== command) {
-    return sandboxFailure(`${toolName} sandbox command did not exactly match the requested command.`);
   }
   const response = events.find(
     (event) =>

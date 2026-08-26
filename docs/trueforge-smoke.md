@@ -96,8 +96,9 @@ On success, stdout is a JSON evidence packet containing:
   matching tool-response ID, and the structured repository file resource
   URI/content hash;
 - the `sandbox.created` event and sandbox ID;
-- the structured `exec` command call and matching
-  `{ success: true, response: { exitCode: 0, result } }` response.
+- the structured `exec` call with its deterministic verification intent and exact
+  command, plus the matching `{ success: true, response: { exitCode: 0, result } }`
+  response.
 
 The runner exits non-zero if any of those records is missing, if GitHub MCP
 authentication is pending, if the repository arguments differ, or if the

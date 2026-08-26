@@ -8,6 +8,7 @@ import {
 } from "../dist/index.js";
 
 const LOCKED_FIXTURE_SHA = "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b";
+const SANDBOX_VERIFICATION_INTENT = "Run the requested verification command in the sandbox.";
 const LOCKED_FIXTURE_PATCHES = {
   "src/index.ts": [
     "@@ -0,0 +1,11 @@",
@@ -276,8 +277,33 @@ function lockedCommitEvents(
   ];
 }
 
-function sandboxEvents(turnId = "turn-1", exitCode = 0, requiredActions = []) {
-  return [
+function sandboxEvents(
+  turnId = "turn-1",
+  exitCode = 0,
+  requiredActions = [],
+  {
+    sandboxArguments = {
+      intent: SANDBOX_VERIFICATION_INTENT,
+      command: "node --test",
+    },
+    sandboxResult = {
+      success: true,
+      response: {
+        exitCode,
+        result: exitCode === 0 ? "all tests passed\n" : "test failed\n",
+      },
+    },
+    includeSandboxCreated = true,
+    includeSandboxCall = true,
+    additionalSandboxCalls = [],
+    responseCallId = "call-exec",
+    responseContent,
+    includeToolResponse = true,
+    includeTurnDone = true,
+    turnState = { status: "done", requiredActions },
+  } = {},
+) {
+  const events = [
     {
       type: "turn.created",
       id: "event-turn-created",
@@ -286,48 +312,60 @@ function sandboxEvents(turnId = "turn-1", exitCode = 0, requiredActions = []) {
       turnId,
       state: { status: "running" },
     },
-    {
+  ];
+  if (includeSandboxCreated) {
+    events.push({
       type: "sandbox.created",
       id: "event-sandbox",
       createdAt: "2026-08-26T16:00:01.000Z",
       threadId: null,
       sandboxId: "sandbox-1",
-    },
-    {
+    });
+  }
+  if (includeSandboxCall) {
+    events.push({
       type: "model.message",
       id: "event-model",
       createdAt: "2026-08-26T16:00:02.000Z",
       threadId: "thread-1",
-      toolCalls: [{
-        id: "call-exec",
-        function: {
-          name: "exec",
-          arguments: JSON.stringify({ command: "node --test" }),
+      toolCalls: [
+        {
+          id: "call-exec",
+          function: {
+            name: "exec",
+            arguments: JSON.stringify(sandboxArguments),
+          },
         },
-      }],
-    },
-    {
+        ...additionalSandboxCalls.map((call) => ({
+          id: call.callId,
+          function: {
+            name: call.toolName ?? "exec",
+            arguments: JSON.stringify(call.argumentsValue),
+          },
+        })),
+      ],
+    });
+  }
+  if (includeToolResponse) {
+    events.push({
       type: "tool.response",
       id: "event-tool-response",
       createdAt: "2026-08-26T16:00:03.000Z",
       threadId: "thread-1",
-      toolCallId: "call-exec",
-      content: JSON.stringify({
-        success: true,
-        response: {
-          exitCode,
-          result: exitCode === 0 ? "all tests passed\n" : "test failed\n",
-        },
-      }),
-    },
-    {
+      toolCallId: responseCallId,
+      content: responseContent ?? JSON.stringify(sandboxResult),
+    });
+  }
+  if (includeTurnDone) {
+    events.push({
       type: "turn.done",
       id: "event-turn-done",
       createdAt: "2026-08-26T16:00:04.000Z",
       threadId: null,
-      state: { status: "done", requiredActions },
-    },
-  ];
+      state: turnState,
+    });
+  }
+  return events;
 }
 
 function fakeStream(events) {
@@ -890,13 +928,184 @@ test("sandbox verification persists the command, output summary, and exit status
   assert.equal(verification.toolName, "exec");
   assert.equal(verification.exitCode, 0);
   assert.match(verification.stdout, /all tests passed/);
-  assert.equal(calls.turns[0].request.input[0].content.includes("node --test"), true);
+  const instruction = calls.turns[0].request.input[0].content;
+  const argumentsMatch = instruction.match(/this JSON object: (\{[^}]+\})\./);
+  assert.ok(argumentsMatch);
+  assert.deepEqual(JSON.parse(argumentsMatch[1]), {
+    intent: SANDBOX_VERIFICATION_INTENT,
+    command: "node --test",
+  });
   const state = await missions.getState();
   const proof = state.evidence.find((item) => item.id === verification.evidenceId);
   assert.equal(proof.source, "sandbox");
   assert.equal(proof.result, "passed");
+  assert.match(proof.details, /"intent":"Run the requested verification command in the sandbox\."/);
   assert.match(proof.details, /"exit_code":0/);
   assert.match(proof.details, /all tests passed/);
+});
+
+test("sandbox verification rejects incomplete or non-canonical proof", async () => {
+  const cases = [
+    {
+      label: "missing intent",
+      options: { sandboxArguments: { command: "node --test" } },
+      error: /Expected exactly one canonical exec sandbox call, found 0/,
+    },
+    {
+      label: "wrong intent",
+      options: {
+        sandboxArguments: {
+          intent: "Run an unrelated command.",
+          command: "node --test",
+        },
+      },
+      error: /Expected exactly one canonical exec sandbox call, found 0/,
+    },
+    {
+      label: "wrong command",
+      options: {
+        sandboxArguments: {
+          intent: SANDBOX_VERIFICATION_INTENT,
+          command: "npm test",
+        },
+      },
+      error: /Expected exactly one canonical exec sandbox call, found 0/,
+    },
+    {
+      label: "extra argument",
+      options: {
+        sandboxArguments: {
+          intent: SANDBOX_VERIFICATION_INTENT,
+          command: "node --test",
+          cwd: "/tmp",
+        },
+      },
+      error: /Expected exactly one canonical exec sandbox call, found 0/,
+    },
+    {
+      label: "missing sandbox creation",
+      options: { includeSandboxCreated: false },
+      error: /did not record sandbox creation/,
+    },
+    {
+      label: "no canonical exec call",
+      options: { includeSandboxCall: false },
+      error: /Expected exactly one canonical exec sandbox call, found 0/,
+    },
+    {
+      label: "multiple canonical exec calls",
+      options: {
+        additionalSandboxCalls: [{
+          callId: "call-exec-2",
+          argumentsValue: {
+            intent: SANDBOX_VERIFICATION_INTENT,
+            command: "node --test",
+          },
+        }],
+      },
+      error: /Expected exactly one canonical exec sandbox call, found 2/,
+    },
+    {
+      label: "uncorrelated response",
+      options: { responseCallId: "call-other" },
+      error: /exec sandbox call has no structured response/,
+    },
+    {
+      label: "malformed response",
+      options: { responseContent: "not-json" },
+      error: /exec sandbox response was not a JSON object/,
+    },
+    {
+      label: "success is not true",
+      options: {
+        sandboxResult: {
+          success: "true",
+          response: { exitCode: 0, result: "all tests passed\n" },
+        },
+      },
+      error: /exec sandbox execution did not return success: true/,
+    },
+    {
+      label: "missing response object",
+      options: {
+        sandboxResult: { success: true, response: "all tests passed\n" },
+      },
+      error: /exec sandbox response did not include a response object/,
+    },
+    {
+      label: "invalid exit code",
+      options: {
+        sandboxResult: {
+          success: true,
+          response: { exitCode: "0", result: "all tests passed\n" },
+        },
+      },
+      error: /non-numeric exit code/,
+    },
+    {
+      label: "non-zero exit code",
+      exitCode: 1,
+      error: /exec sandbox command exited with code 1/,
+    },
+    {
+      label: "non-string result",
+      options: {
+        sandboxResult: {
+          success: true,
+          response: { exitCode: 0, result: { output: "all tests passed" } },
+        },
+      },
+      error: /exec sandbox response did not include string output/,
+    },
+    {
+      label: "missing terminal turn",
+      options: { includeTurnDone: false },
+      error: /did not record a completed sandbox turn/,
+    },
+    {
+      label: "incomplete terminal status",
+      options: { turnState: { status: "running", requiredActions: [] } },
+      error: /sandbox turn did not finish successfully/,
+    },
+    {
+      label: "missing required actions",
+      options: { turnState: { status: "done" } },
+      error: /sandbox turn did not include required actions/,
+    },
+  ];
+
+  for (const [index, fixture] of cases.entries()) {
+    const missions = new MissionService(new InMemoryMissionRepository());
+    const { client } = fakeClient((turnId) => sandboxEvents(
+      turnId,
+      fixture.exitCode ?? 0,
+      [],
+      fixture.options,
+    ));
+    const runner = new TrueForgeMissionRunner(missions, client, {
+      model: "google-gemini/test-model",
+    });
+    const mission = await runner.createMission({
+      id: `mission-sandbox-negative-${index}`,
+      objective: `Reject ${fixture.label} sandbox proof`,
+    });
+
+    await assert.rejects(
+      runner.runSandboxVerification({ missionId: mission.id, command: "node --test" }),
+      (error) => {
+        assert.equal(error.operation, "run sandbox verification", fixture.label);
+        assert.match(error.message, fixture.error, fixture.label);
+        return true;
+      },
+    );
+    const state = await missions.getState();
+    assert.equal(state.missions[0].status, "blocked", fixture.label);
+    assert.equal(
+      state.evidence.some((item) => item.source === "sandbox" && item.result === "passed"),
+      false,
+      fixture.label,
+    );
+  }
 });
 
 test("nonzero sandbox execution is recorded as failure and blocks the mission", async () => {
