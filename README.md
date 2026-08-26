@@ -43,4 +43,4 @@ npm run smoke:trueforge
 
 ## Repository safety
 
-Local credentials, environment files, MCP configuration, MCPlanner metadata, dependencies, and generated output are ignored by default. Do not commit secrets or machine-specific configuration.
+Local credentials, environment files, MCP configuration, dependencies, and generated output are ignored by default. Do not commit secrets or machine-specific configuration.
