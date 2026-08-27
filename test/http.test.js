@@ -306,7 +306,10 @@ test("run mission uses the runtime adapters and exposes passed proof", async () 
   assert.deepEqual(payload.mission.evidence.map((item) => item.source).sort(), ["mcp", "sandbox"]);
   assert.deepEqual(runner.calls, { create: 1, inspect: 1, turn: 1, sandbox: 1 });
   assert.equal(runner.sandboxInputs[0].command, PRIMARY_VERIFICATION_COMMAND);
-  assert.match(runner.sandboxInputs[0].command, /verify:mission/);
+  assert.match(runner.sandboxInputs[0].command, /node --input-type=module -e/);
+  assert.match(runner.sandboxInputs[0].command, /--loader/);
+  assert.match(runner.sandboxInputs[0].command, /--test\", \"test\/index\.test\.js/);
+  assert.match(runner.sandboxInputs[0].command, /getNextDeliveryStage/);
 
   const serialized = JSON.stringify(payload);
   assert.doesNotMatch(serialized, /must-not-reach-browser|provider_secret/);
