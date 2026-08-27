@@ -31,7 +31,7 @@ async function reviewFixture({
   repository = new InMemoryMissionRepository(),
   includeDiff = true,
   diffCommand = "git diff",
-  diffOutput = "diff --git a/src/index.ts b/src/index.ts\n--- a/src/index.ts\n+++ b/src/index.ts\n@@ -1 +1,2 @@\n before\n+after",
+  diffOutput = "diff --git a/src/index.ts b/src/index.ts\n--- a/src/index.ts\n+++ b/src/index.ts\n@@ -1 +1,2 @@\n before\n+after\ndiff --git a/test/index.test.js b/test/index.test.js\n--- a/test/index.test.js\n+++ b/test/index.test.js\n@@ -1 +1,2 @@\n before\n+after",
 } = {}) {
   const missions = new MissionService(repository, fixedClock);
   const mission = await missions.createMission({
@@ -180,6 +180,7 @@ test("deterministic verifier derives acceptance, changes, and blocking from revi
   const context = await missions.getReviewContext(mission.id, workItem.id);
   const verifier = new DeterministicImplementationVerifier();
 
+  assert.deepEqual(context.actualFilesChanged, ["src/index.ts", "test/index.test.js"]);
   assert.equal(verifier.review(context).outcome, "accepted");
   const metadataOnly = {
     ...context,
@@ -198,6 +199,19 @@ test("deterministic verifier derives acceptance, changes, and blocking from revi
     ...context,
     handoff: { ...context.handoff, openQuestions: ["Confirm the intended compatibility boundary."] },
   }).outcome, "blocked");
+});
+
+test("independent review rejects a content diff that contradicts the handoff files", async () => {
+  const { missions, mission, workItem } = await reviewFixture({
+    diffOutput: "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n before\n+after",
+  });
+  const context = await missions.getReviewContext(mission.id, workItem.id);
+  const decision = new DeterministicImplementationVerifier().review(context);
+
+  assert.deepEqual(context.filesChanged, ["src/index.ts", "test/index.test.js"]);
+  assert.deepEqual(context.actualFilesChanged, ["README.md"]);
+  assert.equal(decision.outcome, "changes_requested");
+  assert.match(decision.finding, /do not match/);
 });
 
 test("independent review accepts adequate proof and persists the reviewed state", async () => {

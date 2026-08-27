@@ -341,7 +341,23 @@ function referencedFiles(
   const inspectedFiles = inspection?.patches === undefined
     ? []
     : Object.keys(inspection.patches);
-  const candidates = objectiveFiles.length > 0 ? objectiveFiles : inspectedFiles;
+  const semanticInspectionFiles = inspectedFiles.filter((file) => {
+    const normalized = file.toLowerCase();
+    if (
+      /\b(?:test|tests|testing|assertion|assertions|coverage)\b/i.test(objective) &&
+      (normalized.startsWith("test/") || normalized.startsWith("tests/") ||
+        /(?:^|\/)\w+\.(?:test|spec)\.[a-z0-9]+$/.test(normalized))
+    ) {
+      return true;
+    }
+    if (/\b(?:documentation|docs?|readme)\b/i.test(objective) && normalized.startsWith("docs/")) {
+      return true;
+    }
+    return /\b(?:script|scripts|automation)\b/i.test(objective) && normalized.startsWith("scripts/");
+  });
+  const candidates = objectiveFiles.length > 0
+    ? [...objectiveFiles, ...semanticInspectionFiles]
+    : inspectedFiles;
   return [...new Set(candidates)]
     .sort()
     .slice(0, MAX_PLANNING_FILE_REFERENCES);

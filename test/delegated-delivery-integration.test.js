@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { M2_FIXTURE, runM2Integration } from "../scripts/m2-integration.mjs";
+import { DELEGATED_DELIVERY_FIXTURE, runDelegatedDeliveryIntegration } from "../scripts/delegated-delivery-integration.mjs";
 
-test("M2 reset fixture unlocks reviewed dependencies and preserves failure history", async () => {
-  const result = await runM2Integration();
+test("delegated delivery reset fixture unlocks reviewed dependencies and preserves failure history", async () => {
+  const result = await runDelegatedDeliveryIntegration();
 
-  assert.equal(result.summary.missionId, M2_FIXTURE.missionId);
+  assert.equal(result.summary.missionId, DELEGATED_DELIVERY_FIXTURE.missionId);
   assert.equal(result.summary.missionStatus, "verifying");
-  assert.deepEqual(result.summary.completedWorkItems, ["m2-root", "m2-dependent", "m2-terminal"]);
+  assert.deepEqual(result.summary.completedWorkItems, ["proof-loop-root", "proof-loop-dependent", "proof-loop-terminal"]);
   assert.equal(result.summary.dependentUnlockedAfterReviewedCompletion, true);
   assert.equal(result.summary.changesRequestedPreservedHistory, true);
   assert.equal(result.summary.malformedDelegationDidNotUnlockDependent, true);
@@ -25,12 +25,12 @@ test("M2 reset fixture unlocks reviewed dependencies and preserves failure histo
   assert.equal(result.blockedReview.dependentStatus, "backlog");
   assert.equal(result.blockedReview.handoffCount, 1);
 
-  const primaryReviews = result.state.reviews.filter((review) => review.missionId === M2_FIXTURE.missionId);
+  const primaryReviews = result.state.reviews.filter((review) => review.missionId === DELEGATED_DELIVERY_FIXTURE.missionId);
   assert.deepEqual(
     primaryReviews.map((review) => review.outcome),
     ["accepted", "changes_requested", "accepted", "accepted"],
   );
-  assert.equal(result.state.missions.some((mission) => mission.id === M2_FIXTURE.malformedMissionId), true);
-  assert.equal(result.state.missions.some((mission) => mission.id === M2_FIXTURE.uncorrelatedMissionId), true);
-  assert.equal(result.state.missions.some((mission) => mission.id === M2_FIXTURE.blockedReviewMissionId), true);
+  assert.equal(result.state.missions.some((mission) => mission.id === DELEGATED_DELIVERY_FIXTURE.malformedMissionId), true);
+  assert.equal(result.state.missions.some((mission) => mission.id === DELEGATED_DELIVERY_FIXTURE.uncorrelatedMissionId), true);
+  assert.equal(result.state.missions.some((mission) => mission.id === DELEGATED_DELIVERY_FIXTURE.blockedReviewMissionId), true);
 });

@@ -11,17 +11,17 @@ import {
   TrueForgeMissionRunner,
 } from "../dist/index.js";
 
-export const M2_FIXTURE = Object.freeze({
-  missionId: "mission-m2-dependent-loop",
-  malformedMissionId: "mission-m2-malformed-loop",
-  uncorrelatedMissionId: "mission-m2-uncorrelated-loop",
-  blockedReviewMissionId: "mission-m2-blocked-review-loop",
-  sessionId: "session-m2-dependent-loop",
-  repository: { owner: "fixture", name: "proof-board", ref: "m2-reset" },
+export const DELEGATED_DELIVERY_FIXTURE = Object.freeze({
+  missionId: "mission-proof-loop-dependent-loop",
+  malformedMissionId: "mission-proof-loop-malformed-loop",
+  uncorrelatedMissionId: "mission-proof-loop-uncorrelated-loop",
+  blockedReviewMissionId: "mission-proof-loop-blocked-review-loop",
+  sessionId: "session-proof-loop-dependent-loop",
+  repository: { owner: "fixture", name: "proof-board", ref: "proof-loop-reset" },
   graph: {
     items: [
       {
-        id: "m2-root",
+        id: "proof-loop-root",
         title: "Complete the foundation change",
         purpose: "Run the first bounded implementation in the dependency chain.",
         acceptanceCriteria: ["The foundation change has a structured handoff and review."],
@@ -30,20 +30,20 @@ export const M2_FIXTURE = Object.freeze({
         requiredChecks: ["typecheck", "test"],
       },
       {
-        id: "m2-dependent",
+        id: "proof-loop-dependent",
         title: "Complete the dependent change",
         purpose: "Run only after the foundation has passed independent review.",
         acceptanceCriteria: ["The dependent change unlocks only after reviewed completion."],
-        dependsOn: ["m2-root"],
+        dependsOn: ["proof-loop-root"],
         assignedRole: "implementer",
         requiredChecks: ["typecheck", "test"],
       },
       {
-        id: "m2-terminal",
+        id: "proof-loop-terminal",
         title: "Complete the terminal change",
         purpose: "Run only after the dependent change has passed independent review.",
         acceptanceCriteria: ["The terminal change runs after the complete dependency chain."],
-        dependsOn: ["m2-dependent"],
+        dependsOn: ["proof-loop-dependent"],
         assignedRole: "implementer",
         requiredChecks: ["typecheck", "test"],
       },
@@ -66,8 +66,8 @@ function fakeStream(events) {
 }
 
 function delegatedEvents(attempt, { malformedCompletion = false } = {}) {
-  const turnId = `turn-m2-${attempt}`;
-  const threadId = `thread-m2-${attempt}`;
+  const turnId = `turn-proof-loop-${attempt}`;
+  const threadId = `thread-proof-loop-${attempt}`;
   const sourceFile = `src/${attempt}.ts`;
   const testFile = `test/${attempt}.test.js`;
   const response = (id, callId, output) => ({
@@ -235,44 +235,44 @@ async function runImplementation(missions, runner, missionId, workItemId, attemp
 async function runMalformedScenario(repository) {
   const missions = new MissionService(repository, fixedClock);
   const { client, calls } = fakeClient({
-    sessionId: "session-m2-malformed-loop",
+    sessionId: "session-proof-loop-malformed-loop",
     malformedCompletion: true,
   });
   const runner = runnerFor(missions, client);
   const mission = await runner.createMission({
-    id: M2_FIXTURE.malformedMissionId,
+    id: DELEGATED_DELIVERY_FIXTURE.malformedMissionId,
     objective: "Keep malformed delegated completion from unlocking a dependent.",
-    repository: M2_FIXTURE.repository,
+    repository: DELEGATED_DELIVERY_FIXTURE.repository,
   });
   await missions.transitionMission(mission.id, "planning");
   await missions.transitionMission(mission.id, "executing");
   await missions.persistWorkGraph(mission.id, {
     items: [
       {
-        ...M2_FIXTURE.graph.items[0],
-        id: "m2-malformed-root",
+        ...DELEGATED_DELIVERY_FIXTURE.graph.items[0],
+        id: "proof-loop-malformed-root",
       },
       {
-        ...M2_FIXTURE.graph.items[1],
-        id: "m2-malformed-dependent",
-        dependsOn: ["m2-malformed-root"],
+        ...DELEGATED_DELIVERY_FIXTURE.graph.items[1],
+        id: "proof-loop-malformed-dependent",
+        dependsOn: ["proof-loop-malformed-root"],
       },
     ],
   });
-  await missions.transitionWorkItem(mission.id, "m2-malformed-root", "in_progress");
+  await missions.transitionWorkItem(mission.id, "proof-loop-malformed-root", "in_progress");
   await assert.rejects(
     runner.runTurn(mission.id, "Return a malformed delegated completion.", {
-      workItemId: "m2-malformed-root",
+      workItemId: "proof-loop-malformed-root",
       delegateToSubagent: true,
     }),
     (error) => /malformed|uncorrelated|interrupted/i.test(error.message),
   );
   const state = await missions.getState();
-  const root = state.workItems.find((item) => item.id === "m2-malformed-root");
+  const root = state.workItems.find((item) => item.id === "proof-loop-malformed-root");
   assert.equal(root.delegation.status, "interrupted");
-  assert.equal(await missions.canStartWorkItem(mission.id, "m2-malformed-dependent"), false);
+  assert.equal(await missions.canStartWorkItem(mission.id, "proof-loop-malformed-dependent"), false);
   await assert.rejects(
-    missions.transitionWorkItem(mission.id, "m2-malformed-dependent", "ready"),
+    missions.transitionWorkItem(mission.id, "proof-loop-malformed-dependent", "ready"),
     domainError("dependency_blocked"),
   );
   assert.equal(state.handoffs.filter((handoff) => handoff.missionId === mission.id).length, 0);
@@ -280,7 +280,7 @@ async function runMalformedScenario(repository) {
   return {
     missionId: mission.id,
     rootDelegationStatus: root.delegation.status,
-    dependentStatus: state.workItems.find((item) => item.id === "m2-malformed-dependent").status,
+    dependentStatus: state.workItems.find((item) => item.id === "proof-loop-malformed-dependent").status,
     handoffCount: state.handoffs.filter((handoff) => handoff.missionId === mission.id).length,
   };
 }
@@ -289,11 +289,11 @@ function twoNodeScenarioGraph(prefix) {
   return {
     items: [
       {
-        ...M2_FIXTURE.graph.items[0],
+        ...DELEGATED_DELIVERY_FIXTURE.graph.items[0],
         id: `${prefix}-root`,
       },
       {
-        ...M2_FIXTURE.graph.items[1],
+        ...DELEGATED_DELIVERY_FIXTURE.graph.items[1],
         id: `${prefix}-dependent`,
         dependsOn: [`${prefix}-root`],
       },
@@ -303,27 +303,27 @@ function twoNodeScenarioGraph(prefix) {
 
 async function runUncorrelatedEvidenceScenario(repository) {
   const missions = new MissionService(repository, fixedClock);
-  const { client } = fakeClient({ sessionId: "session-m2-uncorrelated-loop" });
+  const { client } = fakeClient({ sessionId: "session-proof-loop-uncorrelated-loop" });
   const runner = runnerFor(missions, client);
   const mission = await runner.createMission({
-    id: M2_FIXTURE.uncorrelatedMissionId,
+    id: DELEGATED_DELIVERY_FIXTURE.uncorrelatedMissionId,
     objective: "Keep cross-thread proof from unlocking a dependent.",
-    repository: M2_FIXTURE.repository,
+    repository: DELEGATED_DELIVERY_FIXTURE.repository,
   });
   await missions.transitionMission(mission.id, "planning");
   await missions.transitionMission(mission.id, "executing");
-  await missions.persistWorkGraph(mission.id, twoNodeScenarioGraph("m2-uncorrelated"));
-  await missions.transitionWorkItem(mission.id, "m2-uncorrelated-root", "in_progress");
+  await missions.persistWorkGraph(mission.id, twoNodeScenarioGraph("proof-loop-uncorrelated"));
+  await missions.transitionWorkItem(mission.id, "proof-loop-uncorrelated-root", "in_progress");
   const execution = await runner.runTurn(
     mission.id,
     "Produce valid child execution history before the forged proof attempt.",
-    { workItemId: "m2-uncorrelated-root", delegateToSubagent: true },
+    { workItemId: "proof-loop-uncorrelated-root", delegateToSubagent: true },
   );
   const draft = execution.implementationHandoff;
   assert.ok(draft);
   const childHistoryIds = [...draft.evidenceIds];
   const forged = await missions.addEvidence(mission.id, {
-    workItemId: "m2-uncorrelated-root",
+    workItemId: "proof-loop-uncorrelated-root",
     kind: "typecheck_result",
     result: "passed",
     source: "trueforge",
@@ -341,7 +341,7 @@ async function runUncorrelatedEvidenceScenario(repository) {
     : check);
   await assert.rejects(
     missions.recordHandoff(mission.id, {
-      workItemId: "m2-uncorrelated-root",
+      workItemId: "proof-loop-uncorrelated-root",
       result: "done",
       summary: "This handoff must be rejected because one required check is cross-thread.",
       filesChanged: draft.filesChanged,
@@ -360,47 +360,47 @@ async function runUncorrelatedEvidenceScenario(repository) {
   assert.equal(childHistoryIds.every((id) => state.evidence.some((item) => item.id === id)), true);
   assert.equal(state.evidence.some((item) => item.id === forged.id), true);
   assert.equal(state.handoffs.some((item) => item.missionId === mission.id), false);
-  assert.equal(await missions.canStartWorkItem(mission.id, "m2-uncorrelated-dependent"), false);
+  assert.equal(await missions.canStartWorkItem(mission.id, "proof-loop-uncorrelated-dependent"), false);
   await assert.rejects(
-    missions.transitionWorkItem(mission.id, "m2-uncorrelated-dependent", "ready"),
+    missions.transitionWorkItem(mission.id, "proof-loop-uncorrelated-dependent", "ready"),
     domainError("dependency_blocked"),
   );
   return {
     missionId: mission.id,
     retainedEvidenceCount: state.evidence.filter((item) => item.missionId === mission.id).length,
-    dependentStatus: state.workItems.find((item) => item.id === "m2-uncorrelated-dependent").status,
+    dependentStatus: state.workItems.find((item) => item.id === "proof-loop-uncorrelated-dependent").status,
     handoffCount: state.handoffs.filter((item) => item.missionId === mission.id).length,
   };
 }
 
 async function runBlockedReviewScenario(repository) {
   const missions = new MissionService(repository, fixedClock);
-  const { client } = fakeClient({ sessionId: "session-m2-blocked-review-loop" });
+  const { client } = fakeClient({ sessionId: "session-proof-loop-blocked-review-loop" });
   const runner = runnerFor(missions, client);
   const mission = await runner.createMission({
-    id: M2_FIXTURE.blockedReviewMissionId,
+    id: DELEGATED_DELIVERY_FIXTURE.blockedReviewMissionId,
     objective: "Keep a blocked review from unlocking a dependent.",
-    repository: M2_FIXTURE.repository,
+    repository: DELEGATED_DELIVERY_FIXTURE.repository,
   });
   await missions.transitionMission(mission.id, "planning");
   await missions.transitionMission(mission.id, "executing");
-  await missions.persistWorkGraph(mission.id, twoNodeScenarioGraph("m2-blocked"));
-  await runImplementation(missions, runner, mission.id, "m2-blocked-root", "blocked-root");
+  await missions.persistWorkGraph(mission.id, twoNodeScenarioGraph("proof-loop-blocked"));
+  await runImplementation(missions, runner, mission.id, "proof-loop-blocked-root", "blocked-root");
   const historyBeforeReview = {
-    handoffs: (await missions.listHandoffs(mission.id, "m2-blocked-root")).length,
-    evidence: (await missions.listEvidence(mission.id, "m2-blocked-root")).length,
+    handoffs: (await missions.listHandoffs(mission.id, "proof-loop-blocked-root")).length,
+    evidence: (await missions.listEvidence(mission.id, "proof-loop-blocked-root")).length,
   };
   const review = await missions.reviewWorkItem(mission.id, {
-    workItemId: "m2-blocked-root",
+    workItemId: "proof-loop-blocked-root",
     outcome: "blocked",
     reviewer: "independent-verifier",
     summary: "Independent verification blocked the fixture attempt.",
     finding: "The bounded content diff exposes an unresolved compatibility risk.",
   });
-  assert.equal((await missions.getWorkItem(mission.id, "m2-blocked-root")).status, "blocked");
-  assert.equal(await missions.canStartWorkItem(mission.id, "m2-blocked-dependent"), false);
+  assert.equal((await missions.getWorkItem(mission.id, "proof-loop-blocked-root")).status, "blocked");
+  assert.equal(await missions.canStartWorkItem(mission.id, "proof-loop-blocked-dependent"), false);
   await assert.rejects(
-    missions.transitionWorkItem(mission.id, "m2-blocked-dependent", "ready"),
+    missions.transitionWorkItem(mission.id, "proof-loop-blocked-dependent", "ready"),
     domainError("dependency_blocked"),
   );
   const state = await missions.getState();
@@ -412,88 +412,88 @@ async function runBlockedReviewScenario(repository) {
   return {
     missionId: mission.id,
     reviewOutcome: review.outcome,
-    rootStatus: state.workItems.find((item) => item.id === "m2-blocked-root").status,
-    dependentStatus: state.workItems.find((item) => item.id === "m2-blocked-dependent").status,
+    rootStatus: state.workItems.find((item) => item.id === "proof-loop-blocked-root").status,
+    dependentStatus: state.workItems.find((item) => item.id === "proof-loop-blocked-dependent").status,
     handoffCount: state.handoffs.filter((item) => item.missionId === mission.id).length,
   };
 }
 
-export async function runM2Integration() {
-  const directory = await mkdtemp(path.join(os.tmpdir(), "trueforge-proofboard-m2-reset-"));
+export async function runDelegatedDeliveryIntegration() {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "trueforge-proofboard-proof-loop-reset-"));
   const statePath = path.join(directory, "mission-state.json");
   try {
     const repository = new JsonMissionRepository(statePath);
     let missions = new MissionService(repository, fixedClock);
-    const { client, calls } = fakeClient({ sessionId: M2_FIXTURE.sessionId });
+    const { client, calls } = fakeClient({ sessionId: DELEGATED_DELIVERY_FIXTURE.sessionId });
     let runner = runnerFor(missions, client);
     const mission = await runner.createMission({
-      id: M2_FIXTURE.missionId,
+      id: DELEGATED_DELIVERY_FIXTURE.missionId,
       objective: "Exercise a reviewed dependency chain with deterministic retry history.",
-      repository: M2_FIXTURE.repository,
+      repository: DELEGATED_DELIVERY_FIXTURE.repository,
     });
     await missions.transitionMission(mission.id, "planning");
     await missions.transitionMission(mission.id, "executing");
-    await missions.persistWorkGraph(mission.id, M2_FIXTURE.graph);
+    await missions.persistWorkGraph(mission.id, DELEGATED_DELIVERY_FIXTURE.graph);
 
-    assert.equal(await missions.canStartWorkItem(mission.id, "m2-root"), true);
-    assert.equal(await missions.canStartWorkItem(mission.id, "m2-dependent"), false);
+    assert.equal(await missions.canStartWorkItem(mission.id, "proof-loop-root"), true);
+    assert.equal(await missions.canStartWorkItem(mission.id, "proof-loop-dependent"), false);
     await assert.rejects(
-      missions.transitionWorkItem(mission.id, "m2-dependent", "ready"),
+      missions.transitionWorkItem(mission.id, "proof-loop-dependent", "ready"),
       domainError("dependency_blocked"),
     );
 
-    await runImplementation(missions, runner, mission.id, "m2-root", "root-1");
-    assert.equal(await missions.canStartWorkItem(mission.id, "m2-dependent"), false);
+    await runImplementation(missions, runner, mission.id, "proof-loop-root", "root-1");
+    assert.equal(await missions.canStartWorkItem(mission.id, "proof-loop-dependent"), false);
     await missions.reviewWorkItem(mission.id, {
-      workItemId: "m2-root",
+      workItemId: "proof-loop-root",
       outcome: "accepted",
       reviewer: "independent-verifier",
       summary: "The root changed state and required checks are independently verified.",
       finding: "No blocking findings for the foundation change.",
     });
-    assert.equal((await missions.getWorkItem(mission.id, "m2-root")).status, "complete");
+    assert.equal((await missions.getWorkItem(mission.id, "proof-loop-root")).status, "complete");
 
     missions = new MissionService(repository, fixedClock);
     runner = runnerFor(missions, client);
-    assert.equal(await missions.canStartWorkItem(mission.id, "m2-dependent"), false);
-    await missions.transitionWorkItem(mission.id, "m2-dependent", "ready");
-    assert.equal(await missions.canStartWorkItem(mission.id, "m2-dependent"), true);
-    await runImplementation(missions, runner, mission.id, "m2-dependent", "dependent-1");
-    const firstDependentHandoffCount = (await missions.listHandoffs(mission.id, "m2-dependent")).length;
-    const firstDependentEvidenceCount = (await missions.listEvidence(mission.id, "m2-dependent")).length;
+    assert.equal(await missions.canStartWorkItem(mission.id, "proof-loop-dependent"), false);
+    await missions.transitionWorkItem(mission.id, "proof-loop-dependent", "ready");
+    assert.equal(await missions.canStartWorkItem(mission.id, "proof-loop-dependent"), true);
+    await runImplementation(missions, runner, mission.id, "proof-loop-dependent", "dependent-1");
+    const firstDependentHandoffCount = (await missions.listHandoffs(mission.id, "proof-loop-dependent")).length;
+    const firstDependentEvidenceCount = (await missions.listEvidence(mission.id, "proof-loop-dependent")).length;
     await missions.reviewWorkItem(mission.id, {
-      workItemId: "m2-dependent",
+      workItemId: "proof-loop-dependent",
       outcome: "changes_requested",
       reviewer: "independent-verifier",
       summary: "The dependent implementation needs a correction.",
       finding: "The first attempt did not satisfy the dependent acceptance contract.",
     });
-    assert.equal((await missions.getWorkItem(mission.id, "m2-dependent")).status, "ready");
-    assert.equal(await missions.canStartWorkItem(mission.id, "m2-terminal"), false);
+    assert.equal((await missions.getWorkItem(mission.id, "proof-loop-dependent")).status, "ready");
+    assert.equal(await missions.canStartWorkItem(mission.id, "proof-loop-terminal"), false);
     await assert.rejects(
-      missions.transitionWorkItem(mission.id, "m2-terminal", "ready"),
+      missions.transitionWorkItem(mission.id, "proof-loop-terminal", "ready"),
       domainError("dependency_blocked"),
     );
-    assert.equal((await missions.listHandoffs(mission.id, "m2-dependent")).length, firstDependentHandoffCount);
-    assert.equal((await missions.listEvidence(mission.id, "m2-dependent")).length, firstDependentEvidenceCount + 1);
+    assert.equal((await missions.listHandoffs(mission.id, "proof-loop-dependent")).length, firstDependentHandoffCount);
+    assert.equal((await missions.listEvidence(mission.id, "proof-loop-dependent")).length, firstDependentEvidenceCount + 1);
 
     missions = new MissionService(repository, fixedClock);
     runner = runnerFor(missions, client);
-    await runImplementation(missions, runner, mission.id, "m2-dependent", "dependent-2");
+    await runImplementation(missions, runner, mission.id, "proof-loop-dependent", "dependent-2");
     await missions.reviewWorkItem(mission.id, {
-      workItemId: "m2-dependent",
+      workItemId: "proof-loop-dependent",
       outcome: "accepted",
       reviewer: "independent-verifier",
       summary: "The corrected dependent implementation is independently verified.",
       finding: "No blocking findings for the corrected dependent change.",
     });
-    assert.equal(await missions.canStartWorkItem(mission.id, "m2-terminal"), false);
+    assert.equal(await missions.canStartWorkItem(mission.id, "proof-loop-terminal"), false);
 
-    await missions.transitionWorkItem(mission.id, "m2-terminal", "ready");
-    assert.equal(await missions.canStartWorkItem(mission.id, "m2-terminal"), true);
-    await runImplementation(missions, runner, mission.id, "m2-terminal", "terminal-1");
+    await missions.transitionWorkItem(mission.id, "proof-loop-terminal", "ready");
+    assert.equal(await missions.canStartWorkItem(mission.id, "proof-loop-terminal"), true);
+    await runImplementation(missions, runner, mission.id, "proof-loop-terminal", "terminal-1");
     await missions.reviewWorkItem(mission.id, {
-      workItemId: "m2-terminal",
+      workItemId: "proof-loop-terminal",
       outcome: "accepted",
       reviewer: "independent-verifier",
       summary: "The terminal implementation is independently verified.",
@@ -520,7 +520,7 @@ export async function runM2Integration() {
     assert.equal(
       restored.handoffs
         .filter((item) => item.missionId === mission.id)
-        .every((handoff) => handoff.executionOrigin?.threadId?.startsWith("thread-m2-")),
+        .every((handoff) => handoff.executionOrigin?.threadId?.startsWith("thread-proof-loop-")),
       true,
     );
     assert.equal(
@@ -563,7 +563,7 @@ export async function runM2Integration() {
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
-  runM2Integration()
+  runDelegatedDeliveryIntegration()
     .then((result) => console.log(JSON.stringify(result.summary, null, 2)))
     .catch((error) => {
       console.error(error);

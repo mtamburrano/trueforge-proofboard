@@ -10,6 +10,7 @@ import {
   MAX_WORK_GRAPH_ITEMS,
   MissionDomainError,
   MissionService,
+  PRIMARY_MISSION_OBJECTIVE,
   RepositoryWorkGraphPlanner,
   buildPreflightWorkGraph,
   validateWorkGraph,
@@ -115,6 +116,41 @@ test("the repository planner derives bounded work from verified inspection facts
   assert.notDeepEqual(
     documentationPlan.items.map(({ id, dependsOn }) => ({ id, dependsOn })),
     planned.items.map(({ id, dependsOn }) => ({ id, dependsOn })),
+  );
+});
+
+test("the primary objective authorizes both source and verified focused-test surfaces", () => {
+  const planner = new RepositoryWorkGraphPlanner();
+  const planned = planner.plan({
+    mission: {
+      id: "primary-mission-planning-regression",
+      objective: PRIMARY_MISSION_OBJECTIVE,
+      status: "draft",
+      createdAt: fixedClock().toISOString(),
+      updatedAt: fixedClock().toISOString(),
+      repository: { owner: "owner", name: "repo", ref: "fixture-sha" },
+    },
+    inspection: {
+      resourceUri: "repo://owner/repo/fixture-sha/commit",
+      contentHash: "sha256:primary-fixture",
+      commitSha: "fixture-sha",
+      patches: {
+        "src/index.ts": "@@ verified source",
+        "test/index.test.js": "@@ verified focused tests",
+      },
+    },
+  });
+
+  const implementers = planned.items.filter((item) => item.assignedRole === "implementer");
+  assert.deepEqual(
+    implementers.map((item) => item.id),
+    ["primary-implement-1-src-index-ts", "primary-implement-2-test-index-test-js"],
+  );
+  assert.match(implementers[0].purpose, /src\/index\.ts/);
+  assert.match(implementers[1].purpose, /test\/index\.test\.js/);
+  assert.deepEqual(
+    planned.items.find((item) => item.assignedRole === "reviewer").dependsOn,
+    implementers.map((item) => item.id),
   );
 });
 

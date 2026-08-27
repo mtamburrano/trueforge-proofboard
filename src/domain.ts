@@ -221,6 +221,7 @@ export interface ReviewContext {
   workItem: WorkItem;
   handoff: Handoff;
   filesChanged: string[];
+  actualFilesChanged: string[];
   diffSummary: string;
   checks: ImplementationCheck[];
   evidence: Evidence[];
@@ -1596,13 +1597,13 @@ function ensureAcceptedIndependentReview(state: MissionState, workItem: WorkItem
   }
 }
 
-function isContentBearingChangedStateEvidence(evidence: Evidence): boolean {
+function changedFilesFromContentBearingEvidence(evidence: Evidence): string[] | null {
   if (
     (evidence.kind !== "diff_summary" && evidence.kind !== "file_change") ||
     evidence.result !== "passed" ||
     evidence.details === undefined
   ) {
-    return false;
+    return null;
   }
   try {
     const details = JSON.parse(evidence.details) as unknown;
@@ -1611,20 +1612,33 @@ function isContentBearingChangedStateEvidence(evidence: Evidence): boolean {
       details === null ||
       Array.isArray(details)
     ) {
-      return false;
+      return null;
     }
     const record = details as Record<string, unknown>;
     if (typeof record.output !== "string") {
-      return false;
+      return null;
     }
     const command = typeof record.command === "string" ? record.command : "";
-    return /\bgit\s+diff\b/.test(command) &&
-      !/\s--(?:stat|shortstat|numstat|name-only|name-status|summary|check)\b/.test(command) &&
-      /^diff --git a\/.+ b\/.+$/m.test(record.output) &&
-      /^@@\s/m.test(record.output);
+    if (!/\bgit\s+diff\b/.test(command) ||
+        /\s--(?:stat|shortstat|numstat|name-only|name-status|summary|check)\b/.test(command) ||
+        !/^@@\s/m.test(record.output)) {
+      return null;
+    }
+    const files = new Set<string>();
+    for (const match of record.output.matchAll(/^diff --git a\/(.+) b\/(.+)$/gm)) {
+      const before = match[1]?.trim();
+      const after = match[2]?.trim();
+      if (before) files.add(before);
+      if (after) files.add(after);
+    }
+    return files.size === 0 ? null : [...files];
   } catch {
-    return false;
+    return null;
   }
+}
+
+function isContentBearingChangedStateEvidence(evidence: Evidence): boolean {
+  return changedFilesFromContentBearingEvidence(evidence) !== null;
 }
 
 function buildReviewContext(
@@ -1664,6 +1678,9 @@ function buildReviewContext(
       `Work item ${workItem.id} has no content-bearing changed-state evidence for independent review.`,
     );
   }
+  const actualFilesChanged = [...new Set(evidence.flatMap((item) =>
+    changedFilesFromContentBearingEvidence(item) ?? []
+  ))];
   for (const requiredCheck of workItem.requiredChecks ?? []) {
     const check = structured.checks.find((candidate) => candidate.name === requiredCheck);
     if (check === undefined || check.result !== "passed" || !check.required) {
@@ -1677,6 +1694,7 @@ function buildReviewContext(
     workItem: clone(workItem),
     handoff: clone(handoff),
     filesChanged: [...handoff.filesChanged],
+    actualFilesChanged,
     diffSummary: structured.diffSummary,
     checks: clone(structured.checks),
     evidence: clone(evidence),

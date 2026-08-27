@@ -20,13 +20,15 @@ import {
 class TestMissionRunner {
   constructor(
     missions,
-    { failSandbox = false, secretInspectionError = false, createGate } = {},
+    { failSandbox = false, secretInspectionError = false, createGate, structuredHandoff = false } = {},
   ) {
     this.missions = missions;
     this.failSandbox = failSandbox;
     this.secretInspectionError = secretInspectionError;
     this.createGate = createGate;
+    this.structuredHandoff = structuredHandoff;
     this.sandboxInputs = [];
+    this.turnInputs = [];
     this.calls = { create: 0, inspect: 0, turn: 0, sandbox: 0 };
   }
 
@@ -64,12 +66,31 @@ class TestMissionRunner {
         authorization: "Bearer must-not-reach-browser",
       }),
     });
-    return { evidenceId: evidence.id };
+    return {
+      evidenceId: evidence.id,
+      resourceUri: "repo://mtamburrano/trueforge-proofboard/590aa8a6d72c580f61fc1b19d33e9876bc0feb9b/commit",
+      contentHash: "fixture-content-hash",
+      commitSha: "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b",
+      patches: {
+        "src/index.ts": "@@ verified source",
+        "test/index.test.js": "@@ verified focused tests",
+      },
+    };
   }
 
   async runTurn(missionId, _instruction, options) {
     this.calls.turn += 1;
-    await this.missions.attachTrueforgeTurn(missionId, `test-turn-${this.calls.turn}`);
+    this.turnInputs.push({ instruction: _instruction, options });
+    const turnId = `test-turn-${this.calls.turn}`;
+    const threadId = `test-thread-${options.workItemId}`;
+    await this.missions.attachTrueforgeTurn(missionId, turnId);
+    if (this.structuredHandoff) {
+      await this.missions.startWorkItemDelegation(missionId, options.workItemId, {
+        owner: "bounded-test-implementer",
+        threadId,
+        turnId,
+      });
+    }
     await this.missions.addEvidence(missionId, {
       workItemId: options.workItemId,
       kind: "tool_result",
@@ -78,11 +99,79 @@ class TestMissionRunner {
       summary: "TrueForge turn finished with status done.",
       details: JSON.stringify({ event_type: "turn.done", provider_secret: "hidden" }),
     });
+    let implementationHandoff;
+    if (this.structuredHandoff) {
+      const origin = {
+        kind: "trueforge",
+        sessionId: "test-session-durable",
+        turnId,
+        threadId,
+      };
+      const typecheck = await this.missions.addEvidence(missionId, {
+        workItemId: options.workItemId,
+        kind: "typecheck_result",
+        result: "passed",
+        source: "trueforge",
+        summary: "Delegated typecheck passed.",
+        executionOrigin: { ...origin, toolCallId: `call-typecheck-${this.calls.turn}` },
+      });
+      const tests = await this.missions.addEvidence(missionId, {
+        workItemId: options.workItemId,
+        kind: "test_result",
+        result: "passed",
+        source: "trueforge",
+        summary: "Delegated tests passed.",
+        executionOrigin: { ...origin, toolCallId: `call-test-${this.calls.turn}` },
+      });
+      const diff = await this.missions.addEvidence(missionId, {
+        workItemId: options.workItemId,
+        kind: "diff_summary",
+        result: "passed",
+        source: "trueforge",
+        summary: "Delegated content diff captured.",
+        details: JSON.stringify({
+          command: "git diff",
+          output: "diff --git a/src/index.ts b/src/index.ts\n--- a/src/index.ts\n+++ b/src/index.ts\n@@ -1 +1,2 @@\n before\n+after",
+        }),
+        executionOrigin: { ...origin, toolCallId: `call-diff-${this.calls.turn}` },
+      });
+      await this.missions.completeWorkItemDelegation(missionId, options.workItemId, {
+        threadId,
+        turnId,
+      });
+      implementationHandoff = {
+        filesChanged: ["src/index.ts"],
+        diffSummary: "src/index.ts changed.",
+        checks: [
+          {
+            name: "typecheck",
+            command: "npm run typecheck",
+            result: "passed",
+            required: true,
+            evidenceIds: [typecheck.id],
+            exitCode: 0,
+          },
+          {
+            name: "test",
+            command: "npm test",
+            result: "passed",
+            required: true,
+            evidenceIds: [tests.id],
+            exitCode: 0,
+          },
+        ],
+        evidenceIds: [typecheck.id, tests.id, diff.id],
+        decisions: [],
+        openQuestions: [],
+        executionOrigin: origin,
+      };
+    }
     return {
       sessionId: "test-session-durable",
-      turnId: `test-turn-${this.calls.turn}`,
+      turnId,
       events: [],
       mission: await this.missions.getMission(missionId),
+      ...(implementationHandoff === undefined ? {} : { implementationHandoff }),
     };
   }
 
@@ -127,10 +216,15 @@ class TestMissionRunner {
   }
 }
 
-function testApp(repository = new InMemoryMissionRepository(), options) {
+function testApp(repository = new InMemoryMissionRepository(), options = {}) {
+  const { planner, verifier, ...runnerOptions } = options;
   const missions = new MissionService(repository);
-  const runner = new TestMissionRunner(missions, options);
-  return { missions, runner, app: createMissionHttpApp({ missions, runner }) };
+  const runner = new TestMissionRunner(missions, runnerOptions);
+  return {
+    missions,
+    runner,
+    app: createMissionHttpApp({ missions, runner, planner, verifier }),
+  };
 }
 
 async function json(response) {
@@ -321,10 +415,24 @@ test("run mission uses the runtime adapters and exposes passed proof", async () 
   assert.equal(response.status, 200);
   const payload = await json(response);
   assert.equal(payload.mission.mission.status, "verifying");
-  assert.equal(payload.mission.progress.complete, 3);
+  assert.equal(payload.mission.progress.complete, 4);
   assert.equal(payload.mission.progress.verification, "passed");
   assert.deepEqual(payload.mission.evidence.map((item) => item.source).sort(), ["mcp", "sandbox"]);
-  assert.deepEqual(runner.calls, { create: 1, inspect: 1, turn: 1, sandbox: 1 });
+  assert.deepEqual(runner.calls, { create: 1, inspect: 1, turn: 2, sandbox: 1 });
+  assert.deepEqual(
+    runner.turnInputs.map((input) => input.options.workItemId),
+    ["primary-implement-1-src-index-ts", "primary-implement-2-test-index-test-js"],
+  );
+  assert.match(runner.turnInputs[0].instruction, /src\/index\.ts/);
+  assert.match(
+    runner.turnInputs[0].instruction,
+    /Changes for this work item remain limited to src\/index\.ts/,
+  );
+  assert.match(runner.turnInputs[1].instruction, /test\/index\.test\.js/);
+  assert.match(
+    runner.turnInputs[1].instruction,
+    /Changes for this work item remain limited to test\/index\.test\.js/,
+  );
   assert.equal(runner.sandboxInputs[0].command, PRIMARY_VERIFICATION_COMMAND);
   assert.match(runner.sandboxInputs[0].command, /node --input-type=module -e/);
   assert.match(runner.sandboxInputs[0].command, /--loader/);
@@ -362,8 +470,8 @@ test("a successful retry uses current proof while preserving historical failure"
 
   runner.failSandbox = false;
   const retryResponse = await app.request("/api/mission/run", { method: "POST" });
-  assert.equal(retryResponse.status, 200);
   const retried = await json(retryResponse);
+  assert.equal(retryResponse.status, 200, JSON.stringify(retried));
   assert.equal(retried.mission.mission.status, "verifying");
   assert.equal(retried.mission.progress.verification, "passed");
   assert.equal(retried.mission.progress.failedEvidence, 1);
@@ -374,7 +482,84 @@ test("a successful retry uses current proof while preserving historical failure"
       .sort(),
     ["failed", "passed"],
   );
-  assert.deepEqual(runner.calls, { create: 1, inspect: 1, turn: 1, sandbox: 2 });
+  assert.deepEqual(runner.calls, { create: 1, inspect: 1, turn: 2, sandbox: 2 });
+});
+
+test("the primary controller persists every injected verifier outcome with review history", async () => {
+  const planner = {
+    plan() {
+      return {
+        items: [
+          {
+            id: "primary-inspect",
+            title: "Inspect the verified repository",
+            purpose: "Establish the repository facts required for bounded implementation.",
+            acceptanceCriteria: ["The repository inspection is correlated and persisted."],
+            dependsOn: [],
+            assignedRole: "planner",
+          },
+          {
+            id: "controller-implement",
+            title: "Implement the bounded source change",
+            purpose: "Apply the requested change only to src/index.ts.",
+            acceptanceCriteria: ["The source change satisfies the requested behavior."],
+            dependsOn: ["primary-inspect"],
+            assignedRole: "implementer",
+            requiredChecks: ["typecheck", "test"],
+          },
+          {
+            id: "controller-verify",
+            title: "Verify the bounded source change",
+            purpose: "Run independent verification after implementation review.",
+            acceptanceCriteria: ["The independent verification passes."],
+            dependsOn: ["controller-implement"],
+            assignedRole: "reviewer",
+          },
+        ],
+      };
+    },
+  };
+  const decisions = [
+    { outcome: "accepted", expectedStatus: "complete" },
+    { outcome: "changes_requested", expectedStatus: "ready" },
+    { outcome: "blocked", expectedStatus: "blocked" },
+  ];
+
+  for (const scenario of decisions) {
+    const contexts = [];
+    const verifier = {
+      review(context) {
+        contexts.push(context);
+        return {
+          outcome: scenario.outcome,
+          reviewer: "injected-independent-verifier",
+          summary: `Injected verifier returned ${scenario.outcome}.`,
+          finding: `Durable ${scenario.outcome} finding.`,
+        };
+      },
+    };
+    const { app, missions } = testApp(new InMemoryMissionRepository(), {
+      planner,
+      verifier,
+      structuredHandoff: true,
+    });
+
+    const response = await app.request("/api/mission/run", { method: "POST" });
+    assert.equal(response.status === 200, scenario.outcome === "accepted");
+    const state = await missions.getState();
+    const implementation = state.workItems.find((item) => item.id === "controller-implement");
+    assert.equal(implementation.status, scenario.expectedStatus);
+    assert.equal(contexts.length, 1);
+    assert.deepEqual(contexts[0].actualFilesChanged, ["src/index.ts"]);
+    assert.equal(state.reviews.length, 1);
+    assert.equal(state.reviews[0].outcome, scenario.outcome);
+    assert.equal(state.handoffs.length, 1);
+    assert.equal(state.handoffs[0].result, "done");
+    assert.equal(
+      state.evidence.some((item) => item.id === state.reviews[0].findingEvidenceId),
+      true,
+    );
+  }
 });
 
 test("integration errors expose bounded public text without upstream secrets", async () => {

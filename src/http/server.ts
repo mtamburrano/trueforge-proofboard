@@ -168,6 +168,16 @@ export class DeterministicImplementationVerifier implements ImplementationVerifi
         finding: "Provide a bounded content diff; status, file names, or diff statistics are insufficient.",
       };
     }
+    const claimedFiles = [...new Set(context.filesChanged)].sort();
+    const actualFiles = [...new Set(context.actualFilesChanged)].sort();
+    if (JSON.stringify(claimedFiles) !== JSON.stringify(actualFiles)) {
+      return {
+        outcome: "changes_requested",
+        reviewer: "independent-verifier",
+        summary: "Independent verification found contradictory changed-file proof.",
+        finding: `Handoff files (${claimedFiles.join(", ")}) do not match the content diff (${actualFiles.join(", ")}).`,
+      };
+    }
     if (context.handoff.openQuestions.length > 0) {
       return {
         outcome: "blocked",
@@ -393,7 +403,21 @@ class MissionController {
         });
         await this.requirePassedEvidence(inspectionItem.id, "mcp");
       });
-      await this.persistInspectedWorkGraph(inspectionResult, inspectionItem.id);
+      if (inspectionResult !== undefined) {
+        await this.persistInspectedWorkGraph(inspectionResult, inspectionItem.id);
+      } else {
+        const plannedState = await this.missions.getState();
+        const hasExecutableGraph = plannedState.workItems.some((item) =>
+          item.missionId === PRIMARY_MISSION_ID && item.assignedRole === "implementer"
+        ) && plannedState.workItems.some((item) =>
+          item.missionId === PRIMARY_MISSION_ID && item.assignedRole === "reviewer"
+        );
+        if (!hasExecutableGraph) {
+          throw new MissionControlError(
+            "Completed repository inspection did not produce executable work.",
+          );
+        }
+      }
 
       state = await this.missions.getState();
       const implementers = state.workItems.filter((item) =>
