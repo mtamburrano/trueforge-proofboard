@@ -32,6 +32,67 @@ function diffOutput(files = ["src/index.ts", "test/index.test.js"]) {
   ].join("\n")).join("\n");
 }
 
+function transitionContractVerifier() {
+  return {
+    reviewContract(context) {
+      const contract = [
+        context.workItem.title,
+        context.workItem.purpose,
+        ...context.workItem.acceptanceCriteria,
+      ].join(" ");
+      const addedSource = context.actualDiff
+        .split(/\r?\n/)
+        .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
+        .map((line) => line.slice(1))
+        .join("\n");
+      if (
+        !contract.includes("getNextDeliveryStage") ||
+        !contract.includes("Plan") ||
+        !contract.includes("Execute") ||
+        !context.actualFilesChanged.includes("src/index.ts")
+      ) {
+        return {
+          outcome: "changes_requested",
+          reviewer: "semantic-test-verifier",
+          summary: "The contract-aware verifier could not identify the requested transition contract.",
+          finding: "The work-item contract is not bound to the verified source scope.",
+        };
+      }
+      let implementation;
+      try {
+        implementation = new Function(
+          `${addedSource.replace(/\bexport\s+/, "")}; return getNextDeliveryStage;`,
+        )();
+      } catch {
+        implementation = undefined;
+      }
+      const transitions = [
+        ["Plan", "Execute"],
+        ["Execute", "Prove"],
+        ["Prove", "Approve"],
+        ["Approve", null],
+      ];
+      if (
+        typeof implementation !== "function" ||
+        !transitions.every(([stage, next]) => implementation(stage) === next)
+      ) {
+        return {
+          outcome: "changes_requested",
+          reviewer: "semantic-test-verifier",
+          summary: "The contract-aware verifier found behavior that does not satisfy the transition contract.",
+          finding: "The executable helper does not implement every required transition.",
+        };
+      }
+      return {
+        outcome: "accepted",
+        reviewer: "semantic-test-verifier",
+        summary: "The contract-aware verifier executed the changed helper against every required transition.",
+        finding: "No blocking findings.",
+      };
+    },
+  };
+}
+
 function delegatedEvents(command, output) {
   const response = (id, callId, result) => ({
     type: "tool.response",
@@ -134,11 +195,12 @@ async function runnerFixture({ command = "npm run typecheck && npm test", output
   return { missions, mission, workItem, result };
 }
 
-test("the default reviewer checks contract anchors against changed content", () => {
+test("the default reviewer fails closed instead of trusting lexical contract anchors", () => {
   const diff = [
     "diff --git a/src/index.ts b/src/index.ts",
     "@@ -1 +1,2 @@",
-    "+export const unrelated = true;",
+    "+// getNextDeliveryStage maps Plan to Execute, then Prove and Approve.",
+    "+const unrelated = \"getNextDeliveryStage Plan Execute Prove Approve\";",
   ].join("\n");
   const decision = new DeterministicImplementationVerifier().review({
     workItem: {
@@ -160,7 +222,58 @@ test("the default reviewer checks contract anchors against changed content", () 
   });
 
   assert.equal(decision.outcome, "changes_requested");
-  assert.match(decision.finding, /contract|anchor/i);
+  assert.match(decision.finding, /contract-aware|structural|semantic/i);
+  assert.equal(
+    new DeterministicImplementationVerifier(transitionContractVerifier()).review({
+      workItem: {
+        title: "Implement getNextDeliveryStage",
+        purpose: "Add getNextDeliveryStage to src/index.ts.",
+        acceptanceCriteria: ["The helper maps Plan to Execute."],
+      },
+      handoff: { openQuestions: [] },
+      filesChanged: ["src/index.ts"],
+      actualFilesChanged: ["src/index.ts"],
+      actualDiff: diff,
+      diffSummary: diff,
+      checks: [{ name: "test", required: true, result: "passed" }],
+      evidence: [{
+        kind: "diff_summary",
+        result: "passed",
+        details: JSON.stringify({ command: "git diff", output: diff }),
+      }],
+    }).outcome,
+    "changes_requested",
+  );
+});
+
+test("an injected contract verifier accepts behavior it executes against the changed state", () => {
+  const diff = [
+    "diff --git a/src/index.ts b/src/index.ts",
+    "@@ -1 +1,5 @@",
+    "+export function getNextDeliveryStage(stage) {",
+    '+  return { Plan: "Execute", Execute: "Prove", Prove: "Approve", Approve: null }[stage] ?? null;',
+    "+}",
+  ].join("\n");
+  const decision = new DeterministicImplementationVerifier(transitionContractVerifier()).review({
+    workItem: {
+      title: "Implement getNextDeliveryStage",
+      purpose: "Add getNextDeliveryStage to src/index.ts.",
+      acceptanceCriteria: ["The helper maps Plan to Execute, Execute to Prove, Prove to Approve, and Approve to null."],
+    },
+    handoff: { openQuestions: [] },
+    filesChanged: ["src/index.ts"],
+    actualFilesChanged: ["src/index.ts"],
+    actualDiff: diff,
+    diffSummary: diff,
+    checks: [{ name: "test", required: true, result: "passed" }],
+    evidence: [{
+      kind: "diff_summary",
+      result: "passed",
+      details: JSON.stringify({ command: "git diff", output: diff }),
+    }],
+  });
+
+  assert.equal(decision.outcome, "accepted");
 });
 
 test("shell wrappers cannot satisfy required delegated checks", async () => {
@@ -330,7 +443,20 @@ test("legacy primary missions are upgraded without losing their history", async 
   };
   const missions = new MissionService(new InMemoryMissionRepository(legacyState), fixedClock);
   const runner = new LegacyPrimaryRunner(missions);
-  const app = createMissionHttpApp({ missions, runner });
+  const app = createMissionHttpApp({
+    missions,
+    runner,
+    semanticVerifier: {
+      reviewContract() {
+        return {
+          outcome: "accepted",
+          reviewer: "legacy-contract-verifier",
+          summary: "The migrated primary contract was independently evaluated.",
+          finding: "No blocking findings.",
+        };
+      },
+    },
+  });
 
   const response = await app.request("/api/mission", { method: "POST" });
   assert.equal(response.status, 201);

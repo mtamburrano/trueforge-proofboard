@@ -178,7 +178,27 @@ test("independent review rejects metadata-only changed-state evidence", async ()
 test("deterministic verifier derives acceptance, changes, and blocking from review context", async () => {
   const { missions, mission, workItem } = await reviewFixture();
   const context = await missions.getReviewContext(mission.id, workItem.id);
-  const verifier = new DeterministicImplementationVerifier();
+  const verifier = new DeterministicImplementationVerifier({
+    reviewContract(reviewContext) {
+      if (
+        reviewContext.actualFilesChanged.length !== 2 ||
+        !reviewContext.actualDiff.includes("+after")
+      ) {
+        return {
+          outcome: "changes_requested",
+          reviewer: "fixture-contract-verifier",
+          summary: "The fixture contract was not established by the changed state.",
+          finding: "The changed state does not satisfy the fixture contract.",
+        };
+      }
+      return {
+        outcome: "accepted",
+        reviewer: "fixture-contract-verifier",
+        summary: "The fixture contract was evaluated against the changed state.",
+        finding: "No blocking findings.",
+      };
+    },
+  });
 
   assert.deepEqual(context.actualFilesChanged, ["src/index.ts", "test/index.test.js"]);
   assert.equal(verifier.review(context).outcome, "accepted");

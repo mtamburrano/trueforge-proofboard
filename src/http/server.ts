@@ -135,6 +135,7 @@ export interface MissionHttpOptions {
   runner: MissionRunner;
   planner?: WorkGraphPlanner;
   verifier?: ImplementationVerifier;
+  semanticVerifier?: SemanticContractVerifier;
 }
 
 export interface ImplementationReviewDecision {
@@ -144,6 +145,12 @@ export interface ImplementationReviewDecision {
   finding: string;
 }
 
+export interface SemanticContractVerifier {
+  reviewContract(
+    context: ReviewContext,
+  ): ImplementationReviewDecision | Promise<ImplementationReviewDecision>;
+}
+
 export interface ImplementationVerifier {
   review(
     context: ReviewContext,
@@ -151,7 +158,9 @@ export interface ImplementationVerifier {
 }
 
 export class DeterministicImplementationVerifier implements ImplementationVerifier {
-  review(context: ReviewContext): ImplementationReviewDecision {
+  constructor(private readonly semanticVerifier?: SemanticContractVerifier) {}
+
+  review(context: ReviewContext): ImplementationReviewDecision | Promise<ImplementationReviewDecision> {
     const missingRequiredCheck = context.checks.find((check) =>
       check.required && check.result !== "passed"
     );
@@ -194,19 +203,6 @@ export class DeterministicImplementationVerifier implements ImplementationVerifi
         finding: `Handoff files (${claimedFiles.join(", ")}) do not match the content diff (${actualFiles.join(", ")}).`,
       };
     }
-    const semanticFinding = semanticContractFinding(
-      context,
-      actualFiles,
-      parsedDiffs.at(-1)?.output ?? context.actualDiff,
-    );
-    if (semanticFinding !== undefined) {
-      return {
-        outcome: "changes_requested",
-        reviewer: "independent-verifier",
-        summary: "Independent verification found that the changed state does not prove the work contract.",
-        finding: semanticFinding,
-      };
-    }
     if (context.handoff.openQuestions.length > 0) {
       return {
         outcome: "blocked",
@@ -215,12 +211,15 @@ export class DeterministicImplementationVerifier implements ImplementationVerifi
         finding: context.handoff.openQuestions.join(" "),
       };
     }
-    return {
-      outcome: "accepted",
-      reviewer: "independent-verifier",
-      summary: "Independent verification inspected the bounded content diff and correlated checks.",
-      finding: `No blocking findings; ${context.checks.filter((check) => check.required).length} required checks passed.`,
-    };
+    if (this.semanticVerifier === undefined) {
+      return {
+        outcome: "changes_requested",
+        reviewer: "independent-verifier",
+        summary: "Independent verification could not establish the work-item contract.",
+        finding: "No contract-aware verifier was supplied; structural diff evidence cannot prove that the changed state satisfies the work item's purpose and acceptance criteria.",
+      };
+    }
+    return this.semanticVerifier.reviewContract(context);
   }
 }
 
@@ -1222,125 +1221,12 @@ function normalizeChangedFile(value: string): string {
   return value.trim().replace(/^\.\//, "");
 }
 
-function semanticContractFinding(
-  context: ReviewContext,
-  actualFiles: string[],
-  actualDiff: string,
-): string | undefined {
-  const contract = [
-    context.workItem.title,
-    context.workItem.purpose,
-    ...context.workItem.acceptanceCriteria,
-  ].join("\n");
-  const expectedFiles = [...new Set(extractRepositoryPaths(contract).map(normalizeChangedFile))];
-  const actualFileSet = new Set(actualFiles.map(normalizeChangedFile));
-  const missingFiles = expectedFiles.filter((file) => !actualFileSet.has(file));
-  if (missingFiles.length > 0) {
-    return `The changed state does not cover the contract's required file scope: ${missingFiles.join(", ")}.`;
-  }
-
-  const anchors = extractContractAnchors(contract).filter((anchor) =>
-    !expectedFiles.includes(anchor),
-  );
-  if (anchors.length === 0) {
-    return undefined;
-  }
-  const additions = actualDiff
-    .split(/\r?\n/)
-    .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
-    .join("\n");
-  const changedText = additions.trim().length > 0 ? additions : actualDiff;
-  const missingAnchors = anchors.filter((anchor) => !containsContractAnchor(changedText, anchor));
-  return missingAnchors.length === 0
-    ? undefined
-    : `The changed state does not demonstrate the work contract; expected implementation anchors are missing: ${missingAnchors.join(", ")}.`;
-}
-
-function extractRepositoryPaths(value: string): string[] {
-  return [...value.matchAll(/\b(?:src|test|tests|scripts|docs)\/[A-Za-z0-9._/-]+/g)]
-    .map((match) => match[0]?.replace(/[),.;:]+$/, ""))
-    .filter((path): path is string => path !== undefined && path.length > 0);
-}
-
-function extractContractAnchors(value: string): string[] {
-  const anchors = new Set<string>();
-  const add = (candidate: string): void => {
-    const normalized = candidate.trim();
-    if (
-      normalized.length >= 4 &&
-      !CONTRACT_ANCHOR_STOP_WORDS.has(normalized.toLowerCase())
-    ) {
-      anchors.add(normalized);
-    }
-  };
-  for (const match of value.matchAll(/\b[A-Za-z_$][A-Za-z0-9_$]*[A-Z][A-Za-z0-9_$]*\b/g)) {
-    if (match[0] !== undefined) {
-      add(match[0]);
-    }
-  }
-  for (const match of value.matchAll(/["'`]([^"'`\r\n]{2,})["'`]/g)) {
-    if (match[1] !== undefined && !/\s/.test(match[1])) {
-      add(match[1]);
-    }
-  }
-  for (const match of value.matchAll(/\b[A-Z][A-Za-z0-9_]{3,}\b/g)) {
-    if (match[0] !== undefined) {
-      add(match[0]);
-    }
-  }
-  return [...anchors];
-}
-
-function containsContractAnchor(value: string, anchor: string): boolean {
-  if (anchor.includes("/") || anchor.includes(".")) {
-    return value.includes(anchor);
-  }
-  const escaped = anchor.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`(?<![A-Za-z0-9_$])${escaped}(?![A-Za-z0-9_$])`).test(value);
-}
-
-const CONTRACT_ANCHOR_STOP_WORDS = new Set([
-  "acceptance",
-  "apply",
-  "approve",
-  "bounded",
-  "change",
-  "changes",
-  "check",
-  "criteria",
-  "execute",
-  "existing",
-  "focused",
-  "implementation",
-  "implement",
-  "independent",
-  "keep",
-  "mission",
-  "objective",
-  "preserves",
-  "prove",
-  "required",
-  "repository",
-  "requested",
-  "return",
-  "returns",
-  "review",
-  "source",
-  "satisfies",
-  "test",
-  "tests",
-  "the",
-  "trueforge",
-  "verified",
-  "work",
-]);
-
 export function createMissionHttpApp(options: MissionHttpOptions) {
   const controller = new MissionController(
     options.missions,
     options.runner,
     options.planner,
-    options.verifier,
+    options.verifier ?? new DeterministicImplementationVerifier(options.semanticVerifier),
   );
   return {
     request(path: string, init?: RequestInit) {
