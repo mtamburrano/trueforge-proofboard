@@ -1,6 +1,7 @@
 const app = document.querySelector("#app");
 const connectionState = document.querySelector("#connection-state");
 const messageRegion = document.querySelector("#message");
+let runCoordinator;
 
 const labels = {
   draft: "Draft",
@@ -108,7 +109,10 @@ function renderMission(view) {
   const mission = view.mission;
   const repository = mission.repository;
   const terminal = ["delivered", "failed"].includes(mission.status);
-  const runLabel = mission.status === "verifying"
+  const runInFlight = runCoordinator?.isRunning() ?? false;
+  const runLabel = runInFlight
+    ? "Mission running…"
+    : mission.status === "verifying"
     ? "Verification current"
     : mission.status === "blocked"
     ? "Retry mission"
@@ -132,7 +136,7 @@ function renderMission(view) {
         </p>
       </div>
       <div class="mission-actions">
-        <button id="run-mission" class="primary-action" type="button" ${terminal || mission.status === "verifying" ? "disabled" : ""}>${escapeHtml(runLabel)}</button>
+        <button id="run-mission" class="primary-action" type="button" ${terminal || mission.status === "verifying" || runInFlight ? "disabled" : ""} ${runInFlight ? 'aria-busy="true"' : ""}>${escapeHtml(runLabel)}</button>
       </div>
     </section>
 
@@ -244,31 +248,30 @@ async function createMission(event) {
   await withBusy(event.currentTarget, async () => {
     try {
       const payload = await api("/api/mission", { method: "POST" });
-      renderMission(payload.mission);
+      runCoordinator.accept(payload.mission, { force: true, authoritative: true });
       setConnection("connected", "Durable state");
       showMessage("success", "Primary mission created and connected.");
     } catch (error) {
       setConnection("failed", "Operation failed");
       showMessage("error", error.message);
-      if (error.payload?.mission) renderMission(error.payload.mission);
+      if (error.payload?.mission) {
+        runCoordinator.accept(error.payload.mission, { force: true, authoritative: true });
+      }
     }
   });
 }
 
 async function runMission(event) {
-  await withBusy(event.currentTarget, async () => {
-    try {
-      const payload = await api("/api/mission/run", { method: "POST" });
-      renderMission(payload.mission);
-      setConnection("connected", "State persisted");
-      showMessage("success", "Mission run completed with durable verification evidence.");
-    } catch (error) {
-      setConnection("failed", "Run failed");
-      showMessage("error", error.message);
-      if (error.payload?.mission) renderMission(error.payload.mission);
-      else await loadMission();
-    }
-  });
+  event.preventDefault();
+  if (runCoordinator.isRunning()) return;
+  try {
+    await runCoordinator.run();
+    setConnection("connected", "State persisted");
+    showMessage("success", "Mission run completed with durable verification evidence.");
+  } catch (error) {
+    setConnection("failed", "Run failed");
+    showMessage("error", error.message);
+  }
 }
 
 async function withBusy(button, operation) {
@@ -287,7 +290,7 @@ async function loadMission() {
   try {
     const payload = await api("/api/mission");
     if (payload.mission === null) renderEmpty();
-    else renderMission(payload.mission);
+    else runCoordinator.accept(payload.mission, { force: true, authoritative: true });
     setConnection("connected", payload.mission ? "State recovered" : "Ready");
   } catch (error) {
     setConnection("failed", "Unavailable");
@@ -302,5 +305,15 @@ async function loadMission() {
     document.querySelector("#retry-load")?.addEventListener("click", loadMission);
   }
 }
+
+runCoordinator = MissionRunState.createRunCoordinator({
+  start: () => api("/api/mission/run", { method: "POST" }),
+  refresh: () => api("/api/mission"),
+  onState: (view) => renderMission(view),
+  onRunningChange: (running, view) => {
+    if (view) renderMission(view);
+    if (running) setConnection("connected", "Mission running");
+  },
+});
 
 loadMission();

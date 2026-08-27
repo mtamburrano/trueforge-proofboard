@@ -6,18 +6,11 @@ import {
   TrueForgeMissionRunner,
   createTrueForgeClient,
 } from "../trueforge.js";
+import { resolveMissionRuntimeConfig } from "./config.js";
 import { createMissionHttpApp } from "./server.js";
 
-const host = process.env.TRUEFORGE_UI_HOST ?? "127.0.0.1";
-const port = Number(process.env.TRUEFORGE_UI_PORT ?? "8787");
-const statePath = process.env.TRUEFORGE_MISSION_STATE ?? ".trueforge/mission-state.json";
-const baseUrl = process.env.TRUEFORGE_BASE_URL ?? "http://localhost:8790";
-const model = process.env.TRUEFORGE_MODEL ?? "google-gemini/gemini-3.6-flash";
-const githubServer = process.env.TRUEFORGE_GITHUB_SERVER ?? "github";
-
-if (!Number.isInteger(port) || port < 1 || port > 65_535) {
-  throw new Error("TRUEFORGE_UI_PORT must be a valid TCP port.");
-}
+const { host, port, statePath, baseUrl, model, githubServer } =
+  resolveMissionRuntimeConfig(process.env);
 
 const missions = new MissionService(new JsonMissionRepository(statePath));
 const runner = new TrueForgeMissionRunner(

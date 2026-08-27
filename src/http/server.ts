@@ -293,10 +293,10 @@ class MissionController {
 
   private async requirePassedEvidence(workItemId: string, source: "mcp" | "sandbox") {
     const state = await this.missions.getState();
-    const passed = state.evidence.some(
-      (item) => item.workItemId === workItemId && item.source === source && item.result === "passed",
-    );
-    if (!passed) {
+    const latest = state.evidence.filter(
+      (item) => item.workItemId === workItemId && item.source === source,
+    ).at(-1);
+    if (latest?.result !== "passed") {
       throw new MissionControlError(`${source === "mcp" ? "Repository" : "Sandbox"} proof did not pass.`);
     }
   }
@@ -367,11 +367,18 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
   const passedEvidence = evidence.filter((item) => item.result === "passed").length;
   const failedEvidence = evidence.filter((item) => item.result === "failed").length;
   const completed = workItems.filter((item) => item.status === "complete").length;
-  const verification = failedEvidence > 0 || mission.status === "failed" || mission.status === "blocked"
+  const repositoryProof = latestProofResult(missionEvidence, WORK.inspect, "mcp");
+  const sandboxProof = latestProofResult(missionEvidence, WORK.verify, "sandbox");
+  const currentProofFailed = repositoryProof === "failed" || sandboxProof === "failed";
+  const currentProofPassed = repositoryProof === "passed" && sandboxProof === "passed";
+  const verification = mission.status === "failed" || mission.status === "blocked"
     ? "failed"
-    : mission.status === "verifying" || mission.status === "delivered"
+    : (mission.status === "verifying" || mission.status === "delivered") && currentProofPassed
     ? "passed"
+    : currentProofFailed
+    ? "failed"
     : workItems.some((item) => item.status === "in_progress" || item.status === "ready_for_review")
+      || mission.status === "planning" || mission.status === "executing"
     ? "running"
     : "not_started";
 
@@ -449,6 +456,22 @@ function lane(id: "plan" | "execute" | "prove" | "approve", label: string, items
   };
 }
 
+function latestProofResult(
+  evidence: Evidence[],
+  workItemId: string,
+  source: "mcp" | "sandbox",
+): Evidence["result"] | undefined {
+  let latest: Evidence["result"] | undefined;
+  // Evidence is appended through MissionService mutations, so array order is the
+  // durable operation order even when several records share the same timestamp.
+  for (const item of evidence) {
+    if (item.workItemId === workItemId && item.source === source) {
+      latest = item.result;
+    }
+  }
+  return latest;
+}
+
 function mapEvidence(
   evidence: Evidence & { source: "mcp" | "sandbox" },
   titleByWorkId: Map<string, string>,
@@ -493,7 +516,6 @@ function safeEvidenceMetadata(evidence: Evidence): Record<string, string | numbe
     ["command", "command"],
     ["exit_code", "exitCode"],
     ["output", "output"],
-    ["reason", "reason"],
   ] as const;
   const safe: Record<string, string | number> = {};
   for (const [sourceKey, publicKey] of allowed) {
@@ -563,6 +585,9 @@ export function createMissionHttpApp(options: MissionHttpOptions) {
       if (request.method === "GET" && url.pathname === "/public/app.js") {
         return assetResponse("app.js", "text/javascript; charset=utf-8");
       }
+      if (request.method === "GET" && url.pathname === "/public/run-state.js") {
+        return assetResponse("run-state.js", "text/javascript; charset=utf-8");
+      }
       if (request.method === "GET" && url.pathname === "/api/mission") {
         return jsonResponse({ mission: await controller.getPrimaryMission() });
       }
@@ -579,14 +604,17 @@ export function createMissionHttpApp(options: MissionHttpOptions) {
         : error instanceof TrueForgeIntegrationError || error instanceof MissionControlError
         ? 502
         : 500;
-      const message = error instanceof Error ? error.message : "The operation failed.";
+      const message = publicErrorMessage(error);
       const mission = await controller.getPrimaryMission().catch(() => null);
       return jsonResponse({ error: "operation_failed", message, mission }, status);
     }
   }
 }
 
-async function assetResponse(fileName: "style.css" | "app.js", contentType: string) {
+async function assetResponse(
+  fileName: "style.css" | "app.js" | "run-state.js",
+  contentType: string,
+) {
   const content = await readFile(new URL(`./public/${fileName}`, import.meta.url), "utf8");
   return new Response(content, {
     headers: securityHeaders({ "content-type": contentType, "cache-control": "no-cache" }),
@@ -618,6 +646,27 @@ function securityHeaders(headers: Record<string, string>) {
   };
 }
 
+function publicErrorMessage(error: unknown): string {
+  if (error instanceof TrueForgeIntegrationError) {
+    if (error.operation.includes("inspect repository")) {
+      return "Repository inspection failed. Check the configured runtime and repository connector.";
+    }
+    if (error.operation.includes("sandbox")) {
+      return "Sandbox verification failed. Check the configured runtime and sandbox provider.";
+    }
+    return "The execution runtime is unavailable or could not complete the requested operation.";
+  }
+  if (error instanceof MissionControlError) {
+    return error.message.slice(0, 240);
+  }
+  if (error instanceof MissionDomainError) {
+    return error.code === "not_found"
+      ? "The requested mission state was not found."
+      : "The mission state operation could not be completed.";
+  }
+  return "Mission Control could not complete the requested operation.";
+}
+
 const INDEX_HTML = `<!doctype html>
 <html lang="en">
   <head>
@@ -626,6 +675,7 @@ const INDEX_HTML = `<!doctype html>
     <meta name="theme-color" content="#08090a">
     <title>Mission Control · TrueForge</title>
     <link rel="stylesheet" href="/public/style.css">
+    <script src="/public/run-state.js" defer></script>
     <script src="/public/app.js" defer></script>
   </head>
   <body>

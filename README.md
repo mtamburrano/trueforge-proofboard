@@ -34,6 +34,8 @@ npm start
 
 Then open `http://127.0.0.1:8787`. The UI creates or recovers the primary mission from `.trueforge/mission-state.json`. Creating and running the mission uses the configured local TrueForge server; provider and connector credentials remain in that server and are never included in browser payloads.
 
+The demo model defaults to `alibaba/qwen3-7-plus`. Set `TRUEFORGE_MODEL` to another configured TrueForge model selector when needed; model credentials remain in TrueForge.
+
 Use `TRUEFORGE_UI_HOST`, `TRUEFORGE_UI_PORT`, or `TRUEFORGE_MISSION_STATE` to override the local listener or durable state path. Automated HTTP tests inject isolated adapters and temporary state, so they never contact live providers.
 
 ## TrueForge smoke path

@@ -12,7 +12,7 @@ cannot stand in for tool evidence.
 | Node.js | 22.14 or newer | Required by the current TrueForge local quickstart and this repository's engine constraint. |
 | TrueForge server | `@truefoundry/trueforge@0.1.4` | Pinned local server used by this smoke path. |
 | TrueForge SDK | `@truefoundry/trueforge-sdk@0.1.3` | Pinned in `package.json` for the event-streaming runner. |
-| Model provider | Native `google-gemini` provider | Configure the provider in TrueForge Settings; the API key stays in TrueForge. |
+| Model provider | Native `alibaba` provider | Configure the provider in TrueForge Settings; the API key stays in TrueForge. |
 | MCP connector | GitHub MCP with `get_file_contents` and `get_commit` enabled | Read-only repository provenance for file and locked-commit inspections. |
 | Sandbox provider | Daytona | Configure the provider in TrueForge Settings; the API key stays in TrueForge. |
 
@@ -35,8 +35,8 @@ Official setup references: [TrueForge quickstart](https://trueforge.dev/quicksta
 
    Open `http://localhost:8790`.
 
-2. In Settings → Models, configure the native Google Gemini provider. Set
-   `TRUEFORGE_MODEL` to the exact `google-gemini/<model-id>` shown by the local
+2. In Settings → Models, configure the native Alibaba provider. Set
+   `TRUEFORGE_MODEL` to the exact `alibaba/<model-id>` shown by the local
    catalog if it differs from the example value.
 
 3. In Settings → Connectors, connect the GitHub MCP server and authorize it.

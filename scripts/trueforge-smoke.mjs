@@ -2,7 +2,7 @@ import { pathToFileURL } from "node:url";
 
 export const DEFAULTS = Object.freeze({
   baseUrl: "http://localhost:8790",
-  model: "google-gemini/gemini-3.6-flash",
+  model: "alibaba/qwen3-7-plus",
   githubServer: "github",
   githubOwner: "mtamburrano",
   githubRepo: "trueforge-proofboard",

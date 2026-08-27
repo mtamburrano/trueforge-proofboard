@@ -6,18 +6,21 @@ import test from "node:test";
 
 import {
   InMemoryMissionRepository,
+  DEFAULT_TRUEFORGE_MODEL,
   JsonMissionRepository,
   MissionService,
   PRIMARY_MISSION_ID,
   PRIMARY_MISSION_OBJECTIVE,
   TrueForgeIntegrationError,
   createMissionHttpApp,
+  resolveMissionRuntimeConfig,
 } from "../dist/index.js";
 
 class TestMissionRunner {
-  constructor(missions, { failSandbox = false } = {}) {
+  constructor(missions, { failSandbox = false, secretInspectionError = false } = {}) {
     this.missions = missions;
     this.failSandbox = failSandbox;
+    this.secretInspectionError = secretInspectionError;
     this.calls = { create: 0, inspect: 0, turn: 0, sandbox: 0 };
   }
 
@@ -31,6 +34,12 @@ class TestMissionRunner {
 
   async inspectRepository(input) {
     this.calls.inspect += 1;
+    if (this.secretInspectionError) {
+      throw new TrueForgeIntegrationError(
+        "inspect repository",
+        "Provider unavailable: Authorization: Bearer live-token API_KEY=live-key PASSWORD=live-password",
+      );
+    }
     const evidence = await this.missions.addEvidence(input.missionId, {
       workItemId: input.workItemId,
       kind: "tool_result",
@@ -126,7 +135,9 @@ test("initial mission route and static application assets load", async () => {
   const page = await app.request("/");
   assert.equal(page.status, 200);
   assert.match(page.headers.get("content-type"), /text\/html/);
-  assert.match(await page.text(), /MISSION CONTROL/);
+  const pageBody = await page.text();
+  assert.match(pageBody, /MISSION CONTROL/);
+  assert.match(pageBody, /run-state\.js[\s\S]+app\.js/);
   assert.match(page.headers.get("content-security-policy"), /default-src 'self'/);
 
   const script = await app.request("/public/app.js");
@@ -143,6 +154,10 @@ test("initial mission route and static application assets load", async () => {
   assert.match(styleBody, /--color-primary: #5fd9cd/);
   assert.match(styleBody, /evidence-card\[data-source="mcp"\]/);
   assert.match(styleBody, /evidence-card\[data-result="failed"\]/);
+
+  const runState = await app.request("/public/run-state.js");
+  assert.equal(runState.status, 200);
+  assert.match(await runState.text(), /createRunCoordinator/);
 });
 
 test("create or open is idempotent and returns durable structured mission state", async () => {
@@ -175,6 +190,7 @@ test("API maps persisted proof separately from runtime narration and redacts sec
   const { app, missions } = testApp();
   await app.request("/api/mission", { method: "POST" });
   await missions.addEvidence(PRIMARY_MISSION_ID, {
+    workItemId: "primary-inspect",
     kind: "tool_result",
     result: "passed",
     source: "mcp",
@@ -188,6 +204,7 @@ test("API maps persisted proof separately from runtime narration and redacts sec
     }),
   });
   await missions.addEvidence(PRIMARY_MISSION_ID, {
+    workItemId: "primary-verify",
     kind: "test_result",
     result: "failed",
     source: "sandbox",
@@ -250,6 +267,65 @@ test("failed sandbox proof remains visibly failed and blocks the mission", async
   assert.equal(payload.mission.evidence.some(
     (item) => item.source === "sandbox" && item.result === "passed",
   ), false);
+});
+
+test("a successful retry uses current proof while preserving historical failure", async () => {
+  const { app, runner } = testApp(new InMemoryMissionRepository(), { failSandbox: true });
+
+  const failedResponse = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(failedResponse.status, 502);
+  const failed = await json(failedResponse);
+  assert.equal(failed.mission.mission.status, "blocked");
+  assert.equal(failed.mission.progress.verification, "failed");
+
+  runner.failSandbox = false;
+  const retryResponse = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(retryResponse.status, 200);
+  const retried = await json(retryResponse);
+  assert.equal(retried.mission.mission.status, "verifying");
+  assert.equal(retried.mission.progress.verification, "passed");
+  assert.equal(retried.mission.progress.failedEvidence, 1);
+  assert.deepEqual(
+    retried.mission.evidence
+      .filter((item) => item.source === "sandbox")
+      .map((item) => item.result)
+      .sort(),
+    ["failed", "passed"],
+  );
+  assert.deepEqual(runner.calls, { create: 1, inspect: 1, turn: 1, sandbox: 2 });
+});
+
+test("integration errors expose bounded public text without upstream secrets", async () => {
+  const { app } = testApp(new InMemoryMissionRepository(), { secretInspectionError: true });
+
+  const response = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(response.status, 502);
+  const payload = await json(response);
+  assert.match(payload.message, /Repository inspection failed/);
+  assert.equal(payload.mission.mission.status, "blocked");
+
+  const serialized = JSON.stringify(payload);
+  assert.doesNotMatch(
+    serialized,
+    /live-token|live-key|live-password|Authorization|Bearer|API_KEY|PASSWORD/i,
+  );
+});
+
+test("Mission Control defaults to Alibaba Qwen and accepts an explicit model selector", () => {
+  assert.equal(DEFAULT_TRUEFORGE_MODEL, "alibaba/qwen3-7-plus");
+  assert.equal(resolveMissionRuntimeConfig({}).model, DEFAULT_TRUEFORGE_MODEL);
+  assert.equal(
+    resolveMissionRuntimeConfig({ TRUEFORGE_MODEL: "custom/provider-model" }).model,
+    "custom/provider-model",
+  );
+  assert.equal(
+    resolveMissionRuntimeConfig({ TRUEFORGE_MODEL: "  " }).model,
+    DEFAULT_TRUEFORGE_MODEL,
+  );
+  assert.throws(
+    () => resolveMissionRuntimeConfig({ TRUEFORGE_UI_PORT: "invalid" }),
+    /valid TCP port/,
+  );
 });
 
 test("a fresh service recovers the same mission and evidence from isolated JSON state", async () => {
