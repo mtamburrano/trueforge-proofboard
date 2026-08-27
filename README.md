@@ -11,7 +11,7 @@ TrueForge Proof Board is a small foundation for making autonomous software work 
 - **Prove** progress with concrete, inspectable evidence rather than agent claims alone.
 - **Approve** consequential delivery actions with a human in control.
 
-This repository deliberately starts with only the TypeScript/Node foundation needed for the upcoming TrueForge integration. Mission, work-item, board, evidence, and approval behavior will be added incrementally as the end-to-end delivery path is built.
+The application exposes that flow through a compact Mission Control screen backed by durable mission state. Runtime activity remains separate from verified repository and sandbox evidence, so agent narration cannot be mistaken for proof.
 
 ## Development
 
@@ -23,6 +23,18 @@ npm run check
 ```
 
 `npm run check` type-checks the source, builds it into `dist/`, and runs the Node test suite.
+
+## Mission Control UI
+
+Start the local Mission Control server with:
+
+```sh
+npm start
+```
+
+Then open `http://127.0.0.1:8787`. The UI creates or recovers the primary mission from `.trueforge/mission-state.json`. Creating and running the mission uses the configured local TrueForge server; provider and connector credentials remain in that server and are never included in browser payloads.
+
+Use `TRUEFORGE_UI_HOST`, `TRUEFORGE_UI_PORT`, or `TRUEFORGE_MISSION_STATE` to override the local listener or durable state path. Automated HTTP tests inject isolated adapters and temporary state, so they never contact live providers.
 
 ## TrueForge smoke path
 

@@ -13,3 +13,4 @@ export function getProductSummary(): string {
 export * from "./domain.js";
 export * from "./persistence.js";
 export * from "./trueforge.js";
+export * from "./http/server.js";
