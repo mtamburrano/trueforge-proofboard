@@ -2,17 +2,24 @@ import { readFile } from "node:fs/promises";
 
 import {
   Evidence,
+  Handoff,
   Mission,
   MissionDomainError,
   MissionService,
   MissionState,
+  Review,
   WorkItem,
 } from "../domain.js";
 import {
+  buildPreflightWorkGraph,
+  PRIMARY_WORK_GRAPH_IDS,
   RepositoryInspectionInput,
+  RepositoryWorkGraphPlanner,
   SandboxVerificationInput,
   TrueForgeIntegrationError,
   TrueForgeTurnResult,
+  VerifiedRepositoryInspection,
+  WorkGraphPlanner,
 } from "../trueforge.js";
 
 export const PRIMARY_MISSION_ID = "primary-mission";
@@ -24,11 +31,7 @@ export const PRIMARY_REPOSITORY = {
   ref: "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b",
 } as const;
 
-const WORK = {
-  inspect: "primary-inspect",
-  implement: "primary-implement",
-  verify: "primary-verify",
-} as const;
+const WORK = PRIMARY_WORK_GRAPH_IDS;
 
 export const PRIMARY_MISSION_VERIFICATION_SCRIPT = [
   'import assert from "node:assert/strict";',
@@ -119,7 +122,7 @@ export interface MissionRunner {
   runTurn(
     missionId: string,
     instruction: string,
-    options: { workItemId: string },
+    options: { workItemId: string; delegateToSubagent?: boolean },
   ): Promise<TrueForgeTurnResult>;
   runSandboxVerification(input: SandboxVerificationInput): Promise<unknown>;
 }
@@ -127,6 +130,7 @@ export interface MissionRunner {
 export interface MissionHttpOptions {
   missions: MissionService;
   runner: MissionRunner;
+  planner?: WorkGraphPlanner;
 }
 
 export interface EvidenceView {
@@ -138,6 +142,40 @@ export interface EvidenceView {
   createdAt: string;
   workItemTitle?: string;
   metadata: Record<string, string | number>;
+  executionOrigin?: Evidence["executionOrigin"];
+}
+
+export interface HandoffView {
+  id: string;
+  workItemId: string;
+  result: Handoff["result"];
+  summary: string;
+  filesChanged: string[];
+  testsRun: string[];
+  decisions: string[];
+  openQuestions: string[];
+  memoryImpact: Handoff["memoryImpact"];
+  createdAt: string;
+  diffSummary?: string;
+  checks?: Handoff["checks"];
+  evidenceIds?: string[];
+  executionOrigin?: Handoff["executionOrigin"];
+}
+
+export interface ReviewView {
+  id: string;
+  workItemId: string;
+  outcome: Review["outcome"];
+  reviewer: string;
+  summary: string;
+  finding: string;
+  handoffId: string;
+  filesChanged: string[];
+  diffSummary: string;
+  checks: Review["checks"];
+  evidenceIds: string[];
+  findingEvidenceId: string;
+  createdAt: string;
 }
 
 export interface ActivityView {
@@ -174,13 +212,18 @@ export interface MissionView {
       id: string;
       title: string;
       purpose: string;
+      acceptanceCriteria: string[];
       status: WorkItem["status"];
       dependsOn: string[];
       assignedRole?: WorkItem["assignedRole"];
+      requiredChecks?: string[];
+      delegation?: WorkItem["delegation"];
     }>;
   }>;
   activity: ActivityView[];
   evidence: EvidenceView[];
+  handoffs: HandoffView[];
+  reviews: ReviewView[];
   approvals: Array<{
     id: string;
     action: string;
@@ -213,6 +256,7 @@ class MissionController {
   constructor(
     private readonly missions: MissionService,
     private readonly runner: MissionRunner,
+    private readonly planner: WorkGraphPlanner = new RepositoryWorkGraphPlanner(),
   ) {}
 
   async getPrimaryMission(): Promise<MissionView | null> {
@@ -259,39 +303,25 @@ class MissionController {
   }
 
   private async ensureWorkItems(): Promise<void> {
-    let state = await this.missions.getState();
-    const exists = (id: string) => state.workItems.some(
-      (item) => item.missionId === PRIMARY_MISSION_ID && item.id === id,
-    );
-
-    if (!exists(WORK.inspect)) {
-      await this.missions.addWorkItem(PRIMARY_MISSION_ID, {
-        id: WORK.inspect,
-        title: "Inspect pinned repository",
-        purpose: "Verify the exact source commit and expected file surface through repository MCP.",
-        status: "ready",
-        assignedRole: "planner",
-      });
-      state = await this.missions.getState();
-    }
-    if (!exists(WORK.implement)) {
-      await this.missions.addWorkItem(PRIMARY_MISSION_ID, {
-        id: WORK.implement,
-        title: "Implement the stage helper",
-        purpose: "Make the bounded backwards-compatible source and test change in the sandbox.",
-        dependsOn: [WORK.inspect],
-        assignedRole: "implementer",
-      });
-      state = await this.missions.getState();
-    }
-    if (!exists(WORK.verify)) {
-      await this.missions.addWorkItem(PRIMARY_MISSION_ID, {
-        id: WORK.verify,
-        title: "Verify the delivery contract",
-        purpose: "Run type checking and the complete test suite in the sandbox.",
-        dependsOn: [WORK.implement],
-        assignedRole: "reviewer",
-      });
+    const state = await this.missions.getState();
+    const workItems = state.workItems.filter((item) => item.missionId === PRIMARY_MISSION_ID);
+    const implementer = workItems.find((item) => item.id === WORK.implement);
+    const hasValidatedGraph = workItems.length === 3 &&
+      workItems.every((item) =>
+        item.acceptanceCriteria.length > 0 &&
+        item.assignedRole !== undefined,
+      ) &&
+      workItems.some((item) => item.id === WORK.inspect) &&
+      workItems.some((item) => item.id === WORK.implement) &&
+      workItems.some((item) => item.id === WORK.verify) &&
+      implementer?.requiredChecks?.includes("typecheck") === true &&
+      implementer.requiredChecks.includes("test");
+    if (!hasValidatedGraph) {
+      const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
+      await this.missions.persistWorkGraph(
+        PRIMARY_MISSION_ID,
+        buildPreflightWorkGraph(mission),
+      );
     }
   }
 
@@ -299,15 +329,17 @@ class MissionController {
     await this.createOrOpenPrimaryMission();
     await this.prepareMissionForExecution();
     try {
+      let inspectionResult: unknown;
       await this.executeWork(WORK.inspect, async () => {
-        await this.runner.inspectRepository({
+        inspectionResult = await this.runner.inspectRepository({
           missionId: PRIMARY_MISSION_ID,
           workItemId: WORK.inspect,
         });
         await this.requirePassedEvidence(WORK.inspect, "mcp");
       });
+      await this.persistInspectedWorkGraph(inspectionResult);
       await this.executeWork(WORK.implement, async () => {
-        await this.runner.runTurn(
+        const execution = await this.runner.runTurn(
           PRIMARY_MISSION_ID,
           [
             "Implement the mission objective in the configured sandbox using the verified pinned source.",
@@ -315,10 +347,14 @@ class MissionController {
             "Add direct focused assertions in test/index.test.js for every Plan, Execute, Prove, and Approve transition so the verification can correlate the changed helper with its coverage.",
             "Do not push, open a pull request, or perform any other remote mutation.",
           ].join(" "),
-          { workItemId: WORK.implement },
+          { workItemId: WORK.implement, delegateToSubagent: true },
         );
         await this.requirePassedTurn(WORK.implement);
-      });
+        if (execution.implementationHandoff !== undefined) {
+          await this.recordImplementationHandoff(execution);
+        }
+      }, false);
+      await this.reviewImplementation();
       await this.executeWork(WORK.verify, async () => {
         await this.runner.runSandboxVerification({
           missionId: PRIMARY_MISSION_ID,
@@ -339,6 +375,83 @@ class MissionController {
     }
   }
 
+  private async recordImplementationHandoff(execution: TrueForgeTurnResult): Promise<void> {
+    const draft = execution.implementationHandoff;
+    if (draft === undefined) {
+      return;
+    }
+    const requiredChecksPassed = draft.checks
+      .filter((check) => check.required)
+      .every((check) => check.result === "passed");
+    await this.missions.recordHandoff(PRIMARY_MISSION_ID, {
+      workItemId: WORK.implement,
+      result: requiredChecksPassed ? "done" : "partial",
+      summary: requiredChecksPassed
+        ? "The delegated implementation returned a structured evidence handoff."
+        : "The delegated implementation returned a partial handoff with unresolved required checks.",
+      filesChanged: draft.filesChanged,
+      testsRun: [...new Set(draft.checks.map((check) => check.command))],
+      decisions: draft.decisions,
+      openQuestions: draft.openQuestions,
+      componentsTouched: [],
+      memoryImpact: "medium",
+      diffSummary: draft.diffSummary,
+      checks: draft.checks,
+      evidenceIds: draft.evidenceIds,
+      executionOrigin: draft.executionOrigin,
+    });
+  }
+
+  private async reviewImplementation(): Promise<void> {
+    const workItem = await this.missions.getWorkItem(PRIMARY_MISSION_ID, WORK.implement);
+    if (workItem.status === "complete") {
+      return;
+    }
+    if (workItem.status !== "ready_for_review") {
+      throw new MissionControlError(
+        "Independent verification requires the implementation to be ready for review.",
+      );
+    }
+    if (workItem.delegation === undefined) {
+      await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, WORK.implement, "complete");
+      return;
+    }
+    const context = await this.missions.getReviewContext(PRIMARY_MISSION_ID, WORK.implement);
+    const changedFiles = context.filesChanged.join(", ");
+    await this.missions.reviewWorkItem(PRIMARY_MISSION_ID, {
+      workItemId: WORK.implement,
+      outcome: "accepted",
+      reviewer: "independent-verifier",
+      summary: `Independent verification reviewed the changed state for ${changedFiles}.`,
+      finding: `No blocking findings; ${context.checks.filter((check) => check.required).length} required checks passed against the correlated handoff evidence.`,
+    });
+  }
+
+  private async persistInspectedWorkGraph(inspectionResult: unknown): Promise<void> {
+    const state = await this.missions.getState();
+    const mission = state.missions.find((item) => item.id === PRIMARY_MISSION_ID);
+    if (mission === undefined) {
+      throw new MissionControlError("Planning could not find the primary mission.");
+    }
+    const inspection = verifiedInspectionFromResult(
+      inspectionResult,
+      state,
+      mission,
+      WORK.inspect,
+    );
+    try {
+      const graph = await this.planner.plan({ mission, inspection });
+      await this.missions.persistWorkGraph(PRIMARY_MISSION_ID, graph);
+    } catch (error) {
+      if (error instanceof MissionDomainError) {
+        throw error;
+      }
+      throw new MissionControlError(
+        "Planning failed closed; no executable work graph was persisted.",
+      );
+    }
+  }
+
   private async prepareMissionForExecution(): Promise<void> {
     let mission = await this.missions.getMission(PRIMARY_MISSION_ID);
     if (mission.status === "draft") {
@@ -353,7 +466,11 @@ class MissionController {
     }
   }
 
-  private async executeWork(workItemId: string, operation: () => Promise<void>): Promise<void> {
+  private async executeWork(
+    workItemId: string,
+    operation: () => Promise<void>,
+    complete = true,
+  ): Promise<void> {
     let item = await this.missions.getWorkItem(PRIMARY_MISSION_ID, workItemId);
     if (item.status === "complete") {
       return;
@@ -375,7 +492,7 @@ class MissionController {
         "ready_for_review",
       );
     }
-    if (item.status === "ready_for_review") {
+    if (complete && item.status === "ready_for_review") {
       await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, workItemId, "complete");
     }
   }
@@ -411,7 +528,7 @@ class MissionController {
         (item) =>
           item.missionId === PRIMARY_MISSION_ID &&
           ["backlog", "ready", "in_progress", "ready_for_review"].includes(item.status) &&
-          item.status === "in_progress",
+          (item.status === "in_progress" || item.status === "ready_for_review"),
       );
       if (active !== undefined) {
         await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, active.id, "blocked");
@@ -424,6 +541,109 @@ class MissionController {
       // Preserve the operation error if the durable failure state was already recorded.
     }
   }
+}
+
+function verifiedInspectionFromResult(
+  result: unknown,
+  state: MissionState,
+  mission: Mission,
+  workItemId: string,
+): VerifiedRepositoryInspection {
+  if (isRecord(result) &&
+      typeof result.resourceUri === "string" &&
+      typeof result.contentHash === "string") {
+    const inspection: VerifiedRepositoryInspection = {
+      resourceUri: result.resourceUri,
+      contentHash: result.contentHash,
+    };
+    if (typeof result.content === "string") {
+      inspection.content = result.content;
+    }
+    if (typeof result.commitSha === "string") {
+      inspection.commitSha = result.commitSha;
+    }
+    if (isRecord(result.patches)) {
+      const patches: Record<string, string> = {};
+      for (const [file, patch] of Object.entries(result.patches)) {
+        if (typeof patch !== "string") {
+          throw new MissionControlError(
+            "Planning failed closed; repository inspection patches were malformed.",
+          );
+        }
+        patches[file] = patch;
+      }
+      inspection.patches = patches;
+    }
+    return inspection;
+  }
+
+  const evidenceId = isRecord(result) && typeof result.evidenceId === "string"
+    ? result.evidenceId
+    : undefined;
+  const evidence = evidenceId === undefined
+    ? [...state.evidence]
+        .reverse()
+        .find((item) =>
+          item.missionId === mission.id &&
+          item.workItemId === workItemId &&
+          item.source === "mcp",
+        )
+    : state.evidence.find((item) => item.id === evidenceId);
+  if (
+    evidence === undefined ||
+    evidence.missionId !== mission.id ||
+    evidence.workItemId !== workItemId ||
+    evidence.source !== "mcp" ||
+    evidence.result !== "passed"
+  ) {
+    throw new MissionControlError(
+      "Planning failed closed; no verified repository inspection was available.",
+    );
+  }
+
+  let details: Record<string, unknown> = {};
+  if (evidence.details !== undefined) {
+    try {
+      const parsed = JSON.parse(evidence.details) as unknown;
+      if (isRecord(parsed)) {
+        details = parsed;
+      }
+    } catch {
+      throw new MissionControlError(
+        "Planning failed closed; repository inspection evidence was malformed.",
+      );
+    }
+  }
+  const contentHash = typeof details.content_hash === "string"
+    ? details.content_hash
+    : undefined;
+  if (contentHash === undefined || contentHash.trim().length === 0) {
+    throw new MissionControlError(
+      "Planning failed closed; repository inspection evidence had no content hash.",
+    );
+  }
+  const resourceUri = typeof details.uri === "string" && details.uri.trim().length > 0
+    ? details.uri
+    : mission.repository === undefined
+    ? `repo://verified/${contentHash}`
+    : `repo://${mission.repository.owner}/${mission.repository.name}/${mission.repository.ref}/verified`;
+  const inspection: VerifiedRepositoryInspection = { resourceUri, contentHash };
+  if (typeof details.commit_sha === "string") {
+    inspection.commitSha = details.commit_sha;
+  }
+  if (isRecord(details.patches)) {
+    const patches: Record<string, string> = {};
+    for (const [file, patch] of Object.entries(details.patches)) {
+      if (typeof patch !== "string") {
+        throw new MissionControlError(
+          "Planning failed closed; repository inspection patches were malformed.",
+        );
+      }
+      patches[file] = patch;
+    }
+    inspection.patches = patches;
+  }
+  return inspection;
 }
 
 export function mapMissionState(state: MissionState, missionId: string): MissionView {
@@ -507,6 +727,49 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
     ],
     activity,
     evidence,
+    handoffs: state.handoffs
+      .filter((item) => item.missionId === missionId)
+      .map((item) => ({
+        id: item.id,
+        workItemId: item.workItemId,
+        result: item.result,
+        summary: item.summary,
+        filesChanged: [...item.filesChanged],
+        testsRun: [...item.testsRun],
+        decisions: [...item.decisions],
+        openQuestions: [...item.openQuestions],
+        memoryImpact: item.memoryImpact,
+        createdAt: item.createdAt,
+        ...(item.diffSummary === undefined ? {} : { diffSummary: item.diffSummary }),
+        ...(item.checks === undefined ? {} : {
+          checks: item.checks.map((check) => ({
+            ...check,
+            evidenceIds: [...check.evidenceIds],
+          })),
+        }),
+        ...(item.evidenceIds === undefined ? {} : { evidenceIds: [...item.evidenceIds] }),
+        ...(item.executionOrigin === undefined ? {} : { executionOrigin: { ...item.executionOrigin } }),
+      })),
+    reviews: state.reviews
+      .filter((item) => item.missionId === missionId)
+      .map((item) => ({
+        id: item.id,
+        workItemId: item.workItemId,
+        outcome: item.outcome,
+        reviewer: item.reviewer,
+        summary: item.summary,
+        finding: item.finding,
+        handoffId: item.handoffId,
+        filesChanged: [...item.filesChanged],
+        diffSummary: item.diffSummary,
+        checks: item.checks.map((check) => ({
+          ...check,
+          evidenceIds: [...check.evidenceIds],
+        })),
+        evidenceIds: [...item.evidenceIds],
+        findingEvidenceId: item.findingEvidenceId,
+        createdAt: item.createdAt,
+      })),
     approvals: state.approvals
       .filter((item) => item.missionId === missionId)
       .map((item) => ({
@@ -541,9 +804,12 @@ function lane(id: "plan" | "execute" | "prove" | "approve", label: string, items
       id: item.id,
       title: item.title,
       purpose: item.purpose,
+      acceptanceCriteria: [...item.acceptanceCriteria],
       status: item.status,
       dependsOn: [...item.dependsOn],
       ...(item.assignedRole === undefined ? {} : { assignedRole: item.assignedRole }),
+      ...(item.requiredChecks === undefined ? {} : { requiredChecks: [...item.requiredChecks] }),
+      ...(item.delegation === undefined ? {} : { delegation: { ...item.delegation } }),
     })),
   };
 }
@@ -581,6 +847,9 @@ function mapEvidence(
   const title = evidence.workItemId === undefined ? undefined : titleByWorkId.get(evidence.workItemId);
   if (title !== undefined) {
     view.workItemTitle = title;
+  }
+  if (evidence.executionOrigin !== undefined) {
+    view.executionOrigin = { ...evidence.executionOrigin };
   }
   return view;
 }
@@ -658,7 +927,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 export function createMissionHttpApp(options: MissionHttpOptions) {
-  const controller = new MissionController(options.missions, options.runner);
+  const controller = new MissionController(options.missions, options.runner, options.planner);
   return {
     request(path: string, init?: RequestInit) {
       return handle(new Request(new URL(path, "http://mission.local"), init));

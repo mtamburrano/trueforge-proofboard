@@ -3,13 +3,19 @@ import type { TrueForgeApi } from "@truefoundry/trueforge-sdk";
 
 import {
   CreateMissionInput,
+  ExecutionOrigin,
+  Evidence,
   EvidenceKind,
   EvidenceResult,
+  ImplementationCheck,
   Mission,
   MissionDomainError,
   MissionService,
+  MissionState,
+  WorkGraphDefinition,
   WorkItem,
   missionTransitions,
+  validateWorkGraph,
 } from "./domain.js";
 
 export interface TrueForgeClientOptions {
@@ -21,6 +27,7 @@ export interface TrueForgeClientOptions {
 export interface TrueForgeMissionConfig {
   model: string;
   instructions?: string;
+  dynamicSubAgents?: boolean;
   mcpServers?: TrueForgeApi.McpServer[];
   mcpServerName?: string;
   repositoryToolName?: string;
@@ -78,6 +85,285 @@ const LOCKED_FIXTURE_PATCHES = {
 
 const SANDBOX_VERIFICATION_INTENT = "Run the requested verification command in the sandbox.";
 
+export const PRIMARY_WORK_GRAPH_IDS = {
+  inspect: "primary-inspect",
+  implement: "primary-implement",
+  verify: "primary-verify",
+} as const;
+
+const MAX_PLANNING_FILE_REFERENCES = 12;
+const MAX_WORK_PACKET_EVIDENCE = 8;
+const MAX_WORK_PACKET_BYTES = 20_000;
+
+export function buildWorkPacket(
+  mission: Mission,
+  workItem: WorkItem,
+  state: Pick<MissionState, "workItems" | "evidence">,
+): WorkPacket {
+  if (workItem.assignedRole === undefined) {
+    throw new MissionDomainError(
+      "invalid_input",
+      `Work item ${workItem.id} cannot be delegated without an execution role.`,
+    );
+  }
+  if (workItem.acceptanceCriteria.length === 0) {
+    throw new MissionDomainError(
+      "invalid_input",
+      `Work item ${workItem.id} cannot be delegated without acceptance criteria.`,
+    );
+  }
+  const dependencies = workItem.dependsOn.map((dependencyId) => {
+    const dependency = state.workItems.find((item) => item.id === dependencyId);
+    if (dependency === undefined || dependency.missionId !== mission.id) {
+      throw new MissionDomainError(
+        "invalid_input",
+        `Work item ${workItem.id} has an unavailable dependency ${dependencyId}.`,
+      );
+    }
+    return { id: dependency.id, status: dependency.status };
+  });
+  const relevantWorkItemIds = new Set([workItem.id, ...workItem.dependsOn]);
+  const evidence = state.evidence
+    .filter((item) => item.missionId === mission.id &&
+      item.workItemId !== undefined && relevantWorkItemIds.has(item.workItemId))
+    .slice(-MAX_WORK_PACKET_EVIDENCE)
+    .map((item) => {
+      const scoped: WorkPacket["evidence"][number] = {
+        id: item.id,
+        kind: item.kind,
+        result: item.result,
+        summary: item.summary.slice(0, 1_000),
+      };
+      if (item.workItemId !== undefined) {
+        scoped.workItemId = item.workItemId;
+      }
+      return scoped;
+    });
+  const packet: WorkPacket = {
+    objective: mission.objective,
+    workItem: {
+      id: workItem.id,
+      title: workItem.title,
+      purpose: workItem.purpose,
+      acceptanceCriteria: [...workItem.acceptanceCriteria],
+      dependencies,
+      role: workItem.assignedRole,
+    },
+    evidence,
+  };
+  if (mission.repository !== undefined) {
+    packet.repository = { ...mission.repository };
+  }
+  if (workItem.requiredChecks !== undefined) {
+    packet.workItem.requiredChecks = [...workItem.requiredChecks];
+  }
+  const serialized = JSON.stringify(packet);
+  if (serialized.length > MAX_WORK_PACKET_BYTES) {
+    throw new MissionDomainError(
+      "invalid_input",
+      `Work Packet must be ${MAX_WORK_PACKET_BYTES} characters or fewer.`,
+    );
+  }
+  return packet;
+}
+
+export function buildDelegatedTurnInstruction(
+  packet: WorkPacket,
+  instruction: string,
+): string {
+  if (instruction.trim().length === 0) {
+    throw new MissionDomainError("invalid_input", "Delegated turn instruction must not be empty.");
+  }
+  return [
+    "Use TrueForge's native dynamic subagent capability.",
+    "Delegate this bounded work item to exactly one dynamic subagent; the parent coordinator must not perform the work itself.",
+    `Work Packet: ${JSON.stringify(packet)}`,
+    `Coordinator instruction: ${instruction.trim()}`,
+    "The subagent may use only the configured tools and the repository/evidence context in this packet. It must execute every required check, inspect the resulting git diff/status, and return control after the subagent finishes.",
+    "End with a machine-readable IMPLEMENTATION_HANDOFF object containing decisions and openQuestions. The coordinator will independently correlate changed files and check results to the observed tool responses.",
+  ].join("\n");
+}
+
+export class RepositoryWorkGraphPlanner implements WorkGraphPlanner {
+  plan(input: WorkGraphPlanningInput): WorkGraphDefinition {
+    const objective = planningString(input.mission.objective, "mission objective");
+    const inspection = validatePlanningInspection(input.inspection);
+    const files = referencedFiles(objective, inspection);
+    const repositoryLabel = input.mission.repository === undefined
+      ? "the verified repository"
+      : `${input.mission.repository.owner}/${input.mission.repository.name}@${input.mission.repository.ref}`;
+    const inspectionLabel = `${inspection.resourceUri} (${inspection.contentHash})`;
+    const fileScope = files.length === 0 ? "the verified repository surface" : files.join(", ");
+
+    return validateWorkGraph({
+      items: [
+        {
+          id: PRIMARY_WORK_GRAPH_IDS.inspect,
+          title: `Confirm ${repositoryLabel}`,
+          purpose: `Establish the repository facts needed to execute the mission from ${inspectionLabel}.`,
+          acceptanceCriteria: [
+            `The repository inspection is correlated to ${inspectionLabel}.`,
+            `The inspected source surface is recorded before implementation starts: ${fileScope}.`,
+          ],
+          dependsOn: [],
+          assignedRole: "planner",
+        },
+        {
+          id: PRIMARY_WORK_GRAPH_IDS.implement,
+          title: `Implement the requested change in ${fileScope}`,
+          purpose: `Apply the bounded mission objective to the verified source surface: ${objective}`,
+          acceptanceCriteria: [
+            `The implementation satisfies the mission objective: ${objective}`,
+            `Only the verified source surface required by the objective is changed: ${fileScope}.`,
+          ],
+          dependsOn: [PRIMARY_WORK_GRAPH_IDS.inspect],
+          assignedRole: "implementer",
+          requiredChecks: ["typecheck", "test"],
+        },
+        {
+          id: PRIMARY_WORK_GRAPH_IDS.verify,
+          title: "Verify the requested delivery",
+          purpose: `Independently check the implementation against the mission objective and its verified repository context from ${inspectionLabel}.`,
+          acceptanceCriteria: [
+            `The verification checks every implementation condition for: ${objective}`,
+            "The verification result is captured from the configured sandbox or review tools.",
+          ],
+          dependsOn: [PRIMARY_WORK_GRAPH_IDS.implement],
+          assignedRole: "reviewer",
+        },
+      ],
+    });
+  }
+}
+
+export function createRepositoryWorkGraphPlanner(): WorkGraphPlanner {
+  return new RepositoryWorkGraphPlanner();
+}
+
+export function deriveWorkGraph(input: WorkGraphPlanningInput): WorkGraphDefinition {
+  return new RepositoryWorkGraphPlanner().plan(input);
+}
+
+export function buildPreflightWorkGraph(mission: Pick<Mission, "objective" | "repository">): WorkGraphDefinition {
+  const objective = planningString(mission.objective, "mission objective");
+  const files = referencedFiles(objective, undefined);
+  const repositoryLabel = mission.repository === undefined
+    ? "the configured repository"
+    : `${mission.repository.owner}/${mission.repository.name}@${mission.repository.ref}`;
+  const fileScope = files.length === 0 ? "the verified source surface" : files.join(", ");
+
+  return validateWorkGraph({
+    items: [
+      {
+        id: PRIMARY_WORK_GRAPH_IDS.inspect,
+        title: `Inspect ${repositoryLabel}`,
+        purpose: "Verify the repository facts required to plan the bounded mission graph.",
+        acceptanceCriteria: [
+          "The repository target is inspected through the configured read-only repository connector.",
+          "The inspection result is correlated and persisted before dependent work becomes executable.",
+        ],
+        dependsOn: [],
+        assignedRole: "planner",
+      },
+      {
+        id: PRIMARY_WORK_GRAPH_IDS.implement,
+        title: `Implement the requested change in ${fileScope}`,
+        purpose: `Carry out the mission objective only after repository inspection: ${objective}`,
+        acceptanceCriteria: [
+          `The implementation satisfies the mission objective: ${objective}`,
+          `The implementation is limited to the source surface identified by planning: ${fileScope}.`,
+        ],
+        dependsOn: [PRIMARY_WORK_GRAPH_IDS.inspect],
+        assignedRole: "implementer",
+        requiredChecks: ["typecheck", "test"],
+      },
+      {
+        id: PRIMARY_WORK_GRAPH_IDS.verify,
+        title: "Verify the requested delivery",
+        purpose: "Run independent checks against the implementation after the implementer completes.",
+        acceptanceCriteria: [
+          "The verification checks the implementation acceptance conditions.",
+          "The verification result is captured as durable evidence.",
+        ],
+        dependsOn: [PRIMARY_WORK_GRAPH_IDS.implement],
+        assignedRole: "reviewer",
+      },
+    ],
+  });
+}
+
+function validatePlanningInspection(
+  inspection: VerifiedRepositoryInspection,
+): VerifiedRepositoryInspection {
+  if (!isRecord(inspection)) {
+    throw new MissionDomainError("invalid_input", "repository inspection must be an object.");
+  }
+  const resourceUri = planningString(inspection?.resourceUri, "repository inspection resource");
+  const contentHash = planningString(inspection?.contentHash, "repository inspection content hash");
+  if (
+    inspection.content !== undefined &&
+    (typeof inspection.content !== "string" || inspection.content.length > 100_000)
+  ) {
+    throw new MissionDomainError(
+      "invalid_input",
+      "repository inspection content must be a string of 100,000 characters or fewer.",
+    );
+  }
+  if (inspection.patches !== undefined) {
+    if (!isRecord(inspection.patches)) {
+      throw new MissionDomainError("invalid_input", "repository inspection patches must be an object.");
+    }
+    for (const [file, patch] of Object.entries(inspection.patches)) {
+      if (file.trim().length === 0 || typeof patch !== "string") {
+        throw new MissionDomainError(
+          "invalid_input",
+          "repository inspection patches must contain named string file patches.",
+        );
+      }
+    }
+  }
+  if (
+    (inspection.content === undefined || inspection.content.length === 0) &&
+    (inspection.patches === undefined || Object.keys(inspection.patches).length === 0) &&
+    inspection.commitSha === undefined
+  ) {
+    throw new MissionDomainError(
+      "invalid_input",
+      "repository inspection must include verified content, patches, or a commit reference.",
+    );
+  }
+  return {
+    resourceUri,
+    contentHash,
+    ...(inspection.content === undefined ? {} : { content: inspection.content }),
+    ...(inspection.commitSha === undefined ? {} : { commitSha: planningString(inspection.commitSha, "repository inspection commit") }),
+    ...(inspection.patches === undefined ? {} : { patches: { ...inspection.patches } }),
+  };
+}
+
+function planningString(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.trim().length === 0 || value.length > 2_000) {
+    throw new MissionDomainError("invalid_input", `${label} must be a bounded non-empty string.`);
+  }
+  return value.trim();
+}
+
+function referencedFiles(
+  objective: string,
+  inspection: VerifiedRepositoryInspection | undefined,
+): string[] {
+  const candidates = [
+    ...objective.matchAll(/\b(?:src|test|tests|scripts|docs)\/[A-Za-z0-9._/-]+/g),
+  ].map((match) => match[0]?.replace(/[),.;:]+$/, ""))
+    .filter((value): value is string => value !== undefined && value.length > 0);
+  if (inspection?.patches !== undefined) {
+    candidates.push(...Object.keys(inspection.patches));
+  }
+  return [...new Set(candidates)]
+    .sort()
+    .slice(0, MAX_PLANNING_FILE_REFERENCES);
+}
+
 export interface TrueForgeClientLike {
   sessions: {
     create(request: TrueForgeApi.CreateSessionRequest): Promise<TrueForgeApi.GetSessionResponse>;
@@ -97,6 +383,7 @@ export interface MissionSession {
 export interface RunTurnOptions {
   workItemId?: string;
   previousTurnId?: string;
+  delegateToSubagent?: boolean;
 }
 
 export interface RepositoryInspectionInput {
@@ -120,6 +407,44 @@ export interface RepositoryInspectionResult {
   patches?: Readonly<Record<string, string>>;
   evidenceId: string;
   mission: Mission;
+}
+
+export interface VerifiedRepositoryInspection {
+  resourceUri: string;
+  contentHash: string;
+  content?: string;
+  commitSha?: string;
+  patches?: Readonly<Record<string, string>>;
+}
+
+export interface WorkGraphPlanningInput {
+  mission: Mission;
+  inspection: VerifiedRepositoryInspection;
+}
+
+export interface WorkGraphPlanner {
+  plan(input: WorkGraphPlanningInput): WorkGraphDefinition | Promise<WorkGraphDefinition>;
+}
+
+export interface WorkPacket {
+  objective: string;
+  workItem: {
+    id: string;
+    title: string;
+    purpose: string;
+    acceptanceCriteria: string[];
+    dependencies: Array<{ id: string; status: WorkItem["status"] }>;
+    role: NonNullable<WorkItem["assignedRole"]>;
+    requiredChecks?: string[];
+  };
+  repository?: { owner: string; name: string; ref: string };
+  evidence: Array<{
+    id: string;
+    kind: Evidence["kind"];
+    result: Evidence["result"];
+    summary: string;
+    workItemId?: string;
+  }>;
 }
 
 export interface SandboxVerificationInput {
@@ -155,6 +480,17 @@ export interface TrueForgeTurnResult {
   turnId: string;
   events: TrueForgeRuntimeEvent[];
   mission: Mission;
+  implementationHandoff?: ImplementationHandoffDraft;
+}
+
+export interface ImplementationHandoffDraft {
+  filesChanged: string[];
+  diffSummary: string;
+  checks: ImplementationCheck[];
+  decisions: string[];
+  openQuestions: string[];
+  evidenceIds: string[];
+  executionOrigin: ExecutionOrigin;
 }
 
 interface RuntimeEvidence {
@@ -228,7 +564,7 @@ export function buildMissionAgentSpec(
     instructions: config.instructions ?? defaultInstructions,
     config: {
       sandbox: { enabled: config.sandboxEnabled ?? true },
-      dynamicSubAgents: { enabled: false },
+      dynamicSubAgents: { enabled: config.dynamicSubAgents ?? false },
       askUserQuestions: { enabled: false },
       generativeUi: { enabled: false },
       iterationLimit: config.iterationLimit ?? 12,
@@ -308,6 +644,9 @@ export class TrueForgeMissionRunner {
       turnId: execution.turnId,
       events: execution.events,
       mission: execution.mission,
+      ...(execution.implementationHandoff === undefined
+        ? {}
+        : { implementationHandoff: execution.implementationHandoff }),
     };
   }
 
@@ -388,6 +727,11 @@ export class TrueForgeMissionRunner {
               content_bytes: verified.content.length,
               content_hash: verified.contentHash,
             }),
+        executionOrigin: {
+          kind: "mcp" as const,
+          sessionId: execution.sessionId,
+          turnId: execution.turnId,
+        },
       };
       const evidence = input.workItemId === undefined
         ? await this.missions.addEvidence(mission.id, evidenceInput)
@@ -470,6 +814,11 @@ export class TrueForgeMissionRunner {
           output: verified.outputSummary,
           ...(verified.sandboxId === undefined ? {} : { sandbox_id: verified.sandboxId }),
         }),
+        executionOrigin: {
+          kind: "sandbox" as const,
+          sessionId: execution.sessionId,
+          turnId: execution.turnId,
+        },
       };
       const evidence = input.workItemId === undefined
         ? await this.missions.addEvidence(mission.id, evidenceInput)
@@ -507,11 +856,31 @@ export class TrueForgeMissionRunner {
     options: RunTurnOptions,
   ): Promise<InternalTurnResult> {
     const mission = await this.missions.getMission(missionId);
-    const session = await this.resumeMission(mission.id);
     const workItem = options.workItemId === undefined
       ? undefined
       : await this.missions.getWorkItem(mission.id, options.workItemId);
-    const content = buildTurnInstruction(mission, workItem, instruction);
+    const state = options.delegateToSubagent === true
+      ? await this.missions.getState()
+      : undefined;
+    if (options.delegateToSubagent === true) {
+      if (this.config.dynamicSubAgents !== true) {
+        throw new TrueForgeIntegrationError(
+          "delegate work item",
+          "TrueForge native dynamic subagents are not enabled.",
+        );
+      }
+      if (workItem === undefined || state === undefined) {
+        throw new TrueForgeIntegrationError(
+          "delegate work item",
+          "A delegated turn requires an active work item.",
+        );
+      }
+    }
+    const packet = options.delegateToSubagent === true && workItem !== undefined && state !== undefined
+      ? buildWorkPacket(mission, workItem, state)
+      : undefined;
+    const session = await this.resumeMission(mission.id);
+    const content = buildTurnInstruction(mission, workItem, instruction, packet);
     const request: TrueForgeApi.CreateTurnSessionsStreamRequest = {
       input: [{ type: "user.message", content }],
     };
@@ -525,59 +894,159 @@ export class TrueForgeMissionRunner {
     const events: TrueForgeRuntimeEvent[] = [];
     const rawEvents: TrueForgeApi.TurnStreamingEvent[] = [];
     let turnId: string | null = null;
-    for await (const event of streamEvents(stream)) {
-      rawEvents.push(event);
-      const runtimeEvent = summarizeRuntimeEvent(event);
-      events.push(runtimeEvent);
-      if (event.type === "turn.created") {
-        const createdTurnId = stringOrNull(event.turnId);
-        if (createdTurnId === null) {
-          throw new TrueForgeIntegrationError(
-            "complete turn",
-            "TrueForge emitted turn.created without a turn id.",
-          );
+    let delegatedThread: { threadId: string; owner: string } | null = null;
+    let delegatedStatus: "completed" | "failed" | "interrupted" | null = null;
+    let delegatedOutput: Record<string, unknown> | undefined;
+    const runtimeEvidenceIds: string[] = [];
+    const runtimeEvidenceIdsByEventId = new Map<string, string>();
+    try {
+      for await (const event of streamEvents(stream)) {
+        rawEvents.push(event);
+        const runtimeEvent = summarizeRuntimeEvent(event);
+        events.push(runtimeEvent);
+        if (event.type === "turn.created") {
+          const createdTurnId = stringOrNull(event.turnId);
+          if (createdTurnId === null) {
+            throw new TrueForgeIntegrationError(
+              "complete turn",
+              "TrueForge emitted turn.created without a turn id.",
+            );
+          }
+          turnId = createdTurnId;
+          await this.missions.attachTrueforgeTurn(mission.id, turnId);
         }
-        turnId = createdTurnId;
-        await this.missions.attachTrueforgeTurn(mission.id, turnId);
+        if (event.type === "sandbox.created") {
+          const sandboxId = sandboxIdFromEvent(event);
+          if (sandboxId === null) {
+            throw new TrueForgeIntegrationError(
+              "track sandbox",
+              "TrueForge emitted sandbox.created without a sandbox id.",
+            );
+          }
+          const currentMission = await this.missions.getMission(mission.id);
+          if (
+            currentMission.trueforgeSandboxId !== undefined &&
+            currentMission.trueforgeSandboxId !== sandboxId
+          ) {
+            throw new TrueForgeIntegrationError(
+              "track sandbox",
+              "TrueForge returned a sandbox id different from the persisted mission sandbox.",
+            );
+          }
+          await this.missions.attachTrueforgeSandbox(mission.id, sandboxId);
+        }
+        if (options.delegateToSubagent === true && workItem !== undefined) {
+          if (event.type === "thread.created") {
+            if (delegatedThread !== null) {
+              throw new TrueForgeIntegrationError(
+                "delegate work item",
+                "TrueForge created more than one dynamic subagent for the bounded work item.",
+              );
+            }
+            const created = parseSubagentCreatedEvent(event);
+            if (created === null) {
+              throw new TrueForgeIntegrationError(
+                "delegate work item",
+                "TrueForge emitted a malformed dynamic subagent start event.",
+              );
+            }
+            delegatedThread = { threadId: created.threadId, owner: created.owner };
+            const delegationInput = {
+              owner: created.owner,
+              threadId: created.threadId,
+              ...(turnId === null ? {} : { turnId }),
+            };
+            await this.missions.startWorkItemDelegation(
+              mission.id,
+              workItem.id,
+              delegationInput,
+            );
+          } else if (event.type === "thread.done") {
+            const completed = parseSubagentDoneEvent(event);
+            if (completed === null || delegatedThread === null || completed.threadId !== delegatedThread.threadId) {
+              throw new TrueForgeIntegrationError(
+                "delegate work item",
+                "TrueForge emitted a malformed or uncorrelated dynamic subagent completion.",
+              );
+            }
+            if (completed.status === "done") {
+              delegatedOutput = completed.output;
+              const delegationInput = {
+                threadId: delegatedThread.threadId,
+                ...(turnId === null ? {} : { turnId }),
+              };
+              await this.missions.completeWorkItemDelegation(
+                mission.id,
+                workItem.id,
+                delegationInput,
+              );
+              delegatedStatus = "completed";
+            } else if (completed.status === "error") {
+              const delegationInput = {
+                threadId: delegatedThread.threadId,
+                error: "The native TrueForge subagent returned an error.",
+                ...(turnId === null ? {} : { turnId }),
+              };
+              await this.missions.failWorkItemDelegation(
+                mission.id,
+                workItem.id,
+                delegationInput,
+              );
+              delegatedStatus = "failed";
+            } else {
+              throw new TrueForgeIntegrationError(
+                "delegate work item",
+                "TrueForge dynamic subagent completion was not terminal.",
+              );
+            }
+          }
+        }
+        const evidence = runtimeEvidence(event);
+        if (evidence !== null) {
+          const evidenceInput = {
+            kind: evidence.kind,
+            result: evidence.result,
+            source: "trueforge" as const,
+            summary: evidence.summary,
+            details: evidence.details,
+            executionOrigin: runtimeExecutionOrigin(session.sessionId, turnId, event),
+          };
+          let persistedEvidence: Evidence;
+          if (workItem !== undefined) {
+            persistedEvidence = await this.missions.addEvidence(mission.id, {
+              ...evidenceInput,
+              workItemId: workItem.id,
+            });
+          } else {
+            persistedEvidence = await this.missions.addEvidence(mission.id, evidenceInput);
+          }
+          runtimeEvidenceIds.push(persistedEvidence.id);
+          const eventId = stringOrNull(recordValue(event).id);
+          if (eventId !== null) {
+            runtimeEvidenceIdsByEventId.set(eventId, persistedEvidence.id);
+          }
+        }
       }
-      if (event.type === "sandbox.created") {
-        const sandboxId = sandboxIdFromEvent(event);
-        if (sandboxId === null) {
-          throw new TrueForgeIntegrationError(
-            "track sandbox",
-            "TrueForge emitted sandbox.created without a sandbox id.",
-          );
-        }
-        const currentMission = await this.missions.getMission(mission.id);
-        if (
-          currentMission.trueforgeSandboxId !== undefined &&
-          currentMission.trueforgeSandboxId !== sandboxId
-        ) {
-          throw new TrueForgeIntegrationError(
-            "track sandbox",
-            "TrueForge returned a sandbox id different from the persisted mission sandbox.",
-          );
-        }
-        await this.missions.attachTrueforgeSandbox(mission.id, sandboxId);
+    } catch (error) {
+      if (
+        options.delegateToSubagent === true &&
+        workItem !== undefined &&
+        delegatedThread !== null &&
+        delegatedStatus === null
+      ) {
+        await this.missions.failWorkItemDelegation(
+          mission.id,
+          workItem.id,
+          {
+            threadId: delegatedThread.threadId,
+            error: "The native TrueForge subagent was interrupted before completion.",
+            interrupted: true,
+            ...(turnId === null ? {} : { turnId }),
+          },
+        ).catch(() => undefined);
+        delegatedStatus = "interrupted";
       }
-      const evidence = runtimeEvidence(event);
-      if (evidence !== null) {
-        const evidenceInput = {
-          kind: evidence.kind,
-          result: evidence.result,
-          source: "trueforge" as const,
-          summary: evidence.summary,
-          details: evidence.details,
-        };
-        if (workItem !== undefined) {
-          await this.missions.addEvidence(mission.id, {
-            ...evidenceInput,
-            workItemId: workItem.id,
-          });
-        } else {
-          await this.missions.addEvidence(mission.id, evidenceInput);
-        }
-      }
+      throw error;
     }
     if (turnId === null) {
       throw new TrueForgeIntegrationError(
@@ -585,12 +1054,213 @@ export class TrueForgeMissionRunner {
         "TrueForge did not emit a turn.created event.",
       );
     }
+    if (options.delegateToSubagent === true) {
+      if (delegatedThread === null) {
+        throw new TrueForgeIntegrationError(
+          "delegate work item",
+          "TrueForge did not create a native dynamic subagent for the work item.",
+        );
+      }
+      if (delegatedStatus === null) {
+        await this.missions.failWorkItemDelegation(
+          mission.id,
+          workItem?.id ?? "",
+          {
+            threadId: delegatedThread.threadId,
+            error: "The native TrueForge subagent did not emit a terminal completion.",
+            interrupted: true,
+            turnId,
+          },
+        ).catch(() => undefined);
+        throw new TrueForgeIntegrationError(
+          "delegate work item",
+          "The native TrueForge subagent did not emit a terminal completion.",
+        );
+      }
+      if (delegatedStatus === "failed") {
+        throw new TrueForgeIntegrationError(
+          "delegate work item",
+          "The native TrueForge subagent failed to complete the work item.",
+        );
+      }
+      requireCompletedTurn(rawEvents, "delegate work item", "subagent");
+    }
+    const implementationHandoff = options.delegateToSubagent === true &&
+        workItem !== undefined &&
+        delegatedThread !== null &&
+        delegatedStatus === "completed"
+      ? await this.buildImplementationHandoff(
+          mission,
+          workItem,
+          session.sessionId,
+          turnId,
+          delegatedThread,
+          rawEvents,
+          runtimeEvidenceIds,
+          runtimeEvidenceIdsByEventId,
+          delegatedOutput,
+        )
+      : undefined;
     return {
       sessionId: session.sessionId,
       turnId,
       events,
       rawEvents,
       mission: await this.missions.getMission(mission.id),
+      ...(implementationHandoff === undefined ? {} : { implementationHandoff }),
+    };
+  }
+
+  private async buildImplementationHandoff(
+    mission: Mission,
+    workItem: WorkItem,
+    sessionId: string,
+    turnId: string,
+    delegatedThread: { threadId: string; owner: string },
+    rawEvents: TrueForgeApi.TurnStreamingEvent[],
+    runtimeEvidenceIds: string[],
+    runtimeEvidenceIdsByEventId: Map<string, string>,
+    delegatedOutput: Record<string, unknown> | undefined,
+  ): Promise<ImplementationHandoffDraft | undefined> {
+    const executions = observedToolCalls(rawEvents)
+      .filter((call) => call.name === "exec")
+      .map((call) => ({
+        call,
+        command: executionCommand(call.arguments),
+        response: toolResponseForCall(rawEvents, call.id),
+      }))
+      .filter((execution): execution is typeof execution & { command: string } =>
+        execution.command !== null,
+      );
+    const checkExecutions = executions.filter((execution) =>
+      checkNamesForCommand(execution.command).length > 0,
+    );
+    const diffExecutions = executions.filter((execution) => isDiffCommand(execution.command));
+    if (diffExecutions.length === 0) {
+      return undefined;
+    }
+
+    const narrative = implementationHandoffNarrative(delegatedOutput);
+    const checkEvidenceIds: string[] = [];
+    const latestChecks = new Map<string, ImplementationCheck>();
+    for (const execution of checkExecutions) {
+      const observed = parseExecutionResponse(execution.response);
+      const result = observed?.success === true && observed.exitCode === 0 ? "passed" : "failed";
+      const origin = runtimeExecutionOrigin(sessionId, turnId, execution.response);
+      const output = observed?.output ?? "TrueForge did not return a structured check result.";
+      const evidence = await this.missions.addEvidence(mission.id, {
+        workItemId: workItem.id,
+        kind: checkNamesForCommand(execution.command).length > 1
+          ? "tool_result"
+          : checkNamesForCommand(execution.command).includes("typecheck")
+          ? "typecheck_result"
+          : "test_result",
+        result,
+        source: "trueforge",
+        summary: `${execution.command} ${result === "passed" ? "passed" : "failed"} in the delegated execution.`,
+        details: JSON.stringify({
+          command: execution.command,
+          exit_code: observed?.exitCode,
+          output: summarizeOutput(output),
+        }),
+        executionOrigin: origin,
+      });
+      const runtimeResponseEvidenceId = execution.response === undefined
+        ? undefined
+        : runtimeEvidenceIdsByEventId.get(stringOrNull(recordValue(execution.response).id) ?? "");
+      const supportingEvidenceIds = [
+        evidence.id,
+        ...(runtimeResponseEvidenceId === undefined ? [] : [runtimeResponseEvidenceId]),
+      ];
+      checkEvidenceIds.push(...supportingEvidenceIds);
+      for (const name of checkNamesForCommand(execution.command)) {
+        latestChecks.set(name, {
+          name,
+          command: execution.command,
+          result,
+          required: workItem.requiredChecks?.includes(name) ?? false,
+          evidenceIds: supportingEvidenceIds,
+          ...(observed?.exitCode === undefined ? {} : { exitCode: observed.exitCode }),
+        });
+      }
+    }
+
+    const requiredChecks = workItem.requiredChecks ?? [];
+    for (const name of requiredChecks) {
+      if (!latestChecks.has(name)) {
+        latestChecks.set(name, {
+          name,
+          command: "not run",
+          result: "not_run",
+          required: true,
+          evidenceIds: [],
+        });
+      }
+    }
+    if (latestChecks.size === 0) {
+      return undefined;
+    }
+
+    const successfulDiffExecutions = diffExecutions.flatMap((execution) => {
+      const observed = parseExecutionResponse(execution.response);
+      return observed !== null &&
+          observed.success === true &&
+          observed.exitCode === 0 &&
+          observed.output.trim().length > 0
+        ? [{ execution, observed }]
+        : [];
+    });
+    if (successfulDiffExecutions.length === 0) {
+      return undefined;
+    }
+    const diffOutputs = successfulDiffExecutions.map((entry) => entry.observed.output);
+    const filesChanged = uniqueStrings(
+      successfulDiffExecutions.flatMap((entry) =>
+        changedFilesFromDiff(entry.observed.output, entry.execution.command),
+      ),
+    );
+    if (filesChanged.length === 0) {
+      return undefined;
+    }
+    const diffOutput = diffOutputs.at(-1) ?? "";
+    const diffSummary = summarizeOutput(diffOutput);
+    if (diffSummary.length === 0) {
+      return undefined;
+    }
+    const latestDiff = successfulDiffExecutions.at(-1);
+    const diffExecution = latestDiff?.execution;
+    const diffObserved = latestDiff?.observed;
+    const diffEvidence = await this.missions.addEvidence(mission.id, {
+      workItemId: workItem.id,
+      kind: "diff_summary",
+      result: "passed",
+      source: "trueforge",
+      summary: "The delegated execution returned a changed-file diff summary.",
+      details: JSON.stringify({
+        command: diffExecution?.command,
+        output: diffSummary,
+        exit_code: diffObserved?.exitCode,
+      }),
+      executionOrigin: runtimeExecutionOrigin(sessionId, turnId, diffExecution?.response),
+    });
+
+    return {
+      filesChanged,
+      diffSummary,
+      checks: [...latestChecks.values()],
+      decisions: narrative.decisions,
+      openQuestions: narrative.openQuestions,
+      evidenceIds: uniqueStrings([
+        ...runtimeEvidenceIds,
+        ...checkEvidenceIds,
+        diffEvidence.id,
+      ]),
+      executionOrigin: {
+        kind: "trueforge",
+        sessionId,
+        turnId,
+        threadId: delegatedThread.threadId,
+      },
     };
   }
 
@@ -714,6 +1384,7 @@ function buildTurnInstruction(
   mission: Mission,
   workItem: WorkItem | undefined,
   instruction: string,
+  packet?: WorkPacket,
 ): string {
   if (instruction.trim().length === 0) {
     throw new MissionDomainError("invalid_input", "Turn instruction must not be empty.");
@@ -721,10 +1392,14 @@ function buildTurnInstruction(
   const workItemContext = workItem === undefined
     ? "No specific work item is selected."
     : `Active work item: ${workItem.title}. Purpose: ${workItem.purpose}`;
+  const delegatedContext = packet === undefined
+    ? []
+    : [buildDelegatedTurnInstruction(packet, instruction)];
   return [
     `Mission objective: ${mission.objective}`,
     workItemContext,
-    `Requested action: ${instruction.trim()}`,
+    ...delegatedContext,
+    ...(packet === undefined ? [`Requested action: ${instruction.trim()}`] : []),
     "Keep the work bounded to this mission and report structured facts from the tools you actually use.",
   ].join("\n");
 }
@@ -973,6 +1648,192 @@ function observedToolCalls(
       ? call.argumentValue
       : parseMaybeJson(call.argumentText.length === 0 ? {} : call.argumentText),
   }));
+}
+
+function executionCommand(argumentsValue: unknown): string | null {
+  return isRecord(argumentsValue) &&
+      typeof argumentsValue.command === "string" &&
+      argumentsValue.command.trim().length > 0
+    ? argumentsValue.command.trim()
+    : null;
+}
+
+function checkNamesForCommand(command: string): string[] {
+  const names: string[] = [];
+  if (/\bnpm\s+run\s+check\b/.test(command)) {
+    names.push("typecheck", "test");
+  }
+  if (/(?:\bnpm\s+run\s+typecheck\b|\btsc\s+--noEmit\b)/.test(command)) {
+    names.push("typecheck");
+  }
+  if (/(?:\bnpm\s+(?:run\s+)?test\b|\bnode\s+--test\b)/.test(command)) {
+    names.push("test");
+  }
+  return names;
+}
+
+function isDiffCommand(command: string): boolean {
+  return /\bgit\s+(?:diff|status)\b/.test(command);
+}
+
+function toolResponseForCall(
+  events: TrueForgeApi.TurnStreamingEvent[],
+  toolCallId: string,
+): TrueForgeApi.TurnStreamingEvent | undefined {
+  return events.find((event) =>
+    (event.type === "tool.response" || event.type === "tool.response_required") &&
+    recordValue(event).toolCallId === toolCallId,
+  );
+}
+
+interface ParsedExecutionResponse {
+  success: boolean;
+  exitCode: number;
+  output: string;
+}
+
+function parseExecutionResponse(
+  event: TrueForgeApi.TurnStreamingEvent | undefined,
+): ParsedExecutionResponse | null {
+  if (event === undefined) {
+    return null;
+  }
+  const responseValue = parseMaybeJson(recordValue(event).content);
+  if (!isRecord(responseValue) || typeof responseValue.success !== "boolean") {
+    return null;
+  }
+  const response = responseValue.response;
+  if (!isRecord(response) ||
+      typeof response.exitCode !== "number" ||
+      !Number.isInteger(response.exitCode) ||
+      response.exitCode < 0 ||
+      typeof response.result !== "string") {
+    return null;
+  }
+  return {
+    success: responseValue.success,
+    exitCode: response.exitCode,
+    output: response.result,
+  };
+}
+
+function changedFilesFromDiff(output: string, command: string): string[] {
+  const files: string[] = [];
+  const isNameOnly = command.includes("--name-only");
+  for (const line of output.replace(/\r\n/g, "\n").split("\n")) {
+    const diffMatch = line.match(/^diff --git a\/(.+) b\/(.+)$/);
+    const statMatch = line.match(/^\s*(.+?)\s+\|\s+\d+\s+[+\-]+\s*$/);
+    const statusMatch = line.match(/^\s*(?:[A-Z?]{1,2})\s+(.+?)\s*$/);
+    const nameOnlyMatch = isNameOnly ? line.match(/^\s*(\S.*\S|\S)\s*$/) : null;
+    const candidate = diffMatch?.[2] ?? statMatch?.[1] ?? statusMatch?.[1] ?? nameOnlyMatch?.[1];
+    if (candidate === undefined) {
+      continue;
+    }
+    const file = candidate.trim().replace(/^\"|\"$/g, "");
+    if (
+      file.length > 0 &&
+      file.length <= 500 &&
+      !file.startsWith("#") &&
+      !/^\d+ files? changed/.test(file) &&
+      !/^\d+ insertion/.test(file) &&
+      !/^\d+ deletion/.test(file)
+    ) {
+      files.push(file);
+    }
+  }
+  return uniqueStrings(files);
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values.map((value) => value.trim()).filter((value) => value.length > 0))];
+}
+
+interface ImplementationHandoffNarrative {
+  filesChanged?: string[];
+  diffSummary?: string;
+  decisions: string[];
+  openQuestions: string[];
+}
+
+function implementationHandoffNarrative(
+  output: Record<string, unknown> | undefined,
+): ImplementationHandoffNarrative {
+  const candidates: unknown[] = [];
+  const visit = (value: unknown, depth: number): void => {
+    if (depth > 3 || value === null || value === undefined) {
+      return;
+    }
+    candidates.push(value);
+    if (isRecord(value)) {
+      for (const key of ["output", "content", "message", "implementationHandoff", "handoff"]) {
+        if (value[key] !== undefined) {
+          visit(value[key], depth + 1);
+        }
+      }
+    } else if (typeof value === "string") {
+      const parsed = parseMaybeJson(value);
+      if (parsed !== value) {
+        visit(parsed, depth + 1);
+      }
+    }
+  };
+  visit(output, 0);
+  let filesChanged: string[] | undefined;
+  let diffSummary: string | undefined;
+  let decisions: string[] = [];
+  let openQuestions: string[] = [];
+  for (const candidate of candidates) {
+    if (!isRecord(candidate)) {
+      continue;
+    }
+    if (filesChanged === undefined && Array.isArray(candidate.filesChanged)) {
+      const values = candidate.filesChanged.filter((value): value is string => typeof value === "string");
+      if (values.length > 0) {
+        filesChanged = uniqueStrings(values);
+      }
+    }
+    if (diffSummary === undefined && typeof candidate.diffSummary === "string" && candidate.diffSummary.trim()) {
+      diffSummary = summarizeOutput(candidate.diffSummary);
+    }
+    if (Array.isArray(candidate.decisions)) {
+      decisions = uniqueStrings(candidate.decisions.filter((value): value is string => typeof value === "string"));
+    }
+    if (Array.isArray(candidate.openQuestions)) {
+      openQuestions = uniqueStrings(candidate.openQuestions.filter((value): value is string => typeof value === "string"));
+    }
+  }
+  return {
+    ...(filesChanged === undefined ? {} : { filesChanged }),
+    ...(diffSummary === undefined ? {} : { diffSummary }),
+    decisions,
+    openQuestions,
+  };
+}
+
+function runtimeExecutionOrigin(
+  sessionId: string,
+  turnId: string | null,
+  event: TrueForgeApi.TurnStreamingEvent | undefined,
+): ExecutionOrigin {
+  const record = event === undefined ? undefined : recordValue(event);
+  const eventTurnId = record === undefined ? null : stringOrNull(record.turnId);
+  const eventThreadId = record === undefined ? null : stringOrNull(record.threadId ?? record.thread_id);
+  const toolCallId = record === undefined ? null : stringOrNull(record.toolCallId ?? record.tool_call_id);
+  const resolvedTurnId = eventTurnId ?? turnId;
+  const origin: ExecutionOrigin = {
+    kind: "trueforge",
+    sessionId,
+  };
+  if (resolvedTurnId !== null) {
+    origin.turnId = resolvedTurnId;
+  }
+  if (eventThreadId !== null) {
+    origin.threadId = eventThreadId;
+  }
+  if (toolCallId !== null) {
+    origin.toolCallId = toolCallId;
+  }
+  return origin;
 }
 
 function expectedRepositoryArguments(
@@ -1376,6 +2237,52 @@ async function* streamEvents(
 
 function recordValue(event: TrueForgeApi.TurnStreamingEvent): Record<string, unknown> {
   return event as unknown as Record<string, unknown>;
+}
+
+function parseSubagentCreatedEvent(
+  event: TrueForgeApi.TurnStreamingEvent,
+): { threadId: string; owner: string } | null {
+  const record = recordValue(event);
+  const threadId = stringOrNull(record.threadId ?? record.thread_id);
+  const rawAgentInfo = record.agentInfo ?? record.agent_info;
+  if (!isRecord(rawAgentInfo)) {
+    return null;
+  }
+  const owner = stringOrNull(rawAgentInfo.name);
+  const input = stringOrNull(rawAgentInfo.input);
+  if (
+    threadId === null ||
+    owner === null ||
+    input === null ||
+    input.length > MAX_WORK_PACKET_BYTES
+  ) {
+    return null;
+  }
+  if (rawAgentInfo.type !== "dynamic") {
+    return null;
+  }
+  return { threadId, owner };
+}
+
+function parseSubagentDoneEvent(
+  event: TrueForgeApi.TurnStreamingEvent,
+): { threadId: string; status: "done"; output: Record<string, unknown> } | { threadId: string; status: "error" } | null {
+  const record = recordValue(event);
+  const threadId = stringOrNull(record.threadId ?? record.thread_id);
+  const state = record.state;
+  if (!isRecord(state) || threadId === null) {
+    return null;
+  }
+  const status = state.status;
+  if (status === "done") {
+    return isRecord(state.output) ? { threadId, status, output: state.output } : null;
+  }
+  if (status === "error") {
+    return typeof state.error === "string" && state.error.trim().length > 0
+      ? { threadId, status }
+      : null;
+  }
+  return null;
 }
 
 function stringOrNull(value: unknown): string | null {

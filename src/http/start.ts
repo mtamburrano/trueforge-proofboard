@@ -23,6 +23,7 @@ const runner = new TrueForgeMissionRunner(
   }),
   {
     model,
+    dynamicSubAgents: true,
     mcpServerName: githubServer,
     repositoryToolName: "get_commit",
     sandboxToolName: "exec",
