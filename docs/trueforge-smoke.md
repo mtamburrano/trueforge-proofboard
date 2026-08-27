@@ -12,8 +12,8 @@ cannot stand in for tool evidence.
 | Node.js | 22.14 or newer | Required by the current TrueForge local quickstart and this repository's engine constraint. |
 | TrueForge server | `@truefoundry/trueforge@0.1.4` | Pinned local server used by this smoke path. |
 | TrueForge SDK | `@truefoundry/trueforge-sdk@0.1.3` | Pinned in `package.json` for the event-streaming runner. |
-| Model provider | Native `google-gemini` provider | Configure the provider in TrueForge Settings; the API key stays in TrueForge. |
-| MCP connector | GitHub MCP with `get_file_contents` enabled | Read-only repository provenance. |
+| Model provider | Native `alibaba` provider | Configure the provider in TrueForge Settings; the API key stays in TrueForge. |
+| MCP connector | GitHub MCP with `get_file_contents` and `get_commit` enabled | Read-only repository provenance for file and locked-commit inspections. |
 | Sandbox provider | Daytona | Configure the provider in TrueForge Settings; the API key stays in TrueForge. |
 
 TrueForge local mode uses SQLite and listens on `http://localhost:8790` by
@@ -35,14 +35,14 @@ Official setup references: [TrueForge quickstart](https://trueforge.dev/quicksta
 
    Open `http://localhost:8790`.
 
-2. In Settings → Models, configure the native Google Gemini provider. Set
-   `TRUEFORGE_MODEL` to the exact `google-gemini/<model-id>` shown by the local
+2. In Settings → Models, configure the native Alibaba provider. Set
+   `TRUEFORGE_MODEL` to the exact `alibaba/<model-id>` shown by the local
    catalog if it differs from the example value.
 
 3. In Settings → Connectors, connect the GitHub MCP server and authorize it.
    The smoke runner expects the configured server name `github`; set
    `TRUEFORGE_GITHUB_SERVER` if the UI uses another name. Verify that
-   `get_file_contents` is available. The official GitHub MCP server documents
+   `get_file_contents` and `get_commit` are available. The official GitHub MCP server documents
    both hosted and local Docker-backed configurations; the TrueForge catalog
    path is preferred here because credentials remain in the harness.
 
@@ -96,13 +96,23 @@ On success, stdout is a JSON evidence packet containing:
   matching tool-response ID, and the structured repository file resource
   URI/content hash;
 - the `sandbox.created` event and sandbox ID;
-- the structured `exec` command call and matching
-  `{ success: true, response: { exitCode: 0, result } }` response.
+- the structured `exec` call with its deterministic verification intent and exact
+  command, plus the matching `{ success: true, response: { exitCode: 0, result } }`
+  response.
 
 The runner exits non-zero if any of those records is missing, if GitHub MCP
 authentication is pending, if the repository arguments differ, or if the
 Daytona result does not contain the expected marker and exit code. The model's
 final answer is never used as proof.
+
+The mission adapter uses the same fail-closed boundary for ordinary
+`get_file_contents` reads. When its repository target is the locked public fixture
+`mtamburrano/trueforge-proofboard` at
+`590aa8a6d72c580f61fc1b19d33e9876bc0feb9b`, it instead requires one correlated
+GitHub MCP `get_commit` call with `detail: "full_patch"`, the exact owner/repo/SHA,
+and textual structured output containing the expected `src/index.ts` and
+`test/index.test.js` patches. Model narration or unrelated text cannot satisfy this
+check.
 
 `npm run check` remains local-only and does not contact Gemini, GitHub, or
 Daytona. A live run requires the operator's configured provider accounts and is

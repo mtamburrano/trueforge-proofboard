@@ -10,6 +10,7 @@ coverage/
 *.local
 .mcp.json
 .mcplanner
+.trueforge/
 
 # Logs and operating-system files
 *.log

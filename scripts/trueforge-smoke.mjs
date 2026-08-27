@@ -2,7 +2,7 @@ import { pathToFileURL } from "node:url";
 
 export const DEFAULTS = Object.freeze({
   baseUrl: "http://localhost:8790",
-  model: "google-gemini/gemini-3.6-flash",
+  model: "alibaba/qwen3-7-plus",
   githubServer: "github",
   githubOwner: "mtamburrano",
   githubRepo: "trueforge-proofboard",
@@ -12,6 +12,7 @@ export const DEFAULTS = Object.freeze({
 });
 
 const EXPECTED_MARKER = "TRUEFORGE_DAYTONA_OK";
+const SANDBOX_VERIFICATION_INTENT = "Run the requested verification command in the sandbox.";
 
 export function configFromEnvironment() {
   return {
@@ -35,8 +36,16 @@ export function githubArguments(config) {
   };
 }
 
+export function sandboxArguments(config) {
+  return {
+    intent: SANDBOX_VERIFICATION_INTENT,
+    command: config.command,
+  };
+}
+
 export function agentSpec(config) {
   const repositoryRequest = JSON.stringify(githubArguments(config));
+  const sandboxRequest = JSON.stringify(sandboxArguments(config));
 
   return {
     model: { name: config.model },
@@ -44,7 +53,7 @@ export function agentSpec(config) {
       "Run a deterministic infrastructure smoke test and do not claim success from narration alone.",
       `Use the attached GitHub MCP server to call get_file_contents exactly once with ${repositoryRequest}.`,
       "Wait for and retain the structured MCP result.",
-      `Then use the configured Daytona-backed sandbox exec tool named exec to execute exactly: ${config.command}`,
+      `Then use the configured Daytona-backed sandbox exec tool named exec exactly once with ${sandboxRequest}.`,
       "Do not execute the command on the host and do not access credentials.",
       "Finish only after both tool calls return.",
     ].join(" "),
@@ -140,6 +149,16 @@ function requireExactGithubArguments(argumentsValue, config) {
       `The get_file_contents MCP argument ${key} did not exactly match the configured value.`,
     );
   }
+}
+
+function argumentsExactlyMatch(actual, expected) {
+  const actualKeys = Object.keys(actual).sort();
+  const expectedKeys = Object.keys(expected).sort();
+  return (
+    actualKeys.length === expectedKeys.length &&
+    actualKeys.every((key, index) => key === expectedKeys[index]) &&
+    Object.entries(expected).every(([key, value]) => actual[key] === value)
+  );
 }
 
 function matchesRepositoryFileUri(uri, config) {
@@ -264,8 +283,13 @@ export function collectEvidence(events, config, sessionId, turnId, sandboxProvid
     done.state?.status === "done",
     `TrueForge smoke paused or failed with status ${done.state?.status ?? "unknown"}.`,
   );
+  const requiredActions = done.state?.requiredActions ?? done.state?.required_actions;
   requireEvent(
-    (done.state?.requiredActions ?? done.state?.required_actions ?? []).length === 0,
+    Array.isArray(requiredActions),
+    "TrueForge smoke turn.done did not include required actions.",
+  );
+  requireEvent(
+    requiredActions.length === 0,
     "TrueForge smoke returned pending actions; complete MCP auth or approval setup first.",
   );
 
@@ -287,14 +311,14 @@ export function collectEvidence(events, config, sessionId, turnId, sandboxProvid
   requireEvent(sandboxCreated, "No sandbox.created event was recorded; Daytona was not proven.");
 
   const sandboxCalls = calls.filter(
-    (call) => call.id !== githubCall.id && call.name === "exec",
+    (call) => call.name === "exec" && isRecord(call.arguments) &&
+      argumentsExactlyMatch(call.arguments, sandboxArguments(config)),
   );
-  requireEvent(sandboxCalls.length === 1, `Expected one Daytona exec call, found ${sandboxCalls.length}.`);
-  const sandboxCall = sandboxCalls[0];
   requireEvent(
-    isRecord(sandboxCall.arguments) && sandboxCall.arguments.command === config.command,
-    "The Daytona exec command did not exactly match the configured command.",
+    sandboxCalls.length === 1,
+    `Expected one canonical Daytona exec call, found ${sandboxCalls.length}.`,
   );
+  const sandboxCall = sandboxCalls[0];
 
   const sandboxResponse = toolResponseFor(events, sandboxCall);
   requireEvent(sandboxResponse, "The sandbox command has no structured tool response.");
@@ -360,6 +384,7 @@ function printDryRun(config) {
         },
         sandbox: {
           configured_provider: "daytona (checked from TrueForge settings during live run)",
+          intent: SANDBOX_VERIFICATION_INTENT,
           command: config.command,
           expected_stdout: EXPECTED_MARKER,
           expected_exit_code: 0,
