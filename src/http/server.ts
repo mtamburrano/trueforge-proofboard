@@ -10,7 +10,9 @@ import {
   Review,
   ReviewContext,
   ReviewOutcome,
+  WorkGraphDefinition,
   WorkItem,
+  MAX_WORK_ITEM_ACCEPTANCE_CRITERIA,
   validateWorkGraph,
 } from "../domain.js";
 import {
@@ -23,6 +25,7 @@ import {
   VerifiedRepositoryInspection,
   WorkGraphPlanner,
 } from "../trueforge.js";
+import { parseContentDiffEvidence } from "../diff.js";
 
 export const PRIMARY_MISSION_ID = "primary-mission";
 export const PRIMARY_MISSION_OBJECTIVE =
@@ -168,14 +171,40 @@ export class DeterministicImplementationVerifier implements ImplementationVerifi
         finding: "Provide a bounded content diff; status, file names, or diff statistics are insufficient.",
       };
     }
-    const claimedFiles = [...new Set(context.filesChanged)].sort();
-    const actualFiles = [...new Set(context.actualFilesChanged)].sort();
+    const parsedDiffs = context.evidence
+      .map((evidence) => parseContentDiffEvidence(evidence))
+      .filter((diff): diff is NonNullable<typeof diff> => diff !== null);
+    if (parsedDiffs.length === 0) {
+      return {
+        outcome: "changes_requested",
+        reviewer: "independent-verifier",
+        summary: "Independent verification could not inspect the changed content.",
+        finding: "Provide a bounded content diff; status, file names, or diff statistics are insufficient.",
+      };
+    }
+    const claimedFiles = [...new Set(context.filesChanged.map(normalizeChangedFile))].sort();
+    const actualFiles = [...new Set(parsedDiffs.flatMap((diff) =>
+      diff.filesChanged.map(normalizeChangedFile),
+    ))].sort();
     if (JSON.stringify(claimedFiles) !== JSON.stringify(actualFiles)) {
       return {
         outcome: "changes_requested",
         reviewer: "independent-verifier",
         summary: "Independent verification found contradictory changed-file proof.",
         finding: `Handoff files (${claimedFiles.join(", ")}) do not match the content diff (${actualFiles.join(", ")}).`,
+      };
+    }
+    const semanticFinding = semanticContractFinding(
+      context,
+      actualFiles,
+      parsedDiffs.at(-1)?.output ?? context.actualDiff,
+    );
+    if (semanticFinding !== undefined) {
+      return {
+        outcome: "changes_requested",
+        reviewer: "independent-verifier",
+        summary: "Independent verification found that the changed state does not prove the work contract.",
+        finding: semanticFinding,
       };
     }
     if (context.handoff.openQuestions.length > 0) {
@@ -311,6 +340,131 @@ class MissionControlError extends Error {
   }
 }
 
+const LEGACY_PRIMARY_WORK_ITEM_IDS = {
+  inspect: "primary-inspect",
+  implement: "primary-implement",
+  verify: "primary-verify",
+} as const;
+
+function hasLegacyPrimaryWorkGraphShape(workItems: WorkItem[]): boolean {
+  const legacyIds = new Set<string>(Object.values(LEGACY_PRIMARY_WORK_ITEM_IDS));
+  return workItems.length === legacyIds.size &&
+    workItems.every((item) => legacyIds.has(item.id));
+}
+
+function needsPrimaryWorkGraphUpgrade(workItems: WorkItem[]): boolean {
+  const legacyIds = new Set<string>(Object.values(LEGACY_PRIMARY_WORK_ITEM_IDS));
+  if (workItems.length === 0 || !workItems.every((item) => legacyIds.has(item.id))) {
+    return false;
+  }
+  const implementer = workItems.find((item) => item.id === LEGACY_PRIMARY_WORK_ITEM_IDS.implement);
+  if (implementer === undefined) {
+    return false;
+  }
+  const requiredChecks = implementer.requiredChecks ?? [];
+  return workItems.some((item) => item.acceptanceCriteria.length === 0 || item.assignedRole === undefined) ||
+    !requiredChecks.includes("typecheck") ||
+    !requiredChecks.includes("test");
+}
+
+function buildLegacyPrimaryWorkGraph(mission: Mission): WorkGraphDefinition {
+  return validateWorkGraph({
+    items: [
+      {
+        id: LEGACY_PRIMARY_WORK_ITEM_IDS.inspect,
+        title: "Inspect the pinned repository",
+        purpose: "Verify the exact source commit and expected file surface before implementation starts.",
+        acceptanceCriteria: [
+          "The pinned repository inspection is correlated to the primary mission.",
+          "The verified source surface is recorded before dependent work becomes executable.",
+        ],
+        dependsOn: [],
+        assignedRole: "planner",
+      },
+      {
+        id: LEGACY_PRIMARY_WORK_ITEM_IDS.implement,
+        title: "Implement the requested change",
+        purpose: `Apply the primary mission objective to the verified repository: ${mission.objective}`,
+        acceptanceCriteria: [
+          `The implementation satisfies the primary mission objective: ${mission.objective}`,
+          "The source change and focused tests remain within the verified repository scope.",
+        ],
+        dependsOn: [LEGACY_PRIMARY_WORK_ITEM_IDS.inspect],
+        assignedRole: "implementer",
+        requiredChecks: ["typecheck", "test"],
+      },
+      {
+        id: LEGACY_PRIMARY_WORK_ITEM_IDS.verify,
+        title: "Verify the requested delivery",
+        purpose: "Independently verify the implementation against the primary mission contract.",
+        acceptanceCriteria: [
+          "The configured verification command passes against the completed implementation.",
+        ],
+        dependsOn: [LEGACY_PRIMARY_WORK_ITEM_IDS.implement],
+        assignedRole: "reviewer",
+      },
+    ],
+  });
+}
+
+function compactPrimaryWorkGraph(graph: WorkGraphDefinition): WorkGraphDefinition {
+  const inspections = graph.items.filter((item) =>
+    item.assignedRole === "planner" && item.dependsOn.length === 0,
+  );
+  const implementers = graph.items.filter((item) => item.assignedRole === "implementer");
+  const reviewers = graph.items.filter((item) => item.assignedRole === "reviewer");
+  if (inspections.length !== 1 || implementers.length === 0 || reviewers.length !== 1 ||
+      inspections.length + implementers.length + reviewers.length !== graph.items.length) {
+    throw new MissionDomainError(
+      "invalid_input",
+      "The legacy primary mission cannot compact the planned work graph without losing a work scope.",
+    );
+  }
+  const acceptanceCriteria = [...new Set(implementers.flatMap((item) => item.acceptanceCriteria))];
+  if (acceptanceCriteria.length > MAX_WORK_ITEM_ACCEPTANCE_CRITERIA) {
+    throw new MissionDomainError(
+      "invalid_input",
+      `The legacy primary mission needs ${acceptanceCriteria.length} implementation acceptance conditions, exceeding the bounded limit of ${MAX_WORK_ITEM_ACCEPTANCE_CRITERIA}.`,
+    );
+  }
+  const purpose = implementers.map((item) => `${item.title}: ${item.purpose}`).join(" ");
+  if (purpose.length > 4_000) {
+    throw new MissionDomainError(
+      "invalid_input",
+      "The legacy primary mission cannot compact its implementation scope into a bounded work item.",
+    );
+  }
+  const requiredChecks = [...new Set(implementers.flatMap((item) => item.requiredChecks ?? []))];
+  const inspection = inspections[0];
+  const reviewer = reviewers[0];
+  if (inspection === undefined || reviewer === undefined) {
+    throw new MissionDomainError(
+      "invalid_input",
+      "The legacy primary mission is missing a bounded inspection or verification scope.",
+    );
+  }
+  const compacted: WorkGraphDefinition = {
+    items: [
+      { ...inspection, id: LEGACY_PRIMARY_WORK_ITEM_IDS.inspect, dependsOn: [] },
+      {
+        id: LEGACY_PRIMARY_WORK_ITEM_IDS.implement,
+        title: "Implement the requested change across the verified scope",
+        purpose,
+        acceptanceCriteria,
+        dependsOn: [LEGACY_PRIMARY_WORK_ITEM_IDS.inspect],
+        assignedRole: "implementer",
+        ...(requiredChecks.length === 0 ? {} : { requiredChecks }),
+      },
+      {
+        ...reviewer,
+        id: LEGACY_PRIMARY_WORK_ITEM_IDS.verify,
+        dependsOn: [LEGACY_PRIMARY_WORK_ITEM_IDS.implement],
+      },
+    ],
+  };
+  return validateWorkGraph(compacted);
+}
+
 class MissionController {
   private operation: Promise<MissionView> | null = null;
   private createOperation: Promise<MissionView> | null = null;
@@ -368,11 +522,20 @@ class MissionController {
   private async ensureWorkItems(): Promise<void> {
     const state = await this.missions.getState();
     const workItems = state.workItems.filter((item) => item.missionId === PRIMARY_MISSION_ID);
+    const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
+    if (needsPrimaryWorkGraphUpgrade(workItems)) {
+      if (mission.status !== "delivered" && mission.status !== "failed") {
+        await this.missions.persistWorkGraph(
+          PRIMARY_MISSION_ID,
+          buildLegacyPrimaryWorkGraph(mission),
+        );
+      }
+      return;
+    }
     if (workItems.length > 0) {
       validateWorkGraph({ items: workItems });
       return;
     }
-    const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
     await this.missions.persistWorkGraph(
       PRIMARY_MISSION_ID,
       buildPreflightWorkGraph(mission),
@@ -548,7 +711,12 @@ class MissionController {
       inspectionWorkItemId,
     );
     try {
-      const graph = await this.planner.plan({ mission, inspection });
+      const plannedGraph = validateWorkGraph(await this.planner.plan({ mission, inspection }));
+      const graph = hasLegacyPrimaryWorkGraphShape(
+        state.workItems.filter((item) => item.missionId === PRIMARY_MISSION_ID),
+      )
+        ? compactPrimaryWorkGraph(plannedGraph)
+        : plannedGraph;
       await this.missions.persistWorkGraph(PRIMARY_MISSION_ID, graph);
     } catch (error) {
       if (error instanceof MissionDomainError) {
@@ -1047,27 +1215,125 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isContentBearingReviewEvidence(evidence: Evidence): boolean {
-  if (
-    (evidence.kind !== "diff_summary" && evidence.kind !== "file_change") ||
-    evidence.result !== "passed" ||
-    evidence.details === undefined
-  ) {
-    return false;
-  }
-  try {
-    const details = JSON.parse(evidence.details) as unknown;
-    if (!isRecord(details) || typeof details.output !== "string") {
-      return false;
-    }
-    const command = typeof details.command === "string" ? details.command : "";
-    return /\bgit\s+diff\b/.test(command) &&
-      !/\s--(?:stat|shortstat|numstat|name-only|name-status|summary|check)\b/.test(command) &&
-      /^diff --git a\/.+ b\/.+$/m.test(details.output) &&
-      /^@@\s/m.test(details.output);
-  } catch {
-    return false;
-  }
+  return parseContentDiffEvidence(evidence) !== null;
 }
+
+function normalizeChangedFile(value: string): string {
+  return value.trim().replace(/^\.\//, "");
+}
+
+function semanticContractFinding(
+  context: ReviewContext,
+  actualFiles: string[],
+  actualDiff: string,
+): string | undefined {
+  const contract = [
+    context.workItem.title,
+    context.workItem.purpose,
+    ...context.workItem.acceptanceCriteria,
+  ].join("\n");
+  const expectedFiles = [...new Set(extractRepositoryPaths(contract).map(normalizeChangedFile))];
+  const actualFileSet = new Set(actualFiles.map(normalizeChangedFile));
+  const missingFiles = expectedFiles.filter((file) => !actualFileSet.has(file));
+  if (missingFiles.length > 0) {
+    return `The changed state does not cover the contract's required file scope: ${missingFiles.join(", ")}.`;
+  }
+
+  const anchors = extractContractAnchors(contract).filter((anchor) =>
+    !expectedFiles.includes(anchor),
+  );
+  if (anchors.length === 0) {
+    return undefined;
+  }
+  const additions = actualDiff
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("+") && !line.startsWith("+++"))
+    .join("\n");
+  const changedText = additions.trim().length > 0 ? additions : actualDiff;
+  const missingAnchors = anchors.filter((anchor) => !containsContractAnchor(changedText, anchor));
+  return missingAnchors.length === 0
+    ? undefined
+    : `The changed state does not demonstrate the work contract; expected implementation anchors are missing: ${missingAnchors.join(", ")}.`;
+}
+
+function extractRepositoryPaths(value: string): string[] {
+  return [...value.matchAll(/\b(?:src|test|tests|scripts|docs)\/[A-Za-z0-9._/-]+/g)]
+    .map((match) => match[0]?.replace(/[),.;:]+$/, ""))
+    .filter((path): path is string => path !== undefined && path.length > 0);
+}
+
+function extractContractAnchors(value: string): string[] {
+  const anchors = new Set<string>();
+  const add = (candidate: string): void => {
+    const normalized = candidate.trim();
+    if (
+      normalized.length >= 4 &&
+      !CONTRACT_ANCHOR_STOP_WORDS.has(normalized.toLowerCase())
+    ) {
+      anchors.add(normalized);
+    }
+  };
+  for (const match of value.matchAll(/\b[A-Za-z_$][A-Za-z0-9_$]*[A-Z][A-Za-z0-9_$]*\b/g)) {
+    if (match[0] !== undefined) {
+      add(match[0]);
+    }
+  }
+  for (const match of value.matchAll(/["'`]([^"'`\r\n]{2,})["'`]/g)) {
+    if (match[1] !== undefined && !/\s/.test(match[1])) {
+      add(match[1]);
+    }
+  }
+  for (const match of value.matchAll(/\b[A-Z][A-Za-z0-9_]{3,}\b/g)) {
+    if (match[0] !== undefined) {
+      add(match[0]);
+    }
+  }
+  return [...anchors];
+}
+
+function containsContractAnchor(value: string, anchor: string): boolean {
+  if (anchor.includes("/") || anchor.includes(".")) {
+    return value.includes(anchor);
+  }
+  const escaped = anchor.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?<![A-Za-z0-9_$])${escaped}(?![A-Za-z0-9_$])`).test(value);
+}
+
+const CONTRACT_ANCHOR_STOP_WORDS = new Set([
+  "acceptance",
+  "apply",
+  "approve",
+  "bounded",
+  "change",
+  "changes",
+  "check",
+  "criteria",
+  "execute",
+  "existing",
+  "focused",
+  "implementation",
+  "implement",
+  "independent",
+  "keep",
+  "mission",
+  "objective",
+  "preserves",
+  "prove",
+  "required",
+  "repository",
+  "requested",
+  "return",
+  "returns",
+  "review",
+  "source",
+  "satisfies",
+  "test",
+  "tests",
+  "the",
+  "trueforge",
+  "verified",
+  "work",
+]);
 
 export function createMissionHttpApp(options: MissionHttpOptions) {
   const controller = new MissionController(

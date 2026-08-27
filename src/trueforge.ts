@@ -8,6 +8,7 @@ import {
   EvidenceKind,
   EvidenceResult,
   ImplementationCheck,
+  MAX_WORK_GRAPH_ITEMS,
   Mission,
   MissionDomainError,
   MissionService,
@@ -17,6 +18,11 @@ import {
   missionTransitions,
   validateWorkGraph,
 } from "./domain.js";
+import {
+  changedFilesFromDiff,
+  isContentDiffCommand,
+  isContentDiffOutput,
+} from "./diff.js";
 
 export interface TrueForgeClientOptions {
   baseUrl: string;
@@ -91,7 +97,7 @@ export const PRIMARY_WORK_GRAPH_IDS = {
   verify: "primary-verify",
 } as const;
 
-const MAX_PLANNING_FILE_REFERENCES = 12;
+const MAX_PLANNING_FILE_REFERENCES = MAX_WORK_GRAPH_ITEMS - 2;
 const MAX_WORK_PACKET_EVIDENCE = 8;
 const MAX_WORK_PACKET_BYTES = 20_000;
 
@@ -358,9 +364,14 @@ function referencedFiles(
   const candidates = objectiveFiles.length > 0
     ? [...objectiveFiles, ...semanticInspectionFiles]
     : inspectedFiles;
-  return [...new Set(candidates)]
-    .sort()
-    .slice(0, MAX_PLANNING_FILE_REFERENCES);
+  const files = [...new Set(candidates)].sort();
+  if (files.length > MAX_PLANNING_FILE_REFERENCES) {
+    throw new MissionDomainError(
+      "invalid_input",
+      `Verified repository scope references ${files.length} files, but the bounded work graph can represent at most ${MAX_PLANNING_FILE_REFERENCES} implementation scopes without dropping repository scope.`,
+    );
+  }
+  return files;
 }
 
 function implementationWorkItemId(file: string, index: number): string {
@@ -1216,21 +1227,17 @@ export class TrueForgeMissionRunner {
     if (successfulDiffExecutions.length === 0) {
       return undefined;
     }
-    const diffOutputs = successfulDiffExecutions.map((entry) => entry.observed.output);
-    const filesChanged = uniqueStrings(
-      successfulDiffExecutions.flatMap((entry) =>
-        changedFilesFromDiff(entry.observed.output, entry.execution.command),
-      ),
-    );
+    const latestDiff = successfulDiffExecutions.at(-1);
+    const diffOutput = latestDiff?.observed.output ?? "";
+    const diffCommand = latestDiff?.execution.command ?? "";
+    const filesChanged = changedFilesFromDiff(diffOutput, diffCommand);
     if (filesChanged.length === 0) {
       return undefined;
     }
-    const diffOutput = diffOutputs.at(-1) ?? "";
     const diffSummary = summarizeOutput(diffOutput);
     if (diffSummary.length === 0) {
       return undefined;
     }
-    const latestDiff = successfulDiffExecutions.at(-1);
     const diffExecution = latestDiff?.execution;
     const diffObserved = latestDiff?.observed;
     const diffEvidence = await this.missions.addEvidence(mission.id, {
@@ -1243,6 +1250,8 @@ export class TrueForgeMissionRunner {
         command: diffExecution?.command,
         output: diffSummary,
         exit_code: diffObserved?.exitCode,
+        changed_files: filesChanged,
+        output_truncated: diffOutput.trim().length > 4_000,
       }),
       executionOrigin: runtimeExecutionOrigin(sessionId, turnId, diffExecution?.response),
     });
@@ -1678,26 +1687,22 @@ function executionCommand(argumentsValue: unknown): string | null {
 }
 
 function checkNamesForCommand(command: string): string[] {
-  const names: string[] = [];
-  if (/\bnpm\s+run\s+check\b/.test(command)) {
-    names.push("typecheck", "test");
+  const normalized = command.trim().replace(/\s+/g, " ");
+  switch (normalized) {
+    case "npm run check":
+    case "npm run typecheck && npm test":
+    case "npm run typecheck && npm run test":
+      return ["typecheck", "test"];
+    case "npm run typecheck":
+    case "tsc --noEmit":
+      return ["typecheck"];
+    case "npm test":
+    case "npm run test":
+    case "node --test":
+      return ["test"];
+    default:
+      return [];
   }
-  if (/(?:\bnpm\s+run\s+typecheck\b|\btsc\s+--noEmit\b)/.test(command)) {
-    names.push("typecheck");
-  }
-  if (/(?:\bnpm\s+(?:run\s+)?test\b|\bnode\s+--test\b)/.test(command)) {
-    names.push("test");
-  }
-  return names;
-}
-
-function isContentDiffCommand(command: string): boolean {
-  return /\bgit\s+diff\b/.test(command) &&
-    !/\s--(?:stat|shortstat|numstat|name-only|name-status|summary|check)\b/.test(command);
-}
-
-function isContentDiffOutput(output: string): boolean {
-  return /^diff --git a\/.+ b\/.+$/m.test(output) && /^@@\s/m.test(output);
 }
 
 function toolResponseForCall(
@@ -1742,33 +1747,6 @@ function parseExecutionResponse(
     exitCode: response.exitCode,
     output: response.result,
   };
-}
-
-function changedFilesFromDiff(output: string, command: string): string[] {
-  const files: string[] = [];
-  const isNameOnly = command.includes("--name-only");
-  for (const line of output.replace(/\r\n/g, "\n").split("\n")) {
-    const diffMatch = line.match(/^diff --git a\/(.+) b\/(.+)$/);
-    const statMatch = line.match(/^\s*(.+?)\s+\|\s+\d+\s+[+\-]+\s*$/);
-    const statusMatch = line.match(/^\s*(?:[A-Z?]{1,2})\s+(.+?)\s*$/);
-    const nameOnlyMatch = isNameOnly ? line.match(/^\s*(\S.*\S|\S)\s*$/) : null;
-    const candidate = diffMatch?.[2] ?? statMatch?.[1] ?? statusMatch?.[1] ?? nameOnlyMatch?.[1];
-    if (candidate === undefined) {
-      continue;
-    }
-    const file = candidate.trim().replace(/^\"|\"$/g, "");
-    if (
-      file.length > 0 &&
-      file.length <= 500 &&
-      !file.startsWith("#") &&
-      !/^\d+ files? changed/.test(file) &&
-      !/^\d+ insertion/.test(file) &&
-      !/^\d+ deletion/.test(file)
-    ) {
-      files.push(file);
-    }
-  }
-  return uniqueStrings(files);
 }
 
 function uniqueStrings(values: string[]): string[] {

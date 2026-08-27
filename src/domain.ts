@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 
+import { parseContentDiffEvidence } from "./diff.js";
+
 export const missionStatuses = [
   "draft",
   "planning",
@@ -222,6 +224,7 @@ export interface ReviewContext {
   handoff: Handoff;
   filesChanged: string[];
   actualFilesChanged: string[];
+  actualDiff: string;
   diffSummary: string;
   checks: ImplementationCheck[];
   evidence: Evidence[];
@@ -1598,43 +1601,7 @@ function ensureAcceptedIndependentReview(state: MissionState, workItem: WorkItem
 }
 
 function changedFilesFromContentBearingEvidence(evidence: Evidence): string[] | null {
-  if (
-    (evidence.kind !== "diff_summary" && evidence.kind !== "file_change") ||
-    evidence.result !== "passed" ||
-    evidence.details === undefined
-  ) {
-    return null;
-  }
-  try {
-    const details = JSON.parse(evidence.details) as unknown;
-    if (
-      typeof details !== "object" ||
-      details === null ||
-      Array.isArray(details)
-    ) {
-      return null;
-    }
-    const record = details as Record<string, unknown>;
-    if (typeof record.output !== "string") {
-      return null;
-    }
-    const command = typeof record.command === "string" ? record.command : "";
-    if (!/\bgit\s+diff\b/.test(command) ||
-        /\s--(?:stat|shortstat|numstat|name-only|name-status|summary|check)\b/.test(command) ||
-        !/^@@\s/m.test(record.output)) {
-      return null;
-    }
-    const files = new Set<string>();
-    for (const match of record.output.matchAll(/^diff --git a\/(.+) b\/(.+)$/gm)) {
-      const before = match[1]?.trim();
-      const after = match[2]?.trim();
-      if (before) files.add(before);
-      if (after) files.add(after);
-    }
-    return files.size === 0 ? null : [...files];
-  } catch {
-    return null;
-  }
+  return parseContentDiffEvidence(evidence)?.filesChanged ?? null;
 }
 
 function isContentBearingChangedStateEvidence(evidence: Evidence): boolean {
@@ -1681,6 +1648,10 @@ function buildReviewContext(
   const actualFilesChanged = [...new Set(evidence.flatMap((item) =>
     changedFilesFromContentBearingEvidence(item) ?? []
   ))];
+  const actualDiff = evidence
+    .map((item) => parseContentDiffEvidence(item)?.output)
+    .filter((output): output is string => output !== undefined)
+    .at(-1) ?? "";
   for (const requiredCheck of workItem.requiredChecks ?? []) {
     const check = structured.checks.find((candidate) => candidate.name === requiredCheck);
     if (check === undefined || check.result !== "passed" || !check.required) {
@@ -1695,6 +1666,7 @@ function buildReviewContext(
     handoff: clone(handoff),
     filesChanged: [...handoff.filesChanged],
     actualFilesChanged,
+    actualDiff,
     diffSummary: structured.diffSummary,
     checks: clone(structured.checks),
     evidence: clone(evidence),
