@@ -2,18 +2,30 @@ import { readFile } from "node:fs/promises";
 
 import {
   Evidence,
+  Handoff,
   Mission,
   MissionDomainError,
   MissionService,
   MissionState,
+  Review,
+  ReviewContext,
+  ReviewOutcome,
+  WorkGraphDefinition,
   WorkItem,
+  MAX_WORK_ITEM_ACCEPTANCE_CRITERIA,
+  validateWorkGraph,
 } from "../domain.js";
 import {
+  buildPreflightWorkGraph,
   RepositoryInspectionInput,
+  RepositoryWorkGraphPlanner,
   SandboxVerificationInput,
   TrueForgeIntegrationError,
   TrueForgeTurnResult,
+  VerifiedRepositoryInspection,
+  WorkGraphPlanner,
 } from "../trueforge.js";
+import { parseContentDiffEvidence } from "../diff.js";
 
 export const PRIMARY_MISSION_ID = "primary-mission";
 export const PRIMARY_MISSION_OBJECTIVE =
@@ -22,12 +34,6 @@ export const PRIMARY_REPOSITORY = {
   owner: "mtamburrano",
   name: "trueforge-proofboard",
   ref: "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b",
-} as const;
-
-const WORK = {
-  inspect: "primary-inspect",
-  implement: "primary-implement",
-  verify: "primary-verify",
 } as const;
 
 export const PRIMARY_MISSION_VERIFICATION_SCRIPT = [
@@ -119,14 +125,113 @@ export interface MissionRunner {
   runTurn(
     missionId: string,
     instruction: string,
-    options: { workItemId: string },
+    options: { workItemId: string; delegateToSubagent?: boolean },
   ): Promise<TrueForgeTurnResult>;
   runSandboxVerification(input: SandboxVerificationInput): Promise<unknown>;
+  reviewContract?(context: ReviewContext): Promise<ImplementationReviewDecision>;
 }
 
 export interface MissionHttpOptions {
   missions: MissionService;
   runner: MissionRunner;
+  planner?: WorkGraphPlanner;
+  verifier?: ImplementationVerifier;
+  semanticVerifier?: SemanticContractVerifier;
+}
+
+export interface ImplementationReviewDecision {
+  outcome: ReviewOutcome;
+  reviewer: string;
+  summary: string;
+  finding: string;
+}
+
+export interface SemanticContractVerifier {
+  reviewContract(
+    context: ReviewContext,
+  ): ImplementationReviewDecision | Promise<ImplementationReviewDecision>;
+}
+
+export interface ImplementationVerifier {
+  review(
+    context: ReviewContext,
+  ): ImplementationReviewDecision | Promise<ImplementationReviewDecision>;
+}
+
+export class DeterministicImplementationVerifier implements ImplementationVerifier {
+  constructor(private readonly semanticVerifier?: SemanticContractVerifier) {}
+
+  review(context: ReviewContext): ImplementationReviewDecision | Promise<ImplementationReviewDecision> {
+    const missingRequiredCheck = context.checks.find((check) =>
+      check.required && check.result !== "passed"
+    );
+    if (missingRequiredCheck !== undefined) {
+      return {
+        outcome: "blocked",
+        reviewer: "independent-verifier",
+        summary: "Independent verification found incomplete required proof.",
+        finding: `Required check ${missingRequiredCheck.name} is ${missingRequiredCheck.result}.`,
+      };
+    }
+    if (!context.evidence.some(isContentBearingReviewEvidence)) {
+      return {
+        outcome: "changes_requested",
+        reviewer: "independent-verifier",
+        summary: "Independent verification could not inspect the changed content.",
+        finding: "Provide a bounded content diff; status, file names, or diff statistics are insufficient.",
+      };
+    }
+    const parsedDiffs = context.evidence
+      .map((evidence) => parseContentDiffEvidence(evidence))
+      .filter((diff): diff is NonNullable<typeof diff> => diff !== null);
+    if (parsedDiffs.length === 0) {
+      return {
+        outcome: "changes_requested",
+        reviewer: "independent-verifier",
+        summary: "Independent verification could not inspect the changed content.",
+        finding: "Provide a bounded content diff; status, file names, or diff statistics are insufficient.",
+      };
+    }
+    const claimedFiles = [...new Set(context.filesChanged.map(normalizeChangedFile))].sort();
+    const actualFiles = [...new Set(parsedDiffs.flatMap((diff) =>
+      diff.filesChanged.map(normalizeChangedFile),
+    ))].sort();
+    if (JSON.stringify(claimedFiles) !== JSON.stringify(actualFiles)) {
+      return {
+        outcome: "changes_requested",
+        reviewer: "independent-verifier",
+        summary: "Independent verification found contradictory changed-file proof.",
+        finding: `Handoff files (${claimedFiles.join(", ")}) do not match the content diff (${actualFiles.join(", ")}).`,
+      };
+    }
+    if (context.handoff.openQuestions.length > 0) {
+      return {
+        outcome: "blocked",
+        reviewer: "independent-verifier",
+        summary: "Independent verification found unresolved implementation uncertainty.",
+        finding: context.handoff.openQuestions.join(" "),
+      };
+    }
+    if (this.semanticVerifier === undefined) {
+      return {
+        outcome: "changes_requested",
+        reviewer: "independent-verifier",
+        summary: "Independent verification could not establish the work-item contract.",
+        finding: "No contract-aware verifier was supplied; structural diff evidence cannot prove that the changed state satisfies the work item's purpose and acceptance criteria.",
+      };
+    }
+    try {
+      const review = this.semanticVerifier.reviewContract(context);
+      if (isPromiseLike(review)) {
+        return Promise.resolve(review)
+          .then(normalizeSemanticReviewDecision)
+          .catch(() => unavailableSemanticReviewDecision());
+      }
+      return normalizeSemanticReviewDecision(review);
+    } catch {
+      return unavailableSemanticReviewDecision();
+    }
+  }
 }
 
 export interface EvidenceView {
@@ -138,6 +243,40 @@ export interface EvidenceView {
   createdAt: string;
   workItemTitle?: string;
   metadata: Record<string, string | number>;
+  executionOrigin?: Evidence["executionOrigin"];
+}
+
+export interface HandoffView {
+  id: string;
+  workItemId: string;
+  result: Handoff["result"];
+  summary: string;
+  filesChanged: string[];
+  testsRun: string[];
+  decisions: string[];
+  openQuestions: string[];
+  memoryImpact: Handoff["memoryImpact"];
+  createdAt: string;
+  diffSummary?: string;
+  checks?: Handoff["checks"];
+  evidenceIds?: string[];
+  executionOrigin?: Handoff["executionOrigin"];
+}
+
+export interface ReviewView {
+  id: string;
+  workItemId: string;
+  outcome: Review["outcome"];
+  reviewer: string;
+  summary: string;
+  finding: string;
+  handoffId: string;
+  filesChanged: string[];
+  diffSummary: string;
+  checks: Review["checks"];
+  evidenceIds: string[];
+  findingEvidenceId: string;
+  createdAt: string;
 }
 
 export interface ActivityView {
@@ -174,13 +313,18 @@ export interface MissionView {
       id: string;
       title: string;
       purpose: string;
+      acceptanceCriteria: string[];
       status: WorkItem["status"];
       dependsOn: string[];
       assignedRole?: WorkItem["assignedRole"];
+      requiredChecks?: string[];
+      delegation?: WorkItem["delegation"];
     }>;
   }>;
   activity: ActivityView[];
   evidence: EvidenceView[];
+  handoffs: HandoffView[];
+  reviews: ReviewView[];
   approvals: Array<{
     id: string;
     action: string;
@@ -206,6 +350,131 @@ class MissionControlError extends Error {
   }
 }
 
+const LEGACY_PRIMARY_WORK_ITEM_IDS = {
+  inspect: "primary-inspect",
+  implement: "primary-implement",
+  verify: "primary-verify",
+} as const;
+
+function hasLegacyPrimaryWorkGraphShape(workItems: WorkItem[]): boolean {
+  const legacyIds = new Set<string>(Object.values(LEGACY_PRIMARY_WORK_ITEM_IDS));
+  return workItems.length === legacyIds.size &&
+    workItems.every((item) => legacyIds.has(item.id));
+}
+
+function needsPrimaryWorkGraphUpgrade(workItems: WorkItem[]): boolean {
+  const legacyIds = new Set<string>(Object.values(LEGACY_PRIMARY_WORK_ITEM_IDS));
+  if (workItems.length === 0 || !workItems.every((item) => legacyIds.has(item.id))) {
+    return false;
+  }
+  const implementer = workItems.find((item) => item.id === LEGACY_PRIMARY_WORK_ITEM_IDS.implement);
+  if (implementer === undefined) {
+    return false;
+  }
+  const requiredChecks = implementer.requiredChecks ?? [];
+  return workItems.some((item) => item.acceptanceCriteria.length === 0 || item.assignedRole === undefined) ||
+    !requiredChecks.includes("typecheck") ||
+    !requiredChecks.includes("test");
+}
+
+function buildLegacyPrimaryWorkGraph(mission: Mission): WorkGraphDefinition {
+  return validateWorkGraph({
+    items: [
+      {
+        id: LEGACY_PRIMARY_WORK_ITEM_IDS.inspect,
+        title: "Inspect the pinned repository",
+        purpose: "Verify the exact source commit and expected file surface before implementation starts.",
+        acceptanceCriteria: [
+          "The pinned repository inspection is correlated to the primary mission.",
+          "The verified source surface is recorded before dependent work becomes executable.",
+        ],
+        dependsOn: [],
+        assignedRole: "planner",
+      },
+      {
+        id: LEGACY_PRIMARY_WORK_ITEM_IDS.implement,
+        title: "Implement the requested change",
+        purpose: `Apply the primary mission objective to the verified repository: ${mission.objective}`,
+        acceptanceCriteria: [
+          `The implementation satisfies the primary mission objective: ${mission.objective}`,
+          "The source change and focused tests remain within the verified repository scope.",
+        ],
+        dependsOn: [LEGACY_PRIMARY_WORK_ITEM_IDS.inspect],
+        assignedRole: "implementer",
+        requiredChecks: ["typecheck", "test"],
+      },
+      {
+        id: LEGACY_PRIMARY_WORK_ITEM_IDS.verify,
+        title: "Verify the requested delivery",
+        purpose: "Independently verify the implementation against the primary mission contract.",
+        acceptanceCriteria: [
+          "The configured verification command passes against the completed implementation.",
+        ],
+        dependsOn: [LEGACY_PRIMARY_WORK_ITEM_IDS.implement],
+        assignedRole: "reviewer",
+      },
+    ],
+  });
+}
+
+function compactPrimaryWorkGraph(graph: WorkGraphDefinition): WorkGraphDefinition {
+  const inspections = graph.items.filter((item) =>
+    item.assignedRole === "planner" && item.dependsOn.length === 0,
+  );
+  const implementers = graph.items.filter((item) => item.assignedRole === "implementer");
+  const reviewers = graph.items.filter((item) => item.assignedRole === "reviewer");
+  if (inspections.length !== 1 || implementers.length === 0 || reviewers.length !== 1 ||
+      inspections.length + implementers.length + reviewers.length !== graph.items.length) {
+    throw new MissionDomainError(
+      "invalid_input",
+      "The legacy primary mission cannot compact the planned work graph without losing a work scope.",
+    );
+  }
+  const acceptanceCriteria = [...new Set(implementers.flatMap((item) => item.acceptanceCriteria))];
+  if (acceptanceCriteria.length > MAX_WORK_ITEM_ACCEPTANCE_CRITERIA) {
+    throw new MissionDomainError(
+      "invalid_input",
+      `The legacy primary mission needs ${acceptanceCriteria.length} implementation acceptance conditions, exceeding the bounded limit of ${MAX_WORK_ITEM_ACCEPTANCE_CRITERIA}.`,
+    );
+  }
+  const purpose = implementers.map((item) => `${item.title}: ${item.purpose}`).join(" ");
+  if (purpose.length > 4_000) {
+    throw new MissionDomainError(
+      "invalid_input",
+      "The legacy primary mission cannot compact its implementation scope into a bounded work item.",
+    );
+  }
+  const requiredChecks = [...new Set(implementers.flatMap((item) => item.requiredChecks ?? []))];
+  const inspection = inspections[0];
+  const reviewer = reviewers[0];
+  if (inspection === undefined || reviewer === undefined) {
+    throw new MissionDomainError(
+      "invalid_input",
+      "The legacy primary mission is missing a bounded inspection or verification scope.",
+    );
+  }
+  const compacted: WorkGraphDefinition = {
+    items: [
+      { ...inspection, id: LEGACY_PRIMARY_WORK_ITEM_IDS.inspect, dependsOn: [] },
+      {
+        id: LEGACY_PRIMARY_WORK_ITEM_IDS.implement,
+        title: "Implement the requested change across the verified scope",
+        purpose,
+        acceptanceCriteria,
+        dependsOn: [LEGACY_PRIMARY_WORK_ITEM_IDS.inspect],
+        assignedRole: "implementer",
+        ...(requiredChecks.length === 0 ? {} : { requiredChecks }),
+      },
+      {
+        ...reviewer,
+        id: LEGACY_PRIMARY_WORK_ITEM_IDS.verify,
+        dependsOn: [LEGACY_PRIMARY_WORK_ITEM_IDS.implement],
+      },
+    ],
+  };
+  return validateWorkGraph(compacted);
+}
+
 class MissionController {
   private operation: Promise<MissionView> | null = null;
   private createOperation: Promise<MissionView> | null = null;
@@ -213,6 +482,8 @@ class MissionController {
   constructor(
     private readonly missions: MissionService,
     private readonly runner: MissionRunner,
+    private readonly planner: WorkGraphPlanner = new RepositoryWorkGraphPlanner(),
+    private readonly verifier: ImplementationVerifier = new DeterministicImplementationVerifier(),
   ) {}
 
   async getPrimaryMission(): Promise<MissionView | null> {
@@ -259,74 +530,109 @@ class MissionController {
   }
 
   private async ensureWorkItems(): Promise<void> {
-    let state = await this.missions.getState();
-    const exists = (id: string) => state.workItems.some(
-      (item) => item.missionId === PRIMARY_MISSION_ID && item.id === id,
+    const state = await this.missions.getState();
+    const workItems = state.workItems.filter((item) => item.missionId === PRIMARY_MISSION_ID);
+    const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
+    if (needsPrimaryWorkGraphUpgrade(workItems)) {
+      if (mission.status !== "delivered" && mission.status !== "failed") {
+        await this.missions.persistWorkGraph(
+          PRIMARY_MISSION_ID,
+          buildLegacyPrimaryWorkGraph(mission),
+        );
+      }
+      return;
+    }
+    if (workItems.length > 0) {
+      validateWorkGraph({ items: workItems });
+      return;
+    }
+    await this.missions.persistWorkGraph(
+      PRIMARY_MISSION_ID,
+      buildPreflightWorkGraph(mission),
     );
-
-    if (!exists(WORK.inspect)) {
-      await this.missions.addWorkItem(PRIMARY_MISSION_ID, {
-        id: WORK.inspect,
-        title: "Inspect pinned repository",
-        purpose: "Verify the exact source commit and expected file surface through repository MCP.",
-        status: "ready",
-        assignedRole: "planner",
-      });
-      state = await this.missions.getState();
-    }
-    if (!exists(WORK.implement)) {
-      await this.missions.addWorkItem(PRIMARY_MISSION_ID, {
-        id: WORK.implement,
-        title: "Implement the stage helper",
-        purpose: "Make the bounded backwards-compatible source and test change in the sandbox.",
-        dependsOn: [WORK.inspect],
-        assignedRole: "implementer",
-      });
-      state = await this.missions.getState();
-    }
-    if (!exists(WORK.verify)) {
-      await this.missions.addWorkItem(PRIMARY_MISSION_ID, {
-        id: WORK.verify,
-        title: "Verify the delivery contract",
-        purpose: "Run type checking and the complete test suite in the sandbox.",
-        dependsOn: [WORK.implement],
-        assignedRole: "reviewer",
-      });
-    }
   }
 
   private async executePrimaryMission(): Promise<MissionView> {
     await this.createOrOpenPrimaryMission();
     await this.prepareMissionForExecution();
     try {
-      await this.executeWork(WORK.inspect, async () => {
-        await this.runner.inspectRepository({
-          missionId: PRIMARY_MISSION_ID,
-          workItemId: WORK.inspect,
-        });
-        await this.requirePassedEvidence(WORK.inspect, "mcp");
-      });
-      await this.executeWork(WORK.implement, async () => {
-        await this.runner.runTurn(
-          PRIMARY_MISSION_ID,
-          [
-            "Implement the mission objective in the configured sandbox using the verified pinned source.",
-            "Keep the change limited to src/index.ts and test/index.test.js.",
-            "Add direct focused assertions in test/index.test.js for every Plan, Execute, Prove, and Approve transition so the verification can correlate the changed helper with its coverage.",
-            "Do not push, open a pull request, or perform any other remote mutation.",
-          ].join(" "),
-          { workItemId: WORK.implement },
+      let state = await this.missions.getState();
+      const inspectionItems = state.workItems.filter((item) =>
+        item.missionId === PRIMARY_MISSION_ID &&
+        item.assignedRole === "planner" &&
+        item.dependsOn.length === 0
+      );
+      if (inspectionItems.length !== 1 || inspectionItems[0] === undefined) {
+        throw new MissionControlError(
+          "Planning requires exactly one executable repository-inspection root.",
         );
-        await this.requirePassedTurn(WORK.implement);
-      });
-      await this.executeWork(WORK.verify, async () => {
-        await this.runner.runSandboxVerification({
+      }
+      const inspectionItem = inspectionItems[0];
+      let inspectionResult: unknown;
+      await this.executeWork(inspectionItem.id, async () => {
+        inspectionResult = await this.runner.inspectRepository({
           missionId: PRIMARY_MISSION_ID,
-          workItemId: WORK.verify,
-          command: PRIMARY_VERIFICATION_COMMAND,
+          workItemId: inspectionItem.id,
         });
-        await this.requirePassedEvidence(WORK.verify, "sandbox");
+        await this.requirePassedEvidence(inspectionItem.id, "mcp");
       });
+      if (inspectionResult !== undefined) {
+        await this.persistInspectedWorkGraph(inspectionResult, inspectionItem.id);
+      } else {
+        const plannedState = await this.missions.getState();
+        const hasExecutableGraph = plannedState.workItems.some((item) =>
+          item.missionId === PRIMARY_MISSION_ID && item.assignedRole === "implementer"
+        ) && plannedState.workItems.some((item) =>
+          item.missionId === PRIMARY_MISSION_ID && item.assignedRole === "reviewer"
+        );
+        if (!hasExecutableGraph) {
+          throw new MissionControlError(
+            "Completed repository inspection did not produce executable work.",
+          );
+        }
+      }
+
+      state = await this.missions.getState();
+      const implementers = state.workItems.filter((item) =>
+        item.missionId === PRIMARY_MISSION_ID && item.assignedRole === "implementer"
+      );
+      const reviewers = state.workItems.filter((item) =>
+        item.missionId === PRIMARY_MISSION_ID && item.assignedRole === "reviewer"
+      );
+      if (implementers.length === 0 || reviewers.length === 0) {
+        throw new MissionControlError(
+          "Planning must produce bounded implementation and verification work.",
+        );
+      }
+      for (const implementer of implementers) {
+        await this.executeWork(implementer.id, async () => {
+          const execution = await this.runner.runTurn(
+            PRIMARY_MISSION_ID,
+            [
+              `Execute only this bounded work item: ${implementer.purpose}`,
+              `Acceptance criteria: ${implementer.acceptanceCriteria.join(" ")}`,
+              "Use the configured sandbox and verified pinned source.",
+              "Do not push, open a pull request, or perform any other remote mutation.",
+            ].join(" "),
+            { workItemId: implementer.id, delegateToSubagent: true },
+          );
+          await this.requirePassedTurn(implementer.id);
+          if (execution.implementationHandoff !== undefined) {
+            await this.recordImplementationHandoff(execution, implementer.id);
+          }
+        }, false);
+        await this.reviewImplementation(implementer.id);
+      }
+      for (const reviewer of reviewers) {
+        await this.executeWork(reviewer.id, async () => {
+          await this.runner.runSandboxVerification({
+            missionId: PRIMARY_MISSION_ID,
+            workItemId: reviewer.id,
+            command: PRIMARY_VERIFICATION_COMMAND,
+          });
+          await this.requirePassedEvidence(reviewer.id, "sandbox");
+        });
+      }
 
       const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
       if (mission.status === "executing") {
@@ -336,6 +642,99 @@ class MissionController {
     } catch (error) {
       await this.blockActiveWork();
       throw error;
+    }
+  }
+
+  private async recordImplementationHandoff(
+    execution: TrueForgeTurnResult,
+    workItemId: string,
+  ): Promise<void> {
+    const draft = execution.implementationHandoff;
+    if (draft === undefined) {
+      return;
+    }
+    const requiredChecksPassed = draft.checks
+      .filter((check) => check.required)
+      .every((check) => check.result === "passed");
+    await this.missions.recordHandoff(PRIMARY_MISSION_ID, {
+      workItemId,
+      result: requiredChecksPassed ? "done" : "partial",
+      summary: requiredChecksPassed
+        ? "The delegated implementation returned a structured evidence handoff."
+        : "The delegated implementation returned a partial handoff with unresolved required checks.",
+      filesChanged: draft.filesChanged,
+      testsRun: [...new Set(draft.checks.map((check) => check.command))],
+      decisions: draft.decisions,
+      openQuestions: draft.openQuestions,
+      componentsTouched: [],
+      memoryImpact: "medium",
+      diffSummary: draft.diffSummary,
+      checks: draft.checks,
+      evidenceIds: draft.evidenceIds,
+      executionOrigin: draft.executionOrigin,
+    });
+  }
+
+  private async reviewImplementation(workItemId: string): Promise<void> {
+    const workItem = await this.missions.getWorkItem(PRIMARY_MISSION_ID, workItemId);
+    if (workItem.status === "complete") {
+      return;
+    }
+    if (workItem.status !== "ready_for_review") {
+      throw new MissionControlError(
+        "Independent verification requires the implementation to be ready for review.",
+      );
+    }
+    if (workItem.delegation === undefined) {
+      await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, workItemId, "complete");
+      return;
+    }
+    const context = await this.missions.getReviewContext(PRIMARY_MISSION_ID, workItemId);
+    const decision = await this.verifier.review(context);
+    await this.missions.reviewWorkItem(PRIMARY_MISSION_ID, {
+      workItemId,
+      outcome: decision.outcome,
+      reviewer: decision.reviewer,
+      summary: decision.summary,
+      finding: decision.finding,
+    });
+    if (decision.outcome !== "accepted") {
+      throw new MissionControlError(
+        `Independent verification returned ${decision.outcome}: ${decision.finding}`,
+      );
+    }
+  }
+
+  private async persistInspectedWorkGraph(
+    inspectionResult: unknown,
+    inspectionWorkItemId: string,
+  ): Promise<void> {
+    const state = await this.missions.getState();
+    const mission = state.missions.find((item) => item.id === PRIMARY_MISSION_ID);
+    if (mission === undefined) {
+      throw new MissionControlError("Planning could not find the primary mission.");
+    }
+    const inspection = verifiedInspectionFromResult(
+      inspectionResult,
+      state,
+      mission,
+      inspectionWorkItemId,
+    );
+    try {
+      const plannedGraph = validateWorkGraph(await this.planner.plan({ mission, inspection }));
+      const graph = hasLegacyPrimaryWorkGraphShape(
+        state.workItems.filter((item) => item.missionId === PRIMARY_MISSION_ID),
+      )
+        ? compactPrimaryWorkGraph(plannedGraph)
+        : plannedGraph;
+      await this.missions.persistWorkGraph(PRIMARY_MISSION_ID, graph);
+    } catch (error) {
+      if (error instanceof MissionDomainError) {
+        throw error;
+      }
+      throw new MissionControlError(
+        "Planning failed closed; no executable work graph was persisted.",
+      );
     }
   }
 
@@ -353,7 +752,11 @@ class MissionController {
     }
   }
 
-  private async executeWork(workItemId: string, operation: () => Promise<void>): Promise<void> {
+  private async executeWork(
+    workItemId: string,
+    operation: () => Promise<void>,
+    complete = true,
+  ): Promise<void> {
     let item = await this.missions.getWorkItem(PRIMARY_MISSION_ID, workItemId);
     if (item.status === "complete") {
       return;
@@ -375,7 +778,7 @@ class MissionController {
         "ready_for_review",
       );
     }
-    if (item.status === "ready_for_review") {
+    if (complete && item.status === "ready_for_review") {
       await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, workItemId, "complete");
     }
   }
@@ -411,7 +814,7 @@ class MissionController {
         (item) =>
           item.missionId === PRIMARY_MISSION_ID &&
           ["backlog", "ready", "in_progress", "ready_for_review"].includes(item.status) &&
-          item.status === "in_progress",
+          (item.status === "in_progress" || item.status === "ready_for_review"),
       );
       if (active !== undefined) {
         await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, active.id, "blocked");
@@ -424,6 +827,109 @@ class MissionController {
       // Preserve the operation error if the durable failure state was already recorded.
     }
   }
+}
+
+function verifiedInspectionFromResult(
+  result: unknown,
+  state: MissionState,
+  mission: Mission,
+  workItemId: string,
+): VerifiedRepositoryInspection {
+  if (isRecord(result) &&
+      typeof result.resourceUri === "string" &&
+      typeof result.contentHash === "string") {
+    const inspection: VerifiedRepositoryInspection = {
+      resourceUri: result.resourceUri,
+      contentHash: result.contentHash,
+    };
+    if (typeof result.content === "string") {
+      inspection.content = result.content;
+    }
+    if (typeof result.commitSha === "string") {
+      inspection.commitSha = result.commitSha;
+    }
+    if (isRecord(result.patches)) {
+      const patches: Record<string, string> = {};
+      for (const [file, patch] of Object.entries(result.patches)) {
+        if (typeof patch !== "string") {
+          throw new MissionControlError(
+            "Planning failed closed; repository inspection patches were malformed.",
+          );
+        }
+        patches[file] = patch;
+      }
+      inspection.patches = patches;
+    }
+    return inspection;
+  }
+
+  const evidenceId = isRecord(result) && typeof result.evidenceId === "string"
+    ? result.evidenceId
+    : undefined;
+  const evidence = evidenceId === undefined
+    ? [...state.evidence]
+        .reverse()
+        .find((item) =>
+          item.missionId === mission.id &&
+          item.workItemId === workItemId &&
+          item.source === "mcp",
+        )
+    : state.evidence.find((item) => item.id === evidenceId);
+  if (
+    evidence === undefined ||
+    evidence.missionId !== mission.id ||
+    evidence.workItemId !== workItemId ||
+    evidence.source !== "mcp" ||
+    evidence.result !== "passed"
+  ) {
+    throw new MissionControlError(
+      "Planning failed closed; no verified repository inspection was available.",
+    );
+  }
+
+  let details: Record<string, unknown> = {};
+  if (evidence.details !== undefined) {
+    try {
+      const parsed = JSON.parse(evidence.details) as unknown;
+      if (isRecord(parsed)) {
+        details = parsed;
+      }
+    } catch {
+      throw new MissionControlError(
+        "Planning failed closed; repository inspection evidence was malformed.",
+      );
+    }
+  }
+  const contentHash = typeof details.content_hash === "string"
+    ? details.content_hash
+    : undefined;
+  if (contentHash === undefined || contentHash.trim().length === 0) {
+    throw new MissionControlError(
+      "Planning failed closed; repository inspection evidence had no content hash.",
+    );
+  }
+  const resourceUri = typeof details.uri === "string" && details.uri.trim().length > 0
+    ? details.uri
+    : mission.repository === undefined
+    ? `repo://verified/${contentHash}`
+    : `repo://${mission.repository.owner}/${mission.repository.name}/${mission.repository.ref}/verified`;
+  const inspection: VerifiedRepositoryInspection = { resourceUri, contentHash };
+  if (typeof details.commit_sha === "string") {
+    inspection.commitSha = details.commit_sha;
+  }
+  if (isRecord(details.patches)) {
+    const patches: Record<string, string> = {};
+    for (const [file, patch] of Object.entries(details.patches)) {
+      if (typeof patch !== "string") {
+        throw new MissionControlError(
+          "Planning failed closed; repository inspection patches were malformed.",
+        );
+      }
+      patches[file] = patch;
+    }
+    inspection.patches = patches;
+  }
+  return inspection;
 }
 
 export function mapMissionState(state: MissionState, missionId: string): MissionView {
@@ -456,8 +962,18 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
   const passedEvidence = evidence.filter((item) => item.result === "passed").length;
   const failedEvidence = evidence.filter((item) => item.result === "failed").length;
   const completed = workItems.filter((item) => item.status === "complete").length;
-  const repositoryProof = latestProofResult(missionEvidence, WORK.inspect, "mcp");
-  const sandboxProof = latestProofResult(missionEvidence, WORK.verify, "sandbox");
+  const repositoryProof = latestProofResultForRole(
+    missionEvidence,
+    workItems,
+    "planner",
+    "mcp",
+  );
+  const sandboxProof = latestProofResultForRole(
+    missionEvidence,
+    workItems,
+    "reviewer",
+    "sandbox",
+  );
   const currentProofFailed = repositoryProof === "failed" || sandboxProof === "failed";
   const currentProofPassed = repositoryProof === "passed" && sandboxProof === "passed";
   const verification = mission.status === "failed" || mission.status === "blocked"
@@ -507,6 +1023,49 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
     ],
     activity,
     evidence,
+    handoffs: state.handoffs
+      .filter((item) => item.missionId === missionId)
+      .map((item) => ({
+        id: item.id,
+        workItemId: item.workItemId,
+        result: item.result,
+        summary: item.summary,
+        filesChanged: [...item.filesChanged],
+        testsRun: [...item.testsRun],
+        decisions: [...item.decisions],
+        openQuestions: [...item.openQuestions],
+        memoryImpact: item.memoryImpact,
+        createdAt: item.createdAt,
+        ...(item.diffSummary === undefined ? {} : { diffSummary: item.diffSummary }),
+        ...(item.checks === undefined ? {} : {
+          checks: item.checks.map((check) => ({
+            ...check,
+            evidenceIds: [...check.evidenceIds],
+          })),
+        }),
+        ...(item.evidenceIds === undefined ? {} : { evidenceIds: [...item.evidenceIds] }),
+        ...(item.executionOrigin === undefined ? {} : { executionOrigin: { ...item.executionOrigin } }),
+      })),
+    reviews: state.reviews
+      .filter((item) => item.missionId === missionId)
+      .map((item) => ({
+        id: item.id,
+        workItemId: item.workItemId,
+        outcome: item.outcome,
+        reviewer: item.reviewer,
+        summary: item.summary,
+        finding: item.finding,
+        handoffId: item.handoffId,
+        filesChanged: [...item.filesChanged],
+        diffSummary: item.diffSummary,
+        checks: item.checks.map((check) => ({
+          ...check,
+          evidenceIds: [...check.evidenceIds],
+        })),
+        evidenceIds: [...item.evidenceIds],
+        findingEvidenceId: item.findingEvidenceId,
+        createdAt: item.createdAt,
+      })),
     approvals: state.approvals
       .filter((item) => item.missionId === missionId)
       .map((item) => ({
@@ -541,23 +1100,28 @@ function lane(id: "plan" | "execute" | "prove" | "approve", label: string, items
       id: item.id,
       title: item.title,
       purpose: item.purpose,
+      acceptanceCriteria: [...item.acceptanceCriteria],
       status: item.status,
       dependsOn: [...item.dependsOn],
       ...(item.assignedRole === undefined ? {} : { assignedRole: item.assignedRole }),
+      ...(item.requiredChecks === undefined ? {} : { requiredChecks: [...item.requiredChecks] }),
+      ...(item.delegation === undefined ? {} : { delegation: { ...item.delegation } }),
     })),
   };
 }
 
-function latestProofResult(
+function latestProofResultForRole(
   evidence: Evidence[],
-  workItemId: string,
+  workItems: WorkItem[],
+  role: "planner" | "implementer" | "reviewer",
   source: "mcp" | "sandbox",
 ): Evidence["result"] | undefined {
+  const workItemIds = new Set(
+    workItems.filter((item) => item.assignedRole === role).map((item) => item.id),
+  );
   let latest: Evidence["result"] | undefined;
-  // Evidence is appended through MissionService mutations, so array order is the
-  // durable operation order even when several records share the same timestamp.
   for (const item of evidence) {
-    if (item.workItemId === workItemId && item.source === source) {
+    if (item.workItemId !== undefined && workItemIds.has(item.workItemId) && item.source === source) {
       latest = item.result;
     }
   }
@@ -581,6 +1145,9 @@ function mapEvidence(
   const title = evidence.workItemId === undefined ? undefined : titleByWorkId.get(evidence.workItemId);
   if (title !== undefined) {
     view.workItemTitle = title;
+  }
+  if (evidence.executionOrigin !== undefined) {
+    view.executionOrigin = { ...evidence.executionOrigin };
   }
   return view;
 }
@@ -657,8 +1224,67 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isPromiseLike<T>(value: T | PromiseLike<T>): value is PromiseLike<T> {
+  return typeof value === "object" && value !== null &&
+    "then" in value && typeof value.then === "function";
+}
+
+function unavailableSemanticReviewDecision(): ImplementationReviewDecision {
+  return {
+    outcome: "changes_requested",
+    reviewer: "independent-verifier",
+    summary: "Independent verification could not establish the work-item contract.",
+    finding: "The contract-aware verifier returned no valid semantic review; structural proof cannot establish that the changed state satisfies the work item's purpose and acceptance criteria.",
+  };
+}
+
+function normalizeSemanticReviewDecision(value: unknown): ImplementationReviewDecision {
+  const reviewer = isRecord(value) ? boundedReviewText(value.reviewer, 200) : null;
+  const summary = isRecord(value) ? boundedReviewText(value.summary, 4_000) : null;
+  const finding = isRecord(value) ? boundedReviewText(value.finding, 4_000) : null;
+  if (
+    !isRecord(value) ||
+    !isReviewOutcome(value.outcome) ||
+    reviewer === null ||
+    summary === null ||
+    finding === null
+  ) {
+    return unavailableSemanticReviewDecision();
+  }
+  return {
+    outcome: value.outcome,
+    reviewer,
+    summary,
+    finding,
+  };
+}
+
+function isReviewOutcome(value: unknown): value is ReviewOutcome {
+  return value === "accepted" || value === "changes_requested" || value === "blocked";
+}
+
+function boundedReviewText(value: unknown, maxLength: number): string | null {
+  return typeof value === "string" && value.trim().length > 0 && value.length <= maxLength
+    ? value.trim()
+    : null;
+}
+
+function isContentBearingReviewEvidence(evidence: Evidence): boolean {
+  return parseContentDiffEvidence(evidence) !== null;
+}
+
+function normalizeChangedFile(value: string): string {
+  return value.trim().replace(/^\.\//, "");
+}
+
 export function createMissionHttpApp(options: MissionHttpOptions) {
-  const controller = new MissionController(options.missions, options.runner);
+  const semanticVerifier = options.semanticVerifier ?? semanticVerifierFromRunner(options.runner);
+  const controller = new MissionController(
+    options.missions,
+    options.runner,
+    options.planner,
+    options.verifier ?? new DeterministicImplementationVerifier(semanticVerifier),
+  );
   return {
     request(path: string, init?: RequestInit) {
       return handle(new Request(new URL(path, "http://mission.local"), init));
@@ -708,6 +1334,17 @@ export function createMissionHttpApp(options: MissionHttpOptions) {
       return jsonResponse({ error: "operation_failed", message, mission }, status);
     }
   }
+}
+
+function semanticVerifierFromRunner(
+  runner: MissionRunner,
+): SemanticContractVerifier | undefined {
+  const reviewContract = runner.reviewContract;
+  return reviewContract === undefined
+    ? undefined
+    : {
+        reviewContract: (context) => reviewContract.call(runner, context),
+      };
 }
 
 function isStateChangingMethod(method: string): boolean {

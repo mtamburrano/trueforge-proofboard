@@ -13,7 +13,8 @@
     "check": "npm run typecheck && npm test",
     "prestart": "npm run build",
     "start": "node --env-file-if-exists=.env dist/http/start.js",
-    "smoke:trueforge": "node --env-file-if-exists=.env scripts/trueforge-smoke.mjs"
+    "smoke:trueforge": "node --env-file-if-exists=.env scripts/trueforge-smoke.mjs",
+    "test:proof-loop": "npm run build && node scripts/delegated-delivery-integration.mjs"
   },
   "devDependencies": {
     "@truefoundry/trueforge-sdk": "0.1.3",

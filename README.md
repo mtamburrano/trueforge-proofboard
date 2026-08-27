@@ -69,7 +69,21 @@ when the configured MCP server made the exact file request and returned a matchi
 structured resource. Failed or incomplete MCP evidence blocks the mission; it is
 never replaced with canned repository content. `runSandboxVerification` applies the
 same proof boundary to the canonical sandbox `exec` tool, recording the exact
-command, exit code, and bounded output summary.
+command, exit code, and bounded output summary. The deterministic primary fixture
+runs its checks from the provisioned project directory.
+
+Delegated implementation work is review-gated by a structured handoff. It records
+changed files, a bounded diff summary, each required check and its observed result,
+decisions, open questions, evidence IDs, and the correlated TrueForge session,
+turn, thread, and tool origin. Missing, failed, contradictory, or uncorrelated
+evidence cannot be promoted to review; earlier durable evidence remains available
+for diagnosis.
+
+Review-ready delegated work is evaluated by an independent verifier before it can
+become complete. The verifier records the changed-state snapshot, structured
+handoff, correlated checks, and a durable finding. It can accept the work, request
+changes back to an executable state, or block it; every prior handoff and proof
+record remains available across those outcomes.
 
 For the deterministic public fixture (`mtamburrano/trueforge-proofboard` at commit
 `590aa8a6d72c580f61fc1b19d33e9876bc0feb9b`), `inspectRepository` uses the GitHub MCP
