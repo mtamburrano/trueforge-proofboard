@@ -24,6 +24,71 @@ function fixedClock() {
   return new Date("2026-08-27T15:00:00.000Z");
 }
 
+function legacyPrimaryState() {
+  const timestamp = fixedClock().toISOString();
+  return {
+    schemaVersion: 1,
+    revision: 20,
+    missions: [{
+      id: PRIMARY_MISSION_ID,
+      objective: PRIMARY_MISSION_OBJECTIVE,
+      status: "planning",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      repository: PRIMARY_REPOSITORY,
+      trueforgeSessionId: "legacy-session",
+    }],
+    workItems: [
+      {
+        id: "primary-inspect",
+        missionId: PRIMARY_MISSION_ID,
+        title: "Inspect pinned repository",
+        purpose: "Inspect the pinned source.",
+        status: "ready",
+        dependsOn: [],
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        assignedRole: "planner",
+      },
+      {
+        id: "primary-implement",
+        missionId: PRIMARY_MISSION_ID,
+        title: "Implement stage helper",
+        purpose: "Implement the requested helper.",
+        status: "backlog",
+        dependsOn: ["primary-inspect"],
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        assignedRole: "implementer",
+      },
+      {
+        id: "primary-verify",
+        missionId: PRIMARY_MISSION_ID,
+        title: "Verify delivery",
+        purpose: "Verify the requested delivery.",
+        status: "backlog",
+        dependsOn: ["primary-implement"],
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        assignedRole: "reviewer",
+      },
+    ],
+    evidence: [{
+      id: "legacy-history",
+      missionId: PRIMARY_MISSION_ID,
+      kind: "tool_result",
+      result: "informational",
+      source: "system",
+      summary: "Legacy mission history remains durable.",
+      createdAt: timestamp,
+    }],
+    handoffs: [],
+    reviews: [],
+    approvals: [],
+    deliveries: [],
+  };
+}
+
 function diffOutput(files = ["src/index.ts", "test/index.test.js"]) {
   return files.map((file) => [
     `diff --git a/${file} b/${file}`,
@@ -378,85 +443,11 @@ test("planner fails closed when repository scope exceeds the graph bound", () =>
 });
 
 test("legacy primary missions are upgraded without losing their history", async () => {
-  const timestamp = fixedClock().toISOString();
-  const history = {
-    id: "legacy-history",
-    missionId: PRIMARY_MISSION_ID,
-    kind: "tool_result",
-    result: "informational",
-    source: "system",
-    summary: "Legacy mission history remains durable.",
-    createdAt: timestamp,
-  };
-  const legacyState = {
-    schemaVersion: 1,
-    revision: 20,
-    missions: [{
-      id: PRIMARY_MISSION_ID,
-      objective: PRIMARY_MISSION_OBJECTIVE,
-      status: "planning",
-      createdAt: timestamp,
-      updatedAt: timestamp,
-      repository: PRIMARY_REPOSITORY,
-      trueforgeSessionId: "legacy-session",
-    }],
-    workItems: [
-      {
-        id: "primary-inspect",
-        missionId: PRIMARY_MISSION_ID,
-        title: "Inspect pinned repository",
-        purpose: "Inspect the pinned source.",
-        status: "ready",
-        dependsOn: [],
-        createdAt: timestamp,
-        updatedAt: timestamp,
-        assignedRole: "planner",
-      },
-      {
-        id: "primary-implement",
-        missionId: PRIMARY_MISSION_ID,
-        title: "Implement stage helper",
-        purpose: "Implement the requested helper.",
-        status: "backlog",
-        dependsOn: ["primary-inspect"],
-        createdAt: timestamp,
-        updatedAt: timestamp,
-        assignedRole: "implementer",
-      },
-      {
-        id: "primary-verify",
-        missionId: PRIMARY_MISSION_ID,
-        title: "Verify delivery",
-        purpose: "Verify the requested delivery.",
-        status: "backlog",
-        dependsOn: ["primary-implement"],
-        createdAt: timestamp,
-        updatedAt: timestamp,
-        assignedRole: "reviewer",
-      },
-    ],
-    evidence: [history],
-    handoffs: [],
-    reviews: [],
-    approvals: [],
-    deliveries: [],
-  };
+  const legacyState = legacyPrimaryState();
+  const history = legacyState.evidence[0];
   const missions = new MissionService(new InMemoryMissionRepository(legacyState), fixedClock);
   const runner = new LegacyPrimaryRunner(missions);
-  const app = createMissionHttpApp({
-    missions,
-    runner,
-    semanticVerifier: {
-      reviewContract() {
-        return {
-          outcome: "accepted",
-          reviewer: "legacy-contract-verifier",
-          summary: "The migrated primary contract was independently evaluated.",
-          finding: "No blocking findings.",
-        };
-      },
-    },
-  });
+  const app = createMissionHttpApp({ missions, runner });
 
   const response = await app.request("/api/mission", { method: "POST" });
   assert.equal(response.status, 201);
@@ -474,10 +465,105 @@ test("legacy primary missions are upgraded without losing their history", async 
   assert.equal(afterRun.evidence.some((evidence) => evidence.id === history.id), true);
 });
 
+test("production app wires bounded contract review and fails closed on invalid results", async () => {
+  const observedContexts = [];
+  const cases = [
+    {
+      label: "valid semantic review",
+      options: {
+        semanticReview(context) {
+          observedContexts.push(context);
+          return {
+            outcome: "accepted",
+            reviewer: "local-contract-reviewer",
+            summary: "The bounded implementation satisfies the contract.",
+            finding: "No blocking findings.",
+          };
+        },
+      },
+      status: 200,
+      outcome: "accepted",
+    },
+    {
+      label: "unavailable semantic review",
+      options: { exposeSemanticReview: false },
+      status: 502,
+      outcome: "changes_requested",
+    },
+    {
+      label: "malformed semantic review",
+      options: { semanticReview: null },
+      status: 502,
+      outcome: "changes_requested",
+    },
+    {
+      label: "invalid semantic review",
+      options: {
+        semanticReview: {
+          outcome: "accepted",
+          reviewer: "",
+          summary: "The result is malformed.",
+          finding: "The reviewer identity is missing.",
+        },
+      },
+      status: 502,
+      outcome: "changes_requested",
+    },
+  ];
+
+  for (const reviewCase of cases) {
+    const missions = new MissionService(
+      new InMemoryMissionRepository(legacyPrimaryState()),
+      fixedClock,
+    );
+    const runner = new LegacyPrimaryRunner(missions, reviewCase.options);
+    const app = createMissionHttpApp({ missions, runner });
+
+    assert.equal(
+      (await app.request("/api/mission", { method: "POST" })).status,
+      201,
+      reviewCase.label,
+    );
+    const response = await app.request("/api/mission/run", { method: "POST" });
+    assert.equal(response.status, reviewCase.status, reviewCase.label);
+
+    const state = await missions.getState();
+    const review = state.reviews.at(-1);
+    assert.equal(review?.outcome, reviewCase.outcome, reviewCase.label);
+    if (reviewCase.status === 200) {
+      const context = observedContexts.at(-1);
+      assert.ok(context, reviewCase.label);
+      assert.deepEqual(context.actualFilesChanged, ["src/index.ts", "test/index.test.js"]);
+      assert.match(context.actualDiff, /getNextDeliveryStage/);
+      assert.equal(context.workItem.purpose.length > 0, true);
+      assert.equal(context.workItem.acceptanceCriteria.length > 0, true);
+      assert.deepEqual(context.checks.map((check) => check.result), ["passed", "passed"]);
+    }
+  }
+});
+
 class LegacyPrimaryRunner {
-  constructor(missions) {
+  constructor(missions, {
+    semanticReview = () => ({
+      outcome: "accepted",
+      reviewer: "legacy-contract-verifier",
+      summary: "The migrated primary contract was independently evaluated.",
+      finding: "No blocking findings.",
+    }),
+    exposeSemanticReview = true,
+  } = {}) {
     this.missions = missions;
     this.turn = 0;
+    this.semanticReview = semanticReview;
+    if (!exposeSemanticReview) {
+      this.reviewContract = undefined;
+    }
+  }
+
+  async reviewContract(context) {
+    return typeof this.semanticReview === "function"
+      ? this.semanticReview(context)
+      : this.semanticReview;
   }
 
   async createMission(input) {

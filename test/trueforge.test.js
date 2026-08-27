@@ -98,6 +98,41 @@ function fakeEvents(turnId = "turn-1") {
   ];
 }
 
+function contractReviewEvents(
+  turnId = "turn-1",
+  output = {
+    outcome: "accepted",
+    reviewer: "trueforge-contract-reviewer",
+    summary: "The changed state satisfies the bounded contract.",
+    finding: "No blocking findings.",
+  },
+) {
+  return [
+    {
+      type: "turn.created",
+      id: "event-review-turn-created",
+      createdAt: "2026-08-26T16:00:00.000Z",
+      threadId: null,
+      turnId,
+      state: { status: "running" },
+    },
+    {
+      type: "model.message",
+      id: "event-review-model",
+      createdAt: "2026-08-26T16:00:01.000Z",
+      threadId: "thread-review",
+      content: typeof output === "string" ? output : JSON.stringify(output),
+    },
+    {
+      type: "turn.done",
+      id: "event-review-turn-done",
+      createdAt: "2026-08-26T16:00:02.000Z",
+      threadId: null,
+      state: { status: "done", requiredActions: [] },
+    },
+  ];
+}
+
 function repositoryEvents(
   turnId = "turn-1",
   ref = "main",
@@ -442,6 +477,59 @@ test("runner creates a TrueForge session and maps safe runtime evidence", async 
   assert.equal(state.evidence.every((item) => item.workItemId === workItem.id), true);
   const serializedState = JSON.stringify(state);
   assert.doesNotMatch(serializedState, /do-not-persist|This content should not be persisted/);
+});
+
+test("runner performs an independent bounded contract review", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client, calls } = fakeClient(contractReviewEvents);
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "google-gemini/test-model",
+  });
+  const mission = await runner.createMission({
+    id: "mission-contract-review",
+    objective: "Review a bounded implementation",
+  });
+  const workItem = await missions.addWorkItem(mission.id, {
+    id: "work-contract-review",
+    title: "Implement the stage transition helper",
+    purpose: "Add the requested transition behavior to the verified source.",
+    acceptanceCriteria: ["Plan advances to Execute and terminal Approve returns null."],
+    requiredChecks: ["test"],
+    assignedRole: "implementer",
+    status: "ready",
+  });
+
+  const review = await runner.reviewContract({
+    workItem,
+    handoff: {},
+    filesChanged: ["src/index.ts"],
+    actualFilesChanged: ["src/index.ts"],
+    actualDiff: "diff --git a/src/index.ts b/src/index.ts\n+export function getNextDeliveryStage(stage) {}",
+    diffSummary: "src/index.ts changed.",
+    checks: [{
+      name: "test",
+      command: "npm test",
+      result: "passed",
+      required: true,
+      evidenceIds: ["evidence-test"],
+      exitCode: 0,
+    }],
+    evidence: [],
+  });
+
+  assert.deepEqual(review, {
+    outcome: "accepted",
+    reviewer: "trueforge-contract-reviewer",
+    summary: "The changed state satisfies the bounded contract.",
+    finding: "No blocking findings.",
+  });
+  assert.equal(calls.turns.length, 1);
+  const instruction = calls.turns[0].request.input[0].content;
+  assert.match(instruction, /independent contract review/);
+  assert.match(instruction, /acceptanceCriteria/);
+  assert.match(instruction, /actualDiff/);
+  assert.match(instruction, /src\/index\.ts/);
+  assert.match(instruction, /Do not rely on implementer narration/);
 });
 
 test("runner does not mark a done turn as passed while required actions remain", async () => {

@@ -128,6 +128,7 @@ export interface MissionRunner {
     options: { workItemId: string; delegateToSubagent?: boolean },
   ): Promise<TrueForgeTurnResult>;
   runSandboxVerification(input: SandboxVerificationInput): Promise<unknown>;
+  reviewContract?(context: ReviewContext): Promise<ImplementationReviewDecision>;
 }
 
 export interface MissionHttpOptions {
@@ -219,7 +220,17 @@ export class DeterministicImplementationVerifier implements ImplementationVerifi
         finding: "No contract-aware verifier was supplied; structural diff evidence cannot prove that the changed state satisfies the work item's purpose and acceptance criteria.",
       };
     }
-    return this.semanticVerifier.reviewContract(context);
+    try {
+      const review = this.semanticVerifier.reviewContract(context);
+      if (isPromiseLike(review)) {
+        return Promise.resolve(review)
+          .then(normalizeSemanticReviewDecision)
+          .catch(() => unavailableSemanticReviewDecision());
+      }
+      return normalizeSemanticReviewDecision(review);
+    } catch {
+      return unavailableSemanticReviewDecision();
+    }
   }
 }
 
@@ -1213,6 +1224,51 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isPromiseLike<T>(value: T | PromiseLike<T>): value is PromiseLike<T> {
+  return typeof value === "object" && value !== null &&
+    "then" in value && typeof value.then === "function";
+}
+
+function unavailableSemanticReviewDecision(): ImplementationReviewDecision {
+  return {
+    outcome: "changes_requested",
+    reviewer: "independent-verifier",
+    summary: "Independent verification could not establish the work-item contract.",
+    finding: "The contract-aware verifier returned no valid semantic review; structural proof cannot establish that the changed state satisfies the work item's purpose and acceptance criteria.",
+  };
+}
+
+function normalizeSemanticReviewDecision(value: unknown): ImplementationReviewDecision {
+  const reviewer = isRecord(value) ? boundedReviewText(value.reviewer, 200) : null;
+  const summary = isRecord(value) ? boundedReviewText(value.summary, 4_000) : null;
+  const finding = isRecord(value) ? boundedReviewText(value.finding, 4_000) : null;
+  if (
+    !isRecord(value) ||
+    !isReviewOutcome(value.outcome) ||
+    reviewer === null ||
+    summary === null ||
+    finding === null
+  ) {
+    return unavailableSemanticReviewDecision();
+  }
+  return {
+    outcome: value.outcome,
+    reviewer,
+    summary,
+    finding,
+  };
+}
+
+function isReviewOutcome(value: unknown): value is ReviewOutcome {
+  return value === "accepted" || value === "changes_requested" || value === "blocked";
+}
+
+function boundedReviewText(value: unknown, maxLength: number): string | null {
+  return typeof value === "string" && value.trim().length > 0 && value.length <= maxLength
+    ? value.trim()
+    : null;
+}
+
 function isContentBearingReviewEvidence(evidence: Evidence): boolean {
   return parseContentDiffEvidence(evidence) !== null;
 }
@@ -1222,11 +1278,12 @@ function normalizeChangedFile(value: string): string {
 }
 
 export function createMissionHttpApp(options: MissionHttpOptions) {
+  const semanticVerifier = options.semanticVerifier ?? semanticVerifierFromRunner(options.runner);
   const controller = new MissionController(
     options.missions,
     options.runner,
     options.planner,
-    options.verifier ?? new DeterministicImplementationVerifier(options.semanticVerifier),
+    options.verifier ?? new DeterministicImplementationVerifier(semanticVerifier),
   );
   return {
     request(path: string, init?: RequestInit) {
@@ -1277,6 +1334,17 @@ export function createMissionHttpApp(options: MissionHttpOptions) {
       return jsonResponse({ error: "operation_failed", message, mission }, status);
     }
   }
+}
+
+function semanticVerifierFromRunner(
+  runner: MissionRunner,
+): SemanticContractVerifier | undefined {
+  const reviewContract = runner.reviewContract;
+  return reviewContract === undefined
+    ? undefined
+    : {
+        reviewContract: (context) => reviewContract.call(runner, context),
+      };
 }
 
 function isStateChangingMethod(method: string): boolean {

@@ -34,7 +34,11 @@ const runner = new TrueForgeMissionRunner(
     }],
   },
 );
-const app = createMissionHttpApp({ missions, runner });
+const app = createMissionHttpApp({
+  missions,
+  runner,
+  semanticVerifier: runner,
+});
 
 const server = createServer(async (request, response) => {
   try {
