@@ -76,16 +76,46 @@ test("the repository planner derives bounded work from verified inspection facts
     },
   });
 
-  assert.equal(planned.items.length, 3);
+  assert.equal(planned.items.length, 4);
   assert.deepEqual(planned.items.map((item) => item.assignedRole), [
     "planner",
     "implementer",
+    "implementer",
     "reviewer",
   ]);
-  assert.deepEqual(planned.items.map((item) => item.dependsOn), [[], ["primary-inspect"], ["primary-implement"]]);
+  assert.deepEqual(planned.items.map((item) => item.dependsOn), [
+    [],
+    ["primary-inspect"],
+    ["primary-inspect"],
+    ["primary-implement-1-src-index-ts", "primary-implement-2-test-index-test-js"],
+  ]);
   assert.equal(planned.items.every((item) => item.acceptanceCriteria.length > 0), true);
   assert.match(planned.items[1].purpose, /src\/index\.ts/);
   assert.match(planned.items[0].acceptanceCriteria[0], /sha256:verified/);
+
+  const documentationPlan = planner.plan({
+    mission: {
+      id: "mission-doc-planning",
+      objective: "Update docs/usage.md with the verified command contract.",
+      status: "draft",
+      createdAt: fixedClock().toISOString(),
+      updatedAt: fixedClock().toISOString(),
+    },
+    inspection: {
+      resourceUri: "repo://owner/repo/docs/commit",
+      contentHash: "sha256:docs",
+      patches: { "docs/usage.md": "@@ verified documentation" },
+    },
+  });
+  assert.equal(documentationPlan.items.length, 3);
+  assert.deepEqual(
+    documentationPlan.items.map((item) => item.id),
+    ["primary-inspect", "primary-implement-1-docs-usage-md", "primary-verify"],
+  );
+  assert.notDeepEqual(
+    documentationPlan.items.map(({ id, dependsOn }) => ({ id, dependsOn })),
+    planned.items.map(({ id, dependsOn }) => ({ id, dependsOn })),
+  );
 });
 
 test("persisted graphs expose executable roots and enforce dependencies in the service", async () => {
@@ -204,5 +234,5 @@ test("graph-size bounds reject oversized and ambiguous plans", () => {
   assert.equal(buildPreflightWorkGraph({
     objective: "Change src/index.ts",
     repository: { owner: "owner", name: "repo", ref: "fixture" },
-  }).items.length, 3);
+  }).items.length, 1);
 });

@@ -179,7 +179,7 @@ export function buildDelegatedTurnInstruction(
     "Delegate this bounded work item to exactly one dynamic subagent; the parent coordinator must not perform the work itself.",
     `Work Packet: ${JSON.stringify(packet)}`,
     `Coordinator instruction: ${instruction.trim()}`,
-    "The subagent may use only the configured tools and the repository/evidence context in this packet. It must execute every required check, inspect the resulting git diff/status, and return control after the subagent finishes.",
+    "The subagent may use only the configured tools and the repository/evidence context in this packet. It must execute every required check, capture a bounded content-bearing git diff, and return control after the subagent finishes.",
     "End with a machine-readable IMPLEMENTATION_HANDOFF object containing decisions and openQuestions. The coordinator will independently correlate changed files and check results to the observed tool responses.",
   ].join("\n");
 }
@@ -194,6 +194,24 @@ export class RepositoryWorkGraphPlanner implements WorkGraphPlanner {
       : `${input.mission.repository.owner}/${input.mission.repository.name}@${input.mission.repository.ref}`;
     const inspectionLabel = `${inspection.resourceUri} (${inspection.contentHash})`;
     const fileScope = files.length === 0 ? "the verified repository surface" : files.join(", ");
+    const implementationScopes = files.length === 0
+      ? [{ id: PRIMARY_WORK_GRAPH_IDS.implement, label: fileScope }]
+      : files.map((file, index) => ({
+        id: implementationWorkItemId(file, index),
+        label: file,
+      }));
+    const implementationItems = implementationScopes.map((scope) => ({
+      id: scope.id,
+      title: `Implement the requested change in ${scope.label}`,
+      purpose: `Apply the bounded mission objective to ${scope.label}: ${objective}`,
+      acceptanceCriteria: [
+        `The implementation satisfies the mission objective for ${scope.label}: ${objective}`,
+        `Changes for this work item remain limited to ${scope.label}.`,
+      ],
+      dependsOn: [PRIMARY_WORK_GRAPH_IDS.inspect],
+      assignedRole: "implementer" as const,
+      requiredChecks: ["typecheck", "test"],
+    }));
 
     return validateWorkGraph({
       items: [
@@ -208,18 +226,7 @@ export class RepositoryWorkGraphPlanner implements WorkGraphPlanner {
           dependsOn: [],
           assignedRole: "planner",
         },
-        {
-          id: PRIMARY_WORK_GRAPH_IDS.implement,
-          title: `Implement the requested change in ${fileScope}`,
-          purpose: `Apply the bounded mission objective to the verified source surface: ${objective}`,
-          acceptanceCriteria: [
-            `The implementation satisfies the mission objective: ${objective}`,
-            `Only the verified source surface required by the objective is changed: ${fileScope}.`,
-          ],
-          dependsOn: [PRIMARY_WORK_GRAPH_IDS.inspect],
-          assignedRole: "implementer",
-          requiredChecks: ["typecheck", "test"],
-        },
+        ...implementationItems,
         {
           id: PRIMARY_WORK_GRAPH_IDS.verify,
           title: "Verify the requested delivery",
@@ -228,7 +235,7 @@ export class RepositoryWorkGraphPlanner implements WorkGraphPlanner {
             `The verification checks every implementation condition for: ${objective}`,
             "The verification result is captured from the configured sandbox or review tools.",
           ],
-          dependsOn: [PRIMARY_WORK_GRAPH_IDS.implement],
+          dependsOn: implementationItems.map((item) => item.id),
           assignedRole: "reviewer",
         },
       ],
@@ -245,12 +252,10 @@ export function deriveWorkGraph(input: WorkGraphPlanningInput): WorkGraphDefinit
 }
 
 export function buildPreflightWorkGraph(mission: Pick<Mission, "objective" | "repository">): WorkGraphDefinition {
-  const objective = planningString(mission.objective, "mission objective");
-  const files = referencedFiles(objective, undefined);
+  planningString(mission.objective, "mission objective");
   const repositoryLabel = mission.repository === undefined
     ? "the configured repository"
     : `${mission.repository.owner}/${mission.repository.name}@${mission.repository.ref}`;
-  const fileScope = files.length === 0 ? "the verified source surface" : files.join(", ");
 
   return validateWorkGraph({
     items: [
@@ -264,29 +269,6 @@ export function buildPreflightWorkGraph(mission: Pick<Mission, "objective" | "re
         ],
         dependsOn: [],
         assignedRole: "planner",
-      },
-      {
-        id: PRIMARY_WORK_GRAPH_IDS.implement,
-        title: `Implement the requested change in ${fileScope}`,
-        purpose: `Carry out the mission objective only after repository inspection: ${objective}`,
-        acceptanceCriteria: [
-          `The implementation satisfies the mission objective: ${objective}`,
-          `The implementation is limited to the source surface identified by planning: ${fileScope}.`,
-        ],
-        dependsOn: [PRIMARY_WORK_GRAPH_IDS.inspect],
-        assignedRole: "implementer",
-        requiredChecks: ["typecheck", "test"],
-      },
-      {
-        id: PRIMARY_WORK_GRAPH_IDS.verify,
-        title: "Verify the requested delivery",
-        purpose: "Run independent checks against the implementation after the implementer completes.",
-        acceptanceCriteria: [
-          "The verification checks the implementation acceptance conditions.",
-          "The verification result is captured as durable evidence.",
-        ],
-        dependsOn: [PRIMARY_WORK_GRAPH_IDS.implement],
-        assignedRole: "reviewer",
       },
     ],
   });
@@ -352,16 +334,23 @@ function referencedFiles(
   objective: string,
   inspection: VerifiedRepositoryInspection | undefined,
 ): string[] {
-  const candidates = [
+  const objectiveFiles = [
     ...objective.matchAll(/\b(?:src|test|tests|scripts|docs)\/[A-Za-z0-9._/-]+/g),
   ].map((match) => match[0]?.replace(/[),.;:]+$/, ""))
     .filter((value): value is string => value !== undefined && value.length > 0);
-  if (inspection?.patches !== undefined) {
-    candidates.push(...Object.keys(inspection.patches));
-  }
+  const inspectedFiles = inspection?.patches === undefined
+    ? []
+    : Object.keys(inspection.patches);
+  const candidates = objectiveFiles.length > 0 ? objectiveFiles : inspectedFiles;
   return [...new Set(candidates)]
     .sort()
     .slice(0, MAX_PLANNING_FILE_REFERENCES);
+}
+
+function implementationWorkItemId(file: string, index: number): string {
+  const slug = file.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")
+    .slice(0, 80);
+  return `primary-implement-${index + 1}-${slug || "repository"}`;
 }
 
 export interface TrueForgeClientLike {
@@ -897,7 +886,6 @@ export class TrueForgeMissionRunner {
     let delegatedThread: { threadId: string; owner: string } | null = null;
     let delegatedStatus: "completed" | "failed" | "interrupted" | null = null;
     let delegatedOutput: Record<string, unknown> | undefined;
-    const runtimeEvidenceIds: string[] = [];
     const runtimeEvidenceIdsByEventId = new Map<string, string>();
     try {
       for await (const event of streamEvents(stream)) {
@@ -1020,7 +1008,6 @@ export class TrueForgeMissionRunner {
           } else {
             persistedEvidence = await this.missions.addEvidence(mission.id, evidenceInput);
           }
-          runtimeEvidenceIds.push(persistedEvidence.id);
           const eventId = stringOrNull(recordValue(event).id);
           if (eventId !== null) {
             runtimeEvidenceIdsByEventId.set(eventId, persistedEvidence.id);
@@ -1096,7 +1083,6 @@ export class TrueForgeMissionRunner {
           turnId,
           delegatedThread,
           rawEvents,
-          runtimeEvidenceIds,
           runtimeEvidenceIdsByEventId,
           delegatedOutput,
         )
@@ -1118,16 +1104,17 @@ export class TrueForgeMissionRunner {
     turnId: string,
     delegatedThread: { threadId: string; owner: string },
     rawEvents: TrueForgeApi.TurnStreamingEvent[],
-    runtimeEvidenceIds: string[],
     runtimeEvidenceIdsByEventId: Map<string, string>,
     delegatedOutput: Record<string, unknown> | undefined,
   ): Promise<ImplementationHandoffDraft | undefined> {
     const executions = observedToolCalls(rawEvents)
-      .filter((call) => call.name === "exec")
+      .filter((call) =>
+        call.name === "exec" && call.threadId === delegatedThread.threadId
+      )
       .map((call) => ({
         call,
         command: executionCommand(call.arguments),
-        response: toolResponseForCall(rawEvents, call.id),
+        response: toolResponseForCall(rawEvents, call.id, delegatedThread.threadId),
       }))
       .filter((execution): execution is typeof execution & { command: string } =>
         execution.command !== null,
@@ -1135,7 +1122,7 @@ export class TrueForgeMissionRunner {
     const checkExecutions = executions.filter((execution) =>
       checkNamesForCommand(execution.command).length > 0,
     );
-    const diffExecutions = executions.filter((execution) => isDiffCommand(execution.command));
+    const diffExecutions = executions.filter((execution) => isContentDiffCommand(execution.command));
     if (diffExecutions.length === 0) {
       return undefined;
     }
@@ -1206,7 +1193,7 @@ export class TrueForgeMissionRunner {
       return observed !== null &&
           observed.success === true &&
           observed.exitCode === 0 &&
-          observed.output.trim().length > 0
+          isContentDiffOutput(observed.output)
         ? [{ execution, observed }]
         : [];
     });
@@ -1243,6 +1230,15 @@ export class TrueForgeMissionRunner {
       }),
       executionOrigin: runtimeExecutionOrigin(sessionId, turnId, diffExecution?.response),
     });
+    const delegatedRuntimeEvidenceIds = rawEvents.flatMap((event) => {
+      const eventRecord = recordValue(event);
+      const eventThreadId = stringOrNull(eventRecord.threadId ?? eventRecord.thread_id);
+      const eventId = stringOrNull(eventRecord.id);
+      const evidenceId = eventId === null ? undefined : runtimeEvidenceIdsByEventId.get(eventId);
+      return eventThreadId === delegatedThread.threadId && evidenceId !== undefined
+        ? [evidenceId]
+        : [];
+    });
 
     return {
       filesChanged,
@@ -1251,7 +1247,7 @@ export class TrueForgeMissionRunner {
       decisions: narrative.decisions,
       openQuestions: narrative.openQuestions,
       evidenceIds: uniqueStrings([
-        ...runtimeEvidenceIds,
+        ...delegatedRuntimeEvidenceIds,
         ...checkEvidenceIds,
         diffEvidence.id,
       ]),
@@ -1591,21 +1587,23 @@ function requireCompletedTurn(
 
 function observedToolCalls(
   events: TrueForgeApi.TurnStreamingEvent[],
-): Array<{ id: string; name: string; arguments: unknown }> {
+): Array<{ id: string; name: string; arguments: unknown; threadId: string | null }> {
   interface MutableToolCall {
     id: string;
     name: string;
+    threadId: string | null;
     argumentText: string;
     argumentValue?: unknown;
   }
 
   const callsById = new Map<string, MutableToolCall>();
-  const callIdsByIndex = new Map<number, string>();
+  const callIdsByIndex = new Map<string, string>();
   for (const event of events) {
     if (event.type !== "model.message" && event.type !== "model.message.delta") {
       continue;
     }
     const record = recordValue(event);
+    const eventThreadId = stringOrNull(record.threadId ?? record.thread_id);
     if (!Array.isArray(record.toolCalls)) {
       continue;
     }
@@ -1616,10 +1614,11 @@ function observedToolCalls(
       const functionValue = isRecord(rawCall.function) ? rawCall.function : rawCall;
       const index = typeof rawCall.index === "number" ? rawCall.index : null;
       const explicitId = stringOrNull(rawCall.id);
+      const indexKey = index === null ? null : `${eventThreadId ?? ""}:${index}`;
       if (explicitId !== null && index !== null) {
-        callIdsByIndex.set(index, explicitId);
+        callIdsByIndex.set(indexKey ?? "", explicitId);
       }
-      const id = explicitId ?? (index === null ? null : callIdsByIndex.get(index) ?? null);
+      const id = explicitId ?? (indexKey === null ? null : callIdsByIndex.get(indexKey) ?? null);
       if (id === null) {
         continue;
       }
@@ -1628,7 +1627,10 @@ function observedToolCalls(
       if (name === null) {
         continue;
       }
-      const call = existing ?? { id, name, argumentText: "" };
+      const call = existing ?? { id, name, threadId: eventThreadId, argumentText: "" };
+      if (call.threadId !== eventThreadId) {
+        continue;
+      }
       call.name = name;
       const rawArguments = functionValue.arguments ?? rawCall.arguments;
       if (typeof rawArguments === "string") {
@@ -1644,6 +1646,7 @@ function observedToolCalls(
   return [...callsById.values()].map((call) => ({
     id: call.id,
     name: call.name,
+    threadId: call.threadId,
     arguments: call.argumentValue !== undefined
       ? call.argumentValue
       : parseMaybeJson(call.argumentText.length === 0 ? {} : call.argumentText),
@@ -1672,17 +1675,25 @@ function checkNamesForCommand(command: string): string[] {
   return names;
 }
 
-function isDiffCommand(command: string): boolean {
-  return /\bgit\s+(?:diff|status)\b/.test(command);
+function isContentDiffCommand(command: string): boolean {
+  return /\bgit\s+diff\b/.test(command) &&
+    !/\s--(?:stat|shortstat|numstat|name-only|name-status|summary|check)\b/.test(command);
+}
+
+function isContentDiffOutput(output: string): boolean {
+  return /^diff --git a\/.+ b\/.+$/m.test(output) && /^@@\s/m.test(output);
 }
 
 function toolResponseForCall(
   events: TrueForgeApi.TurnStreamingEvent[],
   toolCallId: string,
+  expectedThreadId?: string,
 ): TrueForgeApi.TurnStreamingEvent | undefined {
   return events.find((event) =>
     (event.type === "tool.response" || event.type === "tool.response_required") &&
-    recordValue(event).toolCallId === toolCallId,
+    recordValue(event).toolCallId === toolCallId &&
+    (expectedThreadId === undefined ||
+      stringOrNull(recordValue(event).threadId ?? recordValue(event).thread_id) === expectedThreadId),
   );
 }
 

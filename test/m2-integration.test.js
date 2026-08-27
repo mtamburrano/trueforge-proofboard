@@ -12,9 +12,18 @@ test("M2 reset fixture unlocks reviewed dependencies and preserves failure histo
   assert.equal(result.summary.dependentUnlockedAfterReviewedCompletion, true);
   assert.equal(result.summary.changesRequestedPreservedHistory, true);
   assert.equal(result.summary.malformedDelegationDidNotUnlockDependent, true);
+  assert.equal(result.summary.uncorrelatedEvidenceDidNotUnlockDependent, true);
+  assert.equal(result.summary.blockedReviewDidNotUnlockDependent, true);
   assert.equal(result.summary.remoteMutations, 0);
   assert.equal(result.malformed.rootDelegationStatus, "interrupted");
   assert.equal(result.malformed.dependentStatus, "backlog");
+  assert.equal(result.uncorrelated.dependentStatus, "backlog");
+  assert.equal(result.uncorrelated.handoffCount, 0);
+  assert.equal(result.uncorrelated.retainedEvidenceCount > 0, true);
+  assert.equal(result.blockedReview.reviewOutcome, "blocked");
+  assert.equal(result.blockedReview.rootStatus, "blocked");
+  assert.equal(result.blockedReview.dependentStatus, "backlog");
+  assert.equal(result.blockedReview.handoffCount, 1);
 
   const primaryReviews = result.state.reviews.filter((review) => review.missionId === M2_FIXTURE.missionId);
   assert.deepEqual(
@@ -22,4 +31,6 @@ test("M2 reset fixture unlocks reviewed dependencies and preserves failure histo
     ["accepted", "changes_requested", "accepted", "accepted"],
   );
   assert.equal(result.state.missions.some((mission) => mission.id === M2_FIXTURE.malformedMissionId), true);
+  assert.equal(result.state.missions.some((mission) => mission.id === M2_FIXTURE.uncorrelatedMissionId), true);
+  assert.equal(result.state.missions.some((mission) => mission.id === M2_FIXTURE.blockedReviewMissionId), true);
 });

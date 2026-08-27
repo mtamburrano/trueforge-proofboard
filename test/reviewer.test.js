@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  DeterministicImplementationVerifier,
   InMemoryMissionRepository,
   JsonMissionRepository,
   MissionDomainError,
@@ -26,7 +27,12 @@ function domainError(code) {
   return (error) => error instanceof MissionDomainError && error.code === code;
 }
 
-async function reviewFixture({ repository = new InMemoryMissionRepository(), includeDiff = true } = {}) {
+async function reviewFixture({
+  repository = new InMemoryMissionRepository(),
+  includeDiff = true,
+  diffCommand = "git diff",
+  diffOutput = "diff --git a/src/index.ts b/src/index.ts\n--- a/src/index.ts\n+++ b/src/index.ts\n@@ -1 +1,2 @@\n before\n+after",
+} = {}) {
   const missions = new MissionService(repository, fixedClock);
   const mission = await missions.createMission({
     id: "mission-reviewer",
@@ -80,6 +86,10 @@ async function reviewFixture({ repository = new InMemoryMissionRepository(), inc
       result: "passed",
       source: "trueforge",
       summary: "The delegated execution returned the changed-file diff.",
+      details: JSON.stringify({
+        command: diffCommand,
+        output: diffOutput,
+      }),
       executionOrigin: { ...ORIGIN, toolCallId: "call-review-diff" },
     });
     evidenceIds.push(diff.id);
@@ -150,6 +160,44 @@ test("independent review rejects an apparently successful handoff without diff e
   const state = await missions.getState();
   assert.equal(state.reviews.length, 0);
   assert.equal(state.workItems[0].status, "ready_for_review");
+});
+
+test("independent review rejects metadata-only changed-state evidence", async () => {
+  const { missions, mission, workItem } = await reviewFixture({
+    diffCommand: "git diff --stat",
+    diffOutput: " src/index.ts | 2 ++\n 1 file changed, 2 insertions(+)",
+  });
+
+  await assert.rejects(
+    missions.getReviewContext(mission.id, workItem.id),
+    (error) => domainError("invalid_transition")(error) && /content-bearing/.test(error.message),
+  );
+  assert.equal((await missions.getWorkItem(mission.id, workItem.id)).status, "ready_for_review");
+});
+
+test("deterministic verifier derives acceptance, changes, and blocking from review context", async () => {
+  const { missions, mission, workItem } = await reviewFixture();
+  const context = await missions.getReviewContext(mission.id, workItem.id);
+  const verifier = new DeterministicImplementationVerifier();
+
+  assert.equal(verifier.review(context).outcome, "accepted");
+  const metadataOnly = {
+    ...context,
+    evidence: context.evidence.map((evidence) => evidence.kind === "diff_summary"
+      ? {
+          ...evidence,
+          details: JSON.stringify({
+            command: "git diff --stat",
+            output: " src/index.ts | 2 ++",
+          }),
+        }
+      : evidence),
+  };
+  assert.equal(verifier.review(metadataOnly).outcome, "changes_requested");
+  assert.equal(verifier.review({
+    ...context,
+    handoff: { ...context.handoff, openQuestions: ["Confirm the intended compatibility boundary."] },
+  }).outcome, "blocked");
 });
 
 test("independent review accepts adequate proof and persists the reviewed state", async () => {

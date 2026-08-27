@@ -14,6 +14,8 @@ import {
 export const M2_FIXTURE = Object.freeze({
   missionId: "mission-m2-dependent-loop",
   malformedMissionId: "mission-m2-malformed-loop",
+  uncorrelatedMissionId: "mission-m2-uncorrelated-loop",
+  blockedReviewMissionId: "mission-m2-blocked-review-loop",
   sessionId: "session-m2-dependent-loop",
   repository: { owner: "fixture", name: "proof-board", ref: "m2-reset" },
   graph: {
@@ -116,7 +118,7 @@ function delegatedEvents(attempt, { malformedCompletion = false } = {}) {
           id: `call-diff-${attempt}`,
           function: {
             name: "exec",
-            arguments: JSON.stringify({ command: "git diff --stat" }),
+            arguments: JSON.stringify({ command: "git diff" }),
           },
         },
       ],
@@ -129,7 +131,7 @@ function delegatedEvents(attempt, { malformedCompletion = false } = {}) {
     response(
       `event-diff-response-${attempt}`,
       `call-diff-${attempt}`,
-      ` ${sourceFile}       | 2 ++\n ${testFile} | 1 +\n 2 files changed, 3 insertions(+)`,
+      `diff --git a/${sourceFile} b/${sourceFile}\nindex 1111111..2222222 100644\n--- a/${sourceFile}\n+++ b/${sourceFile}\n@@ -1 +1,2 @@\n export const before = true;\n+export const after = true;\ndiff --git a/${testFile} b/${testFile}\nindex 3333333..4444444 100644\n--- a/${testFile}\n+++ b/${testFile}\n@@ -1 +1,2 @@\n test(\"before\", () => {});\n+test(\"after\", () => {});`,
     ),
     {
       type: "thread.done",
@@ -283,6 +285,139 @@ async function runMalformedScenario(repository) {
   };
 }
 
+function twoNodeScenarioGraph(prefix) {
+  return {
+    items: [
+      {
+        ...M2_FIXTURE.graph.items[0],
+        id: `${prefix}-root`,
+      },
+      {
+        ...M2_FIXTURE.graph.items[1],
+        id: `${prefix}-dependent`,
+        dependsOn: [`${prefix}-root`],
+      },
+    ],
+  };
+}
+
+async function runUncorrelatedEvidenceScenario(repository) {
+  const missions = new MissionService(repository, fixedClock);
+  const { client } = fakeClient({ sessionId: "session-m2-uncorrelated-loop" });
+  const runner = runnerFor(missions, client);
+  const mission = await runner.createMission({
+    id: M2_FIXTURE.uncorrelatedMissionId,
+    objective: "Keep cross-thread proof from unlocking a dependent.",
+    repository: M2_FIXTURE.repository,
+  });
+  await missions.transitionMission(mission.id, "planning");
+  await missions.transitionMission(mission.id, "executing");
+  await missions.persistWorkGraph(mission.id, twoNodeScenarioGraph("m2-uncorrelated"));
+  await missions.transitionWorkItem(mission.id, "m2-uncorrelated-root", "in_progress");
+  const execution = await runner.runTurn(
+    mission.id,
+    "Produce valid child execution history before the forged proof attempt.",
+    { workItemId: "m2-uncorrelated-root", delegateToSubagent: true },
+  );
+  const draft = execution.implementationHandoff;
+  assert.ok(draft);
+  const childHistoryIds = [...draft.evidenceIds];
+  const forged = await missions.addEvidence(mission.id, {
+    workItemId: "m2-uncorrelated-root",
+    kind: "typecheck_result",
+    result: "passed",
+    source: "trueforge",
+    summary: "A parent-thread check must not prove delegated work.",
+    executionOrigin: {
+      kind: "trueforge",
+      sessionId: draft.executionOrigin.sessionId,
+      turnId: draft.executionOrigin.turnId,
+      threadId: "thread-parent-forged-proof",
+      toolCallId: "call-parent-forged-proof",
+    },
+  });
+  const forgedChecks = draft.checks.map((check, index) => index === 0
+    ? { ...check, evidenceIds: [forged.id] }
+    : check);
+  await assert.rejects(
+    missions.recordHandoff(mission.id, {
+      workItemId: "m2-uncorrelated-root",
+      result: "done",
+      summary: "This handoff must be rejected because one required check is cross-thread.",
+      filesChanged: draft.filesChanged,
+      testsRun: [...new Set(forgedChecks.map((check) => check.command))],
+      decisions: draft.decisions,
+      openQuestions: draft.openQuestions,
+      memoryImpact: "medium",
+      diffSummary: draft.diffSummary,
+      checks: forgedChecks,
+      evidenceIds: [...new Set([...draft.evidenceIds, forged.id])],
+      executionOrigin: draft.executionOrigin,
+    }),
+    (error) => domainError("invalid_input")(error) && /different execution thread/.test(error.message),
+  );
+  const state = await missions.getState();
+  assert.equal(childHistoryIds.every((id) => state.evidence.some((item) => item.id === id)), true);
+  assert.equal(state.evidence.some((item) => item.id === forged.id), true);
+  assert.equal(state.handoffs.some((item) => item.missionId === mission.id), false);
+  assert.equal(await missions.canStartWorkItem(mission.id, "m2-uncorrelated-dependent"), false);
+  await assert.rejects(
+    missions.transitionWorkItem(mission.id, "m2-uncorrelated-dependent", "ready"),
+    domainError("dependency_blocked"),
+  );
+  return {
+    missionId: mission.id,
+    retainedEvidenceCount: state.evidence.filter((item) => item.missionId === mission.id).length,
+    dependentStatus: state.workItems.find((item) => item.id === "m2-uncorrelated-dependent").status,
+    handoffCount: state.handoffs.filter((item) => item.missionId === mission.id).length,
+  };
+}
+
+async function runBlockedReviewScenario(repository) {
+  const missions = new MissionService(repository, fixedClock);
+  const { client } = fakeClient({ sessionId: "session-m2-blocked-review-loop" });
+  const runner = runnerFor(missions, client);
+  const mission = await runner.createMission({
+    id: M2_FIXTURE.blockedReviewMissionId,
+    objective: "Keep a blocked review from unlocking a dependent.",
+    repository: M2_FIXTURE.repository,
+  });
+  await missions.transitionMission(mission.id, "planning");
+  await missions.transitionMission(mission.id, "executing");
+  await missions.persistWorkGraph(mission.id, twoNodeScenarioGraph("m2-blocked"));
+  await runImplementation(missions, runner, mission.id, "m2-blocked-root", "blocked-root");
+  const historyBeforeReview = {
+    handoffs: (await missions.listHandoffs(mission.id, "m2-blocked-root")).length,
+    evidence: (await missions.listEvidence(mission.id, "m2-blocked-root")).length,
+  };
+  const review = await missions.reviewWorkItem(mission.id, {
+    workItemId: "m2-blocked-root",
+    outcome: "blocked",
+    reviewer: "independent-verifier",
+    summary: "Independent verification blocked the fixture attempt.",
+    finding: "The bounded content diff exposes an unresolved compatibility risk.",
+  });
+  assert.equal((await missions.getWorkItem(mission.id, "m2-blocked-root")).status, "blocked");
+  assert.equal(await missions.canStartWorkItem(mission.id, "m2-blocked-dependent"), false);
+  await assert.rejects(
+    missions.transitionWorkItem(mission.id, "m2-blocked-dependent", "ready"),
+    domainError("dependency_blocked"),
+  );
+  const state = await missions.getState();
+  assert.equal(state.handoffs.filter((item) => item.missionId === mission.id).length, historyBeforeReview.handoffs);
+  assert.equal(
+    state.evidence.filter((item) => item.missionId === mission.id).length,
+    historyBeforeReview.evidence + 1,
+  );
+  return {
+    missionId: mission.id,
+    reviewOutcome: review.outcome,
+    rootStatus: state.workItems.find((item) => item.id === "m2-blocked-root").status,
+    dependentStatus: state.workItems.find((item) => item.id === "m2-blocked-dependent").status,
+    handoffCount: state.handoffs.filter((item) => item.missionId === mission.id).length,
+  };
+}
+
 export async function runM2Integration() {
   const directory = await mkdtemp(path.join(os.tmpdir(), "trueforge-proofboard-m2-reset-"));
   const statePath = path.join(directory, "mission-state.json");
@@ -367,6 +502,8 @@ export async function runM2Integration() {
     await missions.transitionMission(mission.id, "verifying");
 
     const malformed = await runMalformedScenario(repository);
+    const uncorrelated = await runUncorrelatedEvidenceScenario(repository);
+    const blockedReview = await runBlockedReviewScenario(repository);
     const reconnected = new MissionService(repository, fixedClock);
     const restored = await reconnected.getState();
     const restoredMission = restored.missions.find((item) => item.id === mission.id);
@@ -398,6 +535,8 @@ export async function runM2Integration() {
     return {
       state: restored,
       malformed,
+      uncorrelated,
+      blockedReview,
       summary: {
         resetFixture: "fresh temporary JSON state; removed after the run",
         missionId: mission.id,
@@ -407,6 +546,10 @@ export async function runM2Integration() {
         changesRequestedPreservedHistory: true,
         malformedDelegationDidNotUnlockDependent: malformed.rootDelegationStatus === "interrupted" &&
           malformed.dependentStatus === "backlog",
+        uncorrelatedEvidenceDidNotUnlockDependent: uncorrelated.handoffCount === 0 &&
+          uncorrelated.dependentStatus === "backlog",
+        blockedReviewDidNotUnlockDependent: blockedReview.reviewOutcome === "blocked" &&
+          blockedReview.dependentStatus === "backlog",
         handoffCount: restored.handoffs.filter((item) => item.missionId === mission.id).length,
         reviewCount: restored.reviews.filter((item) => item.missionId === mission.id).length,
         evidenceCount: restored.evidence.filter((item) => item.missionId === mission.id).length,

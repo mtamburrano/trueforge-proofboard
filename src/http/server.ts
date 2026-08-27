@@ -8,11 +8,13 @@ import {
   MissionService,
   MissionState,
   Review,
+  ReviewContext,
+  ReviewOutcome,
   WorkItem,
+  validateWorkGraph,
 } from "../domain.js";
 import {
   buildPreflightWorkGraph,
-  PRIMARY_WORK_GRAPH_IDS,
   RepositoryInspectionInput,
   RepositoryWorkGraphPlanner,
   SandboxVerificationInput,
@@ -30,8 +32,6 @@ export const PRIMARY_REPOSITORY = {
   name: "trueforge-proofboard",
   ref: "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b",
 } as const;
-
-const WORK = PRIMARY_WORK_GRAPH_IDS;
 
 export const PRIMARY_MISSION_VERIFICATION_SCRIPT = [
   'import assert from "node:assert/strict";',
@@ -131,6 +131,58 @@ export interface MissionHttpOptions {
   missions: MissionService;
   runner: MissionRunner;
   planner?: WorkGraphPlanner;
+  verifier?: ImplementationVerifier;
+}
+
+export interface ImplementationReviewDecision {
+  outcome: ReviewOutcome;
+  reviewer: string;
+  summary: string;
+  finding: string;
+}
+
+export interface ImplementationVerifier {
+  review(
+    context: ReviewContext,
+  ): ImplementationReviewDecision | Promise<ImplementationReviewDecision>;
+}
+
+export class DeterministicImplementationVerifier implements ImplementationVerifier {
+  review(context: ReviewContext): ImplementationReviewDecision {
+    const missingRequiredCheck = context.checks.find((check) =>
+      check.required && check.result !== "passed"
+    );
+    if (missingRequiredCheck !== undefined) {
+      return {
+        outcome: "blocked",
+        reviewer: "independent-verifier",
+        summary: "Independent verification found incomplete required proof.",
+        finding: `Required check ${missingRequiredCheck.name} is ${missingRequiredCheck.result}.`,
+      };
+    }
+    if (!context.evidence.some(isContentBearingReviewEvidence)) {
+      return {
+        outcome: "changes_requested",
+        reviewer: "independent-verifier",
+        summary: "Independent verification could not inspect the changed content.",
+        finding: "Provide a bounded content diff; status, file names, or diff statistics are insufficient.",
+      };
+    }
+    if (context.handoff.openQuestions.length > 0) {
+      return {
+        outcome: "blocked",
+        reviewer: "independent-verifier",
+        summary: "Independent verification found unresolved implementation uncertainty.",
+        finding: context.handoff.openQuestions.join(" "),
+      };
+    }
+    return {
+      outcome: "accepted",
+      reviewer: "independent-verifier",
+      summary: "Independent verification inspected the bounded content diff and correlated checks.",
+      finding: `No blocking findings; ${context.checks.filter((check) => check.required).length} required checks passed.`,
+    };
+  }
 }
 
 export interface EvidenceView {
@@ -257,6 +309,7 @@ class MissionController {
     private readonly missions: MissionService,
     private readonly runner: MissionRunner,
     private readonly planner: WorkGraphPlanner = new RepositoryWorkGraphPlanner(),
+    private readonly verifier: ImplementationVerifier = new DeterministicImplementationVerifier(),
   ) {}
 
   async getPrimaryMission(): Promise<MissionView | null> {
@@ -305,64 +358,84 @@ class MissionController {
   private async ensureWorkItems(): Promise<void> {
     const state = await this.missions.getState();
     const workItems = state.workItems.filter((item) => item.missionId === PRIMARY_MISSION_ID);
-    const implementer = workItems.find((item) => item.id === WORK.implement);
-    const hasValidatedGraph = workItems.length === 3 &&
-      workItems.every((item) =>
-        item.acceptanceCriteria.length > 0 &&
-        item.assignedRole !== undefined,
-      ) &&
-      workItems.some((item) => item.id === WORK.inspect) &&
-      workItems.some((item) => item.id === WORK.implement) &&
-      workItems.some((item) => item.id === WORK.verify) &&
-      implementer?.requiredChecks?.includes("typecheck") === true &&
-      implementer.requiredChecks.includes("test");
-    if (!hasValidatedGraph) {
-      const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
-      await this.missions.persistWorkGraph(
-        PRIMARY_MISSION_ID,
-        buildPreflightWorkGraph(mission),
-      );
+    if (workItems.length > 0) {
+      validateWorkGraph({ items: workItems });
+      return;
     }
+    const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
+    await this.missions.persistWorkGraph(
+      PRIMARY_MISSION_ID,
+      buildPreflightWorkGraph(mission),
+    );
   }
 
   private async executePrimaryMission(): Promise<MissionView> {
     await this.createOrOpenPrimaryMission();
     await this.prepareMissionForExecution();
     try {
+      let state = await this.missions.getState();
+      const inspectionItems = state.workItems.filter((item) =>
+        item.missionId === PRIMARY_MISSION_ID &&
+        item.assignedRole === "planner" &&
+        item.dependsOn.length === 0
+      );
+      if (inspectionItems.length !== 1 || inspectionItems[0] === undefined) {
+        throw new MissionControlError(
+          "Planning requires exactly one executable repository-inspection root.",
+        );
+      }
+      const inspectionItem = inspectionItems[0];
       let inspectionResult: unknown;
-      await this.executeWork(WORK.inspect, async () => {
+      await this.executeWork(inspectionItem.id, async () => {
         inspectionResult = await this.runner.inspectRepository({
           missionId: PRIMARY_MISSION_ID,
-          workItemId: WORK.inspect,
+          workItemId: inspectionItem.id,
         });
-        await this.requirePassedEvidence(WORK.inspect, "mcp");
+        await this.requirePassedEvidence(inspectionItem.id, "mcp");
       });
-      await this.persistInspectedWorkGraph(inspectionResult);
-      await this.executeWork(WORK.implement, async () => {
-        const execution = await this.runner.runTurn(
-          PRIMARY_MISSION_ID,
-          [
-            "Implement the mission objective in the configured sandbox using the verified pinned source.",
-            "Keep the change limited to src/index.ts and test/index.test.js.",
-            "Add direct focused assertions in test/index.test.js for every Plan, Execute, Prove, and Approve transition so the verification can correlate the changed helper with its coverage.",
-            "Do not push, open a pull request, or perform any other remote mutation.",
-          ].join(" "),
-          { workItemId: WORK.implement, delegateToSubagent: true },
+      await this.persistInspectedWorkGraph(inspectionResult, inspectionItem.id);
+
+      state = await this.missions.getState();
+      const implementers = state.workItems.filter((item) =>
+        item.missionId === PRIMARY_MISSION_ID && item.assignedRole === "implementer"
+      );
+      const reviewers = state.workItems.filter((item) =>
+        item.missionId === PRIMARY_MISSION_ID && item.assignedRole === "reviewer"
+      );
+      if (implementers.length === 0 || reviewers.length === 0) {
+        throw new MissionControlError(
+          "Planning must produce bounded implementation and verification work.",
         );
-        await this.requirePassedTurn(WORK.implement);
-        if (execution.implementationHandoff !== undefined) {
-          await this.recordImplementationHandoff(execution);
-        }
-      }, false);
-      await this.reviewImplementation();
-      await this.executeWork(WORK.verify, async () => {
-        await this.runner.runSandboxVerification({
-          missionId: PRIMARY_MISSION_ID,
-          workItemId: WORK.verify,
-          command: PRIMARY_VERIFICATION_COMMAND,
+      }
+      for (const implementer of implementers) {
+        await this.executeWork(implementer.id, async () => {
+          const execution = await this.runner.runTurn(
+            PRIMARY_MISSION_ID,
+            [
+              `Execute only this bounded work item: ${implementer.purpose}`,
+              `Acceptance criteria: ${implementer.acceptanceCriteria.join(" ")}`,
+              "Use the configured sandbox and verified pinned source.",
+              "Do not push, open a pull request, or perform any other remote mutation.",
+            ].join(" "),
+            { workItemId: implementer.id, delegateToSubagent: true },
+          );
+          await this.requirePassedTurn(implementer.id);
+          if (execution.implementationHandoff !== undefined) {
+            await this.recordImplementationHandoff(execution, implementer.id);
+          }
+        }, false);
+        await this.reviewImplementation(implementer.id);
+      }
+      for (const reviewer of reviewers) {
+        await this.executeWork(reviewer.id, async () => {
+          await this.runner.runSandboxVerification({
+            missionId: PRIMARY_MISSION_ID,
+            workItemId: reviewer.id,
+            command: PRIMARY_VERIFICATION_COMMAND,
+          });
+          await this.requirePassedEvidence(reviewer.id, "sandbox");
         });
-        await this.requirePassedEvidence(WORK.verify, "sandbox");
-      });
+      }
 
       const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
       if (mission.status === "executing") {
@@ -375,7 +448,10 @@ class MissionController {
     }
   }
 
-  private async recordImplementationHandoff(execution: TrueForgeTurnResult): Promise<void> {
+  private async recordImplementationHandoff(
+    execution: TrueForgeTurnResult,
+    workItemId: string,
+  ): Promise<void> {
     const draft = execution.implementationHandoff;
     if (draft === undefined) {
       return;
@@ -384,7 +460,7 @@ class MissionController {
       .filter((check) => check.required)
       .every((check) => check.result === "passed");
     await this.missions.recordHandoff(PRIMARY_MISSION_ID, {
-      workItemId: WORK.implement,
+      workItemId,
       result: requiredChecksPassed ? "done" : "partial",
       summary: requiredChecksPassed
         ? "The delegated implementation returned a structured evidence handoff."
@@ -402,8 +478,8 @@ class MissionController {
     });
   }
 
-  private async reviewImplementation(): Promise<void> {
-    const workItem = await this.missions.getWorkItem(PRIMARY_MISSION_ID, WORK.implement);
+  private async reviewImplementation(workItemId: string): Promise<void> {
+    const workItem = await this.missions.getWorkItem(PRIMARY_MISSION_ID, workItemId);
     if (workItem.status === "complete") {
       return;
     }
@@ -413,21 +489,29 @@ class MissionController {
       );
     }
     if (workItem.delegation === undefined) {
-      await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, WORK.implement, "complete");
+      await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, workItemId, "complete");
       return;
     }
-    const context = await this.missions.getReviewContext(PRIMARY_MISSION_ID, WORK.implement);
-    const changedFiles = context.filesChanged.join(", ");
+    const context = await this.missions.getReviewContext(PRIMARY_MISSION_ID, workItemId);
+    const decision = await this.verifier.review(context);
     await this.missions.reviewWorkItem(PRIMARY_MISSION_ID, {
-      workItemId: WORK.implement,
-      outcome: "accepted",
-      reviewer: "independent-verifier",
-      summary: `Independent verification reviewed the changed state for ${changedFiles}.`,
-      finding: `No blocking findings; ${context.checks.filter((check) => check.required).length} required checks passed against the correlated handoff evidence.`,
+      workItemId,
+      outcome: decision.outcome,
+      reviewer: decision.reviewer,
+      summary: decision.summary,
+      finding: decision.finding,
     });
+    if (decision.outcome !== "accepted") {
+      throw new MissionControlError(
+        `Independent verification returned ${decision.outcome}: ${decision.finding}`,
+      );
+    }
   }
 
-  private async persistInspectedWorkGraph(inspectionResult: unknown): Promise<void> {
+  private async persistInspectedWorkGraph(
+    inspectionResult: unknown,
+    inspectionWorkItemId: string,
+  ): Promise<void> {
     const state = await this.missions.getState();
     const mission = state.missions.find((item) => item.id === PRIMARY_MISSION_ID);
     if (mission === undefined) {
@@ -437,7 +521,7 @@ class MissionController {
       inspectionResult,
       state,
       mission,
-      WORK.inspect,
+      inspectionWorkItemId,
     );
     try {
       const graph = await this.planner.plan({ mission, inspection });
@@ -676,8 +760,18 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
   const passedEvidence = evidence.filter((item) => item.result === "passed").length;
   const failedEvidence = evidence.filter((item) => item.result === "failed").length;
   const completed = workItems.filter((item) => item.status === "complete").length;
-  const repositoryProof = latestProofResult(missionEvidence, WORK.inspect, "mcp");
-  const sandboxProof = latestProofResult(missionEvidence, WORK.verify, "sandbox");
+  const repositoryProof = latestProofResultForRole(
+    missionEvidence,
+    workItems,
+    "planner",
+    "mcp",
+  );
+  const sandboxProof = latestProofResultForRole(
+    missionEvidence,
+    workItems,
+    "reviewer",
+    "sandbox",
+  );
   const currentProofFailed = repositoryProof === "failed" || sandboxProof === "failed";
   const currentProofPassed = repositoryProof === "passed" && sandboxProof === "passed";
   const verification = mission.status === "failed" || mission.status === "blocked"
@@ -814,16 +908,18 @@ function lane(id: "plan" | "execute" | "prove" | "approve", label: string, items
   };
 }
 
-function latestProofResult(
+function latestProofResultForRole(
   evidence: Evidence[],
-  workItemId: string,
+  workItems: WorkItem[],
+  role: "planner" | "implementer" | "reviewer",
   source: "mcp" | "sandbox",
 ): Evidence["result"] | undefined {
+  const workItemIds = new Set(
+    workItems.filter((item) => item.assignedRole === role).map((item) => item.id),
+  );
   let latest: Evidence["result"] | undefined;
-  // Evidence is appended through MissionService mutations, so array order is the
-  // durable operation order even when several records share the same timestamp.
   for (const item of evidence) {
-    if (item.workItemId === workItemId && item.source === source) {
+    if (item.workItemId !== undefined && workItemIds.has(item.workItemId) && item.source === source) {
       latest = item.result;
     }
   }
@@ -926,8 +1022,36 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function isContentBearingReviewEvidence(evidence: Evidence): boolean {
+  if (
+    (evidence.kind !== "diff_summary" && evidence.kind !== "file_change") ||
+    evidence.result !== "passed" ||
+    evidence.details === undefined
+  ) {
+    return false;
+  }
+  try {
+    const details = JSON.parse(evidence.details) as unknown;
+    if (!isRecord(details) || typeof details.output !== "string") {
+      return false;
+    }
+    const command = typeof details.command === "string" ? details.command : "";
+    return /\bgit\s+diff\b/.test(command) &&
+      !/\s--(?:stat|shortstat|numstat|name-only|name-status|summary|check)\b/.test(command) &&
+      /^diff --git a\/.+ b\/.+$/m.test(details.output) &&
+      /^@@\s/m.test(details.output);
+  } catch {
+    return false;
+  }
+}
+
 export function createMissionHttpApp(options: MissionHttpOptions) {
-  const controller = new MissionController(options.missions, options.runner, options.planner);
+  const controller = new MissionController(
+    options.missions,
+    options.runner,
+    options.planner,
+    options.verifier,
+  );
   return {
     request(path: string, init?: RequestInit) {
       return handle(new Request(new URL(path, "http://mission.local"), init));

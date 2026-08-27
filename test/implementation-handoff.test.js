@@ -56,7 +56,7 @@ async function delegatedFixture(repository = new InMemoryMissionRepository()) {
   return { missions, mission, workItem };
 }
 
-async function addEvidence(missions, missionId, id, kind, result, toolCallId) {
+async function addEvidence(missions, missionId, id, kind, result, toolCallId, origin = ORIGIN) {
   return missions.addEvidence(missionId, {
     id,
     workItemId: "work-implementation-handoff",
@@ -64,7 +64,13 @@ async function addEvidence(missions, missionId, id, kind, result, toolCallId) {
     result,
     source: "trueforge",
     summary: `${kind} ${result}`,
-    executionOrigin: { ...ORIGIN, toolCallId },
+    ...(kind === "diff_summary" ? {
+      details: JSON.stringify({
+        command: "git diff",
+        output: "diff --git a/src/index.ts b/src/index.ts\n--- a/src/index.ts\n+++ b/src/index.ts\n@@ -1 +1,2 @@\n before\n+after",
+      }),
+    } : {}),
+    executionOrigin: { ...origin, toolCallId },
   });
 }
 
@@ -113,12 +119,12 @@ function fakeStream(events) {
   };
 }
 
-function delegatedExecutionEvents() {
+function delegatedExecutionEvents({ proofThreadId = ORIGIN.threadId } = {}) {
   const response = (id, callId, output) => ({
     type: "tool.response",
     id,
     createdAt: "2026-08-27T13:00:02.000Z",
-    threadId: "thread-handoff",
+    threadId: proofThreadId,
     toolCallId: callId,
     content: JSON.stringify({
       success: true,
@@ -149,14 +155,14 @@ function delegatedExecutionEvents() {
       type: "model.message",
       id: "event-model",
       createdAt: "2026-08-27T13:00:01.500Z",
-      threadId: "thread-handoff",
+      threadId: proofThreadId,
       toolCalls: [
         { id: "call-checks", function: { name: "exec", arguments: JSON.stringify({ command: "npm run typecheck && npm test" }) } },
-        { id: "call-diff", function: { name: "exec", arguments: JSON.stringify({ command: "git diff --stat" }) } },
+        { id: "call-diff", function: { name: "exec", arguments: JSON.stringify({ command: "git diff" }) } },
       ],
     },
     response("event-check-response", "call-checks", "typecheck passed\ntests passed\n"),
-    response("event-diff-response", "call-diff", " src/index.ts       | 2 ++\n test/index.test.js | 1 +\n 2 files changed, 3 insertions(+)") ,
+    response("event-diff-response", "call-diff", "diff --git a/src/index.ts b/src/index.ts\nindex 1111111..2222222 100644\n--- a/src/index.ts\n+++ b/src/index.ts\n@@ -1 +1,2 @@\n export const value = 1;\n+export const next = 2;\ndiff --git a/test/index.test.js b/test/index.test.js\nindex 3333333..4444444 100644\n--- a/test/index.test.js\n+++ b/test/index.test.js\n@@ -1 +1,2 @@\n test(\"value\", () => {});\n+test(\"next\", () => {});") ,
     {
       type: "thread.done",
       id: "event-thread-done",
@@ -363,6 +369,65 @@ test("uncorrelated evidence is rejected atomically while prior history is preser
   assert.equal(state.handoffs.length, 0);
 });
 
+test("cross-thread proof is rejected while a prior valid handoff remains durable", async () => {
+  const { missions, mission, workItem } = await delegatedFixture();
+  const priorIds = {
+    typecheck: (await addEvidence(missions, mission.id, "evidence-prior-typecheck", "typecheck_result", "passed", "call-prior-typecheck")).id,
+    test: (await addEvidence(missions, mission.id, "evidence-prior-test", "test_result", "passed", "call-prior-test")).id,
+    diff: (await addEvidence(missions, mission.id, "evidence-prior-diff", "diff_summary", "passed", "call-prior-diff")).id,
+  };
+  const prior = await missions.recordHandoff(mission.id, {
+    ...validHandoff(priorIds),
+    id: "handoff-prior-valid",
+  });
+
+  const retryOrigin = {
+    kind: "trueforge",
+    sessionId: ORIGIN.sessionId,
+    turnId: "turn-retry",
+    threadId: "thread-retry",
+  };
+  const parentOrigin = { ...retryOrigin, threadId: "thread-parent" };
+  await missions.startWorkItemDelegation(mission.id, workItem.id, {
+    owner: "bounded-implementer",
+    threadId: retryOrigin.threadId,
+    turnId: retryOrigin.turnId,
+  });
+  await missions.completeWorkItemDelegation(mission.id, workItem.id, {
+    threadId: retryOrigin.threadId,
+    turnId: retryOrigin.turnId,
+  });
+  const retryIds = {
+    typecheck: (await addEvidence(missions, mission.id, "evidence-retry-typecheck", "typecheck_result", "passed", "call-retry-typecheck", parentOrigin)).id,
+    test: (await addEvidence(missions, mission.id, "evidence-retry-test", "test_result", "passed", "call-retry-test", parentOrigin)).id,
+    diff: (await addEvidence(missions, mission.id, "evidence-retry-diff", "diff_summary", "passed", "call-retry-diff", parentOrigin)).id,
+  };
+  const childRuntime = await addEvidence(
+    missions,
+    mission.id,
+    "evidence-retry-child-runtime",
+    "tool_result",
+    "informational",
+    "call-retry-child",
+    retryOrigin,
+  );
+
+  await assert.rejects(
+    missions.recordHandoff(mission.id, {
+      ...validHandoff(retryIds),
+      id: "handoff-retry-cross-thread",
+      evidenceIds: [...Object.values(retryIds), childRuntime.id],
+      executionOrigin: retryOrigin,
+    }),
+    (error) => domainError("invalid_input")(error) && /different execution thread/.test(error.message),
+  );
+
+  const state = await missions.getState();
+  assert.deepEqual(state.handoffs.map((handoff) => handoff.id), [prior.id]);
+  assert.equal(state.evidence.some((evidence) => evidence.id === retryIds.diff), true);
+  assert.equal(state.workItems[0].delegation.threadId, retryOrigin.threadId);
+});
+
 test("TrueForge derives a structured handoff only from delegated tool responses", async () => {
   const missions = new MissionService(new InMemoryMissionRepository(), fixedClock);
   const events = delegatedExecutionEvents();
@@ -406,7 +471,7 @@ test("TrueForge derives a structured handoff only from delegated tool responses"
   assert.deepEqual(result.implementationHandoff.filesChanged, ["src/index.ts", "test/index.test.js"]);
   assert.deepEqual(result.implementationHandoff.checks.map((check) => check.result), ["passed", "passed"]);
   assert.equal(result.implementationHandoff.executionOrigin.threadId, ORIGIN.threadId);
-  assert.match(result.implementationHandoff.diffSummary, /files changed/);
+  assert.match(result.implementationHandoff.diffSummary, /diff --git a\/src\/index\.ts/);
   const handoff = await missions.recordHandoff(mission.id, {
     workItemId: workItem.id,
     result: "done",
@@ -423,4 +488,56 @@ test("TrueForge derives a structured handoff only from delegated tool responses"
   });
   await missions.transitionWorkItem(mission.id, workItem.id, "ready_for_review");
   assert.equal(handoff.result, "done");
+});
+
+test("coordinator-thread checks and diff cannot prove delegated completion", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository(), fixedClock);
+  const events = delegatedExecutionEvents({ proofThreadId: "thread-parent" });
+  const client = {
+    sessions: {
+      async create() {
+        return { data: { id: ORIGIN.sessionId } };
+      },
+      async get(sessionId) {
+        return { data: { id: sessionId } };
+      },
+      async createTurnStream() {
+        return fakeStream(events);
+      },
+    },
+  };
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "alibaba/qwen3-7-plus",
+    dynamicSubAgents: true,
+  });
+  const mission = await runner.createMission({
+    id: "mission-parent-proof",
+    objective: "Reject proof produced outside the delegated thread.",
+  });
+  const workItem = await missions.addWorkItem(mission.id, {
+    id: "work-parent-proof",
+    title: "Implement through the child",
+    purpose: "Require child-thread proof.",
+    acceptanceCriteria: ["The child produces correlated checks and a diff."],
+    requiredChecks: ["typecheck", "test"],
+    assignedRole: "implementer",
+    status: "ready",
+  });
+  await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
+
+  const result = await runner.runTurn(
+    mission.id,
+    "Implement the bounded change.",
+    { workItemId: workItem.id, delegateToSubagent: true },
+  );
+
+  assert.equal(result.implementationHandoff, undefined);
+  await assert.rejects(
+    missions.transitionWorkItem(mission.id, workItem.id, "ready_for_review"),
+    domainError("invalid_transition"),
+  );
+  const state = await missions.getState();
+  assert.equal(state.workItems[0].delegation.status, "completed");
+  assert.equal(state.workItems[0].status, "in_progress");
+  assert.equal(state.evidence.some((item) => item.kind === "diff_summary"), false);
 });

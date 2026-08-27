@@ -1399,6 +1399,14 @@ function validateStructuredHandoffCorrelation(
     return;
   }
   const evidenceById = new Map(state.evidence.map((item) => [item.id, item]));
+  const matchesHandoffOrigin = (evidence: Evidence): boolean => {
+    const evidenceOrigin = evidence.executionOrigin;
+    const handoffOrigin = structured.executionOrigin;
+    return evidenceOrigin !== undefined &&
+      evidenceOrigin.sessionId === handoffOrigin.sessionId &&
+      (handoffOrigin.turnId === undefined || evidenceOrigin.turnId === handoffOrigin.turnId) &&
+      (handoffOrigin.threadId === undefined || evidenceOrigin.threadId === handoffOrigin.threadId);
+  };
   const linkedEvidence = structured.evidenceIds.map((evidenceId) => {
     const evidence = evidenceById.get(evidenceId);
     if (
@@ -1477,6 +1485,15 @@ function validateStructuredHandoffCorrelation(
     }
     const checkEvidence = check.evidenceIds.map((evidenceId) => evidenceById.get(evidenceId));
     if (
+      check.result !== "not_run" &&
+      checkEvidence.some((evidence) => evidence === undefined || !matchesHandoffOrigin(evidence))
+    ) {
+      return fail(
+        "invalid_input",
+        `Handoff ${handoff.id} uses ${check.name} evidence from a different execution thread.`,
+      );
+    }
+    if (
       check.result === "passed" &&
       !checkEvidence.some((evidence) => evidence?.result === "passed")
     ) {
@@ -1488,6 +1505,16 @@ function validateStructuredHandoffCorrelation(
     ) {
       return fail("invalid_input", `Handoff ${handoff.id} marks ${check.name} failed without failed evidence.`);
     }
+  }
+
+  const changedStateEvidence = linkedEvidence.filter((evidence) =>
+    evidence.kind === "diff_summary" || evidence.kind === "file_change"
+  );
+  if (changedStateEvidence.some((evidence) => !matchesHandoffOrigin(evidence))) {
+    return fail(
+      "invalid_input",
+      `Handoff ${handoff.id} uses changed-state evidence from a different execution thread.`,
+    );
   }
 
   if (handoff.result !== "done") {
@@ -1569,6 +1596,37 @@ function ensureAcceptedIndependentReview(state: MissionState, workItem: WorkItem
   }
 }
 
+function isContentBearingChangedStateEvidence(evidence: Evidence): boolean {
+  if (
+    (evidence.kind !== "diff_summary" && evidence.kind !== "file_change") ||
+    evidence.result !== "passed" ||
+    evidence.details === undefined
+  ) {
+    return false;
+  }
+  try {
+    const details = JSON.parse(evidence.details) as unknown;
+    if (
+      typeof details !== "object" ||
+      details === null ||
+      Array.isArray(details)
+    ) {
+      return false;
+    }
+    const record = details as Record<string, unknown>;
+    if (typeof record.output !== "string") {
+      return false;
+    }
+    const command = typeof record.command === "string" ? record.command : "";
+    return /\bgit\s+diff\b/.test(command) &&
+      !/\s--(?:stat|shortstat|numstat|name-only|name-status|summary|check)\b/.test(command) &&
+      /^diff --git a\/.+ b\/.+$/m.test(record.output) &&
+      /^@@\s/m.test(record.output);
+  } catch {
+    return false;
+  }
+}
+
 function buildReviewContext(
   state: MissionState,
   missionId: string,
@@ -1600,12 +1658,10 @@ function buildReviewContext(
     }
     return item;
   });
-  if (!evidence.some((item) =>
-    (item.kind === "diff_summary" || item.kind === "file_change") && item.result === "passed"
-  )) {
+  if (!evidence.some(isContentBearingChangedStateEvidence)) {
     return fail(
       "invalid_transition",
-      `Work item ${workItem.id} has no passed changed-state or diff evidence for independent review.`,
+      `Work item ${workItem.id} has no content-bearing changed-state evidence for independent review.`,
     );
   }
   for (const requiredCheck of workItem.requiredChecks ?? []) {

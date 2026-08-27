@@ -188,7 +188,7 @@ test("create or open is idempotent and returns durable structured mission state"
     "Prove",
     "Approve",
   ]);
-  assert.equal(created.mission.progress.total, 3);
+  assert.equal(created.mission.progress.total, 1);
 
   const opened = await json(await app.request("/api/mission", { method: "POST" }));
   assert.equal(opened.mission.mission.id, created.mission.mission.id);
@@ -246,6 +246,26 @@ test("concurrent primary mission creation shares one durable create operation", 
 test("API maps persisted proof separately from runtime narration and redacts secrets", async () => {
   const { app, missions } = testApp();
   await app.request("/api/mission", { method: "POST" });
+  await missions.persistWorkGraph(PRIMARY_MISSION_ID, {
+    items: [
+      {
+        id: "primary-inspect",
+        title: "Inspect the repository",
+        purpose: "Establish verified repository facts.",
+        acceptanceCriteria: ["Repository inspection is durably correlated."],
+        dependsOn: [],
+        assignedRole: "planner",
+      },
+      {
+        id: "primary-verify",
+        title: "Verify the delivery",
+        purpose: "Capture independent sandbox proof.",
+        acceptanceCriteria: ["Sandbox verification is durably correlated."],
+        dependsOn: ["primary-inspect"],
+        assignedRole: "reviewer",
+      },
+    ],
+  });
   await missions.addEvidence(PRIMARY_MISSION_ID, {
     workItemId: "primary-inspect",
     kind: "tool_result",
