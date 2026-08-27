@@ -30,7 +30,7 @@ const WORK = {
   verify: "primary-verify",
 } as const;
 
-const VERIFY_COMMAND = "npm run typecheck && npm test";
+export const PRIMARY_VERIFICATION_COMMAND = "npm test && npm run verify:mission";
 
 export interface MissionRunner {
   createMission(input: {
@@ -81,7 +81,7 @@ export interface MissionView {
     createdAt: string;
     updatedAt: string;
     repository?: { owner: string; name: string; ref: string };
-    execution: { connected: boolean; resumed: boolean };
+    execution: { connected: boolean; resumed: boolean; sandboxId?: string };
   };
   progress: {
     complete: number;
@@ -131,6 +131,7 @@ class MissionControlError extends Error {
 
 class MissionController {
   private operation: Promise<MissionView> | null = null;
+  private createOperation: Promise<MissionView> | null = null;
 
   constructor(
     private readonly missions: MissionService,
@@ -144,7 +145,17 @@ class MissionController {
       : null;
   }
 
-  async createOrOpenPrimaryMission(): Promise<MissionView> {
+  createOrOpenPrimaryMission(): Promise<MissionView> {
+    if (this.createOperation !== null) {
+      return this.createOperation;
+    }
+    this.createOperation = this.createOrOpenPrimaryMissionOnce().finally(() => {
+      this.createOperation = null;
+    });
+    return this.createOperation;
+  }
+
+  private async createOrOpenPrimaryMissionOnce(): Promise<MissionView> {
     const existing = await this.getPrimaryMission();
     if (existing !== null) {
       await this.ensureWorkItems();
@@ -234,7 +245,7 @@ class MissionController {
         await this.runner.runSandboxVerification({
           missionId: PRIMARY_MISSION_ID,
           workItemId: WORK.verify,
-          command: VERIFY_COMMAND,
+          command: PRIMARY_VERIFICATION_COMMAND,
         });
         await this.requirePassedEvidence(WORK.verify, "sandbox");
       });
@@ -393,6 +404,9 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
       resumed: mission.trueforgeTurnId !== undefined,
     },
   };
+  if (mission.trueforgeSandboxId !== undefined) {
+    missionView.execution.sandboxId = mission.trueforgeSandboxId;
+  }
   if (mission.repository !== undefined) {
     missionView.repository = { ...mission.repository };
   }
@@ -516,6 +530,7 @@ function safeEvidenceMetadata(evidence: Evidence): Record<string, string | numbe
     ["command", "command"],
     ["exit_code", "exitCode"],
     ["output", "output"],
+    ["sandbox_id", "sandboxId"],
   ] as const;
   const safe: Record<string, string | number> = {};
   for (const [sourceKey, publicKey] of allowed) {
@@ -576,6 +591,12 @@ export function createMissionHttpApp(options: MissionHttpOptions) {
   async function handle(request: Request): Promise<Response> {
     const url = new URL(request.url);
     try {
+      if (isStateChangingMethod(request.method) && isCrossOriginRequest(request, url)) {
+        return jsonResponse({
+          error: "cross_origin",
+          message: "Cross-origin state-changing requests are not allowed.",
+        }, 403);
+      }
       if (request.method === "GET" && url.pathname === "/") {
         return htmlResponse(INDEX_HTML);
       }
@@ -609,6 +630,25 @@ export function createMissionHttpApp(options: MissionHttpOptions) {
       return jsonResponse({ error: "operation_failed", message, mission }, status);
     }
   }
+}
+
+function isStateChangingMethod(method: string): boolean {
+  return method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE";
+}
+
+function isCrossOriginRequest(request: Request, url: URL): boolean {
+  const origin = request.headers.get("origin");
+  if (origin !== null) {
+    if (origin === "null") {
+      return true;
+    }
+    try {
+      return new URL(origin).origin !== url.origin;
+    } catch {
+      return true;
+    }
+  }
+  return request.headers.get("sec-fetch-site") === "cross-site";
 }
 
 async function assetResponse(

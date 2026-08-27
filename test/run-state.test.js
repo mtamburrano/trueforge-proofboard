@@ -141,3 +141,34 @@ test("run coordinator renders the authoritative failure state and stops polling"
   assert.equal(coordinator.isRunning(), false);
   assert.equal(scheduler.activeCount(), 0);
 });
+
+test("run coordinator never lets an older revision replace newer state", async () => {
+  const { createRunCoordinator } = await loadRunState();
+  const rendered = [];
+  const coordinator = createRunCoordinator({
+    onState(view, metadata) {
+      rendered.push({ revision: view.revision, marker: view.marker, authoritative: metadata.authoritative });
+    },
+  });
+
+  assert.equal(coordinator.accept({ revision: 5, marker: "newer" }, { force: true }), true);
+  assert.equal(
+    coordinator.accept(
+      { revision: 4, marker: "stale-authoritative" },
+      { force: true, authoritative: true },
+    ),
+    false,
+  );
+  assert.equal(coordinator.latestRevision(), 5);
+  assert.equal(
+    coordinator.accept(
+      { revision: 5, marker: "authoritative-rerender" },
+      { force: true, authoritative: true },
+    ),
+    true,
+  );
+  assert.deepEqual(rendered, [
+    { revision: 5, marker: "newer", authoritative: false },
+    { revision: 5, marker: "authoritative-rerender", authoritative: true },
+  ]);
+});

@@ -11,7 +11,9 @@
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node --test",
     "check": "npm run typecheck && npm test",
+    "prestart": "npm run build",
     "start": "node --env-file-if-exists=.env dist/http/start.js",
+    "verify:mission": "npm run build && node scripts/verify-primary-mission.mjs",
     "smoke:trueforge": "node --env-file-if-exists=.env scripts/trueforge-smoke.mjs"
   },
   "devDependencies": {

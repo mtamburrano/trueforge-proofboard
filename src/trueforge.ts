@@ -137,6 +137,7 @@ export interface SandboxVerificationResult {
   exitCode: number;
   stdout: string;
   outputSummary: string;
+  sandboxId?: string;
   evidenceId: string;
   mission: Mission;
 }
@@ -191,6 +192,7 @@ interface VerifiedSandboxExecution {
   exitCode: number;
   stdout: string;
   outputSummary: string;
+  sandboxId?: string;
 }
 
 export class TrueForgeIntegrationError extends Error {
@@ -273,6 +275,9 @@ export class TrueForgeMissionRunner {
     }
     if (input.repository !== undefined) {
       missionInput.repository = input.repository;
+    }
+    if (input.trueforgeSandboxId !== undefined) {
+      missionInput.trueforgeSandboxId = input.trueforgeSandboxId;
     }
     return this.missions.createMission(missionInput);
   }
@@ -431,12 +436,27 @@ export class TrueForgeMissionRunner {
       if (input.workItemId !== undefined) {
         verificationOptions.workItemId = input.workItemId;
       }
+      if (mission.trueforgeSandboxId !== undefined) {
+        if (mission.trueforgeTurnId === undefined) {
+          throw new TrueForgeIntegrationError(
+            "run sandbox verification",
+            "The persisted sandbox identity has no durable predecessor turn.",
+          );
+        }
+        verificationOptions.previousTurnId = mission.trueforgeTurnId;
+      }
       const execution = await this.executeTurn(
         mission.id,
         buildSandboxVerificationInstruction(mission, command, toolName, intent),
         verificationOptions,
       );
-      const verified = verifySandboxExecution(execution.rawEvents, intent, command, toolName);
+      const verified = verifySandboxExecution(
+        execution.rawEvents,
+        intent,
+        command,
+        toolName,
+        mission.trueforgeSandboxId,
+      );
       const evidenceInput = {
         kind: "test_result" as const,
         result: "passed" as const,
@@ -448,6 +468,7 @@ export class TrueForgeMissionRunner {
           command,
           exit_code: verified.exitCode,
           output: verified.outputSummary,
+          ...(verified.sandboxId === undefined ? {} : { sandbox_id: verified.sandboxId }),
         }),
       };
       const evidence = input.workItemId === undefined
@@ -464,6 +485,7 @@ export class TrueForgeMissionRunner {
         exitCode: verified.exitCode,
         stdout: verified.stdout,
         outputSummary: verified.outputSummary,
+        ...(verified.sandboxId === undefined ? {} : { sandboxId: verified.sandboxId }),
         evidenceId: evidence.id,
         mission: await this.missions.getMission(mission.id),
       };
@@ -508,8 +530,35 @@ export class TrueForgeMissionRunner {
       const runtimeEvent = summarizeRuntimeEvent(event);
       events.push(runtimeEvent);
       if (event.type === "turn.created") {
-        turnId = event.turnId;
+        const createdTurnId = stringOrNull(event.turnId);
+        if (createdTurnId === null) {
+          throw new TrueForgeIntegrationError(
+            "complete turn",
+            "TrueForge emitted turn.created without a turn id.",
+          );
+        }
+        turnId = createdTurnId;
         await this.missions.attachTrueforgeTurn(mission.id, turnId);
+      }
+      if (event.type === "sandbox.created") {
+        const sandboxId = sandboxIdFromEvent(event);
+        if (sandboxId === null) {
+          throw new TrueForgeIntegrationError(
+            "track sandbox",
+            "TrueForge emitted sandbox.created without a sandbox id.",
+          );
+        }
+        const currentMission = await this.missions.getMission(mission.id);
+        if (
+          currentMission.trueforgeSandboxId !== undefined &&
+          currentMission.trueforgeSandboxId !== sandboxId
+        ) {
+          throw new TrueForgeIntegrationError(
+            "track sandbox",
+            "TrueForge returned a sandbox id different from the persisted mission sandbox.",
+          );
+        }
+        await this.missions.attachTrueforgeSandbox(mission.id, sandboxId);
       }
       const evidence = runtimeEvidence(event);
       if (evidence !== null) {
@@ -787,6 +836,9 @@ function buildSandboxVerificationInstruction(
   return [
     `Use the configured sandbox for mission ${mission.id}.`,
     `Call the sandbox tool ${toolName} exactly once with this JSON object: ${JSON.stringify(argumentsValue)}.`,
+    mission.trueforgeSandboxId === undefined
+      ? "Record the sandbox identity before executing the command."
+      : `Reuse the persisted sandbox ${mission.trueforgeSandboxId} and do not create a replacement sandbox.`,
     "Do not run the command on the host, do not use a different execution tool, and do not fabricate the result.",
     "Return the structured sandbox response after the command completes.",
   ].join(" ");
@@ -1188,13 +1240,31 @@ function verifySandboxExecution(
   intent: string,
   command: string,
   toolName: string,
+  expectedSandboxId?: string,
 ): VerifiedSandboxExecution {
   if (toolName !== "exec") {
     return sandboxFailure("Sandbox verification requires the canonical TrueForge exec tool.");
   }
-  const sandboxCreated = events.find((event) => event.type === "sandbox.created");
-  if (sandboxCreated === undefined) {
+  const sandboxCreatedEvents = events.filter((event) => event.type === "sandbox.created");
+  if (sandboxCreatedEvents.length === 0 && expectedSandboxId === undefined) {
     return sandboxFailure("TrueForge did not record sandbox creation.");
+  }
+  if (sandboxCreatedEvents.length > 1) {
+    return sandboxFailure(
+      `Expected at most one sandbox.created event, found ${sandboxCreatedEvents.length}.`,
+    );
+  }
+  let sandboxId = expectedSandboxId;
+  const sandboxCreated = sandboxCreatedEvents[0];
+  if (sandboxCreated !== undefined) {
+    const observedSandboxId = sandboxIdFromEvent(sandboxCreated);
+    if (observedSandboxId === null) {
+      return sandboxFailure("TrueForge sandbox creation did not include a sandbox id.");
+    }
+    if (expectedSandboxId !== undefined && observedSandboxId !== expectedSandboxId) {
+      return sandboxFailure("TrueForge returned a sandbox id different from the persisted mission sandbox.");
+    }
+    sandboxId = observedSandboxId;
   }
   const expectedArguments = { intent, command };
   const canonicalCalls = observedToolCalls(events).filter(
@@ -1245,6 +1315,7 @@ function verifySandboxExecution(
     exitCode,
     stdout,
     outputSummary: summarizeOutput(stdout),
+    ...(sandboxId === undefined ? {} : { sandboxId }),
   };
 }
 
@@ -1311,6 +1382,22 @@ function stringOrNull(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
+function sandboxIdFromEvent(event: TrueForgeApi.TurnStreamingEvent): string | null {
+  const record = recordValue(event);
+  const direct = record.sandboxId ?? record.sandbox_id;
+  if (typeof direct === "string" && direct.trim().length > 0) {
+    return direct.trim();
+  }
+  const sandbox = record.sandbox;
+  if (isRecord(sandbox)) {
+    const nested = sandbox.id ?? sandbox.sandboxId ?? sandbox.sandbox_id;
+    if (typeof nested === "string" && nested.trim().length > 0) {
+      return nested.trim();
+    }
+  }
+  return null;
+}
+
 function summarizeRuntimeEvent(event: TrueForgeApi.TurnStreamingEvent): TrueForgeRuntimeEvent {
   const record = recordValue(event);
   return {
@@ -1346,6 +1433,12 @@ function runtimeDetails(event: TrueForgeApi.TurnStreamingEvent): string {
   }
   if (event.type === "tool.response" || event.type === "tool.response_required") {
     details.tool_call_id = stringOrNull(record.toolCallId);
+  }
+  if (event.type === "sandbox.created") {
+    const sandboxId = sandboxIdFromEvent(event);
+    if (sandboxId !== null) {
+      details.sandbox_id = sandboxId;
+    }
   }
   return JSON.stringify(details);
 }

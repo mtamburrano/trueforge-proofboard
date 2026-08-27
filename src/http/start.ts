@@ -39,7 +39,13 @@ const server = createServer(async (request, response) => {
   try {
     const method = request.method ?? "GET";
     const url = `http://${request.headers.host ?? `${host}:${port}`}${request.url ?? "/"}`;
-    const result = await app.fetch(new Request(url, { method }));
+    const headers = new Headers();
+    for (const [name, value] of Object.entries(request.headers)) {
+      if (value !== undefined) {
+        headers.set(name, Array.isArray(value) ? value.join(", ") : value);
+      }
+    }
+    const result = await app.fetch(new Request(url, { method, headers }));
     response.statusCode = result.status;
     result.headers.forEach((value, name) => response.setHeader(name, value));
     response.end(new Uint8Array(await result.arrayBuffer()));

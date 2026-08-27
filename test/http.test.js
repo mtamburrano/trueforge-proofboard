@@ -11,21 +11,30 @@ import {
   MissionService,
   PRIMARY_MISSION_ID,
   PRIMARY_MISSION_OBJECTIVE,
+  PRIMARY_VERIFICATION_COMMAND,
   TrueForgeIntegrationError,
   createMissionHttpApp,
   resolveMissionRuntimeConfig,
 } from "../dist/index.js";
 
 class TestMissionRunner {
-  constructor(missions, { failSandbox = false, secretInspectionError = false } = {}) {
+  constructor(
+    missions,
+    { failSandbox = false, secretInspectionError = false, createGate } = {},
+  ) {
     this.missions = missions;
     this.failSandbox = failSandbox;
     this.secretInspectionError = secretInspectionError;
+    this.createGate = createGate;
+    this.sandboxInputs = [];
     this.calls = { create: 0, inspect: 0, turn: 0, sandbox: 0 };
   }
 
   async createMission(input) {
     this.calls.create += 1;
+    if (this.createGate !== undefined) {
+      await this.createGate;
+    }
     return this.missions.createMission({
       ...input,
       trueforgeSessionId: "test-session-durable",
@@ -79,6 +88,7 @@ class TestMissionRunner {
 
   async runSandboxVerification(input) {
     this.calls.sandbox += 1;
+    this.sandboxInputs.push(input);
     if (this.failSandbox) {
       await this.missions.addEvidence(input.missionId, {
         workItemId: input.workItemId,
@@ -186,6 +196,53 @@ test("create or open is idempotent and returns durable structured mission state"
   assert.equal(runner.calls.create, 1);
 });
 
+test("cross-origin browser state changes are rejected while same-origin changes remain valid", async () => {
+  const { app, runner } = testApp();
+
+  const rejected = await json(await app.request("/api/mission", {
+    method: "POST",
+    headers: { Origin: "https://attacker.example" },
+  }));
+  assert.equal(rejected.error, "cross_origin");
+  assert.equal(runner.calls.create, 0);
+  assert.equal((await json(await app.request("/api/mission"))).mission, null);
+
+  const acceptedResponse = await app.request("/api/mission", {
+    method: "POST",
+    headers: { Origin: "http://mission.local" },
+  });
+  assert.equal(acceptedResponse.status, 201);
+  assert.equal(runner.calls.create, 1);
+});
+
+test("concurrent primary mission creation shares one durable create operation", async () => {
+  let releaseCreate;
+  const createGate = new Promise((resolve) => {
+    releaseCreate = resolve;
+  });
+  const { app, runner } = testApp(new InMemoryMissionRepository(), { createGate });
+
+  const first = app.request("/api/mission", { method: "POST" });
+  while (runner.calls.create === 0) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  const second = app.request("/api/mission", { method: "POST" });
+  assert.equal(runner.calls.create, 1);
+  releaseCreate();
+
+  const [firstResponse, secondResponse] = await Promise.all([first, second]);
+  assert.equal(firstResponse.status, 201);
+  assert.equal(secondResponse.status, 201);
+  const [firstPayload, secondPayload] = await Promise.all([
+    json(firstResponse),
+    json(secondResponse),
+  ]);
+  assert.equal(firstPayload.mission.mission.id, PRIMARY_MISSION_ID);
+  assert.equal(secondPayload.mission.mission.id, PRIMARY_MISSION_ID);
+  assert.equal(firstPayload.mission.revision, secondPayload.mission.revision);
+  assert.equal(runner.calls.create, 1);
+});
+
 test("API maps persisted proof separately from runtime narration and redacts secrets", async () => {
   const { app, missions } = testApp();
   await app.request("/api/mission", { method: "POST" });
@@ -248,6 +305,8 @@ test("run mission uses the runtime adapters and exposes passed proof", async () 
   assert.equal(payload.mission.progress.verification, "passed");
   assert.deepEqual(payload.mission.evidence.map((item) => item.source).sort(), ["mcp", "sandbox"]);
   assert.deepEqual(runner.calls, { create: 1, inspect: 1, turn: 1, sandbox: 1 });
+  assert.equal(runner.sandboxInputs[0].command, PRIMARY_VERIFICATION_COMMAND);
+  assert.match(runner.sandboxInputs[0].command, /verify:mission/);
 
   const serialized = JSON.stringify(payload);
   assert.doesNotMatch(serialized, /must-not-reach-browser|provider_secret/);
@@ -325,6 +384,12 @@ test("Mission Control defaults to Alibaba Qwen and accepts an explicit model sel
   assert.throws(
     () => resolveMissionRuntimeConfig({ TRUEFORGE_UI_PORT: "invalid" }),
     /valid TCP port/,
+  );
+  assert.equal(resolveMissionRuntimeConfig({ TRUEFORGE_UI_HOST: "localhost" }).host, "localhost");
+  assert.equal(resolveMissionRuntimeConfig({ TRUEFORGE_UI_HOST: "[::1]" }).host, "[::1]");
+  assert.throws(
+    () => resolveMissionRuntimeConfig({ TRUEFORGE_UI_HOST: "0.0.0.0" }),
+    /loopback address/,
   );
 });
 

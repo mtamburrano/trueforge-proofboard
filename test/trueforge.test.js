@@ -294,6 +294,7 @@ function sandboxEvents(
       },
     },
     includeSandboxCreated = true,
+    sandboxId = "sandbox-1",
     includeSandboxCall = true,
     additionalSandboxCalls = [],
     responseCallId = "call-exec",
@@ -319,7 +320,7 @@ function sandboxEvents(
       id: "event-sandbox",
       createdAt: "2026-08-26T16:00:01.000Z",
       threadId: null,
-      sandboxId: "sandbox-1",
+      sandboxId,
     });
   }
   if (includeSandboxCall) {
@@ -436,6 +437,7 @@ test("runner creates a TrueForge session and maps safe runtime evidence", async 
   const state = await missions.getState();
   assert.equal(state.missions[0].trueforgeSessionId, "session-created");
   assert.equal(state.missions[0].trueforgeTurnId, "turn-1");
+  assert.equal(state.missions[0].trueforgeSandboxId, "sandbox-1");
   assert.equal(state.evidence.length, 6);
   assert.equal(state.evidence.every((item) => item.workItemId === workItem.id), true);
   const serializedState = JSON.stringify(state);
@@ -942,6 +944,87 @@ test("sandbox verification persists the command, output summary, and exit status
   assert.match(proof.details, /"intent":"Run the requested verification command in the sandbox\."/);
   assert.match(proof.details, /"exit_code":0/);
   assert.match(proof.details, /all tests passed/);
+});
+
+test("sandbox verification resumes the persisted sandbox without creating another one", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client, calls } = fakeClient((turnId) => sandboxEvents(turnId, 0, [], {
+    includeSandboxCreated: false,
+  }));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "google-gemini/test-model",
+  });
+  const mission = await runner.createMission({
+    id: "mission-sandbox-continuity",
+    objective: "Reuse the implementation sandbox for verification",
+  });
+  await missions.attachTrueforgeTurn(mission.id, "implementation-turn");
+  await missions.attachTrueforgeSandbox(mission.id, "sandbox-1");
+
+  const verification = await runner.runSandboxVerification({
+    missionId: mission.id,
+    command: "node --test",
+  });
+
+  assert.equal(calls.turns[0].request.previousTurnId, "implementation-turn");
+  assert.equal(verification.sandboxId, "sandbox-1");
+  const state = await missions.getState();
+  assert.equal(state.missions[0].trueforgeSandboxId, "sandbox-1");
+  assert.equal(state.missions[0].trueforgeTurnId, "turn-1");
+});
+
+test("sandbox verification fails closed when a persisted sandbox has no predecessor turn", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client, calls } = fakeClient((turnId) => sandboxEvents(turnId, 0, [], {
+    includeSandboxCreated: false,
+  }));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "google-gemini/test-model",
+  });
+  const mission = await runner.createMission({
+    id: "mission-sandbox-without-turn",
+    objective: "Reject unverifiable sandbox continuation",
+    trueforgeSandboxId: "sandbox-1",
+  });
+
+  await assert.rejects(
+    runner.runSandboxVerification({ missionId: mission.id, command: "node --test" }),
+    /no durable predecessor turn/,
+  );
+  assert.equal(calls.turns.length, 0);
+  const state = await missions.getState();
+  assert.equal(state.missions[0].trueforgeSandboxId, "sandbox-1");
+  assert.equal(
+    state.evidence.some((item) => item.source === "sandbox" && item.result === "passed"),
+    false,
+  );
+});
+
+test("sandbox continuity rejects a replacement sandbox identity", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client } = fakeClient((turnId) => sandboxEvents(turnId, 0, [], {
+    sandboxId: "sandbox-2",
+  }));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "google-gemini/test-model",
+  });
+  const mission = await runner.createMission({
+    id: "mission-sandbox-replacement",
+    objective: "Reject a changed sandbox identity",
+  });
+  await missions.attachTrueforgeTurn(mission.id, "implementation-turn");
+  await missions.attachTrueforgeSandbox(mission.id, "sandbox-1");
+
+  await assert.rejects(
+    runner.runSandboxVerification({ missionId: mission.id, command: "node --test" }),
+    /different from the persisted mission sandbox/,
+  );
+  const state = await missions.getState();
+  assert.equal(state.missions[0].trueforgeSandboxId, "sandbox-1");
+  assert.equal(
+    state.evidence.some((item) => item.source === "sandbox" && item.result === "passed"),
+    false,
+  );
 });
 
 test("sandbox verification rejects incomplete or non-canonical proof", async () => {

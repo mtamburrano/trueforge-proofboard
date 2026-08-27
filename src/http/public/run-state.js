@@ -13,6 +13,7 @@
 
     function accept(view, { force = false, authoritative = false } = {}) {
       if (!view || typeof view.revision !== "number") return false;
+      if (latestRevision !== null && view.revision < latestRevision) return false;
       if (!force && view.revision === latestRevision) return false;
       latestRevision = view.revision;
       latestView = view;

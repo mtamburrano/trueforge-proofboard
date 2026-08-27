@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 
 import {
@@ -71,7 +71,9 @@ export class JsonMissionRepository implements MissionRepository {
     try {
       await mkdir(directory, { recursive: true });
       await writeFile(temporaryPath, `${JSON.stringify(validated, null, 2)}\n`, "utf8");
+      await syncFile(temporaryPath);
       await rename(temporaryPath, this.filePath);
+      await syncDirectory(directory);
     } catch {
       try {
         await unlink(temporaryPath);
@@ -84,6 +86,36 @@ export class JsonMissionRepository implements MissionRepository {
       );
     }
   }
+}
+
+async function syncFile(filePath: string): Promise<void> {
+  const handle = await open(filePath, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function syncDirectory(directory: string): Promise<void> {
+  let handle: FileHandle | undefined;
+  try {
+    handle = await open(directory, "r");
+    await handle.sync();
+  } catch (error) {
+    if (!isUnsupportedDirectorySync(error)) {
+      throw error;
+    }
+  } finally {
+    if (handle !== undefined) {
+      await handle.close();
+    }
+  }
+}
+
+function isUnsupportedDirectorySync(error: unknown): boolean {
+  const code = errorCode(error);
+  return code === "EINVAL" || code === "ENOTSUP" || code === "EOPNOTSUPP" || code === "ENOSYS";
 }
 
 export { JsonMissionRepository as FileMissionRepository };

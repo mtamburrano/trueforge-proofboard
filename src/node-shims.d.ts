@@ -6,8 +6,14 @@ declare module "node:fs/promises" {
   export function readFile(path: string | URL, encoding: "utf8"): Promise<string>;
   export function writeFile(path: string, data: string, encoding: "utf8"): Promise<void>;
   export function mkdir(path: string, options: { recursive: boolean }): Promise<string | undefined>;
+  export function open(path: string, flags: string): Promise<FileHandle>;
   export function rename(oldPath: string, newPath: string): Promise<void>;
   export function unlink(path: string): Promise<void>;
+}
+
+interface FileHandle {
+  sync(): Promise<void>;
+  close(): Promise<void>;
 }
 
 declare module "node:path" {
@@ -20,7 +26,7 @@ declare module "node:http" {
   interface IncomingMessage extends AsyncIterable<Uint8Array> {
     method?: string;
     url?: string;
-    headers: { host?: string };
+    headers: { host?: string; [name: string]: string | string[] | undefined };
   }
 
   interface ServerResponse {

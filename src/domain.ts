@@ -107,6 +107,7 @@ export interface Mission {
   repository?: RepositoryTarget;
   trueforgeSessionId?: string;
   trueforgeTurnId?: string;
+  trueforgeSandboxId?: string;
 }
 
 export interface WorkItem {
@@ -192,6 +193,7 @@ export interface CreateMissionInput {
   id?: string;
   repository?: RepositoryTarget;
   trueforgeSessionId?: string;
+  trueforgeSandboxId?: string;
 }
 
 export interface CreateWorkItemInput {
@@ -387,6 +389,11 @@ function validateMission(value: unknown, label: string): Mission {
     200,
   );
   const trueforgeTurnId = optionalString(mission.trueforgeTurnId, `${label}.trueforgeTurnId`, 200);
+  const trueforgeSandboxId = optionalString(
+    mission.trueforgeSandboxId,
+    `${label}.trueforgeSandboxId`,
+    200,
+  );
   const result: Mission = {
     id: identifier(mission.id, `${label}.id`),
     objective: requiredString(mission.objective, `${label}.objective`),
@@ -402,6 +409,9 @@ function validateMission(value: unknown, label: string): Mission {
   }
   if (trueforgeTurnId !== undefined) {
     result.trueforgeTurnId = trueforgeTurnId;
+  }
+  if (trueforgeSandboxId !== undefined) {
+    result.trueforgeSandboxId = trueforgeSandboxId;
   }
   return result;
 }
@@ -796,6 +806,11 @@ export class MissionService {
         "trueforgeSessionId",
         200,
       );
+      const trueforgeSandboxId = optionalString(
+        input.trueforgeSandboxId,
+        "trueforgeSandboxId",
+        200,
+      );
       const mission: Mission = {
         id,
         objective: requiredString(input.objective, "objective"),
@@ -808,6 +823,9 @@ export class MissionService {
       }
       if (trueforgeSessionId !== undefined) {
         mission.trueforgeSessionId = trueforgeSessionId;
+      }
+      if (trueforgeSandboxId !== undefined) {
+        mission.trueforgeSandboxId = trueforgeSandboxId;
       }
       state.missions.push(mission);
       return mission;
@@ -829,6 +847,16 @@ export class MissionService {
       const mission = findMission(state, normalizedId(missionId, "missionId"));
       ensureOpen(mission);
       mission.trueforgeTurnId = requiredString(turnId, "trueforgeTurnId", 200);
+      mission.updatedAt = now;
+      return mission;
+    });
+  }
+
+  async attachTrueforgeSandbox(missionId: string, sandboxId: string): Promise<Mission> {
+    return this.mutate((state, now) => {
+      const mission = findMission(state, normalizedId(missionId, "missionId"));
+      ensureOpen(mission);
+      mission.trueforgeSandboxId = requiredString(sandboxId, "trueforgeSandboxId", 200);
       mission.updatedAt = now;
       return mission;
     });

@@ -141,10 +141,14 @@ test("JSON persistence restores mission state for a new service instance", async
       purpose: "Keep the mission state available after reconnect.",
       status: "ready",
     });
+    await firstService.attachTrueforgeTurn(mission.id, "turn-reconnect");
+    await firstService.attachTrueforgeSandbox(mission.id, "sandbox-reconnect");
 
     const persisted = JSON.parse(await readFile(filePath, "utf8"));
     assert.equal(persisted.missions[0].id, mission.id);
     assert.equal(persisted.workItems[0].id, workItem.id);
+    assert.equal(persisted.missions[0].trueforgeTurnId, "turn-reconnect");
+    assert.equal(persisted.missions[0].trueforgeSandboxId, "sandbox-reconnect");
 
     const reconnectedService = new MissionService(
       new JsonMissionRepository(filePath),
@@ -153,7 +157,9 @@ test("JSON persistence restores mission state for a new service instance", async
     const restored = await reconnectedService.getState();
     assert.equal(restored.missions[0].objective, "Survive a process reconnect");
     assert.equal(restored.workItems[0].status, "ready");
-    assert.equal(restored.revision, 2);
+    assert.equal(restored.missions[0].trueforgeTurnId, "turn-reconnect");
+    assert.equal(restored.missions[0].trueforgeSandboxId, "sandbox-reconnect");
+    assert.equal(restored.revision, 4);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
