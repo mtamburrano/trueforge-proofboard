@@ -1556,6 +1556,58 @@ test("locked fixture inspection rejects when no canonical get_commit call exists
   );
 });
 
+test("failed repository inspection preserves its exact verification reason and bounded tool metadata", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, {
+    attempts: [{
+      callId: "call-non-canonical",
+      argumentsValue: {
+        owner: "mtamburrano",
+        repo: "proofboard-demo-fixture",
+        sha: LOCKED_FIXTURE_REF,
+        detail: "summary",
+      },
+      sha: LOCKED_FIXTURE_SHA,
+      patches: LOCKED_FIXTURE_PATCHES,
+    }],
+  }));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "google-gemini/test-model",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-mcp-diagnostic-failure",
+    objective: "Preserve the exact repository inspection rejection for diagnostics",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  const expectedReason = "Expected exactly one canonical get_commit MCP call, found 0.";
+  await assert.rejects(
+    runner.inspectRepository({ missionId: mission.id }),
+    new RegExp(expectedReason.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+  );
+
+  const state = await missions.getState();
+  const failure = state.evidence.find((item) =>
+    item.source === "mcp" && item.result === "failed"
+  );
+  assert.ok(failure);
+  const details = JSON.parse(failure.details);
+  assert.equal(details.reason, expectedReason);
+  assert.equal(details.verification_reason, expectedReason);
+  assert.equal(details.session_id, "session-created");
+  assert.equal(details.turn_id, "turn-1");
+  assert.equal(details.tool_calls[0].name, "get_commit");
+  assert.equal(details.tool_calls[0].arguments.detail, "summary");
+  assert.equal(details.tool_responses[0].tool_call_id, "call-non-canonical");
+  assert.equal(failure.executionOrigin.kind, "mcp");
+  assert.equal(failure.executionOrigin.turnId, "turn-1");
+});
+
 test("locked fixture inspection rejects multiple canonical get_commit calls", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
   const canonicalArguments = {

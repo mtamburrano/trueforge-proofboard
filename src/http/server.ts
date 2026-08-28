@@ -1,6 +1,12 @@
 import { readFile } from "node:fs/promises";
 
 import {
+  buildDiagnosticSnapshot,
+  DiagnosticFailureCategory,
+  DiagnosticFailureLayer,
+  DiagnosticSnapshot,
+} from "../diagnostics.js";
+import {
   Approval,
   Evidence,
   Handoff,
@@ -360,6 +366,7 @@ export interface MissionView {
   }>;
   activity: ActivityView[];
   evidence: EvidenceView[];
+  diagnostics: DiagnosticSnapshot;
   handoffs: HandoffView[];
   reviews: ReviewView[];
   approvals: Array<{
@@ -558,6 +565,13 @@ class MissionController {
       : null;
   }
 
+  async getPrimaryDiagnostics(): Promise<DiagnosticSnapshot | null> {
+    const state = await this.missions.getState();
+    return state.missions.some((mission) => mission.id === PRIMARY_MISSION_ID)
+      ? buildDiagnosticSnapshot(state, PRIMARY_MISSION_ID)
+      : null;
+  }
+
   createOrOpenPrimaryMission(): Promise<MissionView> {
     if (this.createOperation !== null) {
       return this.createOperation;
@@ -619,8 +633,8 @@ class MissionController {
 
   private async executePrimaryMission(): Promise<MissionView> {
     await this.createOrOpenPrimaryMission();
-    await this.prepareMissionForExecution();
     try {
+      await this.prepareMissionForExecution();
       let state = await this.missions.getState();
       const inspectionItems = state.workItems.filter((item) =>
         item.missionId === PRIMARY_MISSION_ID &&
@@ -713,6 +727,7 @@ class MissionController {
       }
       return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID);
     } catch (error) {
+      await this.recordMissionFailure(error);
       await this.blockActiveWork();
       throw error;
     }
@@ -1097,6 +1112,43 @@ class MissionController {
     );
     if (!completed) {
       throw new MissionControlError("Execution stopped before the turn completed successfully.");
+    }
+  }
+
+  private async recordMissionFailure(error: unknown): Promise<void> {
+    const reason = missionFailureReason(error);
+    const classification = missionFailureClassification(error);
+    try {
+      const state = await this.missions.getState();
+      const alreadyRecorded = state.evidence.some((item) =>
+        item.missionId === PRIMARY_MISSION_ID &&
+        item.result === "failed" &&
+        evidenceDetails(item)?.reason === reason,
+      );
+      if (alreadyRecorded) {
+        return;
+      }
+      const activeWorkItem = state.workItems.find((item) =>
+        item.missionId === PRIMARY_MISSION_ID &&
+        (item.status === "in_progress" || item.status === "ready_for_review")
+      );
+      await this.missions.addEvidence(PRIMARY_MISSION_ID, {
+        ...(activeWorkItem === undefined ? {} : { workItemId: activeWorkItem.id }),
+        kind: "reviewer_finding",
+        result: "failed",
+        source: "system",
+        summary: "Mission execution failed closed; inspect the diagnostic snapshot for the cause.",
+        details: JSON.stringify({
+          failure_layer: classification.layer,
+          failure_category: classification.category,
+          reason,
+          ...(error instanceof TrueForgeIntegrationError
+            ? { operation: error.operation }
+            : {}),
+        }),
+      });
+    } catch {
+      // Preserve the original operation error when durable failure recording is unavailable.
     }
   }
 
@@ -1574,6 +1626,7 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
     ],
     activity,
     evidence,
+    diagnostics: buildDiagnosticSnapshot(state, missionId),
     handoffs: state.handoffs
       .filter((item) => item.missionId === missionId)
       .map((item) => ({
@@ -1884,6 +1937,9 @@ export function createMissionHttpApp(options: MissionHttpOptions) {
       if (request.method === "GET" && url.pathname === "/api/mission") {
         return jsonResponse({ mission: await controller.getPrimaryMission() });
       }
+      if (request.method === "GET" && url.pathname === "/api/mission/diagnostics") {
+        return jsonResponse({ diagnostics: await controller.getPrimaryDiagnostics() });
+      }
       if (request.method === "POST" && url.pathname === "/api/mission") {
         return jsonResponse({ mission: await controller.createOrOpenPrimaryMission() }, 201);
       }
@@ -2029,6 +2085,37 @@ function publicErrorMessage(error: unknown): string {
       : "The mission state operation could not be completed.";
   }
   return "Mission Control could not complete the requested operation.";
+}
+
+function missionFailureReason(error: unknown): string {
+  const message = error instanceof Error
+    ? error.message
+    : "Mission Control encountered an unknown failure.";
+  return message
+    .replace(/authorization\s*[:=]\s*bearer\s+[^\s,;]+/gi, "[redacted]")
+    .replace(/\b(?:api[_-]?key|token|password|secret|credential|cookie)\s*[:=]\s*[^\s,;]+/gi, "[redacted]")
+    .replace(/\bBearer\s+[^\s,;]+/gi, "[redacted]")
+    .slice(0, 2_000);
+}
+
+function missionFailureClassification(error: unknown): {
+  layer: DiagnosticFailureLayer;
+  category: DiagnosticFailureCategory;
+} {
+  if (error instanceof TrueForgeIntegrationError) {
+    const operation = error.operation.toLowerCase();
+    if (operation.includes("inspect") || operation.includes("repository")) {
+      return { layer: "tool", category: "mcp" };
+    }
+    if (operation.includes("sandbox")) {
+      return { layer: "tool", category: "sandbox" };
+    }
+    return { layer: "trueforge", category: "runtime" };
+  }
+  if (error instanceof MissionDomainError) {
+    return { layer: "proof_board", category: "policy" };
+  }
+  return { layer: "proof_board", category: "pipeline" };
 }
 
 function sanitizePublicRuntimeError(message: string): string {

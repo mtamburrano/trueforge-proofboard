@@ -437,6 +437,31 @@ button[aria-busy="true"]::after {
 .evidence-meta dt { color: var(--color-muted-dim); font: 700 9px/1.2 var(--font-mono); text-transform: uppercase; }
 .evidence-meta dd { margin: 3px 0 0; color: var(--color-ink); font: 10px/1.35 var(--font-mono); overflow-wrap: anywhere; white-space: pre-wrap; }
 .evidence-empty, .activity-empty { padding: var(--space-5); color: var(--color-muted); font-size: 12px; text-align: center; }
+.diagnostics-panel {
+  margin-top: var(--space-5);
+  border-color: #863b46;
+  background: #21171c;
+}
+.diagnostics-heading { margin: 0; padding: var(--space-3) var(--space-4); }
+.diagnostics-heading h2 { color: var(--color-danger-soft); }
+.diagnostics-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-4) var(--space-4);
+}
+.diagnostics-reason { margin: 0; color: var(--color-ink); font-size: 12px; font-weight: 650; overflow-wrap: anywhere; }
+.diagnostics-correlation { margin: var(--space-1) 0 0; color: var(--color-danger-soft); font: 10px/1.35 var(--font-mono); text-transform: uppercase; }
+.diagnostics-summary details { min-width: 170px; }
+.diagnostics-summary summary { color: var(--color-muted); cursor: pointer; font-size: 11px; }
+.diagnostics-meta {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(100px, 1fr));
+  gap: var(--space-2);
+  margin: var(--space-3) 0 0;
+}
+.diagnostics-meta dt { color: var(--color-muted-dim); font: 700 9px/1.2 var(--font-mono); text-transform: uppercase; }
+.diagnostics-meta dd { margin: 2px 0 0; color: var(--color-ink); font: 10px/1.3 var(--font-mono); overflow-wrap: anywhere; }
 .proof-boundary {
   display: inline-flex;
   align-items: center;
@@ -496,6 +521,8 @@ button[aria-busy="true"]::after {
   .work-board { display: flex; margin-right: calc(var(--space-3) * -1); padding-right: var(--space-3); overflow-x: auto; scroll-snap-type: x mandatory; }
   .lane { flex: 0 0 min(86vw, 340px); scroll-snap-align: start; }
   .section-heading { align-items: flex-start; flex-direction: column; gap: var(--space-1); }
+  .diagnostics-summary { grid-template-columns: 1fr; }
+  .diagnostics-summary details { min-width: 0; }
 }
 
 @media (max-width: 430px) {

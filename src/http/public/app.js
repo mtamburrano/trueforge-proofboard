@@ -29,6 +29,9 @@ const labels = {
   contentHash: "Content hash",
   contentBytes: "Content bytes",
   exitCode: "Exit code",
+  tool: "Tool",
+  server: "Server",
+  reason: "Reason",
 };
 
 function escapeHtml(value) {
@@ -196,12 +199,70 @@ function renderMission(view) {
         </header>
         ${renderEvidence(view.evidence)}
       </article>
-    </section>`;
+    </section>
+    ${renderDiagnostics(view)}
+    `;
 
   document.querySelector("#run-mission")?.addEventListener("click", runMission);
+  document.querySelector("#copy-diagnostics")?.addEventListener("click", () => copyDiagnostics(view.diagnostics));
   document.querySelectorAll("[data-approval-decision]").forEach((button) => {
     button.addEventListener("click", decideApproval);
   });
+}
+
+function renderDiagnostics(view) {
+  const diagnostics = view.diagnostics;
+  if (!diagnostics || (!diagnostics.failures?.length && !diagnostics.failedEvidence?.length)) {
+    return "";
+  }
+  const latest = diagnostics.failures?.find((failure) => failure.evidenceId !== undefined) ??
+    diagnostics.failures?.find((failure) => !failure.id.startsWith("mission:")) ??
+    diagnostics.failures?.[0];
+  const reason = latest?.reason ?? diagnostics.failedEvidence?.[0]?.reason ?? "No specific reason recorded.";
+  const eventCount = diagnostics.events?.length ?? 0;
+  return `
+    <section class="diagnostics-panel panel" aria-labelledby="diagnostics-heading">
+      <div class="section-heading diagnostics-heading">
+        <div><p class="section-kicker">Failure record</p><h2 id="diagnostics-heading">Diagnostics</h2></div>
+        <button id="copy-diagnostics" class="compact-action" type="button">Copy diagnostic snapshot</button>
+      </div>
+      <div class="diagnostics-summary">
+        <div>
+          <p class="diagnostics-reason">${escapeHtml(reason)}</p>
+          <p class="diagnostics-correlation">${escapeHtml(latest?.layer ?? "proof_board")} / ${escapeHtml(latest?.category ?? "pipeline")} · ${eventCount} correlated event${eventCount === 1 ? "" : "s"}</p>
+        </div>
+        <details>
+          <summary>Show failure details</summary>
+          <dl class="diagnostics-meta">
+            <div><dt>Mission</dt><dd>${escapeHtml(diagnostics.mission.id)}</dd></div>
+            <div><dt>Status</dt><dd>${escapeHtml(humanLabel(diagnostics.mission.status))}</dd></div>
+            ${diagnostics.trueforge?.sessionId ? `<div><dt>Session</dt><dd>${escapeHtml(shortRef(diagnostics.trueforge.sessionId))}</dd></div>` : ""}
+            ${diagnostics.trueforge?.turnId ? `<div><dt>Turn</dt><dd>${escapeHtml(shortRef(diagnostics.trueforge.turnId))}</dd></div>` : ""}
+            ${diagnostics.trueforge?.sandboxId ? `<div><dt>Sandbox</dt><dd>${escapeHtml(shortRef(diagnostics.trueforge.sandboxId))}</dd></div>` : ""}
+          </dl>
+        </details>
+      </div>
+    </section>`;
+}
+
+async function copyDiagnostics(snapshot) {
+  const content = JSON.stringify(snapshot, null, 2);
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(content);
+      showMessage("success", "Diagnostic snapshot copied.");
+      return;
+    }
+  } catch {
+    // Fall back to a local download when clipboard permissions are unavailable.
+  }
+  const blob = new Blob([content], { type: "application/json" });
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = `mission-diagnostics-${snapshot.mission.id}.json`;
+  link.click();
+  window.setTimeout(() => URL.revokeObjectURL(link.href), 0);
+  showMessage("success", "Diagnostic snapshot exported locally.");
 }
 
 function renderLane(lane, view) {

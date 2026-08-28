@@ -1103,6 +1103,7 @@ export class TrueForgeMissionRunner {
       return undefined;
     }
 
+    let execution: InternalTurnResult | undefined;
     try {
       const toolName = canonicalSandboxToolName(undefined, this.config.sandboxToolName);
       const preparationOptions: RunTurnOptions = {};
@@ -1117,7 +1118,7 @@ export class TrueForgeMissionRunner {
       } else if (previousTurnId !== undefined) {
         preparationOptions.previousTurnId = previousTurnId;
       }
-      const execution = await this.executeCoordinatorTurn(
+      execution = await this.executeCoordinatorTurn(
         mission.id,
         buildLockedRepositoryPreparationInstruction(mission, toolName),
         preparationOptions,
@@ -1161,7 +1162,7 @@ export class TrueForgeMissionRunner {
         mission: await this.missions.getMission(mission.id),
       };
     } catch (error) {
-      await this.recordRepositoryPreparationFailure(mission.id, workItemId, error);
+      await this.recordRepositoryPreparationFailure(mission.id, workItemId, error, execution);
       if (error instanceof TrueForgeIntegrationError && error.operation === "prepare repository") {
         throw error;
       }
@@ -1648,6 +1649,7 @@ export class TrueForgeMissionRunner {
     input: RepositoryInspectionInput,
   ): Promise<RepositoryInspectionResult> {
     const mission = await this.missions.getMission(input.missionId);
+    let execution: InternalTurnResult | undefined;
     try {
       if (mission.repository === undefined) {
         throw new TrueForgeIntegrationError(
@@ -1681,7 +1683,7 @@ export class TrueForgeMissionRunner {
       if (input.workItemId !== undefined) {
         inspectionOptions.workItemId = input.workItemId;
       }
-      const execution = await this.executeTurn(
+      execution = await this.executeTurn(
         mission.id,
         lockedFixture
           ? buildLockedFixtureInspectionInstruction(mission, mcpServerName)
@@ -1756,7 +1758,7 @@ export class TrueForgeMissionRunner {
       }
       return result;
     } catch (error) {
-      await this.recordInspectionFailure(mission.id, input.workItemId, error);
+      await this.recordInspectionFailure(mission.id, input.workItemId, error, execution);
       if (error instanceof TrueForgeIntegrationError) {
         throw error;
       }
@@ -1771,6 +1773,7 @@ export class TrueForgeMissionRunner {
     input: DeliveryHeadInspectionInput,
   ): Promise<RepositoryInspectionResult> {
     const mission = await this.missions.getMission(input.missionId);
+    let execution: InternalTurnResult | undefined;
     try {
       const target = validatePullRequestDeliveryTarget(input.target);
       if (
@@ -1788,7 +1791,7 @@ export class TrueForgeMissionRunner {
         "MCP server name",
       );
       ensureRepositoryMcpConfigured(this.config, mcpServerName, "get_commit");
-      const execution = await this.executeTurn(
+      execution = await this.executeTurn(
         mission.id,
         buildDeliveryHeadInspectionInstruction(target, mcpServerName),
         {},
@@ -1838,7 +1841,7 @@ export class TrueForgeMissionRunner {
         mission: await this.missions.getMission(mission.id),
       };
     } catch (error) {
-      await this.recordInspectionFailure(mission.id, undefined, error);
+      await this.recordInspectionFailure(mission.id, undefined, error, execution);
       if (error instanceof TrueForgeIntegrationError) {
         throw error;
       }
@@ -1853,6 +1856,7 @@ export class TrueForgeMissionRunner {
     input: SandboxPreparationInput,
   ): Promise<SandboxPreparationResult> {
     const mission = await this.missions.getMission(input.missionId);
+    let execution: InternalTurnResult | undefined;
     try {
       const toolName = canonicalSandboxToolName(undefined, this.config.sandboxToolName);
       const preparationOptions: RunTurnOptions = {};
@@ -1865,7 +1869,7 @@ export class TrueForgeMissionRunner {
         }
         preparationOptions.previousTurnId = mission.trueforgeTurnId;
       }
-      const execution = await this.executeCoordinatorTurn(
+      execution = await this.executeCoordinatorTurn(
         mission.id,
         buildSandboxPreparationInstruction(mission, toolName),
         preparationOptions,
@@ -1906,7 +1910,7 @@ export class TrueForgeMissionRunner {
         mission: await this.missions.getMission(mission.id),
       };
     } catch (error) {
-      await this.recordSandboxPreparationFailure(mission.id, error);
+      await this.recordSandboxPreparationFailure(mission.id, error, execution);
       if (error instanceof TrueForgeIntegrationError && error.operation === "prepare sandbox") {
         throw error;
       }
@@ -1924,6 +1928,7 @@ export class TrueForgeMissionRunner {
     input: SandboxVerificationInput,
   ): Promise<SandboxVerificationResult> {
     const mission = await this.missions.getMission(input.missionId);
+    let execution: InternalTurnResult | undefined;
     try {
       const command = requiredSandboxString(input.command, "sandbox command");
       const toolName = canonicalSandboxToolName(input.toolName, this.config.sandboxToolName);
@@ -1941,7 +1946,7 @@ export class TrueForgeMissionRunner {
         }
         verificationOptions.previousTurnId = mission.trueforgeTurnId;
       }
-      const execution = await this.executeCoordinatorTurn(
+      execution = await this.executeCoordinatorTurn(
         mission.id,
         buildSandboxVerificationInstruction(mission, command, toolName, intent),
         verificationOptions,
@@ -1991,7 +1996,13 @@ export class TrueForgeMissionRunner {
         mission: await this.missions.getMission(mission.id),
       };
     } catch (error) {
-      await this.recordSandboxFailure(mission.id, input.workItemId, input.command, error);
+      await this.recordSandboxFailure(
+        mission.id,
+        input.workItemId,
+        input.command,
+        error,
+        execution,
+      );
       if (error instanceof TrueForgeIntegrationError) {
         throw error;
       }
@@ -2678,6 +2689,7 @@ export class TrueForgeMissionRunner {
     missionId: string,
     workItemId: string | undefined,
     error: unknown,
+    execution: InternalTurnResult | undefined,
   ): Promise<void> {
     const message = error instanceof TrueForgeIntegrationError
       ? error.message
@@ -2688,7 +2700,16 @@ export class TrueForgeMissionRunner {
         result: "failed" as const,
         source: "mcp" as const,
         summary: "MCP repository inspection failed; no repository finding was accepted.",
-        details: JSON.stringify({ reason: message }),
+        details: JSON.stringify({
+          failure_layer: "tool",
+          failure_category: "mcp",
+          ...inspectionFailureRuntimeDetails(message, execution),
+        }),
+        ...(execution === undefined
+          ? {}
+          : {
+              executionOrigin: inspectionFailureOrigin(execution),
+            }),
       };
       if (workItemId === undefined) {
         await this.missions.addEvidence(missionId, evidenceInput);
@@ -2770,6 +2791,7 @@ export class TrueForgeMissionRunner {
   private async recordSandboxPreparationFailure(
     missionId: string,
     error: unknown,
+    execution: InternalTurnResult | undefined,
   ): Promise<void> {
     const message = error instanceof TrueForgeIntegrationError
       ? error.message
@@ -2781,11 +2803,17 @@ export class TrueForgeMissionRunner {
         source: "sandbox",
         summary: "Sandbox toolchain readiness failed; coding delegation did not start.",
         details: JSON.stringify({
+          failure_layer: "tool",
+          failure_category: "sandbox",
           tool: "exec",
           intent: SANDBOX_TOOLCHAIN_READINESS_INTENT,
           command: SANDBOX_TOOLCHAIN_READINESS_COMMAND,
           reason: message,
+          ...runtimeFailureDetails(execution),
         }),
+        ...(execution === undefined
+          ? {}
+          : { executionOrigin: sandboxFailureOrigin(execution) }),
       });
     } catch {
       // Preserve the original readiness error if durable failure evidence cannot be recorded.
@@ -2826,6 +2854,7 @@ export class TrueForgeMissionRunner {
     missionId: string,
     workItemId: string,
     error: unknown,
+    execution: InternalTurnResult | undefined,
   ): Promise<void> {
     const message = error instanceof TrueForgeIntegrationError
       ? error.message
@@ -2839,10 +2868,16 @@ export class TrueForgeMissionRunner {
         source: "sandbox",
         summary: "Locked repository preparation failed; delegated workspace proof did not start.",
         details: JSON.stringify({
+          failure_layer: "tool",
+          failure_category: "sandbox",
           intent: LOCKED_REPOSITORY_PREPARATION_INTENT,
           command: LOCKED_REPOSITORY_PREPARATION_COMMAND,
           reason,
+          ...runtimeFailureDetails(execution),
         }),
+        ...(execution === undefined
+          ? {}
+          : { executionOrigin: sandboxFailureOrigin(execution) }),
       });
     } catch {
       // Preserve the original preparation error if durable failure evidence cannot be recorded.
@@ -2862,6 +2897,7 @@ export class TrueForgeMissionRunner {
     workItemId: string | undefined,
     command: string,
     error: unknown,
+    execution: InternalTurnResult | undefined,
   ): Promise<void> {
     const message = error instanceof TrueForgeIntegrationError
       ? error.message
@@ -2873,9 +2909,15 @@ export class TrueForgeMissionRunner {
         source: "sandbox" as const,
         summary: "Sandbox verification failed; the command was not accepted as passing.",
         details: JSON.stringify({
+          failure_layer: "tool",
+          failure_category: "sandbox",
           command: typeof command === "string" ? command.trim().slice(0, 2_000) : "",
           reason: message,
+          ...runtimeFailureDetails(execution),
         }),
+        ...(execution === undefined
+          ? {}
+          : { executionOrigin: sandboxFailureOrigin(execution) }),
       };
       if (workItemId === undefined) {
         await this.missions.addEvidence(missionId, evidenceInput);
@@ -4135,6 +4177,162 @@ function runtimeExecutionOrigin(
   return origin;
 }
 
+function inspectionFailureRuntimeDetails(
+  message: string,
+  execution: InternalTurnResult | undefined,
+): Record<string, unknown> {
+  const reason = sanitizeRuntimeText(message);
+  return {
+    reason,
+    verification_reason: reason,
+    ...runtimeFailureDetails(execution),
+  };
+}
+
+function runtimeFailureDetails(
+  execution: InternalTurnResult | undefined,
+): Record<string, unknown> {
+  if (execution === undefined) {
+    return {};
+  }
+  const details: Record<string, unknown> = {
+    session_id: execution.sessionId,
+    turn_id: execution.turnId,
+    runtime_events: execution.rawEvents
+      .slice(-80)
+      .map(diagnosticRuntimeEvent),
+    tool_calls: observedToolCalls(execution.rawEvents)
+      .slice(-16)
+      .map((call) => ({
+        id: call.id,
+        name: call.name,
+        thread_id: call.threadId,
+        arguments: safeRuntimeDiagnosticValue(call.arguments, "arguments"),
+      })),
+    tool_responses: execution.rawEvents
+      .filter((event) => event.type === "tool.response" || event.type === "tool.response_required")
+      .slice(-16)
+      .map((event) => {
+        const record = recordValue(event);
+        const response: Record<string, unknown> = {
+          event_id: stringOrNull(record.id),
+          event_type: event.type,
+          created_at: stringOrNull(record.createdAt),
+          thread_id: stringOrNull(record.threadId ?? record.thread_id),
+          tool_call_id: stringOrNull(record.toolCallId ?? record.tool_call_id),
+        };
+        if (record.content !== undefined) {
+          response.content = safeRuntimeDiagnosticValue(
+            parseMaybeJson(record.content),
+            "content",
+          );
+        }
+        return response;
+      }),
+  };
+  const sandboxIds = execution.rawEvents
+    .map(sandboxIdFromEvent)
+    .filter((sandboxId): sandboxId is string => sandboxId !== null);
+  if (sandboxIds.length > 0) {
+    details.sandbox_ids = [...new Set(sandboxIds)].slice(-8);
+    details.sandbox_id = sandboxIds.at(-1);
+  }
+  return details;
+}
+
+function inspectionFailureOrigin(execution: InternalTurnResult): ExecutionOrigin {
+  const call = observedToolCalls(execution.rawEvents).find((candidate) => candidate.name !== "exec") ??
+    observedToolCalls(execution.rawEvents)[0];
+  return {
+    kind: "mcp",
+    sessionId: execution.sessionId,
+    turnId: execution.turnId,
+    ...(call === undefined ? {} : { toolCallId: call.id }),
+  };
+}
+
+function sandboxFailureOrigin(execution: InternalTurnResult): ExecutionOrigin {
+  const call = observedToolCalls(execution.rawEvents).find((candidate) => candidate.name === "exec");
+  return {
+    kind: "sandbox",
+    sessionId: execution.sessionId,
+    turnId: execution.turnId,
+    ...(call === undefined ? {} : { toolCallId: call.id }),
+  };
+}
+
+function diagnosticRuntimeEvent(
+  event: TrueForgeApi.TurnStreamingEvent,
+): Record<string, unknown> {
+  const summary = summarizeRuntimeEvent(event);
+  const record = recordValue(event);
+  const result: Record<string, unknown> = {
+    event_id: summary.id,
+    event_type: summary.type,
+    created_at: summary.createdAt,
+    thread_id: summary.threadId,
+    turn_id: summary.turnId,
+  };
+  if (event.type === "turn.done" || event.type === "thread.done") {
+    const state = record.state;
+    if (isRecord(state)) {
+      result.status = stringOrNull(state.status);
+      const error = safeRuntimeError(state.error) ??
+        safeRuntimeError(state.message) ??
+        safeRuntimeError(state.reason);
+      if (error !== null) {
+        result.error = error;
+      }
+    }
+  }
+  if (event.type === "mcp.initialize" && Array.isArray(record.mcpServers)) {
+    result.servers = record.mcpServers
+      .filter(isRecord)
+      .map((server) => safeRuntimeDiagnosticValue(server.name, "name"))
+      .filter((name): name is string => typeof name === "string")
+      .slice(0, 16);
+  }
+  const sandboxId = sandboxIdFromEvent(event);
+  if (sandboxId !== null) {
+    result.sandbox_id = sandboxId;
+  }
+  return result;
+}
+
+function safeRuntimeDiagnosticValue(value: unknown, key: string, depth = 0): unknown {
+  if (/(authorization|api[_-]?key|token|password|secret|credential|cookie|private[_-]?key)/i.test(key)) {
+    return "[redacted]";
+  }
+  if (typeof value === "string") {
+    return sanitizeRuntimeText(value);
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : "[unavailable]";
+  }
+  if (typeof value === "boolean" || value === null) {
+    return value;
+  }
+  if (depth >= 4) {
+    return "[bounded]";
+  }
+  if (Array.isArray(value)) {
+    return value.slice(0, 24).map((child) =>
+      safeRuntimeDiagnosticValue(child, key, depth + 1)
+    );
+  }
+  if (isRecord(value)) {
+    const result: Record<string, unknown> = {};
+    for (const [childKey, child] of Object.entries(value).slice(0, 40)) {
+      if (/(authorization|api[_-]?key|token|password|secret|credential|cookie|private[_-]?key)/i.test(childKey)) {
+        continue;
+      }
+      result[childKey.slice(0, 120)] = safeRuntimeDiagnosticValue(child, childKey, depth + 1);
+    }
+    return result;
+  }
+  return "[unavailable]";
+}
+
 function expectedRepositoryArguments(
   repository: NonNullable<Mission["repository"]>,
   path: string,
@@ -4735,8 +4933,9 @@ function verifySandboxReadiness(
 
 function sanitizeRuntimeText(value: string): string {
   return value
-    .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s,;]+/gi, "$1[redacted]")
-    .replace(/((?:api[_-]?key|token|password|secret)\s*[:=]\s*)[^\s,;]+/gi, "$1[redacted]")
+    .replace(/authorization\s*[:=]\s*bearer\s+[^\s,;]+/gi, "[redacted]")
+    .replace(/\b(?:api[_-]?key|token|password|secret|credential|cookie)\s*[:=]\s*[^\s,;]+/gi, "[redacted]")
+    .replace(/\bBearer\s+[^\s,;]+/gi, "[redacted]")
     .slice(0, 1_200);
 }
 

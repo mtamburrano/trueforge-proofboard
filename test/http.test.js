@@ -419,6 +419,7 @@ test("initial mission route and static application assets load", async () => {
   assert.match(scriptBody, /Cancelled\. The protected repository operation was not executed/);
   assert.match(scriptBody, /Waiting for correlated remote result evidence/);
   assert.match(scriptBody, /Delivered pull request/);
+  assert.match(scriptBody, /Copy diagnostic snapshot/);
 
   const style = await app.request("/public/style.css");
   assert.equal(style.status, 200);
@@ -428,6 +429,7 @@ test("initial mission route and static application assets load", async () => {
   assert.match(styleBody, /evidence-card\[data-result="failed"\]/);
   assert.match(styleBody, /approval-actions/);
   assert.match(styleBody, /delivery-card/);
+  assert.match(styleBody, /diagnostics-panel/);
 
   const runState = await app.request("/public/run-state.js");
   assert.equal(runState.status, 200);
@@ -575,6 +577,68 @@ test("API maps persisted proof separately from runtime narration and redacts sec
 
   const serialized = JSON.stringify(payload);
   assert.doesNotMatch(serialized, /browser-secret|apiKey|authorization|token/);
+  assert.doesNotMatch(serialized, /details/);
+});
+
+test("blocked missions expose one safe diagnostic snapshot with exact tool failure context", async () => {
+  const { app, missions } = testApp();
+  await app.request("/api/mission", { method: "POST" });
+  const exactReason = "Expected exactly one canonical get_commit MCP call, found 0.";
+  await missions.addEvidence(PRIMARY_MISSION_ID, {
+    workItemId: "primary-inspect",
+    kind: "tool_result",
+    result: "failed",
+    source: "mcp",
+    summary: "MCP repository inspection failed; no repository finding was accepted.",
+    details: JSON.stringify({
+      failure_layer: "tool",
+      failure_category: "mcp",
+      reason: exactReason,
+      tool_calls: [{
+        id: "diagnostic-call",
+        name: "get_commit",
+        arguments: { owner: "mtamburrano", repo: "wrong-repository" },
+      }],
+      tool_responses: [{
+        event_id: "diagnostic-response",
+        tool_call_id: "diagnostic-call",
+        content: { isError: true, token: "must-not-reach-browser" },
+      }],
+    }),
+    executionOrigin: {
+      kind: "mcp",
+      sessionId: "diagnostic-session",
+      turnId: "diagnostic-turn",
+      toolCallId: "diagnostic-call",
+    },
+  });
+  await missions.transitionWorkItem(PRIMARY_MISSION_ID, "primary-inspect", "blocked");
+  await missions.transitionMission(PRIMARY_MISSION_ID, "blocked");
+
+  const response = await app.request("/api/mission");
+  assert.equal(response.status, 200);
+  const payload = await json(response);
+  const diagnostics = payload.mission.diagnostics;
+  assert.equal(diagnostics.version, 1);
+  assert.equal(diagnostics.mission.status, "blocked");
+  assert.equal(diagnostics.workItems[0].status, "blocked");
+  assert.equal(diagnostics.failedEvidence[0].reason, exactReason);
+  assert.equal(diagnostics.failures.some((failure) =>
+    failure.layer === "tool" && failure.category === "mcp" && failure.reason === exactReason
+  ), true);
+  assert.equal(diagnostics.trueforge.sessionId, "test-session-durable");
+  assert.equal(diagnostics.trueforge.turnId, undefined);
+  assert.equal(diagnostics.failedEvidence[0].origin.sessionId, "diagnostic-session");
+  assert.equal(diagnostics.failedEvidence[0].origin.turnId, "diagnostic-turn");
+  assert.equal(diagnostics.events.some((event) =>
+    event.type === "tool.call" && event.toolCallId === "diagnostic-call"
+  ), true);
+  assert.equal(diagnostics.events.some((event) => event.type === "tool.response"), true);
+
+  const diagnosticsRoute = await json(await app.request("/api/mission/diagnostics"));
+  assert.deepEqual(diagnosticsRoute.diagnostics, diagnostics);
+  const serialized = JSON.stringify(payload);
+  assert.doesNotMatch(serialized, /must-not-reach-browser/);
   assert.doesNotMatch(serialized, /details/);
 });
 
