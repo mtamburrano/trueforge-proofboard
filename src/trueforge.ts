@@ -39,6 +39,7 @@ export interface TrueForgeMissionConfig {
   mcpServerName?: string;
   repositoryToolName?: string;
   sandboxToolName?: string;
+  deliveryToolName?: string;
   iterationLimit?: number;
   sandboxEnabled?: boolean;
 }
@@ -403,6 +404,38 @@ export interface RunTurnOptions {
   delegateToSubagent?: boolean;
 }
 
+interface InternalRunTurnOptions extends RunTurnOptions {
+  input?: TrueForgeApi.TurnInputItem[];
+}
+
+export interface PullRequestDeliveryTarget {
+  owner: string;
+  repo: string;
+  base: string;
+  head: string;
+  title: string;
+  body: string;
+}
+
+export interface TrueForgeDeliveryApproval {
+  sessionId: string;
+  turnId: string;
+  threadId: string;
+  toolCallId: string;
+  serverName: string;
+  toolName: "create_pull_request";
+  target: PullRequestDeliveryTarget;
+}
+
+export interface TrueForgePullRequestResult {
+  number: number;
+  url: string;
+  sessionId: string;
+  turnId: string;
+  threadId: string;
+  toolCallId: string;
+}
+
 export interface RepositoryInspectionInput {
   missionId: string;
   path?: string;
@@ -609,12 +642,23 @@ function defaultRepositoryMcpServer(
   config: TrueForgeMissionConfig,
 ): TrueForgeApi.McpServer {
   const toolName = config.repositoryToolName ?? "get_file_contents";
-  const toolNames = [...new Set([toolName, "get_file_contents", "get_commit"])];
-  return {
+  const toolNames = [
+    ...new Set([
+      toolName,
+      "get_file_contents",
+      "get_commit",
+      ...(config.deliveryToolName === undefined ? [] : [config.deliveryToolName]),
+    ]),
+  ];
+  const server: TrueForgeApi.McpServer = {
     name: config.mcpServerName ?? "github",
     enableTools: toolNames,
     preloadTools: toolNames,
   };
+  if (config.deliveryToolName !== undefined) {
+    server.requireApprovalForTools = [config.deliveryToolName];
+  }
+  return server;
 }
 
 export class TrueForgeMissionRunner {
@@ -671,6 +715,104 @@ export class TrueForgeMissionRunner {
       ...(execution.implementationHandoff === undefined
         ? {}
         : { implementationHandoff: execution.implementationHandoff }),
+    };
+  }
+
+  async requestPullRequestApproval(
+    missionId: string,
+    targetInput: PullRequestDeliveryTarget,
+  ): Promise<TrueForgeDeliveryApproval> {
+    const target = validatePullRequestDeliveryTarget(targetInput);
+    const serverName = requiredString(
+      this.config.mcpServerName ?? "github",
+      "MCP server name",
+      "request pull request approval",
+    );
+    ensureDeliveryMcpConfigured(this.config, serverName);
+    const execution = await this.executeTurn(
+      missionId,
+      buildPullRequestDeliveryInstruction(serverName, target),
+      {},
+    );
+    return pendingDeliveryApprovalFromEvents(
+      execution.rawEvents,
+      execution.sessionId,
+      execution.turnId,
+      serverName,
+      target,
+    );
+  }
+
+  async resolvePullRequestApproval(
+    missionId: string,
+    pending: TrueForgeDeliveryApproval,
+    decision: "approved" | "rejected" | "cancelled",
+  ): Promise<TrueForgePullRequestResult | null> {
+    const target = validatePullRequestDeliveryTarget(pending.target);
+    validatePendingDeliveryApproval(pending, target);
+    const mission = await this.missions.getMission(missionId);
+    if (mission.trueforgeSessionId !== pending.sessionId) {
+      throw new TrueForgeIntegrationError(
+        "resolve pull request approval",
+        "The pending approval is not correlated to the mission TrueForge session.",
+      );
+    }
+    ensureDeliveryMcpConfigured(this.config, pending.serverName);
+    const input: TrueForgeApi.UserToolApprovalEvent = {
+      type: "user.tool_approval",
+      threadId: pending.threadId,
+      toolCallId: pending.toolCallId,
+      approval: decision === "approved"
+        ? { status: "allow" }
+        : {
+            status: "deny",
+            reason: decision === "cancelled"
+              ? "The operator cancelled this delivery action."
+              : "The operator rejected this delivery action.",
+          },
+    };
+    const execution = await this.executeTurn(missionId, "", {
+      previousTurnId: pending.turnId,
+      input: [input],
+    });
+    requireCompletedTurn(
+      execution.rawEvents,
+      "resolve pull request approval",
+      "delivery approval",
+    );
+    const response = toolResponseForCall(
+      execution.rawEvents,
+      pending.toolCallId,
+      pending.threadId,
+    );
+    if (decision !== "approved") {
+      if (response !== undefined) {
+        throw new TrueForgeIntegrationError(
+          "resolve pull request approval",
+          "TrueForge advanced the protected tool boundary after the action was denied.",
+        );
+      }
+      return null;
+    }
+    if (response?.type !== "tool.response") {
+      throw new TrueForgeIntegrationError(
+        "resolve pull request approval",
+        "The approved create_pull_request tool call returned no structured response.",
+      );
+    }
+    const pullRequest = parsePullRequestDeliveryResponse(response, target);
+    if (pullRequest === null) {
+      throw new TrueForgeIntegrationError(
+        "resolve pull request approval",
+        "The create_pull_request response did not prove the expected pull request result.",
+      );
+    }
+    return {
+      ...pullRequest,
+      sessionId: execution.sessionId,
+      turnId: execution.turnId,
+      threadId: pending.threadId,
+      toolCallId: pending.toolCallId,
     };
   }
 
@@ -897,7 +1039,7 @@ export class TrueForgeMissionRunner {
   private async executeTurn(
     missionId: string,
     instruction: string,
-    options: RunTurnOptions,
+    options: InternalRunTurnOptions,
   ): Promise<InternalTurnResult> {
     const mission = await this.missions.getMission(missionId);
     const workItem = options.workItemId === undefined
@@ -924,10 +1066,14 @@ export class TrueForgeMissionRunner {
       ? buildWorkPacket(mission, workItem, state)
       : undefined;
     const session = await this.resumeMission(mission.id);
-    const content = buildTurnInstruction(mission, workItem, instruction, packet);
-    const request: TrueForgeApi.CreateTurnSessionsStreamRequest = {
-      input: [{ type: "user.message", content }],
-    };
+    const request: TrueForgeApi.CreateTurnSessionsStreamRequest = options.input === undefined
+      ? {
+          input: [{
+            type: "user.message",
+            content: buildTurnInstruction(mission, workItem, instruction, packet),
+          }],
+        }
+      : { input: options.input };
     if (options.previousTurnId !== undefined) {
       request.previousTurnId = options.previousTurnId;
     }
@@ -1504,6 +1650,176 @@ function ensureRepositoryMcpConfigured(
   }
 }
 
+function ensureDeliveryMcpConfigured(
+  config: TrueForgeMissionConfig,
+  serverName: string,
+): void {
+  const toolName = config.deliveryToolName ?? "create_pull_request";
+  if (toolName !== "create_pull_request") {
+    throw new TrueForgeIntegrationError(
+      "request pull request approval",
+      "Repository delivery requires the canonical create_pull_request MCP tool.",
+    );
+  }
+  const servers = config.mcpServers ?? [defaultRepositoryMcpServer(config)];
+  const server = servers.find((candidate) => candidate.name === serverName);
+  const enabledTools = server?.enableTools ?? [];
+  const approvalTools = server?.requireApprovalForTools ?? [];
+  if (
+    server === undefined ||
+    (!enabledTools.includes(toolName) && !enabledTools.includes("@all")) ||
+    (!approvalTools.includes(toolName) && !approvalTools.includes("@all"))
+  ) {
+    throw new TrueForgeIntegrationError(
+      "request pull request approval",
+      `MCP server ${serverName} must expose ${toolName} and require native approval for it.`,
+    );
+  }
+}
+
+function validatePullRequestDeliveryTarget(
+  input: PullRequestDeliveryTarget,
+): PullRequestDeliveryTarget {
+  const operation = "request pull request approval";
+  return {
+    owner: requiredString(input.owner, "repository owner", operation),
+    repo: requiredString(input.repo, "repository name", operation),
+    base: requiredString(input.base, "pull request base", operation),
+    head: requiredString(input.head, "pull request head", operation),
+    title: requiredString(input.title, "pull request title", operation),
+    body: requiredString(input.body, "pull request body", operation),
+  };
+}
+
+function pullRequestArguments(
+  target: PullRequestDeliveryTarget,
+): Record<string, string> {
+  return {
+    owner: target.owner,
+    repo: target.repo,
+    base: target.base,
+    head: target.head,
+    title: target.title,
+    body: target.body,
+  };
+}
+
+function buildPullRequestDeliveryInstruction(
+  serverName: string,
+  target: PullRequestDeliveryTarget,
+): string {
+  return [
+    `Use the configured MCP server ${serverName}.`,
+    `Call create_pull_request exactly once with this JSON object: ${JSON.stringify(pullRequestArguments(target))}.`,
+    "Do not call any other write or destructive tool.",
+    "Stop at TrueForge's native tool approval boundary and wait for the correlated human decision.",
+    "Do not claim that a pull request exists until the approved tool call returns its number and URL.",
+  ].join(" ");
+}
+
+function pendingDeliveryApprovalFromEvents(
+  events: TrueForgeApi.TurnStreamingEvent[],
+  sessionId: string,
+  turnId: string,
+  serverName: string,
+  target: PullRequestDeliveryTarget,
+): TrueForgeDeliveryApproval {
+  const doneEvents = events.filter((event) => event.type === "turn.done");
+  const done = doneEvents.at(-1);
+  const completion = done === undefined ? null : turnCompletion(done);
+  if (
+    completion?.status !== "done" ||
+    completion.requiredActions === null ||
+    completion.requiredActions.length === 0
+  ) {
+    throw new TrueForgeIntegrationError(
+      "request pull request approval",
+      "TrueForge did not pause the delivery turn with a required approval action.",
+    );
+  }
+  const approvalEvents = events.filter(
+    (event): event is TrueForgeApi.ToolApprovalRequiredEvent =>
+      event.type === "tool.approval_required",
+  );
+  if (approvalEvents.length !== 1 || approvalEvents[0]?.toolCalls.length !== 1) {
+    throw new TrueForgeIntegrationError(
+      "request pull request approval",
+      "TrueForge must pause exactly one consequential tool call for approval.",
+    );
+  }
+  const approvalEvent = approvalEvents[0];
+  const callRef = approvalEvent?.toolCalls[0];
+  if (approvalEvent === undefined || callRef === undefined) {
+    throw new TrueForgeIntegrationError(
+      "request pull request approval",
+      "TrueForge returned a malformed tool approval event.",
+    );
+  }
+  const sourceEvent = events.find((event) =>
+    recordValue(event).id === callRef.sourceEventId &&
+    (event.type === "model.message" || event.type === "model.message.delta") &&
+    Array.isArray(recordValue(event).toolCalls) &&
+    (recordValue(event).toolCalls as unknown[]).some((rawCall) =>
+      isRecord(rawCall) && stringOrNull(rawCall.id) === callRef.id
+    )
+  );
+  if (sourceEvent === undefined) {
+    throw new TrueForgeIntegrationError(
+      "request pull request approval",
+      "The approval event is not correlated to its source tool-call event.",
+    );
+  }
+  const calls = observedToolCalls(events).filter((call) =>
+    call.id === callRef.id &&
+    call.name === "create_pull_request" &&
+    call.threadId === approvalEvent.threadId &&
+    isRecord(call.arguments) &&
+    argumentsExactlyMatch(call.arguments, pullRequestArguments(target))
+  );
+  if (calls.length !== 1) {
+    throw new TrueForgeIntegrationError(
+      "request pull request approval",
+      "The paused tool call did not exactly match the requested repository/base/head delivery effect.",
+    );
+  }
+  if (toolResponseForCall(events, callRef.id, approvalEvent.threadId) !== undefined) {
+    throw new TrueForgeIntegrationError(
+      "request pull request approval",
+      "The protected create_pull_request call returned before human approval.",
+    );
+  }
+  return {
+    sessionId,
+    turnId,
+    threadId: approvalEvent.threadId,
+    toolCallId: callRef.id,
+    serverName,
+    toolName: "create_pull_request",
+    target: { ...target },
+  };
+}
+
+function validatePendingDeliveryApproval(
+  pending: TrueForgeDeliveryApproval,
+  target: PullRequestDeliveryTarget,
+): void {
+  const operation = "resolve pull request approval";
+  requiredString(pending.sessionId, "approval session id", operation);
+  requiredString(pending.turnId, "approval turn id", operation);
+  requiredString(pending.threadId, "approval thread id", operation);
+  requiredString(pending.toolCallId, "approval tool call id", operation);
+  requiredString(pending.serverName, "approval MCP server", operation);
+  if (
+    pending.toolName !== "create_pull_request" ||
+    !argumentsExactlyMatch(pullRequestArguments(pending.target), pullRequestArguments(target))
+  ) {
+    throw new TrueForgeIntegrationError(
+      operation,
+      "The pending approval does not identify the canonical pull request action.",
+    );
+  }
+}
+
 function buildRepositoryInspectionInstruction(
   mission: Mission,
   path: string,
@@ -1888,6 +2204,67 @@ function toolResponseForCall(
     (expectedThreadId === undefined ||
       stringOrNull(recordValue(event).threadId ?? recordValue(event).thread_id) === expectedThreadId),
   );
+}
+
+function parsePullRequestDeliveryResponse(
+  event: TrueForgeApi.TurnStreamingEvent,
+  target: PullRequestDeliveryTarget,
+): { number: number; url: string } | null {
+  const root = parseMaybeJson(recordValue(event).content);
+  const candidates: unknown[] = [];
+  const visit = (value: unknown, depth: number): void => {
+    if (depth > 6 || value === null || value === undefined) {
+      return;
+    }
+    candidates.push(value);
+    if (typeof value === "string") {
+      const parsed = parseMaybeJson(value);
+      if (parsed !== value) {
+        visit(parsed, depth + 1);
+      }
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach((item) => visit(item, depth + 1));
+      return;
+    }
+    if (isRecord(value)) {
+      if (value.isError === true || value.success === false) {
+        return;
+      }
+      Object.values(value).forEach((item) => visit(item, depth + 1));
+    }
+  };
+  visit(root, 0);
+  for (const candidate of candidates) {
+    if (!isRecord(candidate)) {
+      continue;
+    }
+    const number = candidate.number ?? candidate.pull_number;
+    const url = candidate.html_url ?? candidate.pull_request_url ?? candidate.url;
+    if (
+      typeof number !== "number" ||
+      !Number.isInteger(number) ||
+      number < 1 ||
+      typeof url !== "string"
+    ) {
+      continue;
+    }
+    try {
+      const parsed = new URL(url);
+      const expectedPath = `/${target.owner}/${target.repo}/pull/${number}`;
+      if (
+        parsed.protocol === "https:" &&
+        parsed.hostname === "github.com" &&
+        parsed.pathname.replace(/\/$/, "") === expectedPath
+      ) {
+        return { number, url: parsed.toString() };
+      }
+    } catch {
+      // Ignore non-URL response fields and continue looking for the canonical PR URL.
+    }
+  }
+  return null;
 }
 
 interface ParsedExecutionResponse {

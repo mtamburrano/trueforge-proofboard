@@ -317,6 +317,20 @@ test("mission lifecycle stores typed evidence, handoffs, approvals, and delivery
     risk: "A remote change will be created.",
     expectedEffect: "Publish the verified patch for review.",
     evidenceIds: [evidence.id],
+    executionContext: {
+      sessionId: "session-delivery",
+      turnId: "turn-approval",
+      threadId: "thread-delivery",
+      toolCallId: "call-create-pr",
+      serverName: "github",
+      toolName: "create_pull_request",
+      repositoryOwner: "example",
+      repositoryName: "proof-board",
+      base: "main",
+      head: "verified-delivery",
+      title: "Publish the verified delivery",
+      body: "Contains only the independently verified fixture change.",
+    },
   });
 
   await service.transitionMission(mission.id, "awaiting_approval");
@@ -328,8 +342,24 @@ test("mission lifecycle stores typed evidence, handoffs, approvals, and delivery
   const delivery = await service.recordDelivery(mission.id, {
     id: "delivery-lifecycle",
     status: "delivered",
-    reference: "https://example.test/review/1",
+    reference: "https://github.com/example/proof-board/pull/1",
     verificationSummary: "Evidence and approval checks passed.",
+    approvalId: approval.id,
+    pullRequest: {
+      number: 1,
+      url: "https://github.com/example/proof-board/pull/1",
+      repositoryOwner: "example",
+      repositoryName: "proof-board",
+      base: "main",
+      head: "verified-delivery",
+    },
+    executionOrigin: {
+      kind: "mcp",
+      sessionId: "session-delivery",
+      turnId: "turn-delivery-result",
+      threadId: "thread-delivery",
+      toolCallId: "call-create-pr",
+    },
   });
 
   const state = await service.getState();
@@ -338,6 +368,9 @@ test("mission lifecycle stores typed evidence, handoffs, approvals, and delivery
   assert.equal(state.handoffs[0].result, "done");
   assert.equal(state.approvals[0].decision, "approved");
   assert.equal(delivery.status, "delivered");
+  assert.equal(delivery.pullRequest.number, 1);
+  assert.equal(delivery.approvalId, approval.id);
+  assert.equal(delivery.executionOrigin.turnId, "turn-delivery-result");
   assert.equal(handoff.memoryImpact, "medium");
 });
 

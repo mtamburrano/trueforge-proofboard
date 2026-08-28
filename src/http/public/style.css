@@ -249,12 +249,14 @@ button[aria-busy="true"]::after {
 .status-executing, .status-in-progress, .status-running { border-color: #4a6e91; color: var(--color-secondary); background: #182b3e; }
 .status-awaiting-approval, .status-ready-for-review { border-color: #8d654e; color: #ffb59b; background: #35251f; }
 .status-verifying, .status-delivered, .status-complete, .status-passed,
+.status-approved,
 .result-passed { border-color: #287c75; color: #7ce8db; background: #102a2a; }
-.status-blocked, .status-failed, .result-failed {
+.status-blocked, .status-failed, .status-rejected, .result-failed {
   border-color: #863b46;
   color: var(--color-danger-soft);
   background: #321a20;
 }
+.status-cancelled { border-color: #6d6675; color: #c7becf; background: #28242d; }
 .result-informational { color: var(--color-secondary); }
 
 .metrics-strip {
@@ -341,7 +343,14 @@ button[aria-busy="true"]::after {
 }
 .work-card h4 { margin: 0 0 var(--space-2); font-size: 13px; line-height: 1.3; }
 .work-card p { margin: 0; color: var(--color-muted); font-size: 11px; }
+.work-card p + p { margin-top: var(--space-2); }
 .work-card-meta { display: flex; flex-wrap: wrap; gap: var(--space-1); margin-top: var(--space-3); }
+.runtime-correlation { font-family: var(--font-mono); overflow-wrap: anywhere; }
+.approval-actions { display: flex; flex-wrap: wrap; gap: var(--space-1); margin-top: var(--space-3); }
+.compact-action { min-height: 28px; padding: 4px 8px; font-size: 10px; }
+.approval-outcome { margin-top: var(--space-3) !important; color: var(--color-ink) !important; }
+.delivery-card { border-left-color: var(--color-success); }
+.delivery-card a { color: var(--color-primary); overflow-wrap: anywhere; }
 .lane-empty { align-self: center; margin: auto; color: var(--color-muted-dim); font-size: 11px; text-align: center; }
 
 .operations-grid {

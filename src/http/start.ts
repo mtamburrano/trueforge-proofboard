@@ -27,10 +27,12 @@ const runner = new TrueForgeMissionRunner(
     mcpServerName: githubServer,
     repositoryToolName: "get_commit",
     sandboxToolName: "exec",
+    deliveryToolName: "create_pull_request",
     mcpServers: [{
       name: githubServer,
-      enableTools: ["get_file_contents", "get_commit"],
-      preloadTools: ["get_file_contents", "get_commit"],
+      enableTools: ["get_file_contents", "get_commit", "create_pull_request"],
+      preloadTools: ["get_file_contents", "get_commit", "create_pull_request"],
+      requireApprovalForTools: ["create_pull_request"],
     }],
   },
 );

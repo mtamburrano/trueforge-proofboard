@@ -76,7 +76,7 @@ export type ReviewOutcome = (typeof reviewOutcomes)[number];
 export const memoryImpacts = ["low", "medium", "high"] as const;
 export type MemoryImpact = (typeof memoryImpacts)[number];
 
-export const approvalDecisions = ["pending", "approved", "rejected"] as const;
+export const approvalDecisions = ["pending", "approved", "rejected", "cancelled"] as const;
 export type ApprovalDecision = (typeof approvalDecisions)[number];
 
 export const readOnlyActions = [
@@ -137,7 +137,7 @@ export const missionTransitions: Readonly<{
   planning: ["executing", "blocked", "failed"],
   executing: ["awaiting_approval", "verifying", "blocked", "failed"],
   awaiting_approval: ["verifying", "blocked", "failed"],
-  verifying: ["delivered", "blocked", "failed"],
+  verifying: ["awaiting_approval", "delivered", "blocked", "failed"],
   delivered: [],
   failed: [],
   blocked: ["planning", "executing", "failed"],
@@ -310,6 +310,31 @@ export interface Approval {
   expiresAt: string;
   decidedBy?: string;
   decidedAt?: string;
+  executionContext?: ApprovalExecutionContext;
+}
+
+export interface ApprovalExecutionContext {
+  sessionId: string;
+  turnId: string;
+  threadId: string;
+  toolCallId: string;
+  serverName: string;
+  toolName: string;
+  repositoryOwner: string;
+  repositoryName: string;
+  base: string;
+  head: string;
+  title: string;
+  body: string;
+}
+
+export interface PullRequestReference {
+  number: number;
+  url: string;
+  repositoryOwner: string;
+  repositoryName: string;
+  base: string;
+  head: string;
 }
 
 export interface Delivery {
@@ -319,6 +344,9 @@ export interface Delivery {
   verificationSummary: string;
   createdAt: string;
   reference?: string;
+  approvalId?: string;
+  pullRequest?: PullRequestReference;
+  executionOrigin?: ExecutionOrigin;
 }
 
 export interface MissionState {
@@ -423,6 +451,7 @@ export interface RequestApprovalInput {
   evidenceIds?: string[];
   expiresAt?: string;
   id?: string;
+  executionContext?: ApprovalExecutionContext;
 }
 
 export interface ActionExecutionInput {
@@ -438,10 +467,12 @@ export interface RecordDeliveryInput {
   reference?: string;
   approvalId?: string;
   id?: string;
+  pullRequest?: PullRequestReference;
+  executionOrigin?: ExecutionOrigin;
 }
 
 export interface DecideApprovalInput {
-  decision: "approved" | "rejected";
+  decision: "approved" | "rejected" | "cancelled";
   decidedBy: string;
 }
 
@@ -1137,6 +1168,74 @@ function validateApproval(value: unknown, label: string): Approval {
   if (decidedAt !== undefined) {
     result.decidedAt = decidedAt;
   }
+  if (approval.executionContext !== undefined) {
+    result.executionContext = validateApprovalExecutionContext(
+      approval.executionContext,
+      `${label}.executionContext`,
+    );
+  }
+  return result;
+}
+
+function validateApprovalExecutionContext(
+  value: unknown,
+  label: string,
+): ApprovalExecutionContext {
+  const context = objectValue(value, label);
+  return {
+    sessionId: identifier(context.sessionId, `${label}.sessionId`),
+    turnId: identifier(context.turnId, `${label}.turnId`),
+    threadId: identifier(context.threadId, `${label}.threadId`),
+    toolCallId: identifier(context.toolCallId, `${label}.toolCallId`),
+    serverName: requiredString(context.serverName, `${label}.serverName`, 200),
+    toolName: requiredString(context.toolName, `${label}.toolName`, 200),
+    repositoryOwner: requiredString(context.repositoryOwner, `${label}.repositoryOwner`, 200),
+    repositoryName: requiredString(context.repositoryName, `${label}.repositoryName`, 200),
+    base: requiredString(context.base, `${label}.base`, 500),
+    head: requiredString(context.head, `${label}.head`, 500),
+    title: requiredString(context.title, `${label}.title`, 500),
+    body: requiredString(context.body, `${label}.body`, 4_000),
+  };
+}
+
+function validatePullRequestReference(value: unknown, label: string): PullRequestReference {
+  const pullRequest = objectValue(value, label);
+  if (
+    typeof pullRequest.number !== "number" ||
+    !Number.isInteger(pullRequest.number) ||
+    pullRequest.number < 1
+  ) {
+    return fail("invalid_input", `${label}.number must be a positive integer.`);
+  }
+  const result = {
+    number: pullRequest.number,
+    url: requiredString(pullRequest.url, `${label}.url`, 2_000),
+    repositoryOwner: requiredString(
+      pullRequest.repositoryOwner,
+      `${label}.repositoryOwner`,
+      200,
+    ),
+    repositoryName: requiredString(
+      pullRequest.repositoryName,
+      `${label}.repositoryName`,
+      200,
+    ),
+    base: requiredString(pullRequest.base, `${label}.base`, 500),
+    head: requiredString(pullRequest.head, `${label}.head`, 500),
+  };
+  try {
+    const url = new URL(result.url);
+    const expectedPath = `/${result.repositoryOwner}/${result.repositoryName}/pull/${result.number}`;
+    if (
+      url.protocol !== "https:" ||
+      url.hostname !== "github.com" ||
+      url.pathname.replace(/\/$/, "") !== expectedPath
+    ) {
+      return fail("invalid_input", `${label}.url must match the recorded GitHub pull request.`);
+    }
+  } catch {
+    return fail("invalid_input", `${label}.url must be a valid GitHub pull request URL.`);
+  }
   return result;
 }
 
@@ -1159,6 +1258,34 @@ function validateDelivery(value: unknown, label: string): Delivery {
   };
   if (reference !== undefined) {
     result.reference = reference;
+  }
+  if (delivery.approvalId !== undefined) {
+    result.approvalId = identifier(delivery.approvalId, `${label}.approvalId`);
+  }
+  if (delivery.pullRequest !== undefined) {
+    result.pullRequest = validatePullRequestReference(
+      delivery.pullRequest,
+      `${label}.pullRequest`,
+    );
+  }
+  if (delivery.executionOrigin !== undefined) {
+    result.executionOrigin = validateExecutionOrigin(
+      delivery.executionOrigin,
+      `${label}.executionOrigin`,
+    );
+  }
+  if (
+    result.pullRequest !== undefined &&
+    (
+      result.reference !== result.pullRequest.url ||
+      result.approvalId === undefined ||
+      result.executionOrigin === undefined
+    )
+  ) {
+    return fail(
+      "invalid_input",
+      `${label} needs a matching reference, approval, and execution origin for its pull request.`,
+    );
   }
   return result;
 }
@@ -1360,6 +1487,36 @@ export function validateMissionState(value: unknown): MissionState {
   for (const delivery of result.deliveries) {
     if (!missions.has(delivery.missionId)) {
       fail("invalid_input", `Delivery ${delivery.id} references an unknown mission.`);
+    }
+    if (delivery.approvalId !== undefined) {
+      const approval = result.approvals.find((item) => item.id === delivery.approvalId);
+      if (approval === undefined || approval.missionId !== delivery.missionId) {
+        fail("invalid_input", `Delivery ${delivery.id} references an invalid approval.`);
+      }
+      if (
+        approval.decision !== "approved" ||
+        approval.actionType !== PRIMARY_CONSEQUENTIAL_ACTION
+      ) {
+        fail("invalid_input", `Delivery ${delivery.id} does not reference an approved delivery action.`);
+      }
+      if (delivery.pullRequest !== undefined && delivery.executionOrigin !== undefined) {
+        const context = approval.executionContext;
+        if (
+          context === undefined ||
+          context.repositoryOwner !== delivery.pullRequest.repositoryOwner ||
+          context.repositoryName !== delivery.pullRequest.repositoryName ||
+          context.base !== delivery.pullRequest.base ||
+          context.head !== delivery.pullRequest.head ||
+          context.sessionId !== delivery.executionOrigin.sessionId ||
+          context.threadId !== delivery.executionOrigin.threadId ||
+          context.toolCallId !== delivery.executionOrigin.toolCallId
+        ) {
+          fail(
+            "invalid_input",
+            `Delivery ${delivery.id} is not correlated to its approved tool call.`,
+          );
+        }
+      }
     }
   }
 
@@ -2614,6 +2771,12 @@ export class MissionService {
         createdAt: now,
         expiresAt,
       };
+      if (input.executionContext !== undefined) {
+        approval.executionContext = validateApprovalExecutionContext(
+          input.executionContext,
+          "executionContext",
+        );
+      }
       state.approvals.push(approval);
       return approval;
     });
@@ -2690,7 +2853,11 @@ export class MissionService {
       if (approval.decision !== "pending") {
         fail("invalid_transition", `Approval ${approval.id} has already been decided.`);
       }
-      const decision = enumValue(input.decision, ["approved", "rejected"], "decision");
+      const decision = enumValue(
+        input.decision,
+        ["approved", "rejected", "cancelled"],
+        "decision",
+      );
       if (decision === "approved" && approvalIsExpired(approval, now)) {
         fail("approval_blocked", `Approval ${approval.id} has expired and cannot be approved.`);
       }
@@ -2715,14 +2882,53 @@ export class MissionService {
         "verificationSummary",
       );
       const reference = optionalString(input.reference, "reference", 2_000);
+      const pullRequest = input.pullRequest === undefined
+        ? undefined
+        : validatePullRequestReference(input.pullRequest, "pullRequest");
+      const executionOrigin = input.executionOrigin === undefined
+        ? undefined
+        : validateExecutionOrigin(input.executionOrigin, "executionOrigin");
+      let approvedDelivery: Approval | undefined;
       if (status === "delivered") {
         if (mission.status !== "verifying") {
           fail("invalid_transition", "A delivered record requires a mission in verifying state.");
         }
         ensureAllWorkComplete(state, normalizedMissionId);
-        ensureApprovedDelivery(state, normalizedMissionId, input.approvalId, now);
+        approvedDelivery = ensureApprovedDelivery(
+          state,
+          normalizedMissionId,
+          input.approvalId,
+          now,
+        );
         if (reference === undefined) {
           fail("invalid_input", "reference is required for a delivered record.");
+        }
+        if (pullRequest !== undefined && reference !== pullRequest.url) {
+          fail("invalid_input", "Delivered pull request URL must match the delivery reference.");
+        }
+        if (pullRequest !== undefined || executionOrigin !== undefined) {
+          if (pullRequest === undefined || executionOrigin === undefined) {
+            fail(
+              "invalid_input",
+              "A correlated pull request delivery needs both the pull request and execution origin.",
+            );
+          }
+          const context = approvedDelivery.executionContext;
+          if (
+            context === undefined ||
+            context.repositoryOwner !== pullRequest.repositoryOwner ||
+            context.repositoryName !== pullRequest.repositoryName ||
+            context.base !== pullRequest.base ||
+            context.head !== pullRequest.head ||
+            context.sessionId !== executionOrigin.sessionId ||
+            context.threadId !== executionOrigin.threadId ||
+            context.toolCallId !== executionOrigin.toolCallId
+          ) {
+            fail(
+              "approval_blocked",
+              "The pull request result is not correlated to the approved TrueForge tool call.",
+            );
+          }
         }
       } else if (!["executing", "awaiting_approval", "verifying", "blocked"].includes(mission.status)) {
         fail("invalid_transition", `A failed delivery cannot be recorded from ${mission.status} state.`);
@@ -2738,6 +2944,15 @@ export class MissionService {
       };
       if (reference !== undefined) {
         delivery.reference = reference;
+      }
+      if (approvedDelivery !== undefined) {
+        delivery.approvalId = approvedDelivery.id;
+      }
+      if (pullRequest !== undefined) {
+        delivery.pullRequest = pullRequest;
+      }
+      if (executionOrigin !== undefined) {
+        delivery.executionOrigin = executionOrigin;
       }
       state.deliveries.push(delivery);
       mission.status = status === "delivered" ? "delivered" : "failed";

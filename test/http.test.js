@@ -29,6 +29,7 @@ class TestMissionRunner {
     this.structuredHandoff = structuredHandoff;
     this.sandboxInputs = [];
     this.turnInputs = [];
+    this.deliveryCalls = { requested: [], resolved: [], protectedOperations: 0 };
     this.calls = { create: 0, inspect: 0, turn: 0, sandbox: 0 };
   }
 
@@ -214,6 +215,35 @@ class TestMissionRunner {
     });
     return { evidenceId: evidence.id };
   }
+
+  async requestPullRequestApproval(missionId, target) {
+    this.deliveryCalls.requested.push({ missionId, target });
+    return {
+      sessionId: "test-session-durable",
+      turnId: "test-delivery-approval-turn",
+      threadId: "test-delivery-thread",
+      toolCallId: "test-create-pull-request-call",
+      serverName: "github",
+      toolName: "create_pull_request",
+      target: { ...target },
+    };
+  }
+
+  async resolvePullRequestApproval(missionId, pending, decision) {
+    this.deliveryCalls.resolved.push({ missionId, pending, decision });
+    if (decision !== "approved") {
+      return null;
+    }
+    this.deliveryCalls.protectedOperations += 1;
+    return {
+      number: 73,
+      url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/73",
+      sessionId: pending.sessionId,
+      turnId: "test-delivery-result-turn",
+      threadId: pending.threadId,
+      toolCallId: pending.toolCallId,
+    };
+  }
 }
 
 function testApp(repository = new InMemoryMissionRepository(), options = {}) {
@@ -251,6 +281,11 @@ test("initial mission route and static application assets load", async () => {
   assert.match(scriptBody, /data-source=/);
   assert.match(scriptBody, /data-result=/);
   assert.match(scriptBody, /Runtime narration never appears in this panel/);
+  assert.match(scriptBody, /Approve exact action/);
+  assert.match(scriptBody, /Rejected\. The protected repository operation was not executed/);
+  assert.match(scriptBody, /Cancelled\. The protected repository operation was not executed/);
+  assert.match(scriptBody, /Waiting for correlated remote result evidence/);
+  assert.match(scriptBody, /Delivered pull request/);
 
   const style = await app.request("/public/style.css");
   assert.equal(style.status, 200);
@@ -258,6 +293,8 @@ test("initial mission route and static application assets load", async () => {
   assert.match(styleBody, /--color-primary: #5fd9cd/);
   assert.match(styleBody, /evidence-card\[data-source="mcp"\]/);
   assert.match(styleBody, /evidence-card\[data-result="failed"\]/);
+  assert.match(styleBody, /approval-actions/);
+  assert.match(styleBody, /delivery-card/);
 
   const runState = await app.request("/public/run-state.js");
   assert.equal(runState.status, 200);
@@ -414,16 +451,20 @@ test("run mission uses the runtime adapters and exposes passed proof", async () 
   const response = await app.request("/api/mission/run", { method: "POST" });
   assert.equal(response.status, 200);
   const payload = await json(response);
-  assert.equal(payload.mission.mission.status, "verifying");
+  assert.equal(payload.mission.mission.status, "awaiting_approval");
   assert.equal(payload.mission.progress.complete, 4);
   assert.equal(payload.mission.progress.verification, "passed");
   assert.deepEqual(payload.mission.evidence.map((item) => item.source).sort(), ["mcp", "sandbox"]);
   assert.equal(payload.mission.approvals.length, 1);
   assert.equal(payload.mission.approvals[0].actionType, "create_pull_request");
-  assert.equal(payload.mission.approvals[0].target, "mtamburrano/trueforge-proofboard@590aa8a6d72c580f61fc1b19d33e9876bc0feb9b");
-  assert.match(payload.mission.approvals[0].expectedEffect, /pull request/);
+  assert.equal(payload.mission.approvals[0].target, "mtamburrano/proofboard-demo-fixture base=main head=proofboard-verified-delivery");
+  assert.match(payload.mission.approvals[0].expectedEffect, /proofboard-demo-fixture/);
   assert.match(payload.mission.approvals[0].rationale, /human/);
   assert.equal(payload.mission.approvals[0].evidenceIds.length > 0, true);
+  assert.equal(payload.mission.approvals[0].executionContext.sessionId, "test-session-durable");
+  assert.equal(payload.mission.approvals[0].executionContext.toolCallId, "test-create-pull-request-call");
+  assert.equal(runner.deliveryCalls.requested.length, 1);
+  assert.equal(runner.deliveryCalls.protectedOperations, 0);
   assert.deepEqual(runner.calls, { create: 1, inspect: 1, turn: 2, sandbox: 1 });
   assert.deepEqual(
     runner.turnInputs.map((input) => input.options.workItemId),
@@ -447,6 +488,82 @@ test("run mission uses the runtime adapters and exposes passed proof", async () 
 
   const serialized = JSON.stringify(payload);
   assert.doesNotMatch(serialized, /must-not-reach-browser|provider_secret/);
+});
+
+test("rejecting or cancelling the exact pending delivery invokes no protected operation", async () => {
+  for (const decision of ["rejected", "cancelled"]) {
+    const { app, runner } = testApp();
+    const run = await json(await app.request("/api/mission/run", { method: "POST" }));
+    const approval = run.mission.approvals[0];
+
+    const response = await app.request(`/api/mission/approvals/${approval.id}`, {
+      method: "POST",
+      body: JSON.stringify({ decision }),
+    });
+    assert.equal(response.status, 200);
+    const payload = await json(response);
+    assert.equal(payload.mission.mission.status, "blocked");
+    assert.equal(payload.mission.approvals[0].decision, decision);
+    assert.equal(payload.mission.delivery.length, 0);
+    assert.equal(runner.deliveryCalls.protectedOperations, 0);
+    assert.equal(runner.deliveryCalls.resolved.length, 1);
+    assert.equal(runner.deliveryCalls.resolved[0].decision, decision);
+    assert.equal(
+      runner.deliveryCalls.resolved[0].pending.toolCallId,
+      "test-create-pull-request-call",
+    );
+
+    const recovered = await json(await app.request("/api/mission"));
+    assert.equal(recovered.mission.approvals[0].decision, decision);
+    assert.equal(recovered.mission.delivery.length, 0);
+  }
+});
+
+test("approving the exact pending delivery records one correlated pull request result", async () => {
+  const { app, missions, runner } = testApp();
+  const run = await json(await app.request("/api/mission/run", { method: "POST" }));
+  const approval = run.mission.approvals[0];
+
+  const response = await app.request(`/api/mission/approvals/${approval.id}`, {
+    method: "POST",
+    body: JSON.stringify({ decision: "approved" }),
+  });
+  assert.equal(response.status, 200);
+  const payload = await json(response);
+  assert.equal(payload.mission.mission.status, "delivered");
+  assert.equal(payload.mission.approvals[0].decision, "approved");
+  assert.equal(payload.mission.delivery.length, 1);
+  assert.equal(payload.mission.delivery[0].reference, "https://github.com/mtamburrano/proofboard-demo-fixture/pull/73");
+  assert.deepEqual(payload.mission.delivery[0].pullRequest, {
+    number: 73,
+    url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/73",
+    repositoryOwner: "mtamburrano",
+    repositoryName: "proofboard-demo-fixture",
+    base: "main",
+    head: "proofboard-verified-delivery",
+  });
+  assert.equal(payload.mission.delivery[0].executionOrigin.sessionId, "test-session-durable");
+  assert.equal(payload.mission.delivery[0].executionOrigin.turnId, "test-delivery-result-turn");
+  assert.equal(payload.mission.delivery[0].executionOrigin.toolCallId, "test-create-pull-request-call");
+  assert.equal(runner.deliveryCalls.protectedOperations, 1);
+  assert.equal(runner.deliveryCalls.resolved.length, 1);
+
+  const state = await missions.getState();
+  const deliveryEvidence = state.evidence.find((item) =>
+    item.summary.includes("created pull request #73")
+  );
+  assert.equal(deliveryEvidence.result, "passed");
+  assert.equal(deliveryEvidence.executionOrigin.sessionId, "test-session-durable");
+  assert.equal(deliveryEvidence.executionOrigin.turnId, "test-delivery-result-turn");
+  assert.equal(deliveryEvidence.executionOrigin.toolCallId, "test-create-pull-request-call");
+  assert.equal(state.deliveries[0].approvalId, approval.id);
+
+  const replay = await app.request(`/api/mission/approvals/${approval.id}`, {
+    method: "POST",
+    body: JSON.stringify({ decision: "approved" }),
+  });
+  assert.equal(replay.status, 400);
+  assert.equal(runner.deliveryCalls.protectedOperations, 1);
 });
 
 test("failed sandbox proof remains visibly failed and blocks the mission", async () => {
@@ -478,7 +595,7 @@ test("a successful retry uses current proof while preserving historical failure"
   const retryResponse = await app.request("/api/mission/run", { method: "POST" });
   const retried = await json(retryResponse);
   assert.equal(retryResponse.status, 200, JSON.stringify(retried));
-  assert.equal(retried.mission.mission.status, "verifying");
+  assert.equal(retried.mission.mission.status, "awaiting_approval");
   assert.equal(retried.mission.progress.verification, "passed");
   assert.equal(retried.mission.progress.failedEvidence, 1);
   assert.deepEqual(
@@ -619,7 +736,7 @@ test("a fresh service recovers the same mission and evidence from isolated JSON 
     const second = testApp(new JsonMissionRepository(filePath));
     const after = await json(await second.app.request("/api/mission"));
     assert.equal(after.mission.mission.id, before.mission.mission.id);
-    assert.equal(after.mission.mission.status, "verifying");
+    assert.equal(after.mission.mission.status, "awaiting_approval");
     assert.equal(after.mission.revision, before.mission.revision);
     assert.deepEqual(after.mission.evidence, before.mission.evidence);
     assert.equal(second.runner.calls.create, 0);

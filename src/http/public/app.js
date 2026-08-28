@@ -21,6 +21,10 @@ const labels = {
   running: "Running",
   passed: "Passed",
   informational: "Info",
+  pending: "Pending approval",
+  approved: "Approved execution",
+  rejected: "Rejected delivery",
+  cancelled: "Cancelled delivery",
   commitSha: "Commit SHA",
   contentHash: "Content hash",
   contentBytes: "Content bytes",
@@ -61,6 +65,15 @@ function formatTime(value) {
 
 function shortRef(value) {
   return String(value).length > 12 ? String(value).slice(0, 12) : String(value);
+}
+
+function safePullRequestUrl(value) {
+  try {
+    const url = new URL(String(value));
+    return url.protocol === "https:" && url.hostname === "github.com" ? url.toString() : null;
+  } catch {
+    return null;
+  }
 }
 
 async function api(path, options = {}) {
@@ -112,6 +125,8 @@ function renderMission(view) {
   const runInFlight = runCoordinator?.isRunning() ?? false;
   const runLabel = runInFlight
     ? "Mission running…"
+    : mission.status === "awaiting_approval"
+    ? "Approval required"
     : mission.status === "verifying"
     ? "Verification current"
     : mission.status === "blocked"
@@ -136,7 +151,7 @@ function renderMission(view) {
         </p>
       </div>
       <div class="mission-actions">
-        <button id="run-mission" class="primary-action" type="button" ${terminal || mission.status === "verifying" || runInFlight ? "disabled" : ""} ${runInFlight ? 'aria-busy="true"' : ""}>${escapeHtml(runLabel)}</button>
+        <button id="run-mission" class="primary-action" type="button" ${terminal || ["awaiting_approval", "verifying"].includes(mission.status) || runInFlight ? "disabled" : ""} ${runInFlight ? 'aria-busy="true"' : ""}>${escapeHtml(runLabel)}</button>
       </div>
     </section>
 
@@ -177,18 +192,45 @@ function renderMission(view) {
     </section>`;
 
   document.querySelector("#run-mission")?.addEventListener("click", runMission);
+  document.querySelectorAll("[data-approval-decision]").forEach((button) => {
+    button.addEventListener("click", decideApproval);
+  });
 }
 
 function renderLane(lane, view) {
   const approvalCards = lane.id === "approve"
     ? view.approvals.map((approval) => `
-        <article class="work-card">
+        <article class="work-card approval-card" data-approval-state="${escapeHtml(approval.decision)}">
           <h4>${escapeHtml(approval.action)}</h4>
           <p><strong>Target:</strong> ${escapeHtml(approval.target)}</p>
           <p>${escapeHtml(approval.expectedEffect)}</p>
           <p class="work-card-secondary">${escapeHtml(approval.rationale)}</p>
+          ${approval.executionContext ? `<p class="runtime-correlation"><strong>TrueForge:</strong> session ${escapeHtml(shortRef(approval.executionContext.sessionId))} · turn ${escapeHtml(shortRef(approval.executionContext.turnId))} · call ${escapeHtml(shortRef(approval.executionContext.toolCallId))}</p>` : ""}
           <div class="work-card-meta">${chip(approval.decision)}</div>
+          ${approval.decision === "pending" ? `
+            <div class="approval-actions" aria-label="Delivery approval decision">
+              <button class="primary-action compact-action" type="button" data-approval-id="${escapeHtml(approval.id)}" data-approval-decision="approved">Approve exact action</button>
+              <button class="compact-action" type="button" data-approval-id="${escapeHtml(approval.id)}" data-approval-decision="rejected">Reject</button>
+              <button class="compact-action" type="button" data-approval-id="${escapeHtml(approval.id)}" data-approval-decision="cancelled">Cancel</button>
+            </div>` : ""}
+          ${approval.decision === "approved" && view.delivery.length === 0 ? `<p class="approval-outcome">Approved. Waiting for correlated remote result evidence; delivery is not yet proven.</p>` : ""}
+          ${approval.decision === "rejected" ? `<p class="approval-outcome">Rejected. The protected repository operation was not executed.</p>` : ""}
+          ${approval.decision === "cancelled" ? `<p class="approval-outcome">Cancelled. The protected repository operation was not executed.</p>` : ""}
         </article>`).join("")
+    : "";
+  const deliveryCards = lane.id === "approve"
+    ? view.delivery.map((delivery) => {
+        const pullRequestUrl = safePullRequestUrl(delivery.reference);
+        return `
+        <article class="work-card delivery-card" data-delivery-state="${escapeHtml(delivery.status)}">
+          <h4>${delivery.pullRequest ? `Delivered pull request #${escapeHtml(delivery.pullRequest.number)}` : "Delivery result"}</h4>
+          <p>${escapeHtml(delivery.verificationSummary)}</p>
+          ${delivery.pullRequest ? `<p><strong>Repository:</strong> ${escapeHtml(delivery.pullRequest.repositoryOwner)}/${escapeHtml(delivery.pullRequest.repositoryName)} · ${escapeHtml(delivery.pullRequest.head)} → ${escapeHtml(delivery.pullRequest.base)}</p>` : ""}
+          ${pullRequestUrl ? `<p><a href="${escapeHtml(pullRequestUrl)}" target="_blank" rel="noreferrer">Open delivered pull request</a></p>` : ""}
+          ${delivery.executionOrigin ? `<p class="runtime-correlation"><strong>Result:</strong> turn ${escapeHtml(shortRef(delivery.executionOrigin.turnId))} · call ${escapeHtml(shortRef(delivery.executionOrigin.toolCallId))}</p>` : ""}
+          <div class="work-card-meta">${chip(delivery.status)}</div>
+        </article>`;
+      }).join("")
     : "";
   const items = lane.items.map((item) => `
     <article class="work-card">
@@ -200,8 +242,9 @@ function renderLane(lane, view) {
         ${item.dependsOn.length ? `<span class="badge" title="Depends on ${escapeHtml(item.dependsOn.join(", "))}">${item.dependsOn.length} dependency</span>` : ""}
       </div>
     </article>`).join("");
-  const content = items || approvalCards || `<p class="lane-empty">${lane.id === "approve" ? "No remote action requested" : "No work in this stage"}</p>`;
-  const count = lane.items.length + (lane.id === "approve" ? view.approvals.length : 0);
+  const approvalContent = `${approvalCards}${deliveryCards}`;
+  const content = items || approvalContent || `<p class="lane-empty">${lane.id === "approve" ? "No remote action requested" : "No work in this stage"}</p>`;
+  const count = lane.items.length + (lane.id === "approve" ? view.approvals.length + view.delivery.length : 0);
   return `
     <article class="lane" data-lane="${escapeHtml(lane.id)}">
       <header class="lane-header">
@@ -274,6 +317,34 @@ async function runMission(event) {
     setConnection("failed", "Run failed");
     showMessage("error", error.message);
   }
+}
+
+async function decideApproval(event) {
+  const button = event.currentTarget;
+  const approvalId = button.dataset.approvalId;
+  const decision = button.dataset.approvalDecision;
+  await withBusy(button, async () => {
+    try {
+      const payload = await api(`/api/mission/approvals/${encodeURIComponent(approvalId)}`, {
+        method: "POST",
+        body: JSON.stringify({ decision }),
+      });
+      runCoordinator.accept(payload.mission, { force: true, authoritative: true });
+      setConnection("connected", "Decision persisted");
+      showMessage(
+        "success",
+        decision === "approved"
+          ? "Approved action completed with durable pull request evidence."
+          : `Delivery ${decision}; no protected repository operation was executed.`,
+      );
+    } catch (error) {
+      setConnection("failed", "Decision failed");
+      showMessage("error", error.message);
+      if (error.payload?.mission) {
+        runCoordinator.accept(error.payload.mission, { force: true, authoritative: true });
+      }
+    }
+  });
 }
 
 async function withBusy(button, operation) {

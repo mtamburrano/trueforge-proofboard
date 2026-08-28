@@ -460,7 +460,7 @@ test("legacy primary missions are upgraded without losing their history", async 
   const run = await app.request("/api/mission/run", { method: "POST" });
   assert.equal(run.status, 200);
   const afterRun = await missions.getState();
-  assert.equal(afterRun.missions[0].status, "verifying");
+  assert.equal(afterRun.missions[0].status, "awaiting_approval");
   assert.equal(afterRun.workItems.filter((item) => item.status === "complete").length, 3);
   assert.equal(afterRun.evidence.some((evidence) => evidence.id === history.id), true);
 });
@@ -688,5 +688,30 @@ class LegacyPrimaryRunner {
       summary: "The sandbox verification passed.",
     });
     return { evidenceId: evidence.id };
+  }
+
+  async requestPullRequestApproval(missionId, target) {
+    return {
+      sessionId: "legacy-session",
+      turnId: "legacy-delivery-approval-turn",
+      threadId: "legacy-delivery-thread",
+      toolCallId: "legacy-create-pr-call",
+      serverName: "github",
+      toolName: "create_pull_request",
+      target: { ...target },
+    };
+  }
+
+  async resolvePullRequestApproval(_missionId, _pending, decision) {
+    return decision === "approved"
+      ? {
+          number: 1,
+          url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/1",
+          sessionId: "legacy-session",
+          turnId: "legacy-delivery-result-turn",
+          threadId: "legacy-delivery-thread",
+          toolCallId: "legacy-create-pr-call",
+        }
+      : null;
   }
 }

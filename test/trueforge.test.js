@@ -584,6 +584,210 @@ test("runner resumes the persisted session after a reconnect", async () => {
   assert.equal(result.mission.trueforgeSessionId, "session-created");
 });
 
+test("pull request delivery pauses one exact TrueForge tool call and resumes only after approval", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const target = {
+    owner: "mtamburrano",
+    repo: "proofboard-demo-fixture",
+    base: "main",
+    head: "proofboard-verified-delivery",
+    title: "Add the verified delivery-stage helper",
+    body: "Verified delivery body.",
+  };
+  const { client, calls } = fakeClient((turnId) => {
+    if (turnId === "turn-1") {
+      const toolCall = {
+        id: "call-create-pr",
+        function: { name: "create_pull_request", arguments: JSON.stringify(target) },
+      };
+      const approval = {
+        type: "tool.approval_required",
+        id: "approval-event",
+        createdAt: "2026-08-28T08:00:02.000Z",
+        threadId: "thread-delivery",
+        toolCalls: [{ id: "call-create-pr", sourceEventId: "message-create-pr" }],
+      };
+      return [
+        {
+          type: "turn.created",
+          id: "turn-created-delivery",
+          createdAt: "2026-08-28T08:00:00.000Z",
+          turnId,
+          threadId: null,
+        },
+        {
+          type: "model.message",
+          id: "message-create-pr",
+          createdAt: "2026-08-28T08:00:01.000Z",
+          threadId: "thread-delivery",
+          toolCalls: [toolCall],
+        },
+        approval,
+        {
+          type: "turn.done",
+          id: "turn-paused-delivery",
+          createdAt: "2026-08-28T08:00:03.000Z",
+          threadId: null,
+          state: { status: "done", requiredActions: [approval] },
+        },
+      ];
+    }
+    return [
+      {
+        type: "turn.created",
+        id: "turn-created-delivery-resume",
+        createdAt: "2026-08-28T08:01:00.000Z",
+        turnId,
+        threadId: null,
+      },
+      {
+        type: "tool.response",
+        id: "response-create-pr",
+        createdAt: "2026-08-28T08:01:01.000Z",
+        threadId: "thread-delivery",
+        toolCallId: "call-create-pr",
+        content: JSON.stringify({
+          isError: false,
+          structuredContent: {
+            number: 42,
+            html_url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/42",
+          },
+        }),
+      },
+      {
+        type: "turn.done",
+        id: "turn-done-delivery-resume",
+        createdAt: "2026-08-28T08:01:02.000Z",
+        threadId: null,
+        state: { status: "done", requiredActions: [] },
+      },
+    ];
+  });
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "google-gemini/test-model",
+    mcpServerName: "github",
+    deliveryToolName: "create_pull_request",
+    mcpServers: [{
+      name: "github",
+      enableTools: ["create_pull_request"],
+      preloadTools: ["create_pull_request"],
+      requireApprovalForTools: ["create_pull_request"],
+    }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-delivery-approval",
+    objective: "Open only the verified delivery pull request",
+  });
+
+  const pending = await runner.requestPullRequestApproval(mission.id, target);
+  assert.deepEqual(pending, {
+    sessionId: "session-created",
+    turnId: "turn-1",
+    threadId: "thread-delivery",
+    toolCallId: "call-create-pr",
+    serverName: "github",
+    toolName: "create_pull_request",
+    target,
+  });
+  assert.equal(calls.turns.length, 1);
+  assert.match(calls.turns[0].request.input[0].content, /create_pull_request exactly once/);
+  assert.match(calls.turns[0].request.input[0].content, /proofboard-demo-fixture/);
+  assert.equal(
+    (await missions.getState()).evidence.some((item) =>
+      item.summary === "TrueForge paused for tool approval."
+    ),
+    true,
+  );
+
+  const delivered = await runner.resolvePullRequestApproval(mission.id, pending, "approved");
+  assert.deepEqual(delivered, {
+    number: 42,
+    url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/42",
+    sessionId: "session-created",
+    turnId: "turn-2",
+    threadId: "thread-delivery",
+    toolCallId: "call-create-pr",
+  });
+  assert.deepEqual(calls.turns[1].request, {
+    input: [{
+      type: "user.tool_approval",
+      threadId: "thread-delivery",
+      toolCallId: "call-create-pr",
+      approval: { status: "allow" },
+    }],
+    previousTurnId: "turn-1",
+  });
+});
+
+test("rejecting or cancelling a TrueForge delivery approval returns no protected result", async () => {
+  for (const decision of ["rejected", "cancelled"]) {
+    let protectedOperations = 0;
+    const missions = new MissionService(new InMemoryMissionRepository());
+    const target = {
+      owner: "mtamburrano",
+      repo: "proofboard-demo-fixture",
+      base: "main",
+      head: "proofboard-verified-delivery",
+      title: "Verified fixture delivery",
+      body: "Verified fixture delivery body.",
+    };
+    const { client, calls } = fakeClient((turnId) => {
+      if (turnId === "turn-1") {
+        const approval = {
+          type: "tool.approval_required",
+          id: `approval-${decision}`,
+          createdAt: "2026-08-28T08:00:02.000Z",
+          threadId: "thread-denied-delivery",
+          toolCalls: [{ id: "call-denied-pr", sourceEventId: "message-denied-pr" }],
+        };
+        return [
+          { type: "turn.created", id: "turn-start", createdAt: "2026-08-28T08:00:00.000Z", turnId, threadId: null },
+          {
+            type: "model.message",
+            id: "message-denied-pr",
+            createdAt: "2026-08-28T08:00:01.000Z",
+            threadId: "thread-denied-delivery",
+            toolCalls: [{
+              id: "call-denied-pr",
+              function: { name: "create_pull_request", arguments: JSON.stringify(target) },
+            }],
+          },
+          approval,
+          { type: "turn.done", id: "turn-paused", createdAt: "2026-08-28T08:00:03.000Z", threadId: null, state: { status: "done", requiredActions: [approval] } },
+        ];
+      }
+      const approvalInput = calls.turns.at(-1).request.input[0];
+      if (approvalInput.approval.status === "allow") {
+        protectedOperations += 1;
+      }
+      return [
+        { type: "turn.created", id: "turn-denied-start", createdAt: "2026-08-28T08:01:00.000Z", turnId, threadId: null },
+        { type: "turn.done", id: "turn-denied-done", createdAt: "2026-08-28T08:01:01.000Z", threadId: null, state: { status: "done", requiredActions: [] } },
+      ];
+    });
+    const runner = new TrueForgeMissionRunner(missions, client, {
+      model: "google-gemini/test-model",
+      mcpServerName: "github",
+      mcpServers: [{
+        name: "github",
+        enableTools: ["create_pull_request"],
+        requireApprovalForTools: ["create_pull_request"],
+      }],
+    });
+    const mission = await runner.createMission({
+      id: `mission-${decision}-delivery`,
+      objective: "Keep denied delivery fail closed",
+    });
+    const pending = await runner.requestPullRequestApproval(mission.id, target);
+    const result = await runner.resolvePullRequestApproval(mission.id, pending, decision);
+
+    assert.equal(result, null);
+    assert.equal(protectedOperations, 0);
+    assert.equal(calls.turns[1].request.input[0].approval.status, "deny");
+    assert.match(calls.turns[1].request.input[0].approval.reason, new RegExp(decision));
+  }
+});
+
 test("runner can attach an existing TrueForge session without creating another", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client, calls } = fakeClient();

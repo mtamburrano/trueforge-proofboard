@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 
 import {
+  Approval,
   Evidence,
   Handoff,
   Mission,
@@ -20,8 +21,11 @@ import {
   buildPreflightWorkGraph,
   RepositoryInspectionInput,
   RepositoryWorkGraphPlanner,
+  PullRequestDeliveryTarget,
   SandboxVerificationInput,
+  TrueForgeDeliveryApproval,
   TrueForgeIntegrationError,
+  TrueForgePullRequestResult,
   TrueForgeTurnResult,
   VerifiedRepositoryInspection,
   WorkGraphPlanner,
@@ -36,6 +40,15 @@ export const PRIMARY_REPOSITORY = {
   name: "trueforge-proofboard",
   ref: "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b",
 } as const;
+
+export const PRIMARY_DELIVERY_TARGET: PullRequestDeliveryTarget = {
+  owner: "mtamburrano",
+  repo: "proofboard-demo-fixture",
+  base: "main",
+  head: "proofboard-verified-delivery",
+  title: "Add the verified delivery-stage helper",
+  body: "Adds the backwards-compatible delivery-stage helper and focused transition coverage verified by the Proof Board mission.",
+};
 
 export const PRIMARY_MISSION_VERIFICATION_SCRIPT = [
   'import assert from "node:assert/strict";',
@@ -129,6 +142,15 @@ export interface MissionRunner {
     options: { workItemId: string; delegateToSubagent?: boolean },
   ): Promise<TrueForgeTurnResult>;
   runSandboxVerification(input: SandboxVerificationInput): Promise<unknown>;
+  requestPullRequestApproval(
+    missionId: string,
+    target: PullRequestDeliveryTarget,
+  ): Promise<TrueForgeDeliveryApproval>;
+  resolvePullRequestApproval(
+    missionId: string,
+    pending: TrueForgeDeliveryApproval,
+    decision: "approved" | "rejected" | "cancelled",
+  ): Promise<TrueForgePullRequestResult | null>;
   reviewContract?(context: ReviewContext): Promise<ImplementationReviewDecision>;
 }
 
@@ -338,6 +360,9 @@ export interface MissionView {
     decision: string;
     createdAt: string;
     expiresAt: string;
+    decidedBy?: string;
+    decidedAt?: string;
+    executionContext?: Approval["executionContext"];
   }>;
   delivery: Array<{
     id: string;
@@ -345,6 +370,22 @@ export interface MissionView {
     verificationSummary: string;
     createdAt: string;
     reference?: string;
+    approvalId?: string;
+    pullRequest?: {
+      number: number;
+      url: string;
+      repositoryOwner: string;
+      repositoryName: string;
+      base: string;
+      head: string;
+    };
+    executionOrigin?: {
+      kind: string;
+      sessionId: string;
+      turnId?: string;
+      threadId?: string;
+      toolCallId?: string;
+    };
   }>;
 }
 
@@ -639,11 +680,11 @@ class MissionController {
         });
       }
 
-      const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
-      if (mission.status === "executing") {
-        await this.missions.transitionMission(PRIMARY_MISSION_ID, "verifying");
-      }
       await this.ensurePrimaryDeliveryApproval();
+      const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
+      if (mission.status === "executing" || mission.status === "verifying") {
+        await this.missions.transitionMission(PRIMARY_MISSION_ID, "awaiting_approval");
+      }
       return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID);
     } catch (error) {
       await this.blockActiveWork();
@@ -683,38 +724,168 @@ class MissionController {
 
   private async ensurePrimaryDeliveryApproval(): Promise<void> {
     const state = await this.missions.getState();
+    const workItems = state.workItems.filter((item) => item.missionId === PRIMARY_MISSION_ID);
+    if (workItems.length === 0 || workItems.some((item) => item.status !== "complete")) {
+      throw new MissionControlError(
+        "Delivery approval requires every bounded work item to be independently complete.",
+      );
+    }
     const activeRequest = state.approvals.find((approval) =>
       approval.missionId === PRIMARY_MISSION_ID &&
-      approval.actionType === PRIMARY_CONSEQUENTIAL_ACTION &&
+      isPrimaryDeliveryApproval(approval) &&
       ["pending", "approved"].includes(approval.decision) &&
       Date.parse(approval.expiresAt) > Date.now(),
     );
     if (activeRequest !== undefined) {
       return;
     }
-    const mission = state.missions.find((item) => item.id === PRIMARY_MISSION_ID);
-    if (mission === undefined) {
-      throw new MissionControlError("Approval could not find the primary mission.");
+    const plannerIds = new Set(
+      workItems.filter((item) => item.assignedRole === "planner").map((item) => item.id),
+    );
+    const reviewerIds = new Set(
+      workItems.filter((item) => item.assignedRole === "reviewer").map((item) => item.id),
+    );
+    const repositoryProof = state.evidence.filter((evidence) =>
+      evidence.missionId === PRIMARY_MISSION_ID &&
+      evidence.workItemId !== undefined &&
+      plannerIds.has(evidence.workItemId) &&
+      evidence.source === "mcp"
+    ).at(-1);
+    const sandboxProof = state.evidence.filter((evidence) =>
+      evidence.missionId === PRIMARY_MISSION_ID &&
+      evidence.workItemId !== undefined &&
+      reviewerIds.has(evidence.workItemId) &&
+      evidence.source === "sandbox"
+    ).at(-1);
+    if (repositoryProof?.result !== "passed" || sandboxProof?.result !== "passed") {
+      throw new MissionControlError(
+        "Delivery approval requires current passed repository and sandbox proof.",
+      );
     }
-    const target = mission.repository === undefined
-      ? `mission ${mission.id}`
-      : `${mission.repository.owner}/${mission.repository.name}@${mission.repository.ref}`;
-    const evidenceIds = state.evidence
-      .filter((evidence) =>
-        evidence.missionId === PRIMARY_MISSION_ID &&
-        (evidence.source === "mcp" || evidence.source === "sandbox") &&
-        evidence.result === "passed",
+    const acceptedReviewEvidenceIds = state.reviews
+      .filter((review) =>
+        review.missionId === PRIMARY_MISSION_ID && review.outcome === "accepted"
       )
-      .map((evidence) => evidence.id);
+      .map((review) => review.findingEvidenceId);
+    const evidenceIds = [
+      repositoryProof.id,
+      sandboxProof.id,
+      ...acceptedReviewEvidenceIds,
+    ];
+    const pending = await this.runner.requestPullRequestApproval(
+      PRIMARY_MISSION_ID,
+      PRIMARY_DELIVERY_TARGET,
+    );
+    const target = pullRequestApprovalTarget(PRIMARY_DELIVERY_TARGET);
     await this.missions.requestActionApproval(PRIMARY_MISSION_ID, {
       action: "Open the verified delivery",
       actionType: PRIMARY_CONSEQUENTIAL_ACTION,
       target,
       risk: "A remote repository mutation will create a pull request.",
       rationale: "A human must authorize the verified change before it is published for review.",
-      expectedEffect: "Open a pull request containing the verified source change for review.",
+      expectedEffect: pullRequestExpectedEffect(PRIMARY_DELIVERY_TARGET),
       evidenceIds,
+      executionContext: approvalExecutionContext(pending),
     });
+  }
+
+  async decidePrimaryDelivery(
+    approvalId: string,
+    decision: "approved" | "rejected" | "cancelled",
+  ): Promise<MissionView> {
+    const state = await this.missions.getState();
+    const approval = state.approvals.find((item) =>
+      item.id === approvalId && item.missionId === PRIMARY_MISSION_ID
+    );
+    if (approval === undefined) {
+      throw new MissionDomainError("not_found", "The requested approval was not found.");
+    }
+    const pending = deliveryApprovalFromState(approval);
+    await this.missions.decideApproval(PRIMARY_MISSION_ID, approval.id, {
+      decision,
+      decidedBy: "mission-operator",
+    });
+    if (decision !== "approved") {
+      const result = await this.runner.resolvePullRequestApproval(
+        PRIMARY_MISSION_ID,
+        pending,
+        decision,
+      );
+      if (result !== null) {
+        throw new MissionControlError("A denied delivery unexpectedly returned a pull request result.");
+      }
+      const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
+      if (mission.status === "awaiting_approval") {
+        await this.missions.transitionMission(PRIMARY_MISSION_ID, "blocked");
+      }
+      return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID);
+    }
+
+    const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
+    if (mission.status === "awaiting_approval") {
+      await this.missions.transitionMission(PRIMARY_MISSION_ID, "verifying");
+    }
+    const result = await this.missions.executeProtectedAction(
+      PRIMARY_MISSION_ID,
+      {
+        action: PRIMARY_CONSEQUENTIAL_ACTION,
+        target: approval.target,
+        expectedEffect: approval.expectedEffect,
+        approvalId: approval.id,
+      },
+      () => this.runner.resolvePullRequestApproval(
+        PRIMARY_MISSION_ID,
+        pending,
+        "approved",
+      ),
+    );
+    if (result === null) {
+      throw new MissionControlError("Approved delivery returned no pull request result.");
+    }
+    const evidence = await this.missions.addEvidence(PRIMARY_MISSION_ID, {
+      kind: "tool_result",
+      result: "passed",
+      source: "trueforge",
+      summary: `TrueForge created pull request #${result.number} in the approved fixture repository.`,
+      details: JSON.stringify({
+        tool: PRIMARY_CONSEQUENTIAL_ACTION,
+        repository: `${PRIMARY_DELIVERY_TARGET.owner}/${PRIMARY_DELIVERY_TARGET.repo}`,
+        base: PRIMARY_DELIVERY_TARGET.base,
+        head: PRIMARY_DELIVERY_TARGET.head,
+        pull_request_number: result.number,
+        pull_request_url: result.url,
+        approval_id: approval.id,
+      }),
+      executionOrigin: {
+        kind: "mcp",
+        sessionId: result.sessionId,
+        turnId: result.turnId,
+        threadId: result.threadId,
+        toolCallId: result.toolCallId,
+      },
+    });
+    await this.missions.recordDelivery(PRIMARY_MISSION_ID, {
+      status: "delivered",
+      reference: result.url,
+      approvalId: approval.id,
+      verificationSummary: `Verified evidence ${approval.evidenceIds.join(", ")} authorized the correlated pull request result ${evidence.id}.`,
+      pullRequest: {
+        number: result.number,
+        url: result.url,
+        repositoryOwner: PRIMARY_DELIVERY_TARGET.owner,
+        repositoryName: PRIMARY_DELIVERY_TARGET.repo,
+        base: PRIMARY_DELIVERY_TARGET.base,
+        head: PRIMARY_DELIVERY_TARGET.head,
+      },
+      executionOrigin: {
+        kind: "mcp",
+        sessionId: result.sessionId,
+        turnId: result.turnId,
+        threadId: result.threadId,
+        toolCallId: result.toolCallId,
+      },
+    });
+    return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID);
   }
 
   private async reviewImplementation(workItemId: string): Promise<void> {
@@ -871,6 +1042,68 @@ class MissionController {
   }
 }
 
+function pullRequestApprovalTarget(target: PullRequestDeliveryTarget): string {
+  return `${target.owner}/${target.repo} base=${target.base} head=${target.head}`;
+}
+
+function pullRequestExpectedEffect(target: PullRequestDeliveryTarget): string {
+  return `Open one pull request in ${target.owner}/${target.repo} from ${target.head} into ${target.base}; do not merge or mutate any other repository state.`;
+}
+
+function approvalExecutionContext(
+  pending: TrueForgeDeliveryApproval,
+): NonNullable<Approval["executionContext"]> {
+  return {
+    sessionId: pending.sessionId,
+    turnId: pending.turnId,
+    threadId: pending.threadId,
+    toolCallId: pending.toolCallId,
+    serverName: pending.serverName,
+    toolName: pending.toolName,
+    repositoryOwner: pending.target.owner,
+    repositoryName: pending.target.repo,
+    base: pending.target.base,
+    head: pending.target.head,
+    title: pending.target.title,
+    body: pending.target.body,
+  };
+}
+
+function deliveryApprovalFromState(approval: Approval): TrueForgeDeliveryApproval {
+  const context = approval.executionContext;
+  if (!isPrimaryDeliveryApproval(approval) || context === undefined) {
+    throw new MissionControlError(
+      "The persisted approval is not correlated to the exact fixture pull request action.",
+    );
+  }
+  return {
+    sessionId: context.sessionId,
+    turnId: context.turnId,
+    threadId: context.threadId,
+    toolCallId: context.toolCallId,
+    serverName: context.serverName,
+    toolName: "create_pull_request",
+    target: { ...PRIMARY_DELIVERY_TARGET },
+  };
+}
+
+function isPrimaryDeliveryApproval(approval: Approval): boolean {
+  const context = approval.executionContext;
+  return (
+    approval.actionType === PRIMARY_CONSEQUENTIAL_ACTION &&
+    approval.target === pullRequestApprovalTarget(PRIMARY_DELIVERY_TARGET) &&
+    approval.expectedEffect === pullRequestExpectedEffect(PRIMARY_DELIVERY_TARGET) &&
+    context !== undefined &&
+    context.toolName === PRIMARY_CONSEQUENTIAL_ACTION &&
+    context.repositoryOwner === PRIMARY_DELIVERY_TARGET.owner &&
+    context.repositoryName === PRIMARY_DELIVERY_TARGET.repo &&
+    context.base === PRIMARY_DELIVERY_TARGET.base &&
+    context.head === PRIMARY_DELIVERY_TARGET.head &&
+    context.title === PRIMARY_DELIVERY_TARGET.title &&
+    context.body === PRIMARY_DELIVERY_TARGET.body
+  );
+}
+
 function verifiedInspectionFromResult(
   result: unknown,
   state: MissionState,
@@ -1020,7 +1253,7 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
   const currentProofPassed = repositoryProof === "passed" && sandboxProof === "passed";
   const verification = mission.status === "failed" || mission.status === "blocked"
     ? "failed"
-    : (mission.status === "verifying" || mission.status === "delivered") && currentProofPassed
+    : (["awaiting_approval", "verifying", "delivered"].includes(mission.status)) && currentProofPassed
     ? "passed"
     : currentProofFailed
     ? "failed"
@@ -1122,6 +1355,11 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
         decision: item.decision,
         createdAt: item.createdAt,
         expiresAt: item.expiresAt,
+        ...(item.decidedBy === undefined ? {} : { decidedBy: item.decidedBy }),
+        ...(item.decidedAt === undefined ? {} : { decidedAt: item.decidedAt }),
+        ...(item.executionContext === undefined
+          ? {}
+          : { executionContext: { ...item.executionContext } }),
       })),
     delivery: state.deliveries
       .filter((item) => item.missionId === missionId)
@@ -1132,6 +1370,13 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
           verificationSummary: item.verificationSummary,
           createdAt: item.createdAt,
           ...(item.reference === undefined ? {} : { reference: item.reference }),
+          ...(item.approvalId === undefined ? {} : { approvalId: item.approvalId }),
+          ...(item.pullRequest === undefined
+            ? {}
+            : { pullRequest: { ...item.pullRequest } }),
+          ...(item.executionOrigin === undefined
+            ? {}
+            : { executionOrigin: { ...item.executionOrigin } }),
         };
         return delivery;
       }),
@@ -1368,6 +1613,16 @@ export function createMissionHttpApp(options: MissionHttpOptions) {
       if (request.method === "POST" && url.pathname === "/api/mission/run") {
         return jsonResponse({ mission: await controller.runPrimaryMission() });
       }
+      const approvalRoute = url.pathname.match(/^\/api\/mission\/approvals\/([^/]+)$/);
+      if (request.method === "POST" && approvalRoute?.[1] !== undefined) {
+        const decision = await approvalDecisionFromRequest(request);
+        return jsonResponse({
+          mission: await controller.decidePrimaryDelivery(
+            decodeURIComponent(approvalRoute[1]),
+            decision,
+          ),
+        });
+      }
       return jsonResponse({ error: "not_found", message: "Route not found." }, 404);
     } catch (error) {
       const status = error instanceof MissionDomainError
@@ -1380,6 +1635,25 @@ export function createMissionHttpApp(options: MissionHttpOptions) {
       return jsonResponse({ error: "operation_failed", message, mission }, status);
     }
   }
+}
+
+async function approvalDecisionFromRequest(
+  request: Request,
+): Promise<"approved" | "rejected" | "cancelled"> {
+  let value: unknown;
+  try {
+    value = await request.json();
+  } catch {
+    throw new MissionDomainError("invalid_input", "Approval decision body must be valid JSON.");
+  }
+  if (!isRecord(value)) {
+    throw new MissionDomainError("invalid_input", "Approval decision body must be an object.");
+  }
+  const decision = value.decision;
+  if (decision !== "approved" && decision !== "rejected" && decision !== "cancelled") {
+    throw new MissionDomainError("invalid_input", "Approval decision is not supported.");
+  }
+  return decision;
 }
 
 function semanticVerifierFromRunner(
