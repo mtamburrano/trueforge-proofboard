@@ -99,6 +99,7 @@ async function reviewFixture({
       kind: "trueforge",
       sessionId: ORIGIN.sessionId,
       turnId: "turn-workspace-delta",
+      threadId: "main",
       toolCallId: "call-review-manifest",
     },
   });

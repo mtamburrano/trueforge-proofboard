@@ -240,6 +240,7 @@ class TestMissionRunner {
           kind: "trueforge",
           sessionId: "test-session-durable",
           turnId: `test-proof-delta-${this.calls.turn}`,
+          threadId: "main",
           toolCallId: `call-manifest-${this.calls.turn}`,
         },
       });

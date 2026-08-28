@@ -84,6 +84,7 @@ async function addEvidence(missions, missionId, id, kind, result, toolCallId, or
         kind: "trueforge",
         sessionId: ORIGIN.sessionId,
         turnId: "turn-workspace-delta",
+        threadId: "main",
         toolCallId,
       },
     } : {}),
@@ -402,6 +403,67 @@ test("valid handoffs correlate every check and origin, then survive reconnect", 
   }
 });
 
+test("workspace delta evidence requires explicit root thread provenance", async () => {
+  for (const [label, threadId] of [["missing", undefined], ["child", "thread-child"]]) {
+    const { missions, mission, workItem } = await delegatedFixture();
+    const typecheck = await addEvidence(
+      missions,
+      mission.id,
+      `evidence-${label}-typecheck`,
+      "typecheck_result",
+      "passed",
+      `call-${label}-typecheck`,
+    );
+    const testEvidence = await addEvidence(
+      missions,
+      mission.id,
+      `evidence-${label}-test`,
+      "test_result",
+      "passed",
+      `call-${label}-test`,
+    );
+    const diff = await addEvidence(
+      missions,
+      mission.id,
+      `evidence-${label}-diff`,
+      "diff_summary",
+      "passed",
+      `call-${label}-diff`,
+    );
+    const manifest = await missions.addEvidence(mission.id, {
+      id: `evidence-${label}-manifest`,
+      workItemId: workItem.id,
+      kind: "file_change",
+      result: "passed",
+      source: "trueforge",
+      summary: "The coordinator workspace delta was captured.",
+      details: workspaceDeltaEvidenceDetails(),
+      executionOrigin: {
+        kind: "trueforge",
+        sessionId: ORIGIN.sessionId,
+        turnId: ORIGIN.turnId,
+        ...(threadId === undefined ? {} : { threadId }),
+        toolCallId: `call-${label}-manifest`,
+      },
+    });
+
+    await assert.rejects(
+      missions.recordHandoff(mission.id, {
+        ...validHandoff({
+          typecheck: typecheck.id,
+          test: testEvidence.id,
+          diff: diff.id,
+          manifest: manifest.id,
+        }),
+        id: `handoff-${label}-workspace-thread`,
+      }),
+      (error) => domainError("invalid_input")(error) &&
+        /different execution (?:turn|thread)/i.test(error.message),
+    );
+    assert.equal((await missions.getState()).handoffs.length, 0, label);
+  }
+});
+
 test("a structured handoff cannot authorize a diff outside the explicit file scope", async () => {
   const { missions, mission, workItem } = await delegatedFixture();
   const typecheck = await addEvidence(
@@ -455,6 +517,7 @@ test("a structured handoff cannot authorize a diff outside the explicit file sco
       kind: "trueforge",
       sessionId: ORIGIN.sessionId,
       turnId: "turn-workspace-delta",
+      threadId: "main",
       toolCallId: "call-scope-manifest",
     },
   });

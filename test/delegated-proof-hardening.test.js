@@ -1516,6 +1516,8 @@ test("legacy primary missions are upgraded without losing their history", async 
   assert.equal(afterRun.missions[0].status, "awaiting_approval");
   assert.equal(afterRun.workItems.filter((item) => item.status === "complete").length, 3);
   assert.equal(afterRun.evidence.some((evidence) => evidence.id === history.id), true);
+  const manifest = afterRun.evidence.find((evidence) => evidence.kind === "file_change");
+  assert.equal(manifest?.executionOrigin?.threadId, "main");
 });
 
 test("production app wires bounded contract review and fails closed on invalid results", async () => {
@@ -1767,6 +1769,7 @@ class LegacyPrimaryRunner {
         kind: "trueforge",
         sessionId: "legacy-session",
         turnId: `legacy-proof-turn-${this.turn}`,
+        threadId: "main",
         toolCallId: `legacy-manifest-${this.turn}`,
       },
     });

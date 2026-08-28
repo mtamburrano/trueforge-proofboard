@@ -1855,7 +1855,7 @@ function isCoordinatorWorkspaceDeltaEvidence(evidence: Evidence): boolean {
   return evidence.source === "trueforge" &&
     origin?.kind === "trueforge" &&
     origin.turnId !== undefined &&
-    (origin.threadId === undefined || origin.threadId === TRUEFORGE_ROOT_THREAD_ID) &&
+    origin.threadId === TRUEFORGE_ROOT_THREAD_ID &&
     origin.toolCallId !== undefined &&
     parseDelegatedWorkspaceDeltaEvidence(evidence) !== null;
 }
