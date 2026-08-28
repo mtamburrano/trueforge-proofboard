@@ -116,6 +116,8 @@ export const MAX_TRUEFORGE_ITERATION_LIMIT = 1_024;
 export const MINIMUM_SANDBOX_NODE_MAJOR_VERSION = 20;
 export const SANDBOX_TOOLCHAIN_READINESS_INTENT =
   "Prepare and verify the sandbox toolchain before coding delegation.";
+export const LOCKED_REPOSITORY_PREPARATION_INTENT =
+  "Prepare and verify the locked repository before delegated workspace proof.";
 const SANDBOX_TOOLCHAIN_REQUIREMENT =
   "Node.js >=20 and npm are required before coding delegation.";
 const SANDBOX_NODE_SOURCE_MAJOR = 22;
@@ -126,6 +128,73 @@ const SANDBOX_NODE_SOURCE_REPOSITORY =
 export const DELEGATED_COMPLETE_CHANGED_FILES_COMMAND =
   "git status --porcelain=v1 -z --untracked-files=all";
 export { DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND } from "./diff.js";
+
+/**
+ * Prepare the primary fixture in the sandbox workspace used by every later
+ * proof turn. The command only reads from the remote and mutates the local
+ * checkout; it never creates a branch or performs a remote write.
+ */
+export const LOCKED_REPOSITORY_PREPARATION_COMMAND = [
+  "set -eu",
+  "unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE",
+  `expected_repository='${LOCKED_FIXTURE_OWNER}/${LOCKED_FIXTURE_REPO}'`,
+  `expected_sha='${LOCKED_FIXTURE_SHA}'`,
+  "git_root=\"$(git rev-parse --show-toplevel 2>/dev/null || true)\"",
+  "if [ -z \"$git_root\" ]; then",
+  "  workspace_entry=\"$(find . -mindepth 1 -maxdepth 1 -print -quit)\"",
+  "  if [ -n \"$workspace_entry\" ]; then",
+  `    printf '%s\\n' 'LOCKED_REPOSITORY_PREPARATION_FAILED workspace is not empty and is not a Git worktree for ${LOCKED_FIXTURE_OWNER}/${LOCKED_FIXTURE_REPO}.' >&2`,
+  "    exit 86",
+  "  fi",
+  `  if ! git clone --quiet --no-checkout --no-tags 'https://github.com/${LOCKED_FIXTURE_OWNER}/${LOCKED_FIXTURE_REPO}.git' . >/dev/null 2>&1; then`,
+  `    printf '%s\\n' 'LOCKED_REPOSITORY_PREPARATION_FAILED clone of ${LOCKED_FIXTURE_OWNER}/${LOCKED_FIXTURE_REPO} failed.' >&2`,
+  "    exit 86",
+  "  fi",
+  "  git_root=\"$(git rev-parse --show-toplevel 2>/dev/null || true)\"",
+  "fi",
+  "if [ -z \"$git_root\" ]; then",
+  "  printf '%s\\n' 'LOCKED_REPOSITORY_PREPARATION_FAILED no Git worktree was found after preparation.' >&2",
+  "  exit 86",
+  "fi",
+  "cd \"$git_root\"",
+  "if [ ! -e .git ] || [ \"$(git rev-parse --is-inside-work-tree 2>/dev/null || true)\" != \"true\" ]; then",
+  "  printf '%s\\n' 'LOCKED_REPOSITORY_PREPARATION_FAILED the prepared path has no usable Git worktree.' >&2",
+  "  exit 86",
+  "fi",
+  "remote_url=\"$(git config --get remote.origin.url 2>/dev/null || true)\"",
+  "remote_identity=\"$(printf '%s' \"$remote_url\" | sed -E 's#^(https://github\\.com/|ssh://git@github\\.com/|git@github\\.com:)##; s#\\.git$##; s#/$##')\"",
+  "if [ \"$remote_identity\" != \"$expected_repository\" ]; then",
+  "  printf '%s\\n' \"LOCKED_REPOSITORY_PREPARATION_FAILED repository identity did not match expected $expected_repository.\" >&2",
+  "  exit 86",
+  "fi",
+  "worktree_status=\"$(git status --porcelain=v1 --untracked-files=all 2>/dev/null || true)\"",
+  "if [ -n \"$worktree_status\" ]; then",
+  "  printf '%s\\n' 'LOCKED_REPOSITORY_PREPARATION_FAILED existing Git worktree is not clean.' >&2",
+  "  exit 86",
+  "fi",
+  "if ! git cat-file -e \"$expected_sha^{commit}\" 2>/dev/null; then",
+  "  if ! git fetch --quiet --no-tags origin \"$expected_sha\" >/dev/null 2>&1; then",
+  "    printf '%s\\n' \"LOCKED_REPOSITORY_PREPARATION_FAILED could not fetch the locked baseline $expected_sha from the verified repository.\" >&2",
+  "    exit 86",
+  "  fi",
+  "fi",
+  "if ! git checkout --quiet --detach \"$expected_sha\" >/dev/null 2>&1; then",
+  "  printf '%s\\n' \"LOCKED_REPOSITORY_PREPARATION_FAILED could not check out the locked baseline $expected_sha.\" >&2",
+  "  exit 86",
+  "fi",
+  "head_sha=\"$(git rev-parse --verify HEAD 2>/dev/null || true)\"",
+  "if [ \"$head_sha\" != \"$expected_sha\" ]; then",
+  "  printf '%s\\n' \"LOCKED_REPOSITORY_PREPARATION_FAILED checked out SHA did not match expected $expected_sha.\" >&2",
+  "  exit 86",
+  "fi",
+  "if [ -n \"$(git symbolic-ref --short -q HEAD || true)\" ]; then",
+  "  printf '%s\\n' 'LOCKED_REPOSITORY_PREPARATION_FAILED the locked baseline is not checked out in detached mode.' >&2",
+  "  exit 86",
+  "fi",
+  "printf 'TRUEFORGE_REPOSITORY_READY repository=%s sha=%s root=%s\\n' \"$expected_repository\" \"$head_sha\" \"$git_root\"",
+].join("\n");
+export const DELEGATED_REPOSITORY_PREPARATION_INTENT = LOCKED_REPOSITORY_PREPARATION_INTENT;
+export const DELEGATED_REPOSITORY_PREPARATION_COMMAND = LOCKED_REPOSITORY_PREPARATION_COMMAND;
 
 /**
  * Debian 12/bookworm ships Node.js 18. Add the NodeSource 22.x repository
@@ -619,6 +688,17 @@ export interface SandboxPreparationResult {
   mission: Mission;
 }
 
+export interface SandboxRepositoryPreparationResult {
+  sessionId: string;
+  turnId: string;
+  repository: string;
+  baselineSha: string;
+  repositoryRoot: string;
+  sandboxId?: string;
+  evidenceId: string;
+  mission: Mission;
+}
+
 export interface SandboxVerificationResult {
   sessionId: string;
   turnId: string;
@@ -733,6 +813,12 @@ interface VerifiedSandboxExecution {
 interface VerifiedSandboxReadiness extends VerifiedSandboxExecution {
   nodeVersion: string;
   npmVersion: string;
+}
+
+interface VerifiedLockedRepositoryPreparation extends VerifiedSandboxExecution {
+  repository: string;
+  baselineSha: string;
+  repositoryRoot: string;
 }
 
 export class TrueForgeIntegrationError extends Error {
@@ -869,9 +955,25 @@ export class TrueForgeMissionRunner {
     const delegatedWorkItem = options.delegateToSubagent === true && options.workItemId !== undefined
       ? await this.missions.getWorkItem(missionId, options.workItemId)
       : undefined;
+    const repositoryPreparation = delegatedWorkItem === undefined
+      ? undefined
+      : await this.prepareLockedRepositoryBeforeDelegation(
+          missionId,
+          delegatedWorkItem.id,
+          options.previousTurnId,
+        );
+    const workspaceStartPreviousTurnId = delegatedWorkItem === undefined
+      ? undefined
+      : repositoryPreparation?.turnId ??
+        options.previousTurnId ??
+        (await this.missions.getMission(missionId)).trueforgeTurnId;
     const workspaceStart = delegatedWorkItem === undefined
       ? undefined
-      : await this.captureDelegatedWorkspaceStart(missionId, delegatedWorkItem.id, options.previousTurnId);
+      : await this.captureDelegatedWorkspaceStart(
+          missionId,
+          delegatedWorkItem.id,
+          workspaceStartPreviousTurnId,
+        );
     const execution = await this.executeTurn(
       missionId,
       instruction,
@@ -938,6 +1040,92 @@ export class TrueForgeMissionRunner {
         ? {}
         : { implementationHandoff }),
     };
+  }
+
+  private async prepareLockedRepositoryBeforeDelegation(
+    missionId: string,
+    workItemId: string,
+    previousTurnId: string | undefined,
+  ): Promise<SandboxRepositoryPreparationResult | undefined> {
+    const mission = await this.missions.getMission(missionId);
+    if (
+      mission.repository === undefined ||
+      !isLockedFixtureRepository(mission.repository) ||
+      mission.trueforgeWorkspaceBaselineTreeRef !== undefined
+    ) {
+      return undefined;
+    }
+
+    try {
+      const toolName = canonicalSandboxToolName(undefined, this.config.sandboxToolName);
+      const preparationOptions: RunTurnOptions = {};
+      if (mission.trueforgeSandboxId !== undefined) {
+        if (mission.trueforgeTurnId === undefined) {
+          throw new TrueForgeIntegrationError(
+            "prepare repository",
+            "The persisted sandbox identity has no durable predecessor turn.",
+          );
+        }
+        preparationOptions.previousTurnId = mission.trueforgeTurnId;
+      } else if (previousTurnId !== undefined) {
+        preparationOptions.previousTurnId = previousTurnId;
+      }
+      const execution = await this.executeTurn(
+        mission.id,
+        buildLockedRepositoryPreparationInstruction(mission, toolName),
+        preparationOptions,
+      );
+      const verified = verifyLockedRepositoryPreparation(
+        execution.rawEvents,
+        LOCKED_REPOSITORY_PREPARATION_INTENT,
+        LOCKED_REPOSITORY_PREPARATION_COMMAND,
+        toolName,
+        mission.trueforgeSandboxId,
+      );
+      const evidence = await this.missions.addEvidence(mission.id, {
+        workItemId,
+        kind: "tool_result",
+        result: "passed",
+        source: "sandbox",
+        summary: `Sandbox prepared ${verified.repository} at locked baseline ${verified.baselineSha}.`,
+        details: JSON.stringify({
+          tool: toolName,
+          intent: LOCKED_REPOSITORY_PREPARATION_INTENT,
+          command: LOCKED_REPOSITORY_PREPARATION_COMMAND,
+          repository: verified.repository,
+          baseline_sha: verified.baselineSha,
+          repository_root: verified.repositoryRoot,
+          ...(verified.sandboxId === undefined ? {} : { sandbox_id: verified.sandboxId }),
+        }),
+        executionOrigin: {
+          kind: "sandbox",
+          sessionId: execution.sessionId,
+          turnId: execution.turnId,
+        },
+      });
+      return {
+        sessionId: execution.sessionId,
+        turnId: execution.turnId,
+        repository: verified.repository,
+        baselineSha: verified.baselineSha,
+        repositoryRoot: verified.repositoryRoot,
+        ...(verified.sandboxId === undefined ? {} : { sandboxId: verified.sandboxId }),
+        evidenceId: evidence.id,
+        mission: await this.missions.getMission(mission.id),
+      };
+    } catch (error) {
+      await this.recordRepositoryPreparationFailure(mission.id, workItemId, error);
+      if (error instanceof TrueForgeIntegrationError && error.operation === "prepare repository") {
+        throw error;
+      }
+      const reason = error instanceof TrueForgeIntegrationError
+        ? error.message
+        : "The locked repository could not be prepared or verified.";
+      throw new TrueForgeIntegrationError(
+        "prepare repository",
+        `Locked repository preparation failed before delegated workspace proof: ${reason}`,
+      );
+    }
   }
 
   private async captureDelegatedWorkspaceStart(
@@ -2464,6 +2652,41 @@ export class TrueForgeMissionRunner {
     }
   }
 
+  private async recordRepositoryPreparationFailure(
+    missionId: string,
+    workItemId: string,
+    error: unknown,
+  ): Promise<void> {
+    const message = error instanceof TrueForgeIntegrationError
+      ? error.message
+      : "The locked repository could not be prepared or verified.";
+    const reason = sanitizeRuntimeText(message);
+    try {
+      await this.missions.addEvidence(missionId, {
+        workItemId,
+        kind: "tool_result",
+        result: "failed",
+        source: "sandbox",
+        summary: "Locked repository preparation failed; delegated workspace proof did not start.",
+        details: JSON.stringify({
+          intent: LOCKED_REPOSITORY_PREPARATION_INTENT,
+          command: LOCKED_REPOSITORY_PREPARATION_COMMAND,
+          reason,
+        }),
+      });
+    } catch {
+      // Preserve the original preparation error if durable failure evidence cannot be recorded.
+    }
+    try {
+      const current = await this.missions.getWorkItem(missionId, workItemId);
+      if (current.status === "in_progress" || current.status === "ready_for_review") {
+        await this.missions.transitionWorkItem(missionId, workItemId, "blocked");
+      }
+    } catch {
+      // Preserve the original preparation error when the work item cannot be transitioned.
+    }
+  }
+
   private async recordSandboxFailure(
     missionId: string,
     workItemId: string | undefined,
@@ -2518,7 +2741,14 @@ function buildTurnInstruction(
     : `Active work item: ${workItem.title}. Purpose: ${workItem.purpose}`;
   const delegatedContext = packet === undefined
     ? []
-    : [buildDelegatedTurnInstruction(packet, instruction)];
+    : [
+        buildDelegatedTurnInstruction(packet, instruction),
+        ...(mission.repository !== undefined && isLockedFixtureRepository(mission.repository)
+          ? [
+              "The coordinator has prepared and verified the pinned repository in this persistent sandbox workspace. Reuse that workspace; do not clone, check out, or create a second repository.",
+            ]
+          : []),
+      ];
   return [
     `Mission objective: ${mission.objective}`,
     workItemContext,
@@ -2912,6 +3142,31 @@ function buildSandboxPreparationInstruction(
       : `Reuse the persisted sandbox ${mission.trueforgeSandboxId} and do not create a replacement sandbox.`,
     "Do not run the command on the host, do not use a different execution tool, and do not fabricate the result.",
     "Return the structured sandbox response after the toolchain is prepared and verified.",
+  ].join(" ");
+}
+
+function buildLockedRepositoryPreparationInstruction(
+  mission: Mission,
+  toolName: string,
+): string {
+  if (mission.repository === undefined || !isLockedFixtureRepository(mission.repository)) {
+    throw new TrueForgeIntegrationError(
+      "prepare repository",
+      "Locked repository preparation requires the pinned fixture repository target.",
+    );
+  }
+  return [
+    `Prepare the locked repository for mission ${mission.id} in the persistent sandbox workspace before the first delegated workspace snapshot.`,
+    `Call the sandbox tool ${toolName} exactly once with this JSON object: ${JSON.stringify({
+      intent: LOCKED_REPOSITORY_PREPARATION_INTENT,
+      command: LOCKED_REPOSITORY_PREPARATION_COMMAND,
+    })}.`,
+    mission.trueforgeSandboxId === undefined
+      ? "Record the sandbox identity before executing the command."
+      : `Reuse the persisted sandbox ${mission.trueforgeSandboxId} and do not create a replacement sandbox.`,
+    "The command may clone or fetch the pinned repository and use a local detached checkout, but it must not push, create a branch, commit, open a pull request, or perform any other remote mutation.",
+    "Do not run the command on the host, do not use a different execution tool, and do not fabricate the result.",
+    "Return the structured sandbox response only after repository identity, worktree, and exact baseline SHA have been verified.",
   ].join(" ");
 }
 
@@ -3520,14 +3775,12 @@ function coordinatorWorkspaceExecution(
   events: TrueForgeApi.TurnStreamingEvent[],
   expectedCommand: string,
 ): CoordinatorWorkspaceExecution | null {
-  const executions = observedToolCalls(events).filter((call) =>
-    call.name === "exec" && call.threadId === null,
-  );
+  const executions = observedToolCalls(events).filter((call) => call.name === "exec");
   if (executions.length !== 1) {
     return null;
   }
   const execution = executions[0];
-  if (execution === undefined) {
+  if (execution === undefined || execution.threadId !== null) {
     return null;
   }
   const command = normalizeSafeWorkingDirectoryPrefix(executionCommand(execution.arguments) ?? "");
@@ -4033,27 +4286,7 @@ function verifySandboxExecution(
   if (toolName !== "exec") {
     return sandboxFailure("Sandbox verification requires the canonical TrueForge exec tool.");
   }
-  const sandboxCreatedEvents = events.filter((event) => event.type === "sandbox.created");
-  if (sandboxCreatedEvents.length === 0 && expectedSandboxId === undefined) {
-    return sandboxFailure("TrueForge did not record sandbox creation.");
-  }
-  if (sandboxCreatedEvents.length > 1) {
-    return sandboxFailure(
-      `Expected at most one sandbox.created event, found ${sandboxCreatedEvents.length}.`,
-    );
-  }
-  let sandboxId = expectedSandboxId;
-  const sandboxCreated = sandboxCreatedEvents[0];
-  if (sandboxCreated !== undefined) {
-    const observedSandboxId = sandboxIdFromEvent(sandboxCreated);
-    if (observedSandboxId === null) {
-      return sandboxFailure("TrueForge sandbox creation did not include a sandbox id.");
-    }
-    if (expectedSandboxId !== undefined && observedSandboxId !== expectedSandboxId) {
-      return sandboxFailure("TrueForge returned a sandbox id different from the persisted mission sandbox.");
-    }
-    sandboxId = observedSandboxId;
-  }
+  const sandboxId = verifySandboxIdentity(events, expectedSandboxId, "run sandbox verification");
   const expectedArguments = { intent, command };
   const canonicalCalls = observedToolCalls(events).filter(
     (call) => call.name === toolName && isRecord(call.arguments) &&
@@ -4103,6 +4336,137 @@ function verifySandboxExecution(
     exitCode,
     stdout,
     outputSummary: summarizeOutput(stdout),
+    ...(sandboxId === undefined ? {} : { sandboxId }),
+  };
+}
+
+function verifySandboxIdentity(
+  events: TrueForgeApi.TurnStreamingEvent[],
+  expectedSandboxId: string | undefined,
+  operation: string,
+): string | undefined {
+  const sandboxCreatedEvents = events.filter((event) => event.type === "sandbox.created");
+  if (sandboxCreatedEvents.length === 0 && expectedSandboxId === undefined) {
+    return verificationFailure(operation, "TrueForge did not record sandbox creation.");
+  }
+  if (sandboxCreatedEvents.length > 1) {
+    return verificationFailure(
+      operation,
+      `Expected at most one sandbox.created event, found ${sandboxCreatedEvents.length}.`,
+    );
+  }
+  let sandboxId = expectedSandboxId;
+  const sandboxCreated = sandboxCreatedEvents[0];
+  if (sandboxCreated !== undefined) {
+    const observedSandboxId = sandboxIdFromEvent(sandboxCreated);
+    if (observedSandboxId === null) {
+      return verificationFailure(operation, "TrueForge sandbox creation did not include a sandbox id.");
+    }
+    if (expectedSandboxId !== undefined && observedSandboxId !== expectedSandboxId) {
+      return verificationFailure(
+        operation,
+        "TrueForge returned a sandbox id different from the persisted mission sandbox.",
+      );
+    }
+    sandboxId = observedSandboxId;
+  }
+  return sandboxId;
+}
+
+function verifyLockedRepositoryPreparation(
+  events: TrueForgeApi.TurnStreamingEvent[],
+  intent: string,
+  command: string,
+  toolName: string,
+  expectedSandboxId?: string,
+): VerifiedLockedRepositoryPreparation {
+  const operation = "prepare repository";
+  if (toolName !== "exec") {
+    return verificationFailure(operation, "Repository preparation requires the canonical TrueForge exec tool.");
+  }
+  const sandboxId = verifySandboxIdentity(events, expectedSandboxId, operation);
+  const expectedArguments = { intent, command };
+  const executionCalls = observedToolCalls(events).filter((call) => call.name === toolName);
+  if (executionCalls.length !== 1) {
+    return verificationFailure(
+      operation,
+      `Expected exactly one coordinator-owned ${toolName} repository-preparation call, found ${executionCalls.length}.`,
+    );
+  }
+  const call = executionCalls[0];
+  if (call === undefined || call.threadId !== null) {
+    return verificationFailure(
+      operation,
+      "The locked repository preparation call was not coordinator-owned.",
+    );
+  }
+  if (!isRecord(call.arguments) || !argumentsExactlyMatch(call.arguments, expectedArguments)) {
+    return verificationFailure(
+      operation,
+      "The coordinator-owned repository preparation call did not match the required command and intent.",
+    );
+  }
+  const response = toolResponseForCall(events, call.id);
+  if (
+    response === undefined ||
+    stringOrNull(recordValue(response).threadId ?? recordValue(response).thread_id) !== null
+  ) {
+    return verificationFailure(
+      operation,
+      "The coordinator-owned locked repository preparation call has no uncorrelated structured response.",
+    );
+  }
+  const observed = parseExecutionResponse(response);
+  if (observed === null) {
+    return verificationFailure(
+      operation,
+      "The coordinator-owned locked repository preparation returned no structured sandbox response.",
+    );
+  }
+  if (observed.success !== true) {
+    return verificationFailure(
+      operation,
+      "The locked repository preparation sandbox response did not return success: true.",
+    );
+  }
+  if (observed.exitCode !== 0) {
+    const failureMarker = observed.output.match(
+      /(?:^|\n)LOCKED_REPOSITORY_PREPARATION_FAILED ([^\n]+)/,
+    );
+    const failure = failureMarker?.[1] === undefined
+      ? `The locked repository preparation command exited with code ${observed.exitCode}.`
+      : `Locked repository preparation failed: ${sanitizeRuntimeText(failureMarker[1])}`;
+    return verificationFailure(operation, failure);
+  }
+  requireCompletedTurn(events, operation, "repository preparation");
+  const ready = observed.output.trim().match(
+    /^TRUEFORGE_REPOSITORY_READY repository=([^\s]+) sha=([0-9a-fA-F]{40}) root=(\/.+)$/,
+  );
+  if (ready === null || ready[1] === undefined || ready[2] === undefined || ready[3] === undefined) {
+    return verificationFailure(
+      operation,
+      "The coordinator-owned repository preparation did not return the required repository identity, root, and exact baseline SHA proof.",
+    );
+  }
+  if (ready[1] !== `${LOCKED_FIXTURE_OWNER}/${LOCKED_FIXTURE_REPO}`) {
+    return verificationFailure(
+      operation,
+      `Repository preparation returned ${sanitizeRuntimeText(ready[1])}; expected ${LOCKED_FIXTURE_OWNER}/${LOCKED_FIXTURE_REPO}.`,
+    );
+  }
+  if (ready[2] !== LOCKED_FIXTURE_SHA) {
+    return verificationFailure(
+      operation,
+      `Repository preparation returned baseline SHA ${ready[2]}; expected ${LOCKED_FIXTURE_SHA}.`,
+    );
+  }
+  return {
+    exitCode: observed.exitCode,
+    stdout: observed.output,
+    outputSummary: summarizeOutput(observed.output),
+    repository: ready[1],
+    baselineSha: ready[2],
+    repositoryRoot: ready[3],
     ...(sandboxId === undefined ? {} : { sandboxId }),
   };
 }

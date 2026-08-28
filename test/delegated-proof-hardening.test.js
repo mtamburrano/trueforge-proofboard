@@ -13,6 +13,8 @@ import {
   RepositoryWorkGraphPlanner,
   TrueForgeMissionRunner,
   DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
+  LOCKED_REPOSITORY_PREPARATION_COMMAND,
+  LOCKED_REPOSITORY_PREPARATION_INTENT,
   buildDelegatedWorkspaceDeltaCommand,
   createMissionHttpApp,
 } from "../dist/index.js";
@@ -185,6 +187,108 @@ function workspaceDeltaEvents({
     },
     { type: "turn.done", id: `${turnId}-done`, threadId: null, state: { status: "done", requiredActions: [] } },
   ];
+}
+
+function repositoryPreparationEvents({
+  repository = `${PRIMARY_REPOSITORY.owner}/${PRIMARY_REPOSITORY.name}`,
+  sha = PRIMARY_REPOSITORY.ref,
+  root = "/workspace",
+  exitCode = 0,
+  result = `TRUEFORGE_REPOSITORY_READY repository=${repository} sha=${sha} root=${root}\n`,
+  turnId = "turn-repository-preparation",
+} = {}) {
+  const callId = `${turnId}-call-preparation`;
+  return [
+    { type: "turn.created", id: `${turnId}-created`, turnId, threadId: null, state: { status: "running" } },
+    { type: "sandbox.created", id: `${turnId}-sandbox`, threadId: null, sandboxId: "sandbox-1" },
+    {
+      type: "model.message",
+      id: `${turnId}-model`,
+      threadId: null,
+      toolCalls: [{
+        id: callId,
+        function: {
+          name: "exec",
+          arguments: JSON.stringify({
+            intent: LOCKED_REPOSITORY_PREPARATION_INTENT,
+            command: LOCKED_REPOSITORY_PREPARATION_COMMAND,
+          }),
+        },
+      }],
+    },
+    {
+      type: "tool.response",
+      id: `${turnId}-response`,
+      threadId: null,
+      toolCallId: callId,
+      content: JSON.stringify({ success: true, response: { exitCode, result } }),
+    },
+    { type: "turn.done", id: `${turnId}-done`, threadId: null, state: { status: "done", requiredActions: [] } },
+  ];
+}
+
+function trueforgeStream(events) {
+  return {
+    async *withMetadata() {
+      for (const event of events) {
+        yield { data: event };
+      }
+    },
+  };
+}
+
+async function lockedRepositoryRunnerFixture({ preparation = {} } = {}) {
+  const missions = new MissionService(new InMemoryMissionRepository(), fixedClock);
+  const turnRequests = [];
+  let turnNumber = 0;
+  const client = {
+    sessions: {
+      async create() {
+        return { data: { id: ORIGIN.sessionId } };
+      },
+      async get(sessionId) {
+        return { data: { id: sessionId } };
+      },
+      async createTurnStream(sessionId, request) {
+        turnRequests.push({ sessionId, request });
+        const current = turnNumber++;
+        if (current === 0) {
+          return trueforgeStream(repositoryPreparationEvents(preparation));
+        }
+        if (current === 1) {
+          return trueforgeStream(workspaceSnapshotEvents(WORKSPACE_START_TREE));
+        }
+        if (current === 2) {
+          return trueforgeStream(delegatedEvents(
+            "npm run typecheck && npm test",
+            diffOutput(),
+          ));
+        }
+        return trueforgeStream(workspaceDeltaEvents());
+      },
+    },
+  };
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "local/locked-repository-fixture",
+    dynamicSubAgents: true,
+  });
+  const mission = await runner.createMission({
+    id: "mission-locked-repository-preparation",
+    objective: "Prepare the locked repository before delegated proof.",
+    repository: PRIMARY_REPOSITORY,
+  });
+  const workItem = await missions.addWorkItem(mission.id, {
+    id: "work-locked-repository-preparation",
+    title: "Implement the bounded change",
+    purpose: "Apply the bounded change in the prepared repository.",
+    acceptanceCriteria: ["The bounded change is checked."],
+    requiredChecks: ["typecheck", "test"],
+    assignedRole: "implementer",
+    allowedFiles: ["src/index.ts", "test/index.test.js"],
+    status: "ready",
+  });
+  await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
+  return { missions, runner, mission, workItem, turnRequests };
 }
 
 function transitionContractVerifier() {
@@ -646,6 +750,73 @@ test("coordinator workspace proof turns request their exact sandbox exec command
     intent: "Capture the coordinator-owned current work-item and cumulative mission workspace deltas after delegated implementation.",
     command: expectedDeltaCommand,
   });
+});
+
+test("empty locked fixture sandboxes are prepared before the workspace snapshot and delegation", async () => {
+  const fixture = await lockedRepositoryRunnerFixture();
+
+  const result = await fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
+    workItemId: fixture.workItem.id,
+    delegateToSubagent: true,
+  });
+
+  assert.ok(result.implementationHandoff);
+  assert.equal(fixture.turnRequests.length, 4);
+  assert.deepEqual(sandboxInstructionArguments(fixture.turnRequests[0].request), {
+    intent: LOCKED_REPOSITORY_PREPARATION_INTENT,
+    command: LOCKED_REPOSITORY_PREPARATION_COMMAND,
+  });
+  assert.equal(fixture.turnRequests[1].request.previousTurnId, "turn-repository-preparation");
+  assert.match(
+    fixture.turnRequests[2].request.input[0].content,
+    /prepared and verified the pinned repository in this persistent sandbox workspace/i,
+  );
+  assert.equal(fixture.turnRequests[3].request.previousTurnId, ORIGIN.turnId);
+
+  const state = await fixture.missions.getState();
+  const preparation = state.evidence.find((evidence) =>
+    evidence.summary.startsWith("Sandbox prepared mtamburrano/proofboard-demo-fixture"),
+  );
+  assert.ok(preparation);
+  assert.equal(preparation.result, "passed");
+  assert.match(preparation.details, /"baseline_sha":"590aa8a6d72c580f61fc1b19d33e9876bc0feb9b"/);
+  assert.match(LOCKED_REPOSITORY_PREPARATION_COMMAND, /git clone --quiet/);
+  assert.match(LOCKED_REPOSITORY_PREPARATION_COMMAND, /git checkout --quiet --detach/);
+  assert.doesNotMatch(LOCKED_REPOSITORY_PREPARATION_COMMAND, /git push|create_pull_request/);
+});
+
+test("wrong locked repository identity or baseline blocks before delegation", async () => {
+  for (const preparation of [
+    {
+      repository: "unexpected/repository",
+      error: /expected mtamburrano\/proofboard-demo-fixture/i,
+    },
+    {
+      sha: "b".repeat(40),
+      error: /expected 590aa8a6d72c580f61fc1b19d33e9876bc0feb9b/i,
+    },
+    {
+      exitCode: 86,
+      result: "LOCKED_REPOSITORY_PREPARATION_FAILED could not check out the locked baseline.\n",
+      error: /could not check out the locked baseline/i,
+    },
+  ]) {
+    const fixture = await lockedRepositoryRunnerFixture({ preparation });
+    await assert.rejects(
+      fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
+        workItemId: fixture.workItem.id,
+        delegateToSubagent: true,
+      }),
+      (error) => preparation.error.test(error.message),
+    );
+    assert.equal(fixture.turnRequests.length, 1);
+    const state = await fixture.missions.getState();
+    assert.equal(state.workItems.find((item) => item.id === fixture.workItem.id).status, "blocked");
+    const failure = state.evidence.find((evidence) =>
+      evidence.result === "failed" && evidence.summary.includes("Locked repository preparation failed"),
+    );
+    assert.ok(failure);
+  }
 });
 
 test("delegated diffs outside the work-item scope block implementation", async () => {
