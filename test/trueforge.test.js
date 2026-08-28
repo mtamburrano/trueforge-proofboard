@@ -315,6 +315,182 @@ function lockedCommitEvents(
   ];
 }
 
+function pullRequestReadbackEvents(
+  turnId = "turn-4",
+  {
+    number = 42,
+    url = "https://github.com/mtamburrano/proofboard-demo-fixture/pull/42",
+    owner = "mtamburrano",
+    repo = "proofboard-demo-fixture",
+    base = "main",
+    head = "proofboard-verified-delivery",
+    headSha = VERIFIED_DELIVERY_HEAD_SHA,
+    includeHeadSha = true,
+  } = {},
+) {
+  const readback = {
+    number,
+    html_url: url,
+    base: {
+      ref: base,
+      repo: { full_name: `${owner}/${repo}` },
+    },
+    head: {
+      ref: head,
+      ...(includeHeadSha ? { sha: headSha } : {}),
+      repo: { full_name: `${owner}/${repo}` },
+    },
+  };
+  return [
+    {
+      type: "turn.created",
+      id: "event-readback-turn-created",
+      createdAt: "2026-08-28T08:01:03.000Z",
+      threadId: null,
+      turnId,
+      state: { status: "running" },
+    },
+    {
+      type: "mcp.initialize",
+      id: "event-readback-mcp",
+      createdAt: "2026-08-28T08:01:04.000Z",
+      threadId: "thread-readback",
+      mcpServers: [{ name: "github" }],
+    },
+    {
+      type: "model.message",
+      id: "event-readback-call",
+      createdAt: "2026-08-28T08:01:05.000Z",
+      threadId: "thread-readback",
+      toolCalls: [{
+        id: "call-readback-pr",
+        function: {
+          name: "pull_request_read",
+          arguments: JSON.stringify({
+            method: "get",
+            owner,
+            repo,
+            pullNumber: number,
+          }),
+        },
+      }],
+    },
+    {
+      type: "tool.response",
+      id: "event-readback-response",
+      createdAt: "2026-08-28T08:01:06.000Z",
+      threadId: "thread-readback",
+      toolCallId: "call-readback-pr",
+      content: JSON.stringify({
+        isError: false,
+        structuredContent: readback,
+      }),
+    },
+    {
+      type: "turn.done",
+      id: "event-readback-turn-done",
+      createdAt: "2026-08-28T08:01:07.000Z",
+      threadId: null,
+      state: { status: "done", requiredActions: [] },
+    },
+  ];
+}
+
+function deliveryApprovalEvents(turnId, target, readbackOptions = {}) {
+  if (turnId === "turn-1") {
+    const toolArguments = { ...target };
+    delete toolArguments.headSha;
+    const approval = {
+      type: "tool.approval_required",
+      id: "approval-event",
+      createdAt: "2026-08-28T08:00:02.000Z",
+      threadId: "thread-delivery",
+      toolCalls: [{ id: "call-create-pr", sourceEventId: "message-create-pr" }],
+    };
+    return [
+      {
+        type: "turn.created",
+        id: "turn-created-delivery",
+        createdAt: "2026-08-28T08:00:00.000Z",
+        turnId,
+        threadId: null,
+      },
+      {
+        type: "model.message",
+        id: "message-create-pr",
+        createdAt: "2026-08-28T08:00:01.000Z",
+        threadId: "thread-delivery",
+        toolCalls: [{
+          id: "call-create-pr",
+          function: { name: "create_pull_request", arguments: JSON.stringify(toolArguments) },
+        }],
+      },
+      approval,
+      {
+        type: "turn.done",
+        id: "turn-paused-delivery",
+        createdAt: "2026-08-28T08:00:03.000Z",
+        threadId: null,
+        state: { status: "done", requiredActions: [approval] },
+      },
+    ];
+  }
+  if (turnId === "turn-2") {
+    return lockedCommitEvents(turnId, {
+      argumentsValue: {
+        owner: target.owner,
+        repo: target.repo,
+        sha: target.head,
+        detail: "full_patch",
+      },
+      sha: target.headSha,
+      patches: PRIMARY_VERIFIED_DELIVERY_PATCHES,
+    });
+  }
+  if (turnId === "turn-3") {
+    return [
+      {
+        type: "turn.created",
+        id: "turn-created-delivery-resume",
+        createdAt: "2026-08-28T08:01:00.000Z",
+        turnId,
+        threadId: null,
+      },
+      {
+        type: "tool.response",
+        id: "response-create-pr",
+        createdAt: "2026-08-28T08:01:01.000Z",
+        threadId: "thread-delivery",
+        toolCallId: "call-create-pr",
+        content: JSON.stringify({
+          isError: false,
+          structuredContent: {
+            id: "PR_kwDOExample42",
+            url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/42",
+          },
+        }),
+      },
+      {
+        type: "turn.done",
+        id: "turn-done-delivery-resume",
+        createdAt: "2026-08-28T08:01:02.000Z",
+        threadId: null,
+        state: { status: "done", requiredActions: [] },
+      },
+    ];
+  }
+  if (turnId === "turn-4") {
+    return pullRequestReadbackEvents(turnId, {
+      ...readbackOptions,
+      owner: target.owner,
+      repo: target.repo,
+      base: target.base,
+      head: target.head,
+    });
+  }
+  throw new Error(`Unexpected delivery turn ${turnId}.`);
+}
+
 function sandboxEvents(
   turnId = "turn-1",
   exitCode = 0,
@@ -598,98 +774,17 @@ test("pull request delivery pauses one exact TrueForge tool call and resumes onl
     title: "Add the verified delivery-stage helper",
     body: "Verified delivery body.",
   };
-  const { client, calls } = fakeClient((turnId) => {
-    if (turnId === "turn-1") {
-      const toolArguments = { ...target };
-      delete toolArguments.headSha;
-      const toolCall = {
-        id: "call-create-pr",
-        function: { name: "create_pull_request", arguments: JSON.stringify(toolArguments) },
-      };
-      const approval = {
-        type: "tool.approval_required",
-        id: "approval-event",
-        createdAt: "2026-08-28T08:00:02.000Z",
-        threadId: "thread-delivery",
-        toolCalls: [{ id: "call-create-pr", sourceEventId: "message-create-pr" }],
-      };
-      return [
-        {
-          type: "turn.created",
-          id: "turn-created-delivery",
-          createdAt: "2026-08-28T08:00:00.000Z",
-          turnId,
-          threadId: null,
-        },
-        {
-          type: "model.message",
-          id: "message-create-pr",
-          createdAt: "2026-08-28T08:00:01.000Z",
-          threadId: "thread-delivery",
-          toolCalls: [toolCall],
-        },
-        approval,
-        {
-          type: "turn.done",
-          id: "turn-paused-delivery",
-          createdAt: "2026-08-28T08:00:03.000Z",
-          threadId: null,
-          state: { status: "done", requiredActions: [approval] },
-        },
-      ];
-    }
-    if (turnId === "turn-2") {
-      return lockedCommitEvents(turnId, {
-        argumentsValue: {
-          owner: target.owner,
-          repo: target.repo,
-          sha: target.head,
-          detail: "full_patch",
-        },
-        sha: target.headSha,
-        patches: PRIMARY_VERIFIED_DELIVERY_PATCHES,
-      });
-    }
-    return [
-      {
-        type: "turn.created",
-        id: "turn-created-delivery-resume",
-        createdAt: "2026-08-28T08:01:00.000Z",
-        turnId,
-        threadId: null,
-      },
-      {
-        type: "tool.response",
-        id: "response-create-pr",
-        createdAt: "2026-08-28T08:01:01.000Z",
-        threadId: "thread-delivery",
-        toolCallId: "call-create-pr",
-        content: JSON.stringify({
-          isError: false,
-          structuredContent: {
-            number: 42,
-            html_url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/42",
-            head: { ref: target.head, sha: target.headSha },
-          },
-        }),
-      },
-      {
-        type: "turn.done",
-        id: "turn-done-delivery-resume",
-        createdAt: "2026-08-28T08:01:02.000Z",
-        threadId: null,
-        state: { status: "done", requiredActions: [] },
-      },
-    ];
-  });
+  const { client, calls } = fakeClient((turnId) =>
+    deliveryApprovalEvents(turnId, target)
+  );
   const runner = new TrueForgeMissionRunner(missions, client, {
     model: "google-gemini/test-model",
     mcpServerName: "github",
     deliveryToolName: "create_pull_request",
     mcpServers: [{
       name: "github",
-      enableTools: ["create_pull_request", "get_commit"],
-      preloadTools: ["create_pull_request", "get_commit"],
+      enableTools: ["create_pull_request", "get_commit", "pull_request_read"],
+      preloadTools: ["create_pull_request", "get_commit", "pull_request_read"],
       requireApprovalForTools: ["create_pull_request"],
     }],
   });
@@ -743,7 +838,73 @@ test("pull request delivery pauses one exact TrueForge tool call and resumes onl
     }],
     previousTurnId: "turn-1",
   });
-  assert.equal(calls.turns.length, 3);
+  assert.match(calls.turns[3].request.input[0].content, /pull_request_read exactly once/);
+  assert.match(calls.turns[3].request.input[0].content, /"pullNumber":42/);
+  assert.equal(calls.turns[3].request.previousTurnId, "turn-3");
+  const readbackEvidence = (await missions.getState()).evidence.find((item) =>
+    item.summary === "MCP verified pull request #42 after creation."
+  );
+  assert.ok(readbackEvidence);
+  assert.equal(JSON.parse(readbackEvidence.details).head_sha, VERIFIED_DELIVERY_HEAD_SHA);
+  assert.equal(JSON.parse(readbackEvidence.details).base, target.base);
+  assert.equal(JSON.parse(readbackEvidence.details).head, target.head);
+  assert.equal(calls.turns.length, 4);
+});
+
+test("post-create pull request read-back rejects a missing or mismatched head SHA", async () => {
+  for (const [label, readbackOptions] of [
+    ["missing", { includeHeadSha: false }],
+    ["mismatched", { headSha: "9cc33b73c4825f7aa5d3b1ce6c5510fc8e1b20f2" }],
+  ]) {
+    const missions = new MissionService(new InMemoryMissionRepository());
+    const target = {
+      owner: "mtamburrano",
+      repo: "proofboard-demo-fixture",
+      base: "main",
+      head: "proofboard-verified-delivery",
+      headSha: VERIFIED_DELIVERY_HEAD_SHA,
+      title: "Verified fixture delivery",
+      body: "Verified fixture delivery body.",
+    };
+    const { client, calls } = fakeClient((turnId) =>
+      deliveryApprovalEvents(turnId, target, readbackOptions)
+    );
+    const runner = new TrueForgeMissionRunner(missions, client, {
+      model: "google-gemini/test-model",
+      mcpServerName: "github",
+      deliveryToolName: "create_pull_request",
+      mcpServers: [{
+        name: "github",
+        enableTools: ["create_pull_request", "get_commit", "pull_request_read"],
+        preloadTools: ["create_pull_request", "get_commit", "pull_request_read"],
+        requireApprovalForTools: ["create_pull_request"],
+      }],
+    });
+    const mission = await runner.createMission({
+      id: `mission-readback-${label}`,
+      objective: "Reject an unverified created pull request",
+      repository: {
+        owner: target.owner,
+        name: target.repo,
+        ref: LOCKED_FIXTURE_REF,
+      },
+    });
+    const pending = await runner.requestPullRequestApproval(mission.id, target);
+
+    await assert.rejects(
+      runner.resolvePullRequestApproval(mission.id, pending, "approved"),
+      /post-create pull request read-back did not prove the approved repository, base, head, and SHA/,
+    );
+    const state = await missions.getState();
+    assert.equal(state.deliveries.length, 0);
+    assert.equal(
+      state.evidence.some((item) =>
+        item.summary === "MCP pull request read-back failed; delivery was not accepted."
+      ),
+      true,
+    );
+    assert.equal(calls.turns.length, 4);
+  }
 });
 
 test("rejecting or cancelling a TrueForge delivery approval returns no protected result", async () => {
@@ -800,7 +961,7 @@ test("rejecting or cancelling a TrueForge delivery approval returns no protected
       mcpServerName: "github",
       mcpServers: [{
         name: "github",
-        enableTools: ["create_pull_request", "get_commit"],
+        enableTools: ["create_pull_request", "get_commit", "pull_request_read"],
         requireApprovalForTools: ["create_pull_request"],
       }],
     });
@@ -883,8 +1044,8 @@ test("a delivery-head race blocks the approval allow before any protected operat
     deliveryToolName: "create_pull_request",
     mcpServers: [{
       name: "github",
-      enableTools: ["create_pull_request", "get_commit"],
-      preloadTools: ["create_pull_request", "get_commit"],
+      enableTools: ["create_pull_request", "get_commit", "pull_request_read"],
+      preloadTools: ["create_pull_request", "get_commit", "pull_request_read"],
       requireApprovalForTools: ["create_pull_request"],
     }],
   });

@@ -97,6 +97,7 @@ const LOCKED_FIXTURE_PATCHES = {
 } as const;
 
 const SANDBOX_VERIFICATION_INTENT = "Run the requested verification command in the sandbox.";
+const PULL_REQUEST_READ_TOOL_NAME = "pull_request_read";
 
 export const PRIMARY_WORK_GRAPH_IDS = {
   inspect: "primary-inspect",
@@ -660,7 +661,9 @@ function defaultRepositoryMcpServer(
       toolName,
       "get_file_contents",
       "get_commit",
-      ...(config.deliveryToolName === undefined ? [] : [config.deliveryToolName]),
+      ...(config.deliveryToolName === undefined
+        ? []
+        : [config.deliveryToolName, PULL_REQUEST_READ_TOOL_NAME]),
     ]),
   ];
   const server: TrueForgeApi.McpServer = {
@@ -825,13 +828,168 @@ export class TrueForgeMissionRunner {
         "The create_pull_request response did not prove the expected pull request result.",
       );
     }
+    const readback = await this.verifyCreatedPullRequest(
+      missionId,
+      target,
+      pullRequest,
+      pending.serverName,
+      execution.turnId,
+    );
     return {
       ...pullRequest,
+      headSha: readback.headSha,
       sessionId: execution.sessionId,
       turnId: execution.turnId,
       threadId: pending.threadId,
       toolCallId: pending.toolCallId,
     };
+  }
+
+  private async verifyCreatedPullRequest(
+    missionId: string,
+    target: PullRequestDeliveryTarget,
+    pullRequest: { number: number; url: string },
+    serverName: string,
+    previousTurnId: string,
+  ): Promise<{ headSha: string }> {
+    try {
+      ensureRepositoryMcpConfigured(this.config, serverName, PULL_REQUEST_READ_TOOL_NAME);
+      const execution = await this.executeTurn(
+        missionId,
+        buildPullRequestReadbackInstruction(serverName, target, pullRequest.number),
+        { previousTurnId },
+      );
+      requireCompletedTurn(
+        execution.rawEvents,
+        "verify created pull request",
+        "post-create pull request read-back",
+      );
+      const initialization = execution.rawEvents.find((event) => event.type === "mcp.initialize");
+      const initializedServers = initialization === undefined
+        ? undefined
+        : recordValue(initialization).mcpServers;
+      if (
+        !Array.isArray(initializedServers) ||
+        !initializedServers.some((server) => isRecord(server) && server.name === serverName)
+      ) {
+        throw new TrueForgeIntegrationError(
+          "verify created pull request",
+          `MCP server ${serverName} was not initialized for the post-create pull request read-back.`,
+        );
+      }
+      const calls = observedToolCalls(execution.rawEvents);
+      const readCalls = calls.filter((call) =>
+        call.name === PULL_REQUEST_READ_TOOL_NAME &&
+        isRecord(call.arguments) &&
+        argumentsExactlyMatch(
+          call.arguments,
+          pullRequestReadArguments(target, pullRequest.number),
+        )
+      );
+      if (calls.length !== 1 || readCalls.length !== 1) {
+        throw new TrueForgeIntegrationError(
+          "verify created pull request",
+          "The post-create read-back must contain exactly one canonical pull_request_read call and no other tool calls.",
+        );
+      }
+      const readCall = readCalls[0];
+      if (readCall === undefined) {
+        throw new TrueForgeIntegrationError(
+          "verify created pull request",
+          "The post-create pull_request_read call was not recorded.",
+        );
+      }
+      const response = toolResponseForCall(
+        execution.rawEvents,
+        readCall.id,
+        readCall.threadId ?? undefined,
+      );
+      if (response?.type !== "tool.response") {
+        throw new TrueForgeIntegrationError(
+          "verify created pull request",
+          "The post-create pull_request_read call returned no structured response.",
+        );
+      }
+      const verified = parsePullRequestReadbackResponse(
+        response,
+        target,
+        pullRequest,
+      );
+      if (verified === null) {
+        throw new TrueForgeIntegrationError(
+          "verify created pull request",
+          "The post-create pull request read-back did not prove the approved repository, base, head, and SHA.",
+        );
+      }
+      const evidenceDetails: Record<string, unknown> = {
+        server: serverName,
+        tool: PULL_REQUEST_READ_TOOL_NAME,
+        method: "get",
+        arguments: pullRequestReadArguments(target, pullRequest.number),
+        repository_owner: target.owner,
+        repository_name: target.repo,
+        base: verified.base,
+        head: verified.head,
+        head_sha: verified.headSha,
+        pull_request_number: verified.number,
+        pull_request_url: verified.url,
+      };
+      const evidence = await this.missions.addEvidence(missionId, {
+        kind: "tool_result",
+        result: "passed",
+        source: "mcp",
+        summary: `MCP verified pull request #${verified.number} after creation.`,
+        details: JSON.stringify(evidenceDetails),
+        executionOrigin: {
+          kind: "mcp",
+          sessionId: execution.sessionId,
+          turnId: execution.turnId,
+          ...(readCall.threadId === null ? {} : { threadId: readCall.threadId }),
+          toolCallId: readCall.id,
+        },
+      });
+      if (evidence.id.length === 0) {
+        throw new TrueForgeIntegrationError(
+          "verify created pull request",
+          "The post-create pull request read-back evidence was not persisted.",
+        );
+      }
+      return { headSha: verified.headSha };
+    } catch (error) {
+      await this.recordPullRequestReadbackFailure(missionId, serverName, error);
+      if (error instanceof TrueForgeIntegrationError) {
+        throw error;
+      }
+      throw new TrueForgeIntegrationError(
+        "verify created pull request",
+        "The post-create pull request read-back could not be verified.",
+      );
+    }
+  }
+
+  private async recordPullRequestReadbackFailure(
+    missionId: string,
+    serverName: string,
+    error: unknown,
+  ): Promise<void> {
+    const reason = error instanceof TrueForgeIntegrationError
+      ? error.message
+      : "The post-create pull request read-back could not be verified.";
+    try {
+      await this.missions.addEvidence(missionId, {
+        kind: "tool_result",
+        result: "failed",
+        source: "mcp",
+        summary: "MCP pull request read-back failed; delivery was not accepted.",
+        details: JSON.stringify({
+          server: serverName,
+          tool: PULL_REQUEST_READ_TOOL_NAME,
+          reason,
+        }),
+      });
+    } catch {
+      // Preserve the original delivery verification error if durable failure evidence cannot be recorded.
+    }
   }
 
   private async revalidateApprovedDeliveryHead(
@@ -1794,11 +1952,12 @@ function ensureDeliveryMcpConfigured(
     server === undefined ||
     (!enabledTools.includes(toolName) && !enabledTools.includes("@all")) ||
     (!enabledTools.includes("get_commit") && !enabledTools.includes("@all")) ||
+    (!enabledTools.includes(PULL_REQUEST_READ_TOOL_NAME) && !enabledTools.includes("@all")) ||
     (!approvalTools.includes(toolName) && !approvalTools.includes("@all"))
   ) {
     throw new TrueForgeIntegrationError(
       "request pull request approval",
-      `MCP server ${serverName} must expose ${toolName} and get_commit, and require native approval for ${toolName}.`,
+      `MCP server ${serverName} must expose ${toolName}, get_commit, and ${PULL_REQUEST_READ_TOOL_NAME}, and require native approval for ${toolName}.`,
     );
   }
 }
@@ -1850,7 +2009,7 @@ function deliveryPatchesMatch(
 
 function pullRequestArguments(
   target: PullRequestDeliveryTarget,
-): Record<string, string> {
+): Record<string, unknown> {
   return {
     owner: target.owner,
     repo: target.repo,
@@ -1858,6 +2017,18 @@ function pullRequestArguments(
     head: target.head,
     title: target.title,
     body: target.body,
+  };
+}
+
+function pullRequestReadArguments(
+  target: PullRequestDeliveryTarget,
+  number: number,
+): Record<string, unknown> {
+  return {
+    method: "get",
+    owner: target.owner,
+    repo: target.repo,
+    pullNumber: number,
   };
 }
 
@@ -1871,6 +2042,20 @@ function buildPullRequestDeliveryInstruction(
     "Do not call any other write or destructive tool.",
     "Stop at TrueForge's native tool approval boundary and wait for the correlated human decision.",
     "Do not claim that a pull request exists until the approved tool call returns its number and URL.",
+  ].join(" ");
+}
+
+function buildPullRequestReadbackInstruction(
+  serverName: string,
+  target: PullRequestDeliveryTarget,
+  number: number,
+): string {
+  return [
+    `Use the configured MCP server ${serverName}.`,
+    `Call ${PULL_REQUEST_READ_TOOL_NAME} exactly once with this JSON object: ${JSON.stringify(pullRequestReadArguments(target, number))}.`,
+    "This is a read-only post-create verification; do not call any write or destructive tool.",
+    `Verify that the response is pull request #${number} in ${target.owner}/${target.repo}, targeting base ${target.base} from head ${target.head}, with the approved head SHA ${target.headSha}.`,
+    "Stop after the read and return the structured MCP response.",
   ].join(" ");
 }
 
@@ -2388,14 +2573,92 @@ function toolResponseForCall(
   );
 }
 
+interface ParsedPullRequestCreation {
+  number: number;
+  url: string;
+}
+
+interface ParsedPullRequestReadback extends ParsedPullRequestCreation {
+  base: string;
+  head: string;
+  headSha: string;
+}
+
 function parsePullRequestDeliveryResponse(
   event: TrueForgeApi.TurnStreamingEvent,
   target: PullRequestDeliveryTarget,
-): { number: number; url: string; headSha: string } | null {
+): ParsedPullRequestCreation | null {
+  for (const candidate of pullRequestResponseCandidates(event)) {
+    if (!isRecord(candidate)) {
+      continue;
+    }
+    const url = canonicalPullRequestUrl(pullRequestUrl(candidate), target);
+    if (url === null || !declaredPullRequestNumberMatches(candidate, url.number)) {
+      continue;
+    }
+    return url;
+  }
+  return null;
+}
+
+function pullRequestHeadSha(candidate: Record<string, unknown>): string | null {
+  const direct = candidate.headSha ?? candidate.head_sha;
+  if (typeof direct === "string" && /^[0-9a-f]{40}$/i.test(direct)) {
+    return direct;
+  }
+  if (isRecord(candidate.head)) {
+    const nested = candidate.head.sha ?? candidate.head.headSha ?? candidate.head.head_sha;
+    if (typeof nested === "string" && /^[0-9a-f]{40}$/i.test(nested)) {
+      return nested;
+    }
+  }
+  return null;
+}
+
+function parsePullRequestReadbackResponse(
+  event: TrueForgeApi.TurnStreamingEvent,
+  target: PullRequestDeliveryTarget,
+  created: ParsedPullRequestCreation,
+): ParsedPullRequestReadback | null {
+  const approvedHeadSha = target.headSha;
+  if (approvedHeadSha === undefined) {
+    return null;
+  }
+  for (const candidate of pullRequestResponseCandidates(event)) {
+    if (!isRecord(candidate)) {
+      continue;
+    }
+    const url = canonicalPullRequestUrl(pullRequestUrl(candidate), target);
+    const base = pullRequestBranchRef(candidate, "base");
+    const head = pullRequestBranchRef(candidate, "head");
+    const headSha = pullRequestHeadSha(candidate);
+    if (
+      url === null ||
+      url.number !== created.number ||
+      !declaredPullRequestNumberMatches(candidate, created.number) ||
+      base !== target.base ||
+      head !== target.head ||
+      headSha !== approvedHeadSha ||
+      !pullRequestRepositoriesMatch(candidate, target)
+    ) {
+      continue;
+    }
+    return {
+      number: url.number,
+      url: url.url,
+      base,
+      head,
+      headSha,
+    };
+  }
+  return null;
+}
+
+function pullRequestResponseCandidates(event: TrueForgeApi.TurnStreamingEvent): unknown[] {
   const root = parseMaybeJson(recordValue(event).content);
   const candidates: unknown[] = [];
   const visit = (value: unknown, depth: number): void => {
-    if (depth > 6 || value === null || value === undefined) {
+    if (depth > 8 || value === null || value === undefined) {
       return;
     }
     candidates.push(value);
@@ -2418,51 +2681,125 @@ function parsePullRequestDeliveryResponse(
     }
   };
   visit(root, 0);
-  for (const candidate of candidates) {
-    if (!isRecord(candidate)) {
-      continue;
-    }
-    const number = candidate.number ?? candidate.pull_number;
-    const url = candidate.html_url ?? candidate.pull_request_url ?? candidate.url;
-    const headSha = pullRequestHeadSha(candidate);
+  return candidates;
+}
+
+function pullRequestUrl(candidate: Record<string, unknown>): string | null {
+  const value = candidate.html_url ?? candidate.pull_request_url ?? candidate.url;
+  return typeof value === "string" ? value : null;
+}
+
+function canonicalPullRequestUrl(
+  value: string | null,
+  target: PullRequestDeliveryTarget,
+): ParsedPullRequestCreation | null {
+  if (value === null) {
+    return null;
+  }
+  try {
+    const parsed = new URL(value);
+    const path = parsed.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/([1-9][0-9]*)\/?$/);
     if (
-      typeof number !== "number" ||
-      !Number.isInteger(number) ||
-      number < 1 ||
-      typeof url !== "string" ||
-      headSha === null ||
-      target.headSha === undefined ||
-      headSha !== target.headSha
+      parsed.protocol !== "https:" ||
+      parsed.hostname !== "github.com" ||
+      path?.[1] !== target.owner ||
+      path?.[2] !== target.repo ||
+      path?.[3] === undefined
     ) {
-      continue;
+      return null;
     }
-    try {
-      const parsed = new URL(url);
-      const expectedPath = `/${target.owner}/${target.repo}/pull/${number}`;
-      if (
-        parsed.protocol === "https:" &&
-        parsed.hostname === "github.com" &&
-        parsed.pathname.replace(/\/$/, "") === expectedPath
-      ) {
-        return { number, url: parsed.toString(), headSha };
-      }
-    } catch {
-      // Ignore non-URL response fields and continue looking for the canonical PR URL.
+    const number = Number(path[3]);
+    if (!Number.isSafeInteger(number) || number < 1) {
+      return null;
+    }
+    return { number, url: parsed.toString() };
+  } catch {
+    return null;
+  }
+}
+
+function declaredPullRequestNumberMatches(
+  candidate: Record<string, unknown>,
+  expectedNumber: number,
+): boolean {
+  const declared = candidate.number ?? candidate.pull_number;
+  return declared === undefined || declared === expectedNumber;
+}
+
+function pullRequestBranchRef(
+  candidate: Record<string, unknown>,
+  side: "base" | "head",
+): string | null {
+  const nested = pullRequestRefValue(candidate[side]);
+  if (nested !== null) {
+    return nested;
+  }
+  const aliases = side === "base"
+    ? ["baseRef", "base_ref", "baseBranch", "base_branch"]
+    : ["headRef", "head_ref", "headBranch", "head_branch"];
+  for (const alias of aliases) {
+    const value = pullRequestRefValue(candidate[alias]);
+    if (value !== null) {
+      return value;
     }
   }
   return null;
 }
 
-function pullRequestHeadSha(candidate: Record<string, unknown>): string | null {
-  const direct = candidate.headSha ?? candidate.head_sha;
-  if (typeof direct === "string" && /^[0-9a-f]{40}$/i.test(direct)) {
-    return direct;
+function pullRequestRefValue(value: unknown): string | null {
+  if (typeof value === "string" && value.trim().length > 0) {
+    return value.trim();
   }
-  if (isRecord(candidate.head)) {
-    const nested = candidate.head.sha ?? candidate.head.headSha ?? candidate.head.head_sha;
-    if (typeof nested === "string" && /^[0-9a-f]{40}$/i.test(nested)) {
-      return nested;
+  if (!isRecord(value)) {
+    return null;
+  }
+  for (const key of ["ref", "branch", "name"]) {
+    const ref = value[key];
+    if (typeof ref === "string" && ref.trim().length > 0) {
+      return ref.trim();
     }
+  }
+  return null;
+}
+
+function pullRequestRepositoriesMatch(
+  candidate: Record<string, unknown>,
+  target: PullRequestDeliveryTarget,
+): boolean {
+  const repositories = [
+    candidate.repository,
+    candidate.repo,
+    isRecord(candidate.base) ? candidate.base.repo : undefined,
+    isRecord(candidate.head) ? candidate.head.repo : undefined,
+  ]
+    .map(repositoryFullName)
+    .filter((value): value is string => value !== null);
+  const expected = `${target.owner}/${target.repo}`;
+  return repositories.every((repository) => repository === expected);
+}
+
+function repositoryFullName(value: unknown): string | null {
+  if (typeof value === "string") {
+    if (value.includes("/")) {
+      return value.replace(/^https?:\/\/[^/]+\/repos\//, "").replace(/^\/+|\/+$/g, "");
+    }
+    return null;
+  }
+  if (!isRecord(value)) {
+    return null;
+  }
+  for (const key of ["full_name", "fullName"]) {
+    const fullName = value[key];
+    if (typeof fullName === "string" && fullName.trim().length > 0) {
+      return fullName.trim();
+    }
+  }
+  const name = typeof value.name === "string" ? value.name.trim() : "";
+  const owner = isRecord(value.owner)
+    ? value.owner.login ?? value.owner.name
+    : value.owner ?? value.organization;
+  if (name.length > 0 && typeof owner === "string" && owner.trim().length > 0) {
+    return `${owner.trim()}/${name}`;
   }
   return null;
 }
@@ -2875,7 +3212,7 @@ function parseVerifiedDeliveryHeadObject(
 
 function argumentsExactlyMatch(
   actual: Record<string, unknown>,
-  expected: Record<string, string>,
+  expected: Record<string, unknown>,
 ): boolean {
   const actualKeys = Object.keys(actual).sort();
   const expectedKeys = Object.keys(expected).sort();
