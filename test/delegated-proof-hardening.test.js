@@ -343,6 +343,16 @@ function delegatedEvents(
   ];
 }
 
+function sandboxInstructionArguments(request) {
+  const content = request?.input?.[0]?.content;
+  assert.equal(typeof content, "string");
+  const match = content.match(
+    /Call the sandbox tool exec exactly once with this JSON object: (\{[\s\S]*?\})\./,
+  );
+  assert.ok(match, content);
+  return JSON.parse(match[1]);
+}
+
 async function runnerFixture({
   command = "npm run typecheck && npm test",
   output = diffOutput(),
@@ -356,6 +366,7 @@ async function runnerFixture({
   workspaceCurrentFiles = ["src/index.ts", "test/index.test.js"],
   workspaceCumulativeFiles = workspaceCurrentFiles,
   workspaceStartTreeRef = WORKSPACE_START_TREE,
+  workspaceMissionStartTreeRef = workspaceStartTreeRef,
   workspaceEndTreeRef = WORKSPACE_END_TREE,
   narrationOnly = false,
   responseType = "tool.response",
@@ -363,6 +374,7 @@ async function runnerFixture({
 } = {}) {
   const missions = new MissionService(new InMemoryMissionRepository(), fixedClock);
   let turnNumber = 0;
+  const turnRequests = [];
   const client = {
     sessions: {
       async create() {
@@ -371,7 +383,8 @@ async function runnerFixture({
       async get(sessionId) {
         return { data: { id: sessionId } };
       },
-      async createTurnStream() {
+      async createTurnStream(sessionId, request) {
+        turnRequests.push({ sessionId, request });
         const currentTurnNumber = turnNumber;
         turnNumber += 1;
         if (currentTurnNumber === 0) {
@@ -388,7 +401,7 @@ async function runnerFixture({
             async *withMetadata() {
               for (const event of workspaceDeltaEvents({
                 startTreeRef: workspaceStartTreeRef,
-                missionStartTreeRef: workspaceStartTreeRef,
+                missionStartTreeRef: workspaceMissionStartTreeRef,
                 endTreeRef: workspaceEndTreeRef,
                 currentFiles: workspaceCurrentFiles,
                 cumulativeFiles: workspaceCumulativeFiles,
@@ -442,7 +455,7 @@ async function runnerFixture({
         delegateToSubagent: true,
       })
     : undefined;
-  return { missions, mission, runner, workItem, result };
+  return { missions, mission, runner, workItem, result, turnRequests };
 }
 
 test("the default reviewer fails closed instead of trusting lexical contract anchors", () => {
@@ -599,6 +612,40 @@ test("safe working-directory prefixes preserve exit-aware check evidence", async
     ["typecheck", "passed"],
     ["test", "passed"],
   ]);
+});
+
+test("coordinator workspace proof turns request their exact sandbox exec commands", async () => {
+  const missionStartTreeRef = "c".repeat(40);
+  const expectedDeltaCommand = buildDelegatedWorkspaceDeltaCommand(
+    WORKSPACE_START_TREE,
+    missionStartTreeRef,
+  );
+  const fixture = await runnerFixture({
+    workspaceMissionStartTreeRef: missionStartTreeRef,
+    run: false,
+  });
+  await fixture.missions.attachTrueforgeWorkspaceBaseline(fixture.mission.id, missionStartTreeRef);
+
+  await fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
+    workItemId: fixture.workItem.id,
+    delegateToSubagent: true,
+  });
+
+  assert.equal(fixture.turnRequests.length, 3);
+  const snapshotRequest = fixture.turnRequests[0];
+  const deltaRequest = fixture.turnRequests[2];
+  assert.ok(snapshotRequest);
+  assert.ok(deltaRequest);
+  assert.match(snapshotRequest.request.input[0].content, /Call the sandbox tool exec exactly once/);
+  assert.match(deltaRequest.request.input[0].content, /Call the sandbox tool exec exactly once/);
+  assert.deepEqual(sandboxInstructionArguments(snapshotRequest.request), {
+    intent: "Capture the coordinator-owned workspace tree before delegated implementation starts.",
+    command: DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
+  });
+  assert.deepEqual(sandboxInstructionArguments(deltaRequest.request), {
+    intent: "Capture the coordinator-owned current work-item and cumulative mission workspace deltas after delegated implementation.",
+    command: expectedDeltaCommand,
+  });
 });
 
 test("delegated diffs outside the work-item scope block implementation", async () => {

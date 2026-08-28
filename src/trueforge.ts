@@ -101,6 +101,10 @@ const LOCKED_FIXTURE_PATCHES = {
 } as const;
 
 const SANDBOX_VERIFICATION_INTENT = "Run the requested verification command in the sandbox.";
+const DELEGATED_WORKSPACE_SNAPSHOT_INTENT =
+  "Capture the coordinator-owned workspace tree before delegated implementation starts.";
+const DELEGATED_WORKSPACE_DELTA_INTENT =
+  "Capture the coordinator-owned current work-item and cumulative mission workspace deltas after delegated implementation.";
 const PULL_REQUEST_READ_TOOL_NAME = "pull_request_read";
 
 /**
@@ -941,9 +945,15 @@ export class TrueForgeMissionRunner {
     workItemId: string,
     previousTurnId: string | undefined,
   ): Promise<DelegatedWorkspaceStart> {
+    const mission = await this.missions.getMission(missionId);
     const execution = await this.executeTurn(
       missionId,
-      "Capture the coordinator-owned workspace tree before delegated implementation starts.",
+      buildSandboxVerificationInstruction(
+        mission,
+        DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
+        "exec",
+        DELEGATED_WORKSPACE_SNAPSHOT_INTENT,
+      ),
       previousTurnId === undefined ? {} : { previousTurnId },
     );
     requireCompletedTurn(execution.rawEvents, "capture workspace start", "workspace snapshot");
@@ -971,7 +981,6 @@ export class TrueForgeMissionRunner {
         "The coordinator workspace start snapshot was not a successful parseable tool result.",
       );
     }
-    const mission = await this.missions.getMission(missionId);
     const missionStartTreeRef = mission.trueforgeWorkspaceBaselineTreeRef ?? parsed.treeRef;
     await this.missions.attachTrueforgeWorkspaceBaseline(missionId, missionStartTreeRef);
     await this.missions.addEvidence(missionId, {
@@ -1014,9 +1023,15 @@ export class TrueForgeMissionRunner {
       workspaceStart.treeRef,
       workspaceStart.missionStartTreeRef,
     );
+    const mission = await this.missions.getMission(missionId);
     const execution = await this.executeTurn(
       missionId,
-      "Capture the coordinator-owned current work-item and cumulative mission workspace deltas after delegated implementation.",
+      buildSandboxVerificationInstruction(
+        mission,
+        command,
+        "exec",
+        DELEGATED_WORKSPACE_DELTA_INTENT,
+      ),
       { previousTurnId },
     );
     requireCompletedTurn(execution.rawEvents, "capture workspace delta", "workspace delta");
