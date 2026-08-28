@@ -837,6 +837,9 @@ class MissionController {
     if (approvedHeadSha === undefined) {
       throw new MissionControlError("The approved delivery has no verified head identity.");
     }
+    if (decision === "approved") {
+      await this.revalidatePrimaryDeliveryHead(pending.target);
+    }
     await this.missions.decideApproval(PRIMARY_MISSION_ID, approval.id, {
       decision,
       decidedBy: "mission-operator",
@@ -878,6 +881,11 @@ class MissionController {
     if (result === null) {
       throw new MissionControlError("Approved delivery returned no pull request result.");
     }
+    if (result.headSha !== approvedHeadSha) {
+      throw new MissionControlError(
+        "The delivered pull request head does not match the SHA approved by the operator.",
+      );
+    }
     const evidence = await this.missions.addEvidence(PRIMARY_MISSION_ID, {
       kind: "tool_result",
       result: "passed",
@@ -888,7 +896,8 @@ class MissionController {
         repository: `${PRIMARY_DELIVERY_TARGET.owner}/${PRIMARY_DELIVERY_TARGET.repo}`,
         base: PRIMARY_DELIVERY_TARGET.base,
         head: PRIMARY_DELIVERY_TARGET.head,
-        head_sha: approvedHeadSha,
+        head_sha: result.headSha,
+        head_sha_verified: true,
         pull_request_number: result.number,
         pull_request_url: result.url,
         approval_id: approval.id,
@@ -913,7 +922,7 @@ class MissionController {
         repositoryName: PRIMARY_DELIVERY_TARGET.repo,
         base: PRIMARY_DELIVERY_TARGET.base,
         head: PRIMARY_DELIVERY_TARGET.head,
-        headSha: approvedHeadSha,
+        headSha: result.headSha,
       },
       executionOrigin: {
         kind: "mcp",
@@ -924,6 +933,23 @@ class MissionController {
       },
     });
     return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID);
+  }
+
+  private async revalidatePrimaryDeliveryHead(
+    target: PullRequestDeliveryTarget,
+  ): Promise<void> {
+    const result = await this.runner.inspectDeliveryHead({
+      missionId: PRIMARY_MISSION_ID,
+      target,
+    });
+    const state = await this.missions.getState();
+    const { evidence, headSha } = deliveryHeadProofFromResult(result, state);
+    requireDeliveryHeadProof(evidence, target);
+    if (headSha !== target.headSha) {
+      throw new MissionControlError(
+        "The delivery head changed after approval; the protected pull request action was not allowed.",
+      );
+    }
   }
 
   private async reviewImplementation(workItemId: string): Promise<void> {

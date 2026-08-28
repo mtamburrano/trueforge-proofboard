@@ -436,6 +436,7 @@ export interface TrueForgeDeliveryApproval {
 export interface TrueForgePullRequestResult {
   number: number;
   url: string;
+  headSha: string;
   sessionId: string;
   turnId: string;
   threadId: string;
@@ -735,6 +736,7 @@ export class TrueForgeMissionRunner {
     targetInput: PullRequestDeliveryTarget,
   ): Promise<TrueForgeDeliveryApproval> {
     const target = validatePullRequestDeliveryTarget(targetInput);
+    requireVerifiedDeliveryHeadSha(target, "request pull request approval");
     const serverName = requiredString(
       this.config.mcpServerName ?? "github",
       "MCP server name",
@@ -770,6 +772,10 @@ export class TrueForgeMissionRunner {
       );
     }
     ensureDeliveryMcpConfigured(this.config, pending.serverName);
+    if (decision === "approved") {
+      // Branch refs are mutable. Re-read the exact ref immediately before allowing the protected call.
+      await this.revalidateApprovedDeliveryHead(missionId, target);
+    }
     const input: TrueForgeApi.UserToolApprovalEvent = {
       type: "user.tool_approval",
       threadId: pending.threadId,
@@ -826,6 +832,26 @@ export class TrueForgeMissionRunner {
       threadId: pending.threadId,
       toolCallId: pending.toolCallId,
     };
+  }
+
+  private async revalidateApprovedDeliveryHead(
+    missionId: string,
+    target: PullRequestDeliveryTarget,
+  ): Promise<void> {
+    const approvedHeadSha = requireVerifiedDeliveryHeadSha(
+      target,
+      "resolve pull request approval",
+    );
+    const inspection = await this.inspectDeliveryHead({ missionId, target });
+    if (
+      inspection.commitSha !== approvedHeadSha ||
+      !deliveryPatchesMatch(inspection.patches)
+    ) {
+      throw new TrueForgeIntegrationError(
+        "resolve pull request approval",
+        "The delivery head changed after approval; the protected pull request action was not allowed.",
+      );
+    }
   }
 
   async reviewContract(
@@ -1767,11 +1793,12 @@ function ensureDeliveryMcpConfigured(
   if (
     server === undefined ||
     (!enabledTools.includes(toolName) && !enabledTools.includes("@all")) ||
+    (!enabledTools.includes("get_commit") && !enabledTools.includes("@all")) ||
     (!approvalTools.includes(toolName) && !approvalTools.includes("@all"))
   ) {
     throw new TrueForgeIntegrationError(
       "request pull request approval",
-      `MCP server ${serverName} must expose ${toolName} and require native approval for it.`,
+      `MCP server ${serverName} must expose ${toolName} and get_commit, and require native approval for ${toolName}.`,
     );
   }
 }
@@ -1792,6 +1819,33 @@ function validatePullRequestDeliveryTarget(
     target.headSha = requiredString(input.headSha, "verified pull request head SHA", operation);
   }
   return target;
+}
+
+function requireVerifiedDeliveryHeadSha(
+  target: PullRequestDeliveryTarget,
+  operation: string,
+): string {
+  const headSha = target.headSha;
+  if (
+    headSha === undefined ||
+    !/^[0-9a-f]{40}$/i.test(headSha) ||
+    headSha === PRIMARY_DELIVERY_FIXTURE.baselineSha
+  ) {
+    throw new TrueForgeIntegrationError(
+      operation,
+      "The delivery action requires a changed, verified 40-character head SHA.",
+    );
+  }
+  return headSha;
+}
+
+function deliveryPatchesMatch(
+  patches: Readonly<Record<string, string>> | undefined,
+): boolean {
+  const expectedEntries = Object.entries(PRIMARY_VERIFIED_DELIVERY_PATCHES);
+  return patches !== undefined &&
+    Object.keys(patches).length === expectedEntries.length &&
+    expectedEntries.every(([filename, patch]) => patches[filename] === patch);
 }
 
 function pullRequestArguments(
@@ -1912,6 +1966,7 @@ function validatePendingDeliveryApproval(
   requiredString(pending.threadId, "approval thread id", operation);
   requiredString(pending.toolCallId, "approval tool call id", operation);
   requiredString(pending.serverName, "approval MCP server", operation);
+  requireVerifiedDeliveryHeadSha(target, operation);
   if (
     pending.toolName !== "create_pull_request" ||
     !argumentsExactlyMatch(pullRequestArguments(pending.target), pullRequestArguments(target))
@@ -2336,7 +2391,7 @@ function toolResponseForCall(
 function parsePullRequestDeliveryResponse(
   event: TrueForgeApi.TurnStreamingEvent,
   target: PullRequestDeliveryTarget,
-): { number: number; url: string } | null {
+): { number: number; url: string; headSha: string } | null {
   const root = parseMaybeJson(recordValue(event).content);
   const candidates: unknown[] = [];
   const visit = (value: unknown, depth: number): void => {
@@ -2369,11 +2424,15 @@ function parsePullRequestDeliveryResponse(
     }
     const number = candidate.number ?? candidate.pull_number;
     const url = candidate.html_url ?? candidate.pull_request_url ?? candidate.url;
+    const headSha = pullRequestHeadSha(candidate);
     if (
       typeof number !== "number" ||
       !Number.isInteger(number) ||
       number < 1 ||
-      typeof url !== "string"
+      typeof url !== "string" ||
+      headSha === null ||
+      target.headSha === undefined ||
+      headSha !== target.headSha
     ) {
       continue;
     }
@@ -2385,10 +2444,24 @@ function parsePullRequestDeliveryResponse(
         parsed.hostname === "github.com" &&
         parsed.pathname.replace(/\/$/, "") === expectedPath
       ) {
-        return { number, url: parsed.toString() };
+        return { number, url: parsed.toString(), headSha };
       }
     } catch {
       // Ignore non-URL response fields and continue looking for the canonical PR URL.
+    }
+  }
+  return null;
+}
+
+function pullRequestHeadSha(candidate: Record<string, unknown>): string | null {
+  const direct = candidate.headSha ?? candidate.head_sha;
+  if (typeof direct === "string" && /^[0-9a-f]{40}$/i.test(direct)) {
+    return direct;
+  }
+  if (isRecord(candidate.head)) {
+    const nested = candidate.head.sha ?? candidate.head.headSha ?? candidate.head.head_sha;
+    if (typeof nested === "string" && /^[0-9a-f]{40}$/i.test(nested)) {
+      return nested;
     }
   }
   return null;

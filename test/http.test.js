@@ -312,6 +312,7 @@ class TestMissionRunner {
     return {
       number: 73,
       url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/73",
+      headSha: pending.target.headSha,
       sessionId: pending.sessionId,
       turnId: "test-delivery-result-turn",
       threadId: pending.threadId,
@@ -718,6 +719,25 @@ test("approving the exact pending delivery records one correlated pull request r
   });
   assert.equal(replay.status, 400);
   assert.equal(runner.deliveryCalls.protectedOperations, 1);
+});
+
+test("a moved delivery head leaves the approval pending and invokes no protected operation", async () => {
+  const { app, runner } = testApp();
+  const run = await json(await app.request("/api/mission/run", { method: "POST" }));
+  const approval = run.mission.approvals[0];
+  runner.deliveryHeadSha = "9cc33b73c4825f7aa5d3b1ce6c5510fc8e1b20f2";
+
+  const response = await app.request(`/api/mission/approvals/${approval.id}`, {
+    method: "POST",
+    body: JSON.stringify({ decision: "approved" }),
+  });
+  assert.equal(response.status, 502);
+  const payload = await json(response);
+  assert.equal(payload.mission.approvals[0].decision, "pending");
+  assert.equal(payload.mission.delivery.length, 0);
+  assert.equal(runner.deliveryCalls.protectedOperations, 0);
+  assert.equal(runner.deliveryCalls.resolved.length, 0);
+  assert.equal(runner.calls.headInspect, 2);
 });
 
 test("failed sandbox proof remains visibly failed and blocks the mission", async () => {

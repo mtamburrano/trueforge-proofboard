@@ -762,6 +762,7 @@ class LegacyPrimaryRunner {
       ? {
           number: 1,
           url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/1",
+          headSha: _pending.target.headSha,
           sessionId: "legacy-session",
           turnId: "legacy-delivery-result-turn",
           threadId: "legacy-delivery-thread",
