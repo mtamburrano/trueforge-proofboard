@@ -11,6 +11,7 @@ import {
   SANDBOX_TOOLCHAIN_READINESS_COMMAND,
   SANDBOX_TOOLCHAIN_READINESS_INTENT,
   TrueForgeMissionRunner,
+  buildCoordinatorAgentSpec,
   buildMissionAgentSpec,
 } from "../dist/index.js";
 
@@ -1413,6 +1414,14 @@ test("repository inspection proves the MCP call and returned file resource", asy
   assert.deepEqual(JSON.parse(inspection.content), { name: "fixture" });
   assert.equal(inspection.contentBytes, inspection.content.length);
   assert.equal(calls.turns.length, 1);
+  assert.deepEqual(calls.updates[0].request.agent.spec.mcpServers, [{
+    name: "github",
+    enableTools: ["get_file_contents"],
+    preload: true,
+  }]);
+  assert.deepEqual(calls.updates[1].request.agent.spec.mcpServers, [
+    { name: "github", enableTools: ["get_file_contents"] },
+  ]);
   assert.match(
     calls.turns[0].request.input[0].content,
     /get_file_contents exactly once.*owner.*repo.*package\.json/s,
@@ -1572,6 +1581,93 @@ test("locked fixture inspection bounds the first MCP read and restores the norma
     state.evidence.some((item) => item.summary.includes("deterministic read boundary")),
     true,
   );
+});
+
+test("coordinator tool-surface matrix isolates repository reads, sandbox exec, and restoration", async () => {
+  const normalMcpServers = [{
+    name: "github",
+    enableTools: ["get_commit", "get_file_contents", "list_tools", "get_tool_info", "call_tool"],
+    preloadTools: ["get_commit", "get_file_contents"],
+  }];
+  const config = {
+    model: "google-gemini/test-model",
+    dynamicSubAgents: true,
+    iterationLimit: 32,
+    mcpServers: normalMcpServers,
+  };
+  const { client, calls } = fakeClient((turnId, agentSpec) => {
+    const servers = agentSpec?.mcpServers ?? [];
+    if (
+      servers.length === 1 &&
+      servers[0]?.enableTools?.length === 1 &&
+      servers[0].enableTools[0] === "get_commit" &&
+      servers[0].preload === true
+    ) {
+      return lockedCommitEvents(turnId, {
+        turnState: {
+          status: "error",
+          message: "TrueForge iteration limit reached after the canonical repository read.",
+          requiredActions: [],
+        },
+      });
+    }
+    if (servers.length === 0) {
+      return sandboxEvents(turnId);
+    }
+    throw new Error("The bounded coordinator surface exposed the normal MCP tool set.");
+  }, { passAgentSpec: true });
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const runner = new TrueForgeMissionRunner(missions, client, config);
+  const mission = await runner.createMission({
+    id: "mission-coordinator-tool-surface-matrix",
+    objective: "Exercise each deterministic coordinator tool surface",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  await runner.inspectRepository({ missionId: mission.id });
+  await runner.runSandboxVerification({ missionId: mission.id, command: "node --test" });
+
+  const boundedRepositorySpec = calls.updates[0]?.request.agent.spec;
+  const restoredAfterRepositorySpec = calls.updates[1]?.request.agent.spec;
+  const boundedSandboxSpec = calls.updates[2]?.request.agent.spec;
+  const restoredAfterSandboxSpec = calls.updates[3]?.request.agent.spec;
+  assert.ok(boundedRepositorySpec);
+  assert.ok(restoredAfterRepositorySpec);
+  assert.ok(boundedSandboxSpec);
+  assert.ok(restoredAfterSandboxSpec);
+  assert.deepEqual(
+    calls.updates.map((update) => update.sessionId),
+    ["session-created", "session-created", "session-created", "session-created"],
+  );
+  assert.deepEqual(boundedRepositorySpec.mcpServers, [{
+    name: "github",
+    enableTools: ["get_commit"],
+    preload: true,
+  }]);
+  assert.equal(boundedRepositorySpec.config.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
+  assert.equal(boundedRepositorySpec.config.dynamicSubAgents.enabled, false);
+  assert.equal(boundedRepositorySpec.model.params.parallelToolCalls, false);
+  assert.deepEqual(boundedSandboxSpec.mcpServers, []);
+  assert.equal(boundedSandboxSpec.config.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
+  assert.equal(boundedSandboxSpec.config.dynamicSubAgents.enabled, false);
+  assert.equal(boundedSandboxSpec.model.params.parallelToolCalls, false);
+  assert.deepEqual(restoredAfterRepositorySpec, buildMissionAgentSpec(config));
+  assert.deepEqual(restoredAfterSandboxSpec, buildMissionAgentSpec(config));
+  assert.equal(restoredAfterRepositorySpec.config.dynamicSubAgents.enabled, true);
+  assert.equal(restoredAfterRepositorySpec.config.iterationLimit, 32);
+  assert.deepEqual(restoredAfterRepositorySpec.mcpServers, normalMcpServers);
+  assert.deepEqual(buildCoordinatorAgentSpec(config, "repository-read").mcpServers, [{
+    name: "github",
+    enableTools: ["get_commit"],
+    preload: true,
+  }]);
+  assert.deepEqual(buildCoordinatorAgentSpec(config, "sandbox-exec").mcpServers, []);
+  assert.equal(calls.turns[0].agentSpec, boundedRepositorySpec);
+  assert.equal(calls.turns[1].agentSpec, boundedSandboxSpec);
 });
 
 test("delivery-head inspection accepts a changed commit with the verified implementation diff", async () => {

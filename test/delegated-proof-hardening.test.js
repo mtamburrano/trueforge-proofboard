@@ -972,9 +972,18 @@ test("empty locked fixture sandboxes are prepared before the workspace snapshot 
   assert.equal(fixture.agentSpecUpdates[0].request.agent.spec.model.params.parallelToolCalls, false);
   assert.equal(fixture.agentSpecUpdates[2].request.agent.spec.model.params.parallelToolCalls, false);
   assert.equal(fixture.agentSpecUpdates[4].request.agent.spec.model.params.parallelToolCalls, false);
+  assert.deepEqual(fixture.agentSpecUpdates[0].request.agent.spec.mcpServers, []);
+  assert.deepEqual(fixture.agentSpecUpdates[2].request.agent.spec.mcpServers, []);
+  assert.deepEqual(fixture.agentSpecUpdates[4].request.agent.spec.mcpServers, []);
   assert.equal(fixture.agentSpecUpdates[1].request.agent.spec.model.params, undefined);
   assert.equal(fixture.agentSpecUpdates[3].request.agent.spec.model.params, undefined);
   assert.equal(fixture.agentSpecUpdates[5].request.agent.spec.model.params, undefined);
+  assert.equal(fixture.agentSpecUpdates[1].request.agent.spec.config.dynamicSubAgents.enabled, true);
+  assert.equal(fixture.agentSpecUpdates[3].request.agent.spec.config.dynamicSubAgents.enabled, true);
+  assert.equal(fixture.agentSpecUpdates[5].request.agent.spec.config.dynamicSubAgents.enabled, true);
+  assert.equal(fixture.agentSpecUpdates[1].request.agent.spec.mcpServers[0].name, "github");
+  assert.equal(fixture.agentSpecUpdates[3].request.agent.spec.mcpServers[0].name, "github");
+  assert.equal(fixture.agentSpecUpdates[5].request.agent.spec.mcpServers[0].name, "github");
   assert.equal(fixture.turnRequests[0].agentSpec.config.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
   assert.equal(fixture.turnRequests[1].agentSpec.config.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
   assert.equal(fixture.turnRequests[2].agentSpec.config.iterationLimit, DEFAULT_TRUEFORGE_ITERATION_LIMIT);

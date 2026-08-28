@@ -53,6 +53,8 @@ export interface TrueForgeMissionConfig {
   sandboxEnabled?: boolean;
 }
 
+export type TrueForgeCoordinatorToolSurface = "repository-read" | "sandbox-exec";
+
 export interface TrueForgeEventStream extends AsyncIterable<TrueForgeApi.TurnStreamingEvent> {
   withMetadata?: () => AsyncIterable<{ data: TrueForgeApi.TurnStreamingEvent }>;
 }
@@ -115,7 +117,7 @@ const PULL_REQUEST_READ_TOOL_NAME = "pull_request_read";
  */
 export const DEFAULT_TRUEFORGE_ITERATION_LIMIT = 64;
 export const MAX_TRUEFORGE_ITERATION_LIMIT = 1_024;
-/** Deterministic coordinator reads get one model iteration and one tool call. */
+/** Deterministic coordinator operations get one model iteration and one tool call. */
 export const COORDINATOR_TRUEFORGE_ITERATION_LIMIT = 1;
 export const MINIMUM_SANDBOX_NODE_MAJOR_VERSION = 20;
 export const SANDBOX_TOOLCHAIN_READINESS_INTENT =
@@ -581,6 +583,8 @@ export interface RunTurnOptions {
 interface InternalRunTurnOptions extends RunTurnOptions {
   input?: TrueForgeApi.TurnInputItem[];
   coordinatorRuntime?: boolean;
+  coordinatorToolSurface?: TrueForgeCoordinatorToolSurface;
+  coordinatorMcpServerName?: string;
   coordinatorExpectedToolName?: string;
   delegatedWorkspaceStart?: {
     startTreeRef: string;
@@ -896,9 +900,28 @@ export function buildMissionAgentSpec(
 
 export function buildCoordinatorAgentSpec(
   config: TrueForgeMissionConfig,
+  surface: TrueForgeCoordinatorToolSurface = "sandbox-exec",
 ): TrueForgeApi.AgentSpec {
+  return buildCoordinatorAgentSpecForSurface(config, surface);
+}
+
+function buildCoordinatorAgentSpecForSurface(
+  config: TrueForgeMissionConfig,
+  surface: TrueForgeCoordinatorToolSurface,
+  options: {
+    mcpServerName?: string;
+    repositoryToolName?: string;
+  } = {},
+): TrueForgeApi.AgentSpec {
+  const mcpServers = surface === "repository-read"
+    ? [coordinatorRepositoryReadMcpServer(
+        options.mcpServerName ?? config.mcpServerName ?? "github",
+        options.repositoryToolName ?? "get_commit",
+      )]
+    : [];
   const spec = buildMissionAgentSpec({
     ...config,
+    mcpServers,
     dynamicSubAgents: false,
     iterationLimit: COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
   });
@@ -911,6 +934,17 @@ export function buildCoordinatorAgentSpec(
         parallelToolCalls: false,
       },
     },
+  };
+}
+
+function coordinatorRepositoryReadMcpServer(
+  serverName: string,
+  toolName: string,
+): TrueForgeApi.McpServer {
+  return {
+    name: serverName,
+    enableTools: [toolName],
+    preload: true,
   };
 }
 
@@ -1124,7 +1158,10 @@ export class TrueForgeMissionRunner {
       execution = await this.executeCoordinatorTurn(
         mission.id,
         buildLockedRepositoryPreparationInstruction(mission, toolName),
-        preparationOptions,
+        {
+          ...preparationOptions,
+          coordinatorToolSurface: "sandbox-exec",
+        },
       );
       const verified = verifyLockedRepositoryPreparation(
         execution.rawEvents,
@@ -1192,7 +1229,10 @@ export class TrueForgeMissionRunner {
         "exec",
         DELEGATED_WORKSPACE_SNAPSHOT_INTENT,
       ),
-      previousTurnId === undefined ? {} : { previousTurnId },
+      {
+        coordinatorToolSurface: "sandbox-exec",
+        ...(previousTurnId === undefined ? {} : { previousTurnId }),
+      },
     );
     requireCompletedTurn(
       execution.rawEvents,
@@ -1275,7 +1315,10 @@ export class TrueForgeMissionRunner {
         "exec",
         DELEGATED_WORKSPACE_DELTA_INTENT,
       ),
-      { previousTurnId },
+      {
+        previousTurnId,
+        coordinatorToolSurface: "sandbox-exec",
+      },
     );
     requireCompletedTurn(
       execution.rawEvents,
@@ -1695,6 +1738,8 @@ export class TrueForgeMissionRunner {
           : buildRepositoryInspectionInstruction(mission, path as string, mcpServerName, toolName),
         {
           ...inspectionOptions,
+          coordinatorToolSurface: "repository-read",
+          coordinatorMcpServerName: mcpServerName,
           coordinatorExpectedToolName: toolName,
         },
       );
@@ -1802,7 +1847,11 @@ export class TrueForgeMissionRunner {
       execution = await this.executeCoordinatorTurn(
         mission.id,
         buildDeliveryHeadInspectionInstruction(target, mcpServerName),
-        { coordinatorExpectedToolName: "get_commit" },
+        {
+          coordinatorToolSurface: "repository-read",
+          coordinatorMcpServerName: mcpServerName,
+          coordinatorExpectedToolName: "get_commit",
+        },
       );
       const verified = verifyDeliveryHeadInspection(
         execution.rawEvents,
@@ -1880,7 +1929,10 @@ export class TrueForgeMissionRunner {
       execution = await this.executeCoordinatorTurn(
         mission.id,
         buildSandboxPreparationInstruction(mission, toolName),
-        preparationOptions,
+        {
+          ...preparationOptions,
+          coordinatorToolSurface: "sandbox-exec",
+        },
       );
       const verified = verifySandboxReadiness(
         execution.rawEvents,
@@ -1956,7 +2008,10 @@ export class TrueForgeMissionRunner {
       execution = await this.executeCoordinatorTurn(
         mission.id,
         buildSandboxVerificationInstruction(mission, command, toolName, intent),
-        verificationOptions,
+        {
+          ...verificationOptions,
+          coordinatorToolSurface: "sandbox-exec",
+        },
       );
       const verified = verifySandboxExecution(
         execution.rawEvents,
@@ -2041,7 +2096,18 @@ export class TrueForgeMissionRunner {
       restoreRequired = true;
       await this.updateSessionAgent(
         session.sessionId,
-        buildCoordinatorAgentSpec(this.config),
+        buildCoordinatorAgentSpecForSurface(
+          this.config,
+          options.coordinatorToolSurface ?? "sandbox-exec",
+          {
+            ...(options.coordinatorMcpServerName === undefined
+              ? {}
+              : { mcpServerName: options.coordinatorMcpServerName }),
+            ...(options.coordinatorExpectedToolName === undefined
+              ? {}
+              : { repositoryToolName: options.coordinatorExpectedToolName }),
+          },
+        ),
         "bound coordinator runtime",
       );
       execution = await this.executeTurn(missionId, instruction, {
