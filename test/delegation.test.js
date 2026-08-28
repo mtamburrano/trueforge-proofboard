@@ -33,8 +33,12 @@ function fakeStream(events) {
 
 const WORKSPACE_TREE = "a".repeat(40);
 const WORKSPACE_END_TREE = "b".repeat(40);
+const WORKSPACE_SNAPSHOT_INTENT =
+  "Capture the coordinator-owned workspace tree before delegated implementation starts.";
+const WORKSPACE_DELTA_INTENT =
+  "Capture the coordinator-owned current work-item and cumulative mission workspace deltas after delegated implementation.";
 
-function coordinatorEvents(command, output, turnId) {
+function coordinatorEvents(command, output, turnId, intent = WORKSPACE_SNAPSHOT_INTENT) {
   const callId = `${turnId}-call`;
   return [
     { type: "turn.created", id: `${turnId}-created`, turnId, threadId: null, state: { status: "running" } },
@@ -42,7 +46,10 @@ function coordinatorEvents(command, output, turnId) {
       type: "model.message",
       id: `${turnId}-model`,
       threadId: null,
-      toolCalls: [{ id: callId, function: { name: "exec", arguments: JSON.stringify({ command }) } }],
+      toolCalls: [{
+        id: callId,
+        function: { name: "exec", arguments: JSON.stringify({ intent, command }) },
+      }],
     },
     {
       type: "tool.response",
@@ -222,6 +229,7 @@ function fakeClient(events) {
               buildDelegatedWorkspaceDeltaCommand(WORKSPACE_TREE, WORKSPACE_TREE),
               delta.output,
               "turn-workspace-delta",
+              WORKSPACE_DELTA_INTENT,
             ));
           }
           return fakeStream(events);

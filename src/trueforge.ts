@@ -105,6 +105,7 @@ const DELEGATED_WORKSPACE_SNAPSHOT_INTENT =
   "Capture the coordinator-owned workspace tree before delegated implementation starts.";
 const DELEGATED_WORKSPACE_DELTA_INTENT =
   "Capture the coordinator-owned current work-item and cumulative mission workspace deltas after delegated implementation.";
+const MAX_COORDINATOR_EXEC_INTENT_LENGTH = 1_200;
 const PULL_REQUEST_READ_TOOL_NAME = "pull_request_read";
 
 /**
@@ -1126,7 +1127,6 @@ export class TrueForgeMissionRunner {
       );
       const verified = verifyLockedRepositoryPreparation(
         execution.rawEvents,
-        LOCKED_REPOSITORY_PREPARATION_INTENT,
         LOCKED_REPOSITORY_PREPARATION_COMMAND,
         toolName,
         mission.trueforgeSandboxId,
@@ -1282,7 +1282,10 @@ export class TrueForgeMissionRunner {
       "workspace delta",
       { allowCoordinatorIterationStop: true },
     );
-    const coordinatorExecution = coordinatorWorkspaceExecution(execution.rawEvents, command);
+    const coordinatorExecution = coordinatorWorkspaceExecution(
+      execution.rawEvents,
+      command,
+    );
     if (coordinatorExecution === null) {
       throw new TrueForgeIntegrationError(
         "capture workspace delta",
@@ -1880,7 +1883,6 @@ export class TrueForgeMissionRunner {
       );
       const verified = verifySandboxReadiness(
         execution.rawEvents,
-        SANDBOX_TOOLCHAIN_READINESS_INTENT,
         SANDBOX_TOOLCHAIN_READINESS_COMMAND,
         toolName,
         mission.trueforgeSandboxId,
@@ -1957,7 +1959,6 @@ export class TrueForgeMissionRunner {
       );
       const verified = verifySandboxExecution(
         execution.rawEvents,
-        intent,
         command,
         toolName,
         mission.trueforgeSandboxId,
@@ -4052,10 +4053,11 @@ function coordinatorWorkspaceExecution(
   if (execution === undefined || execution.threadId !== null) {
     return null;
   }
-  const command = normalizeSafeWorkingDirectoryPrefix(executionCommand(execution.arguments) ?? "");
-  if (command !== normalizeSafeWorkingDirectoryPrefix(expectedCommand)) {
+  const provenance = coordinatorExecProvenance(execution.arguments, expectedCommand);
+  if (provenance === null) {
     return null;
   }
+  const command = provenance.command;
   const response = toolResponseForCall(events, execution.id);
   if (
     response === undefined ||
@@ -4667,6 +4669,94 @@ function argumentsExactlyMatch(
   );
 }
 
+interface CoordinatorExecProvenance {
+  intent: string;
+  command: string;
+}
+
+/**
+ * Match coordinator-owned exec calls by their executable effect. The intent is
+ * required metadata, but model wording is deliberately not an authority
+ * boundary. Every other argument remains an explicitly expected, exact value.
+ */
+function coordinatorExecProvenance(
+  argumentsValue: unknown,
+  expectedCommand: string,
+  expectedExecutionArguments: Readonly<Record<string, unknown>> = {},
+): CoordinatorExecProvenance | null {
+  if (!isRecord(argumentsValue)) {
+    return null;
+  }
+  const intent = boundedCoordinatorExecIntent(argumentsValue.intent);
+  const actualCommand = typeof argumentsValue.command === "string"
+    ? argumentsValue.command
+    : null;
+  if (
+    intent === null ||
+    actualCommand === null ||
+    actualCommand.trim().length === 0 ||
+    normalizeSafeWorkingDirectoryPrefix(actualCommand) !==
+      normalizeSafeWorkingDirectoryPrefix(expectedCommand)
+  ) {
+    return null;
+  }
+
+  const expectedExecutionKeys = Object.keys(expectedExecutionArguments);
+  if (expectedExecutionKeys.some((key) => key === "intent" || key === "command")) {
+    return null;
+  }
+  const expectedKeys = ["intent", "command", ...expectedExecutionKeys].sort();
+  const actualKeys = Object.keys(argumentsValue).sort();
+  if (
+    actualKeys.length !== expectedKeys.length ||
+    actualKeys.some((key, index) => key !== expectedKeys[index])
+  ) {
+    return null;
+  }
+  if (!Object.entries(expectedExecutionArguments).every(([key, expected]) =>
+    exactlyEqualCoordinatorExecValue(argumentsValue[key], expected)
+  )) {
+    return null;
+  }
+  return {
+    intent,
+    command: normalizeSafeWorkingDirectoryPrefix(actualCommand),
+  };
+}
+
+function boundedCoordinatorExecIntent(value: unknown): string | null {
+  if (
+    typeof value !== "string" ||
+    value.trim().length === 0 ||
+    value.length > MAX_COORDINATOR_EXEC_INTENT_LENGTH
+  ) {
+    return null;
+  }
+  return value.trim();
+}
+
+function exactlyEqualCoordinatorExecValue(actual: unknown, expected: unknown): boolean {
+  if (actual === expected) {
+    return true;
+  }
+  if (Array.isArray(actual) || Array.isArray(expected)) {
+    return Array.isArray(actual) && Array.isArray(expected) &&
+      actual.length === expected.length &&
+      actual.every((value, index) => exactlyEqualCoordinatorExecValue(value, expected[index]));
+  }
+  if (isRecord(actual) || isRecord(expected)) {
+    if (!isRecord(actual) || !isRecord(expected)) {
+      return false;
+    }
+    const actualKeys = Object.keys(actual).sort();
+    const expectedKeys = Object.keys(expected).sort();
+    return actualKeys.length === expectedKeys.length &&
+      actualKeys.every((key, index) => key === expectedKeys[index]) &&
+      expectedKeys.every((key) => exactlyEqualCoordinatorExecValue(actual[key], expected[key]));
+  }
+  return false;
+}
+
 function parseLockedFixtureObject(
   value: Record<string, unknown>,
 ): { commitSha: string; patches: Readonly<Record<string, string>> } | null {
@@ -4725,7 +4815,6 @@ function normalizeCommitPatch(value: string): string {
 
 function verifySandboxExecution(
   events: TrueForgeApi.TurnStreamingEvent[],
-  intent: string,
   command: string,
   toolName: string,
   expectedSandboxId?: string,
@@ -4734,7 +4823,6 @@ function verifySandboxExecution(
     return sandboxFailure("Sandbox verification requires the canonical TrueForge exec tool.");
   }
   const sandboxId = verifySandboxIdentity(events, expectedSandboxId, "run sandbox verification");
-  const expectedArguments = { intent, command };
   const executionCalls = observedToolCalls(events).filter((call) => call.name === toolName);
   if (executionCalls.length > 1) {
     return sandboxFailure(
@@ -4742,8 +4830,8 @@ function verifySandboxExecution(
     );
   }
   const canonicalCalls = executionCalls.filter(
-    (call) => call.name === toolName && isRecord(call.arguments) &&
-      argumentsExactlyMatch(call.arguments, expectedArguments),
+    (call) => call.name === toolName &&
+      coordinatorExecProvenance(call.arguments, command) !== null,
   );
   if (canonicalCalls.length !== 1) {
     return sandboxFailure(
@@ -4833,7 +4921,6 @@ function verifySandboxIdentity(
 
 function verifyLockedRepositoryPreparation(
   events: TrueForgeApi.TurnStreamingEvent[],
-  intent: string,
   command: string,
   toolName: string,
   expectedSandboxId?: string,
@@ -4843,7 +4930,6 @@ function verifyLockedRepositoryPreparation(
     return verificationFailure(operation, "Repository preparation requires the canonical TrueForge exec tool.");
   }
   const sandboxId = verifySandboxIdentity(events, expectedSandboxId, operation);
-  const expectedArguments = { intent, command };
   const executionCalls = observedToolCalls(events).filter((call) => call.name === toolName);
   if (executionCalls.length !== 1) {
     return verificationFailure(
@@ -4858,7 +4944,7 @@ function verifyLockedRepositoryPreparation(
       "The locked repository preparation call was not coordinator-owned.",
     );
   }
-  if (!isRecord(call.arguments) || !argumentsExactlyMatch(call.arguments, expectedArguments)) {
+  if (coordinatorExecProvenance(call.arguments, command) === null) {
     return verificationFailure(
       operation,
       "The coordinator-owned repository preparation call did not match the required command and intent.",
@@ -4936,14 +5022,12 @@ function verifyLockedRepositoryPreparation(
 
 function verifySandboxReadiness(
   events: TrueForgeApi.TurnStreamingEvent[],
-  intent: string,
   command: string,
   toolName: string,
   expectedSandboxId?: string,
 ): VerifiedSandboxReadiness {
   const execution = verifySandboxExecution(
     events,
-    intent,
     command,
     toolName,
     expectedSandboxId,

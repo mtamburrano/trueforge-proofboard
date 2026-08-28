@@ -76,12 +76,16 @@ function fakeStream(events) {
 }
 
 const WORKSPACE_BASELINE_TREE = "a".repeat(40);
+const WORKSPACE_SNAPSHOT_INTENT =
+  "Capture the coordinator-owned workspace tree before delegated implementation starts.";
+const WORKSPACE_DELTA_INTENT =
+  "Capture the coordinator-owned current work-item and cumulative mission workspace deltas after delegated implementation.";
 
 function treeRefForAttempt(attempt) {
   return String.fromCharCode("a".charCodeAt(0) + attempt - 1).repeat(40);
 }
 
-function coordinatorEvents(command, output, turnId) {
+function coordinatorEvents(command, output, turnId, intent = WORKSPACE_SNAPSHOT_INTENT) {
   const callId = `${turnId}-call`;
   return [
     { type: "turn.created", id: `${turnId}-created`, turnId, threadId: null, state: { status: "running" } },
@@ -89,7 +93,10 @@ function coordinatorEvents(command, output, turnId) {
       type: "model.message",
       id: `${turnId}-model`,
       threadId: null,
-      toolCalls: [{ id: callId, function: { name: "exec", arguments: JSON.stringify({ command }) } }],
+      toolCalls: [{
+        id: callId,
+        function: { name: "exec", arguments: JSON.stringify({ intent, command }) },
+      }],
     },
     {
       type: "tool.response",
@@ -279,6 +286,7 @@ function fakeClient({ sessionId, malformedCompletion = false }) {
                 cumulativeFiles,
               ),
               `turn-proof-loop-delta-${attemptNumber}`,
+              WORKSPACE_DELTA_INTENT,
             ));
           }
           return fakeStream(delegatedEvents(attempt, { malformedCompletion }));

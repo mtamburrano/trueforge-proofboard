@@ -37,6 +37,10 @@ const ORIGIN = {
 const execFileAsync = promisify(execFile);
 const LOCKED_REPOSITORY_REMOTE_URL =
   `https://github.com/${PRIMARY_DELIVERY_FIXTURE.owner}/${PRIMARY_DELIVERY_FIXTURE.repository}.git`;
+const WORKSPACE_SNAPSHOT_INTENT =
+  "Capture the coordinator-owned workspace tree before delegated implementation starts.";
+const WORKSPACE_DELTA_INTENT =
+  "Capture the coordinator-owned current work-item and cumulative mission workspace deltas after delegated implementation.";
 
 function fixedClock() {
   return new Date("2026-08-27T15:00:00.000Z");
@@ -170,7 +174,11 @@ function changedFilesManifestOutput(files = ["src/index.ts", "test/index.test.js
 const WORKSPACE_START_TREE = "a".repeat(40);
 const WORKSPACE_END_TREE = "b".repeat(40);
 
-function workspaceSnapshotEvents(treeRef, turnId = "turn-workspace-start") {
+function workspaceSnapshotEvents(
+  treeRef,
+  turnId = "turn-workspace-start",
+  { intent = WORKSPACE_SNAPSHOT_INTENT } = {},
+) {
   return [
     { type: "turn.created", id: `${turnId}-created`, turnId, threadId: null, state: { status: "running" } },
     {
@@ -179,7 +187,10 @@ function workspaceSnapshotEvents(treeRef, turnId = "turn-workspace-start") {
       threadId: null,
       toolCalls: [{
         id: `${turnId}-call-snapshot`,
-        function: { name: "exec", arguments: JSON.stringify({ command: DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND }) },
+        function: {
+          name: "exec",
+          arguments: JSON.stringify({ intent, command: DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND }),
+        },
       }],
     },
     {
@@ -214,6 +225,7 @@ function workspaceDeltaEvents({
   currentFiles = ["src/index.ts", "test/index.test.js"],
   cumulativeFiles = currentFiles,
   turnId = "turn-workspace-delta",
+  intent = WORKSPACE_DELTA_INTENT,
 } = {}) {
   const command = buildDelegatedWorkspaceDeltaCommand(startTreeRef, missionStartTreeRef);
   const callId = `${turnId}-call-delta`;
@@ -223,7 +235,10 @@ function workspaceDeltaEvents({
       type: "model.message",
       id: `${turnId}-model`,
       threadId: null,
-      toolCalls: [{ id: callId, function: { name: "exec", arguments: JSON.stringify({ command }) } }],
+      toolCalls: [{
+        id: callId,
+        function: { name: "exec", arguments: JSON.stringify({ intent, command }) },
+      }],
     },
     {
       type: "tool.response",
@@ -255,6 +270,7 @@ function repositoryPreparationEvents({
   exitCode = 0,
   result = `TRUEFORGE_REPOSITORY_READY repository=${repository} sha=${sha} root=${root}\n`,
   turnId = "turn-repository-preparation",
+  intent = LOCKED_REPOSITORY_PREPARATION_INTENT,
 } = {}) {
   const callId = `${turnId}-call-preparation`;
   return [
@@ -269,7 +285,7 @@ function repositoryPreparationEvents({
         function: {
           name: "exec",
           arguments: JSON.stringify({
-            intent: LOCKED_REPOSITORY_PREPARATION_INTENT,
+            intent,
             command: LOCKED_REPOSITORY_PREPARATION_COMMAND,
           }),
         },
@@ -542,6 +558,8 @@ async function runnerFixture({
   workspaceStartTreeRef = WORKSPACE_START_TREE,
   workspaceMissionStartTreeRef = workspaceStartTreeRef,
   workspaceEndTreeRef = WORKSPACE_END_TREE,
+  workspaceSnapshotIntent = WORKSPACE_SNAPSHOT_INTENT,
+  workspaceDeltaIntent = WORKSPACE_DELTA_INTENT,
   narrationOnly = false,
   responseType = "tool.response",
   run = true,
@@ -567,7 +585,9 @@ async function runnerFixture({
         if (currentTurnNumber === 0) {
           return {
             async *withMetadata() {
-              for (const event of workspaceSnapshotEvents(workspaceStartTreeRef)) {
+              for (const event of workspaceSnapshotEvents(workspaceStartTreeRef, "turn-workspace-start", {
+                intent: workspaceSnapshotIntent,
+              })) {
                 yield { data: event };
               }
             },
@@ -582,6 +602,7 @@ async function runnerFixture({
                 endTreeRef: workspaceEndTreeRef,
                 currentFiles: workspaceCurrentFiles,
                 cumulativeFiles: workspaceCumulativeFiles,
+                intent: workspaceDeltaIntent,
               })) {
                 yield { data: event };
               }
@@ -799,6 +820,8 @@ test("coordinator workspace proof turns request their exact sandbox exec command
   );
   const fixture = await runnerFixture({
     workspaceMissionStartTreeRef: missionStartTreeRef,
+    workspaceSnapshotIntent: "Take the pre-delegation tree snapshot in the coordinator sandbox.",
+    workspaceDeltaIntent: "Collect the anchored workspace changes after delegated implementation.",
     run: false,
   });
   await fixture.missions.attachTrueforgeWorkspaceBaseline(fixture.mission.id, missionStartTreeRef);
@@ -816,17 +839,21 @@ test("coordinator workspace proof turns request their exact sandbox exec command
   assert.match(snapshotRequest.request.input[0].content, /Call the sandbox tool exec exactly once/);
   assert.match(deltaRequest.request.input[0].content, /Call the sandbox tool exec exactly once/);
   assert.deepEqual(sandboxInstructionArguments(snapshotRequest.request), {
-    intent: "Capture the coordinator-owned workspace tree before delegated implementation starts.",
+    intent: WORKSPACE_SNAPSHOT_INTENT,
     command: DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
   });
   assert.deepEqual(sandboxInstructionArguments(deltaRequest.request), {
-    intent: "Capture the coordinator-owned current work-item and cumulative mission workspace deltas after delegated implementation.",
+    intent: WORKSPACE_DELTA_INTENT,
     command: expectedDeltaCommand,
   });
 });
 
 test("empty locked fixture sandboxes are prepared before the workspace snapshot and delegation", async () => {
-  const fixture = await lockedRepositoryRunnerFixture();
+  const fixture = await lockedRepositoryRunnerFixture({
+    preparation: {
+      intent: "Initialize and verify the pinned repository in the persistent sandbox workspace.",
+    },
+  });
 
   const result = await fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
     workItemId: fixture.workItem.id,

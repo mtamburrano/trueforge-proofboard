@@ -639,7 +639,10 @@ function fakeClient(eventFactory = fakeEvents, { passAgentSpec = false } = {}) {
   return { client, calls };
 }
 
-function debian12ProvisionedSandboxEvents(turnId) {
+function debian12ProvisionedSandboxEvents(
+  turnId,
+  { intent = SANDBOX_TOOLCHAIN_READINESS_INTENT, turnState } = {},
+) {
   const runtime = {
     distribution: "debian",
     release: "12",
@@ -674,7 +677,7 @@ function debian12ProvisionedSandboxEvents(turnId) {
 
   return sandboxEvents(turnId, 0, [], {
     sandboxArguments: {
-      intent: SANDBOX_TOOLCHAIN_READINESS_INTENT,
+      intent,
       command,
     },
     sandboxResult: {
@@ -684,6 +687,7 @@ function debian12ProvisionedSandboxEvents(turnId) {
         result: `TRUEFORGE_TOOLCHAIN_READY node=v${runtime.nodeMajor}.14.0 npm=${runtime.npmVersion}\n`,
       },
     },
+    ...(turnState === undefined ? {} : { turnState }),
   });
 }
 
@@ -764,6 +768,49 @@ test("runner provisions a missing Debian 12 sandbox toolchain before delegated w
   assert.equal(readiness.source, "sandbox");
   assert.equal(readiness.result, "passed");
   assert.match(readiness.summary, /Node\.js v22\.14\.0 and npm 10\.9\.2/);
+});
+
+test("bounded sandbox readiness accepts a paraphrased exec intent", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const paraphrasedIntent =
+    "Provision the sandbox runtime and confirm it is usable before delegated work.";
+  const { client, calls } = fakeClient((turnId, agentSpec) => {
+    assert.equal(agentSpec?.config?.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
+    assert.equal(agentSpec?.model?.params?.parallelToolCalls, false);
+    return debian12ProvisionedSandboxEvents(turnId, {
+      intent: paraphrasedIntent,
+      turnState: {
+        status: "error",
+        message: "TrueForge iteration limit reached after the sandbox operation.",
+        requiredActions: [],
+      },
+    });
+  }, { passAgentSpec: true });
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "google-gemini/test-model",
+  });
+  const mission = await runner.createMission({
+    id: "mission-sandbox-paraphrased-intent",
+    objective: "Accept valid readiness provenance with model wording variation",
+  });
+
+  const result = await runner.prepareSandbox({ missionId: mission.id });
+
+  assert.equal(result.nodeVersion, "v22.14.0");
+  assert.equal(result.npmVersion, "10.9.2");
+  assert.equal(calls.turns.length, 1);
+  const execCalls = calls.turns[0].events
+    .flatMap((event) => event.type === "model.message" ? event.toolCalls ?? [] : [])
+    .filter((call) => call.function?.name === "exec");
+  assert.equal(execCalls.length, 1);
+  assert.deepEqual(JSON.parse(execCalls[0].function.arguments), {
+    intent: paraphrasedIntent,
+    command: SANDBOX_TOOLCHAIN_READINESS_COMMAND,
+  });
+  assert.deepEqual(
+    calls.updates.map((update) => update.request.agent.spec.config.iterationLimit),
+    [COORDINATOR_TRUEFORGE_ITERATION_LIMIT, DEFAULT_TRUEFORGE_ITERATION_LIMIT],
+  );
 });
 
 test("coordinator sandbox turns are runtime-bounded and stop cleanly after the canonical exec", async () => {
@@ -2074,7 +2121,7 @@ test("sandbox continuity rejects a replacement sandbox identity", async () => {
   );
 });
 
-test("sandbox verification rejects incomplete or non-canonical proof", async () => {
+test("sandbox verification rejects incomplete or unsafe proof", async () => {
   const cases = [
     {
       label: "missing intent",
@@ -2082,10 +2129,10 @@ test("sandbox verification rejects incomplete or non-canonical proof", async () 
       error: /Expected exactly one canonical exec sandbox call, found 0/,
     },
     {
-      label: "wrong intent",
+      label: "unbounded intent",
       options: {
         sandboxArguments: {
-          intent: "Run an unrelated command.",
+          intent: "i".repeat(1_201),
           command: "node --test",
         },
       },
@@ -2108,6 +2155,17 @@ test("sandbox verification rejects incomplete or non-canonical proof", async () 
           intent: SANDBOX_VERIFICATION_INTENT,
           command: "node --test",
           cwd: "/tmp",
+        },
+      },
+      error: /Expected exactly one canonical exec sandbox call, found 0/,
+    },
+    {
+      label: "unexpected environment",
+      options: {
+        sandboxArguments: {
+          intent: SANDBOX_VERIFICATION_INTENT,
+          command: "node --test",
+          env: { NODE_ENV: "test" },
         },
       },
       error: /Expected exactly one canonical exec sandbox call, found 0/,
