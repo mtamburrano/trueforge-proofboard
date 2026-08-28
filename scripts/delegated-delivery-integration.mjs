@@ -229,7 +229,7 @@ function delegatedEvents(attempt, { malformedCompletion = false } = {}) {
 }
 
 function fakeClient({ sessionId, malformedCompletion = false }) {
-  const calls = { create: [], get: [], turns: [] };
+  const calls = { create: [], get: [], updates: [], turns: [] };
   let turnNumber = 0;
   return {
     calls,
@@ -241,6 +241,10 @@ function fakeClient({ sessionId, malformedCompletion = false }) {
         },
         async get(requestedSessionId) {
           calls.get.push(requestedSessionId);
+          return { data: { id: requestedSessionId } };
+        },
+        async update(requestedSessionId, request) {
+          calls.updates.push({ sessionId: requestedSessionId, request });
           return { data: { id: requestedSessionId } };
         },
         async createTurnStream(requestedSessionId, request) {

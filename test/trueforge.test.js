@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
   DEFAULT_TRUEFORGE_ITERATION_LIMIT,
   InMemoryMissionRepository,
   MAX_TRUEFORGE_ITERATION_LIMIT,
@@ -601,22 +602,34 @@ function fakeStream(events) {
   };
 }
 
-function fakeClient(eventFactory = fakeEvents) {
-  const calls = { create: [], get: [], turns: [] };
+function fakeClient(eventFactory = fakeEvents, { passAgentSpec = false } = {}) {
+  const calls = { create: [], get: [], updates: [], turns: [] };
+  let activeAgentSpec;
   const client = {
     sessions: {
       async create(request) {
         calls.create.push(request);
+        activeAgentSpec = request.agent.spec;
         return { data: { id: "session-created" } };
       },
       async get(sessionId) {
         calls.get.push(sessionId);
         return { data: { id: sessionId } };
       },
+      async update(sessionId, request) {
+        calls.updates.push({ sessionId, request });
+        activeAgentSpec = request.agent.spec;
+        return { data: { id: sessionId } };
+      },
       async createTurnStream(sessionId, request) {
-        calls.turns.push({ sessionId, request });
-        const turnId = `turn-${calls.turns.length}`;
-        return fakeStream(eventFactory(turnId));
+        const turnId = `turn-${calls.turns.length + 1}`;
+        const turnCall = { sessionId, request, agentSpec: activeAgentSpec, events: [] };
+        calls.turns.push(turnCall);
+        const events = passAgentSpec
+          ? eventFactory(turnId, activeAgentSpec)
+          : eventFactory(turnId);
+        turnCall.events = events;
+        return fakeStream(events);
       },
     },
   };
@@ -728,6 +741,19 @@ test("runner provisions a missing Debian 12 sandbox toolchain before delegated w
   assert.equal(result.npmVersion, "10.9.2");
   assert.equal(result.sandboxId, "sandbox-1");
   assert.equal(calls.turns.length, 1);
+  assert.equal(calls.updates.length, 2);
+  assert.equal(calls.updates[0].sessionId, "session-created");
+  assert.equal(
+    calls.updates[0].request.agent.spec.config.iterationLimit,
+    COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
+  );
+  assert.equal(calls.updates[0].request.agent.spec.model.params.parallelToolCalls, false);
+  assert.equal(calls.updates[0].request.agent.spec.config.dynamicSubAgents.enabled, false);
+  assert.equal(
+    calls.updates[1].request.agent.spec.config.iterationLimit,
+    DEFAULT_TRUEFORGE_ITERATION_LIMIT,
+  );
+  assert.equal(calls.updates[1].request.agent.spec.model.params, undefined);
   assert.match(calls.turns[0].request.input[0].content, /before any coding delegation/);
   assert.match(calls.turns[0].request.input[0].content, /TRUEFORGE_TOOLCHAIN_READY/);
   const state = await missions.getState();
@@ -735,6 +761,75 @@ test("runner provisions a missing Debian 12 sandbox toolchain before delegated w
   assert.equal(readiness.source, "sandbox");
   assert.equal(readiness.result, "passed");
   assert.match(readiness.summary, /Node\.js v22\.14\.0 and npm 10\.9\.2/);
+});
+
+test("coordinator sandbox turns are runtime-bounded and stop cleanly after the canonical exec", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client, calls } = fakeClient((turnId, agentSpec) => {
+    const isBounded =
+      agentSpec?.config?.iterationLimit === COORDINATOR_TRUEFORGE_ITERATION_LIMIT &&
+      agentSpec?.model?.params?.parallelToolCalls === false;
+    if (!isBounded) {
+      return sandboxEvents(turnId, 0, [], {
+        additionalSandboxCalls: [
+          { callId: "call-inspect", argumentsValue: { intent: "inspect", command: "git status" } },
+          { callId: "call-edit", argumentsValue: { intent: "edit", command: "sed -n '1,20p' src/index.ts" } },
+          { callId: "call-test", argumentsValue: { intent: "test", command: "npm test" } },
+          { callId: "call-install", argumentsValue: { intent: "install", command: "npm install" } },
+          { callId: "call-later", argumentsValue: { intent: "inspect", command: "git diff" } },
+        ],
+      });
+    }
+    return sandboxEvents(turnId, 0, [], {
+      turnState: {
+        status: "error",
+        message: "TrueForge iteration limit reached after the sandbox operation.",
+      },
+    });
+  }, { passAgentSpec: true });
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "google-gemini/test-model",
+  });
+  const mission = await runner.createMission({
+    id: "mission-runtime-bounded-coordinator",
+    objective: "Prove the coordinator sandbox runtime boundary",
+  });
+
+  const verification = await runner.runSandboxVerification({
+    missionId: mission.id,
+    command: "node --test",
+  });
+
+  assert.equal(verification.exitCode, 0);
+  assert.equal(calls.turns.length, 1);
+  const coordinatorTurn = calls.turns[0];
+  assert.ok(coordinatorTurn);
+  const executableCalls = coordinatorTurn.events
+    .filter((event) => event.type === "model.message")
+    .flatMap((event) => event.toolCalls ?? [])
+    .filter((call) => call.function?.name === "exec");
+  assert.equal(executableCalls.length, 1);
+  assert.equal(calls.updates.length, 2);
+  assert.equal(calls.updates[0].sessionId, "session-created");
+  assert.equal(calls.updates[1].sessionId, "session-created");
+  assert.equal(
+    calls.updates[0].request.agent.spec.config.iterationLimit,
+    COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
+  );
+  assert.equal(calls.updates[0].request.agent.spec.model.params.parallelToolCalls, false);
+  assert.equal(
+    calls.updates[1].request.agent.spec.config.iterationLimit,
+    DEFAULT_TRUEFORGE_ITERATION_LIMIT,
+  );
+  assert.equal(calls.updates[1].request.agent.spec.model.params, undefined);
+  const state = await missions.getState();
+  assert.equal(state.missions[0].trueforgeSessionId, "session-created");
+  assert.equal(state.missions[0].trueforgeSandboxId, "sandbox-1");
+  const completionEvidence = state.evidence.find((item) =>
+    item.summary.includes("one-iteration sandbox boundary"),
+  );
+  assert.ok(completionEvidence);
+  assert.equal(completionEvidence.result, "informational");
 });
 
 test("mission agent specs use a bounded non-twelve default iteration limit", () => {
@@ -1861,7 +1956,20 @@ test("sandbox verification rejects incomplete or non-canonical proof", async () 
           },
         }],
       },
-      error: /Expected exactly one canonical exec sandbox call, found 2/,
+      error: /Expected exactly one coordinator-owned exec sandbox call, found 2/,
+    },
+    {
+      label: "later non-canonical exec call",
+      options: {
+        additionalSandboxCalls: [{
+          callId: "call-exec-later",
+          argumentsValue: {
+            intent: "inspect the workspace",
+            command: "git status --short",
+          },
+        }],
+      },
+      error: /Expected exactly one coordinator-owned exec sandbox call, found 2/,
     },
     {
       label: "uncorrelated response",

@@ -579,6 +579,9 @@ test("TrueForge derives a structured handoff only from delegated tool responses"
       async get(sessionId) {
         return { data: { id: sessionId } };
       },
+      async update(sessionId, request) {
+        return { data: { id: sessionId }, request };
+      },
       async createTurnStream() {
         const current = turnNumber++;
         if (current === 0) {
@@ -657,6 +660,9 @@ test("coordinator-thread checks and diff cannot prove delegated completion", asy
       },
       async get(sessionId) {
         return { data: { id: sessionId } };
+      },
+      async update(sessionId, request) {
+        return { data: { id: sessionId }, request };
       },
       async createTurnStream() {
         const current = turnNumber++;

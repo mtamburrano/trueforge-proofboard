@@ -9,6 +9,8 @@ import { pathToFileURL } from "node:url";
 
 import {
   DeterministicImplementationVerifier,
+  COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
+  DEFAULT_TRUEFORGE_ITERATION_LIMIT,
   InMemoryMissionRepository,
   MissionService,
   PRIMARY_DELIVERY_FIXTURE,
@@ -294,20 +296,31 @@ function trueforgeStream(events) {
   };
 }
 
-async function lockedRepositoryRunnerFixture({ preparation = {} } = {}) {
+async function lockedRepositoryRunnerFixture({ preparation = {}, failRestore = false } = {}) {
   const missions = new MissionService(new InMemoryMissionRepository(), fixedClock);
   const turnRequests = [];
+  const agentSpecUpdates = [];
   let turnNumber = 0;
+  let activeAgentSpec;
   const client = {
     sessions: {
-      async create() {
+      async create(request) {
+        activeAgentSpec = request.agent.spec;
         return { data: { id: ORIGIN.sessionId } };
       },
       async get(sessionId) {
         return { data: { id: sessionId } };
       },
+      async update(sessionId, request) {
+        agentSpecUpdates.push({ sessionId, request });
+        if (failRestore && agentSpecUpdates.length === 2) {
+          throw new Error("session restore rejected");
+        }
+        activeAgentSpec = request.agent.spec;
+        return { data: { id: sessionId } };
+      },
       async createTurnStream(sessionId, request) {
-        turnRequests.push({ sessionId, request });
+        turnRequests.push({ sessionId, request, agentSpec: activeAgentSpec });
         const current = turnNumber++;
         if (current === 0) {
           return trueforgeStream(repositoryPreparationEvents(preparation));
@@ -345,7 +358,7 @@ async function lockedRepositoryRunnerFixture({ preparation = {} } = {}) {
     status: "ready",
   });
   await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
-  return { missions, runner, mission, workItem, turnRequests };
+  return { missions, runner, mission, workItem, turnRequests, agentSpecUpdates };
 }
 
 function transitionContractVerifier() {
@@ -543,6 +556,9 @@ async function runnerFixture({
       },
       async get(sessionId) {
         return { data: { id: sessionId } };
+      },
+      async update(sessionId, request) {
+        return { data: { id: sessionId }, request };
       },
       async createTurnStream(sessionId, request) {
         turnRequests.push({ sessionId, request });
@@ -819,6 +835,10 @@ test("empty locked fixture sandboxes are prepared before the workspace snapshot 
 
   assert.ok(result.implementationHandoff);
   assert.equal(fixture.turnRequests.length, 4);
+  assert.deepEqual(
+    fixture.turnRequests.map((turn) => turn.sessionId),
+    Array(4).fill(ORIGIN.sessionId),
+  );
   assert.deepEqual(sandboxInstructionArguments(fixture.turnRequests[0].request), {
     intent: LOCKED_REPOSITORY_PREPARATION_INTENT,
     command: LOCKED_REPOSITORY_PREPARATION_COMMAND,
@@ -829,8 +849,35 @@ test("empty locked fixture sandboxes are prepared before the workspace snapshot 
     /prepared and verified the pinned repository in this persistent sandbox workspace/i,
   );
   assert.equal(fixture.turnRequests[3].request.previousTurnId, ORIGIN.turnId);
+  assert.deepEqual(
+    fixture.agentSpecUpdates.map((update) => update.sessionId),
+    Array(6).fill(ORIGIN.sessionId),
+  );
+  assert.deepEqual(
+    fixture.agentSpecUpdates.map((update) => update.request.agent.spec.config.iterationLimit),
+    [
+      COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
+      DEFAULT_TRUEFORGE_ITERATION_LIMIT,
+      COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
+      DEFAULT_TRUEFORGE_ITERATION_LIMIT,
+      COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
+      DEFAULT_TRUEFORGE_ITERATION_LIMIT,
+    ],
+  );
+  assert.equal(fixture.agentSpecUpdates[0].request.agent.spec.model.params.parallelToolCalls, false);
+  assert.equal(fixture.agentSpecUpdates[2].request.agent.spec.model.params.parallelToolCalls, false);
+  assert.equal(fixture.agentSpecUpdates[4].request.agent.spec.model.params.parallelToolCalls, false);
+  assert.equal(fixture.agentSpecUpdates[1].request.agent.spec.model.params, undefined);
+  assert.equal(fixture.agentSpecUpdates[3].request.agent.spec.model.params, undefined);
+  assert.equal(fixture.agentSpecUpdates[5].request.agent.spec.model.params, undefined);
+  assert.equal(fixture.turnRequests[0].agentSpec.config.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
+  assert.equal(fixture.turnRequests[1].agentSpec.config.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
+  assert.equal(fixture.turnRequests[2].agentSpec.config.iterationLimit, DEFAULT_TRUEFORGE_ITERATION_LIMIT);
+  assert.equal(fixture.turnRequests[2].agentSpec.config.dynamicSubAgents.enabled, true);
+  assert.equal(fixture.turnRequests[3].agentSpec.config.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
 
   const state = await fixture.missions.getState();
+  assert.equal(state.missions[0].trueforgeSandboxId, "sandbox-1");
   const preparation = state.evidence.find((evidence) =>
     evidence.summary.startsWith("Sandbox prepared mtamburrano/proofboard-demo-fixture"),
   );
@@ -840,6 +887,29 @@ test("empty locked fixture sandboxes are prepared before the workspace snapshot 
   assert.match(LOCKED_REPOSITORY_PREPARATION_COMMAND, /git clone --quiet/);
   assert.match(LOCKED_REPOSITORY_PREPARATION_COMMAND, /git checkout --quiet --detach/);
   assert.doesNotMatch(LOCKED_REPOSITORY_PREPARATION_COMMAND, /git push|create_pull_request/);
+});
+
+test("coordinator runtime restoration failure blocks delegated coding", async () => {
+  const fixture = await lockedRepositoryRunnerFixture({ failRestore: true });
+
+  await assert.rejects(
+    fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
+      workItemId: fixture.workItem.id,
+      delegateToSubagent: true,
+    }),
+    /could not restore the normal multi-iteration agent before delegated coding/i,
+  );
+
+  assert.equal(fixture.turnRequests.length, 1);
+  const state = await fixture.missions.getState();
+  assert.equal(state.workItems.find((item) => item.id === fixture.workItem.id).status, "blocked");
+  assert.equal(
+    state.evidence.some((evidence) =>
+      evidence.result === "failed" &&
+      evidence.summary === "Locked repository preparation failed; delegated workspace proof did not start.",
+    ),
+    true,
+  );
 });
 
 test("real locked repository preparation handles a fresh clone and rejects a dirty worktree", async () => {
@@ -1029,6 +1099,9 @@ async function runSequentialWorkspaceScenario({ forbiddenOnSecond = false } = {}
       },
       async get(sessionId) {
         return { data: { id: sessionId } };
+      },
+      async update(sessionId, request) {
+        return { data: { id: sessionId }, request };
       },
       async createTurnStream() {
         const current = turnNumber++;

@@ -113,6 +113,8 @@ const PULL_REQUEST_READ_TOOL_NAME = "pull_request_read";
  */
 export const DEFAULT_TRUEFORGE_ITERATION_LIMIT = 64;
 export const MAX_TRUEFORGE_ITERATION_LIMIT = 1_024;
+/** The coordinator gets one model iteration and one tool call per deterministic sandbox turn. */
+export const COORDINATOR_TRUEFORGE_ITERATION_LIMIT = 1;
 export const MINIMUM_SANDBOX_NODE_MAJOR_VERSION = 20;
 export const SANDBOX_TOOLCHAIN_READINESS_INTENT =
   "Prepare and verify the sandbox toolchain before coding delegation.";
@@ -552,6 +554,10 @@ export interface TrueForgeClientLike {
   sessions: {
     create(request: TrueForgeApi.CreateSessionRequest): Promise<TrueForgeApi.GetSessionResponse>;
     get(sessionId: string): Promise<TrueForgeApi.GetSessionResponse>;
+    update(
+      sessionId: string,
+      request: TrueForgeApi.UpdateSessionRequest,
+    ): Promise<TrueForgeApi.GetSessionResponse>;
     createTurnStream(
       sessionId: string,
       request: TrueForgeApi.CreateTurnSessionsStreamRequest,
@@ -572,6 +578,7 @@ export interface RunTurnOptions {
 
 interface InternalRunTurnOptions extends RunTurnOptions {
   input?: TrueForgeApi.TurnInputItem[];
+  coordinatorRuntime?: boolean;
   delegatedWorkspaceStart?: {
     startTreeRef: string;
     missionStartTreeRef: string;
@@ -884,6 +891,26 @@ export function buildMissionAgentSpec(
   return spec;
 }
 
+export function buildCoordinatorAgentSpec(
+  config: TrueForgeMissionConfig,
+): TrueForgeApi.AgentSpec {
+  const spec = buildMissionAgentSpec({
+    ...config,
+    dynamicSubAgents: false,
+    iterationLimit: COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
+  });
+  return {
+    ...spec,
+    model: {
+      ...spec.model,
+      params: {
+        ...(spec.model.params ?? {}),
+        parallelToolCalls: false,
+      },
+    },
+  };
+}
+
 const defaultInstructions = [
   "Work only on the supplied mission objective and active work item.",
   "Inspect before changing anything and use the attached MCP tools for repository facts.",
@@ -976,13 +1003,24 @@ export class TrueForgeMissionRunner {
       : repositoryPreparation?.turnId ??
         options.previousTurnId ??
         (await this.missions.getMission(missionId)).trueforgeTurnId;
-    const workspaceStart = delegatedWorkItem === undefined
-      ? undefined
-      : await this.captureDelegatedWorkspaceStart(
+    let workspaceStart: DelegatedWorkspaceStart | undefined;
+    if (delegatedWorkItem !== undefined) {
+      try {
+        workspaceStart = await this.captureDelegatedWorkspaceStart(
           missionId,
           delegatedWorkItem.id,
           workspaceStartPreviousTurnId,
         );
+      } catch (error) {
+        if (
+          error instanceof TrueForgeIntegrationError &&
+          error.operation === "restore coordinator runtime"
+        ) {
+          await this.recordCoordinatorRestoreFailure(missionId, delegatedWorkItem.id, error);
+        }
+        throw error;
+      }
+    }
     const execution = await this.executeTurn(
       missionId,
       instruction,
@@ -1079,7 +1117,7 @@ export class TrueForgeMissionRunner {
       } else if (previousTurnId !== undefined) {
         preparationOptions.previousTurnId = previousTurnId;
       }
-      const execution = await this.executeTurn(
+      const execution = await this.executeCoordinatorTurn(
         mission.id,
         buildLockedRepositoryPreparationInstruction(mission, toolName),
         preparationOptions,
@@ -1143,7 +1181,7 @@ export class TrueForgeMissionRunner {
     previousTurnId: string | undefined,
   ): Promise<DelegatedWorkspaceStart> {
     const mission = await this.missions.getMission(missionId);
-    const execution = await this.executeTurn(
+    const execution = await this.executeCoordinatorTurn(
       missionId,
       buildSandboxVerificationInstruction(
         mission,
@@ -1153,7 +1191,12 @@ export class TrueForgeMissionRunner {
       ),
       previousTurnId === undefined ? {} : { previousTurnId },
     );
-    requireCompletedTurn(execution.rawEvents, "capture workspace start", "workspace snapshot");
+    requireCompletedTurn(
+      execution.rawEvents,
+      "capture workspace start",
+      "workspace snapshot",
+      { allowCoordinatorIterationStop: true },
+    );
     const coordinatorExecution = coordinatorWorkspaceExecution(
       execution.rawEvents,
       DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
@@ -1221,7 +1264,7 @@ export class TrueForgeMissionRunner {
       workspaceStart.missionStartTreeRef,
     );
     const mission = await this.missions.getMission(missionId);
-    const execution = await this.executeTurn(
+    const execution = await this.executeCoordinatorTurn(
       missionId,
       buildSandboxVerificationInstruction(
         mission,
@@ -1231,7 +1274,12 @@ export class TrueForgeMissionRunner {
       ),
       { previousTurnId },
     );
-    requireCompletedTurn(execution.rawEvents, "capture workspace delta", "workspace delta");
+    requireCompletedTurn(
+      execution.rawEvents,
+      "capture workspace delta",
+      "workspace delta",
+      { allowCoordinatorIterationStop: true },
+    );
     const coordinatorExecution = coordinatorWorkspaceExecution(execution.rawEvents, command);
     if (coordinatorExecution === null) {
       throw new TrueForgeIntegrationError(
@@ -1817,7 +1865,7 @@ export class TrueForgeMissionRunner {
         }
         preparationOptions.previousTurnId = mission.trueforgeTurnId;
       }
-      const execution = await this.executeTurn(
+      const execution = await this.executeCoordinatorTurn(
         mission.id,
         buildSandboxPreparationInstruction(mission, toolName),
         preparationOptions,
@@ -1893,7 +1941,7 @@ export class TrueForgeMissionRunner {
         }
         verificationOptions.previousTurnId = mission.trueforgeTurnId;
       }
-      const execution = await this.executeTurn(
+      const execution = await this.executeCoordinatorTurn(
         mission.id,
         buildSandboxVerificationInstruction(mission, command, toolName, intent),
         verificationOptions,
@@ -1952,6 +2000,68 @@ export class TrueForgeMissionRunner {
         "The sandbox verification could not be verified.",
       );
     }
+  }
+
+  private async executeCoordinatorTurn(
+    missionId: string,
+    instruction: string,
+    options: InternalRunTurnOptions,
+  ): Promise<InternalTurnResult> {
+    if (typeof this.client.sessions.update !== "function") {
+      throw new TrueForgeIntegrationError(
+        "bound coordinator runtime",
+        "TrueForge session updates are required to bound coordinator sandbox operations.",
+      );
+    }
+    const session = await this.resumeMission(missionId);
+    // Updating the inline agent keeps the TrueForge session (and its Daytona sandbox)
+    // intact while making the deterministic operation independent of prompt obedience.
+    let restoreRequired = false;
+    let execution: InternalTurnResult | undefined;
+    let operationError: unknown;
+    let operationFailed = false;
+    try {
+      restoreRequired = true;
+      await this.updateSessionAgent(
+        session.sessionId,
+        buildCoordinatorAgentSpec(this.config),
+        "bound coordinator runtime",
+      );
+      execution = await this.executeTurn(missionId, instruction, {
+        ...options,
+        coordinatorRuntime: true,
+      });
+    } catch (error) {
+      operationFailed = true;
+      operationError = error;
+    }
+    if (restoreRequired) {
+      try {
+        await this.updateSessionAgent(
+          session.sessionId,
+          buildMissionAgentSpec(this.config),
+          "restore coordinator runtime",
+        );
+      } catch (error) {
+        const reason = error instanceof TrueForgeIntegrationError
+          ? error.message
+          : "TrueForge returned an unverified session update.";
+        throw new TrueForgeIntegrationError(
+          "restore coordinator runtime",
+          `TrueForge could not restore the normal multi-iteration agent before delegated coding: ${reason}`,
+        );
+      }
+    }
+    if (operationFailed) {
+      throw operationError;
+    }
+    if (execution === undefined) {
+      throw new TrueForgeIntegrationError(
+        "bound coordinator runtime",
+        "TrueForge returned no coordinator execution after applying the bounded runtime.",
+      );
+    }
+    return execution;
   }
 
   private async executeTurn(
@@ -2113,7 +2223,11 @@ export class TrueForgeMissionRunner {
             }
           }
         }
-        const evidence = runtimeEvidence(event);
+        const evidence = runtimeEvidence(
+          event,
+          options.coordinatorRuntime === true,
+          rawEvents,
+        );
         if (evidence !== null) {
           const evidenceInput = {
             kind: evidence.kind,
@@ -2610,6 +2724,23 @@ export class TrueForgeMissionRunner {
     return { sessionId: createdSessionId, created: true };
   }
 
+  private async updateSessionAgent(
+    sessionId: string,
+    spec: TrueForgeApi.AgentSpec,
+    operation: string,
+  ): Promise<void> {
+    if (typeof this.client.sessions.update !== "function") {
+      throw new TrueForgeIntegrationError(
+        operation,
+        "TrueForge session updates are required to change the coordinator runtime safely.",
+      );
+    }
+    const updated = await this.call(operation, () =>
+      this.client.sessions.update(sessionId, { agent: { spec } }),
+    );
+    this.requireSessionId(updated, sessionId, operation);
+  }
+
   private requireSessionId(
     response: TrueForgeApi.GetSessionResponse,
     expectedId: string | null,
@@ -2658,6 +2789,36 @@ export class TrueForgeMissionRunner {
       });
     } catch {
       // Preserve the original readiness error if durable failure evidence cannot be recorded.
+    }
+  }
+
+  private async recordCoordinatorRestoreFailure(
+    missionId: string,
+    workItemId: string,
+    error: unknown,
+  ): Promise<void> {
+    const message = error instanceof TrueForgeIntegrationError
+      ? error.message
+      : "TrueForge could not restore the normal multi-iteration agent before delegated coding.";
+    try {
+      await this.missions.addEvidence(missionId, {
+        workItemId,
+        kind: "tool_result",
+        result: "failed",
+        source: "trueforge",
+        summary: "Coordinator runtime restoration failed; delegated coding did not start.",
+        details: JSON.stringify({ reason: sanitizeRuntimeText(message) }),
+      });
+    } catch {
+      // Preserve the original restoration error if durable failure evidence cannot be recorded.
+    }
+    try {
+      const current = await this.missions.getWorkItem(missionId, workItemId);
+      if (current.status === "in_progress" || current.status === "ready_for_review") {
+        await this.missions.transitionWorkItem(missionId, workItemId, "blocked");
+      }
+    } catch {
+      // Preserve the original restoration error when the work item cannot be transitioned.
     }
   }
 
@@ -3361,6 +3522,10 @@ interface TurnCompletion {
   error: string | null;
 }
 
+interface TurnCompletionOptions {
+  allowCoordinatorIterationStop?: boolean;
+}
+
 function turnCompletion(event: TrueForgeApi.TurnStreamingEvent): TurnCompletion {
   const state = recordValue(event).state;
   if (!isRecord(state)) {
@@ -3370,14 +3535,45 @@ function turnCompletion(event: TrueForgeApi.TurnStreamingEvent): TurnCompletion 
   return {
     status: stringOrNull(state.status),
     requiredActions: Array.isArray(rawRequiredActions) ? rawRequiredActions : null,
-    error: safeRuntimeError(state.error),
+    error: safeRuntimeError(state.error) ??
+      safeRuntimeError(state.message) ??
+      safeRuntimeError(state.reason),
   };
+}
+
+function isExpectedCoordinatorIterationStop(
+  events: TrueForgeApi.TurnStreamingEvent[],
+  completion: TurnCompletion,
+): boolean {
+  if (
+    (completion.status !== "error" && completion.status !== "cancelled") ||
+    completion.error === null ||
+    (completion.requiredActions !== null && completion.requiredActions.length > 0)
+  ) {
+    return false;
+  }
+  const normalizedError = completion.error.toLowerCase().replace(/[_-]+/g, " ");
+  if (
+    !normalizedError.includes("iteration") ||
+    (!normalizedError.includes("limit") &&
+      !normalizedError.includes("maximum") &&
+      !normalizedError.includes("max"))
+  ) {
+    return false;
+  }
+  const executions = observedToolCalls(events).filter((call) => call.name === "exec");
+  if (executions.length !== 1 || executions[0] === undefined) {
+    return false;
+  }
+  const observed = parseExecutionResponse(toolResponseForCall(events, executions[0].id));
+  return observed?.success === true && observed.exitCode === 0;
 }
 
 function requireCompletedTurn(
   events: TrueForgeApi.TurnStreamingEvent[],
   operation: string,
   subject: string,
+  options: TurnCompletionOptions = {},
 ): void {
   const doneEvents = events.filter((event) => event.type === "turn.done");
   const done = doneEvents[doneEvents.length - 1];
@@ -3386,6 +3582,12 @@ function requireCompletedTurn(
   }
   const completion = turnCompletion(done);
   if (completion.status !== "done") {
+    if (
+      options.allowCoordinatorIterationStop === true &&
+      isExpectedCoordinatorIterationStop(events, completion)
+    ) {
+      return;
+    }
     return verificationFailure(
       operation,
       completion.error === null
@@ -4297,7 +4499,13 @@ function verifySandboxExecution(
   }
   const sandboxId = verifySandboxIdentity(events, expectedSandboxId, "run sandbox verification");
   const expectedArguments = { intent, command };
-  const canonicalCalls = observedToolCalls(events).filter(
+  const executionCalls = observedToolCalls(events).filter((call) => call.name === toolName);
+  if (executionCalls.length > 1) {
+    return sandboxFailure(
+      `Expected exactly one coordinator-owned ${toolName} sandbox call, found ${executionCalls.length}.`,
+    );
+  }
+  const canonicalCalls = executionCalls.filter(
     (call) => call.name === toolName && isRecord(call.arguments) &&
       argumentsExactlyMatch(call.arguments, expectedArguments),
   );
@@ -4340,7 +4548,12 @@ function verifySandboxExecution(
   if (exitCode !== 0) {
     return sandboxFailure(`${toolName} sandbox command exited with code ${exitCode}.`);
   }
-  requireCompletedTurn(events, "run sandbox verification", "sandbox");
+  requireCompletedTurn(
+    events,
+    "run sandbox verification",
+    "sandbox",
+    { allowCoordinatorIterationStop: true },
+  );
   return {
     exitCode,
     stdout,
@@ -4447,7 +4660,12 @@ function verifyLockedRepositoryPreparation(
       : `Locked repository preparation failed: ${sanitizeRuntimeText(failureMarker[1])}`;
     return verificationFailure(operation, failure);
   }
-  requireCompletedTurn(events, operation, "repository preparation");
+  requireCompletedTurn(
+    events,
+    operation,
+    "repository preparation",
+    { allowCoordinatorIterationStop: true },
+  );
   const ready = observed.output.trim().match(
     /^TRUEFORGE_REPOSITORY_READY repository=([^\s]+) sha=([0-9a-fA-F]{40}) root=(\/.+)$/,
   );
@@ -4683,7 +4901,9 @@ function runtimeDetails(event: TrueForgeApi.TurnStreamingEvent): string {
     const state = record.state;
     if (isRecord(state)) {
       details.status = stringOrNull(state.status);
-      const error = safeRuntimeError(state.error);
+      const error = safeRuntimeError(state.error) ??
+        safeRuntimeError(state.message) ??
+        safeRuntimeError(state.reason);
       if (error !== null) {
         details.error = error;
       }
@@ -4707,7 +4927,11 @@ function runtimeDetails(event: TrueForgeApi.TurnStreamingEvent): string {
   return JSON.stringify(details);
 }
 
-function runtimeEvidence(event: TrueForgeApi.TurnStreamingEvent): RuntimeEvidence | null {
+function runtimeEvidence(
+  event: TrueForgeApi.TurnStreamingEvent,
+  coordinatorRuntime: boolean,
+  events: TrueForgeApi.TurnStreamingEvent[],
+): RuntimeEvidence | null {
   const details = runtimeDetails(event);
   switch (event.type) {
     case "turn.created":
@@ -4720,12 +4944,22 @@ function runtimeEvidence(event: TrueForgeApi.TurnStreamingEvent): RuntimeEvidenc
     case "turn.done": {
       const state = recordValue(event).state;
       const status = isRecord(state) ? stringOrNull(state.status) ?? "unknown" : "unknown";
-      const error = isRecord(state) ? safeRuntimeError(state.error) : null;
+      const completion = turnCompletion(event);
+      const error = completion.error;
       const rawRequiredActions = isRecord(state)
         ? state.requiredActions ?? state.required_actions
         : undefined;
       const requiredActions = Array.isArray(rawRequiredActions) ? rawRequiredActions : null;
+      const boundedStop = coordinatorRuntime && isExpectedCoordinatorIterationStop(events, completion);
       const isComplete = status === "done" && requiredActions !== null && requiredActions.length === 0;
+      if (boundedStop) {
+        return {
+          kind: "tool_result",
+          result: "informational",
+          summary: "TrueForge stopped the coordinator after the configured one-iteration sandbox boundary.",
+          details,
+        };
+      }
       const summary = error !== null
         ? `TrueForge turn finished with status ${status}: ${error}`
         : requiredActions === null

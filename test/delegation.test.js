@@ -189,7 +189,7 @@ function delegatedEvents({ malformedCompletion = false, includeThread = true, th
 }
 
 function fakeClient(events) {
-  const calls = { create: [], turns: [] };
+  const calls = { create: [], updates: [], turns: [] };
   let turnNumber = 0;
   return {
     calls,
@@ -200,6 +200,10 @@ function fakeClient(events) {
           return { data: { id: "session-delegated" } };
         },
         async get(sessionId) {
+          return { data: { id: sessionId } };
+        },
+        async update(sessionId, request) {
+          calls.updates.push({ sessionId, request });
           return { data: { id: sessionId } };
         },
         async createTurnStream(sessionId, request) {
