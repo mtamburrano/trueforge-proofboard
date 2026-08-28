@@ -418,6 +418,12 @@ test("run mission uses the runtime adapters and exposes passed proof", async () 
   assert.equal(payload.mission.progress.complete, 4);
   assert.equal(payload.mission.progress.verification, "passed");
   assert.deepEqual(payload.mission.evidence.map((item) => item.source).sort(), ["mcp", "sandbox"]);
+  assert.equal(payload.mission.approvals.length, 1);
+  assert.equal(payload.mission.approvals[0].actionType, "create_pull_request");
+  assert.equal(payload.mission.approvals[0].target, "mtamburrano/trueforge-proofboard@590aa8a6d72c580f61fc1b19d33e9876bc0feb9b");
+  assert.match(payload.mission.approvals[0].expectedEffect, /pull request/);
+  assert.match(payload.mission.approvals[0].rationale, /human/);
+  assert.equal(payload.mission.approvals[0].evidenceIds.length > 0, true);
   assert.deepEqual(runner.calls, { create: 1, inspect: 1, turn: 2, sandbox: 1 });
   assert.deepEqual(
     runner.turnInputs.map((input) => input.options.workItemId),

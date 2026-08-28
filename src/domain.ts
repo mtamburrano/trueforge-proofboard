@@ -79,6 +79,54 @@ export type MemoryImpact = (typeof memoryImpacts)[number];
 export const approvalDecisions = ["pending", "approved", "rejected"] as const;
 export type ApprovalDecision = (typeof approvalDecisions)[number];
 
+export const readOnlyActions = [
+  "inspect_repository",
+  "run_sandbox_verification",
+] as const;
+export type ReadOnlyAction = (typeof readOnlyActions)[number];
+
+export const consequentialActions = ["create_pull_request"] as const;
+export type ConsequentialAction = (typeof consequentialActions)[number];
+
+export const PRIMARY_CONSEQUENTIAL_ACTION: ConsequentialAction = "create_pull_request";
+export const APPROVAL_EXPIRATION_MS = 15 * 60 * 1_000;
+
+export interface ActionPolicy {
+  action: string;
+  requiresApproval: boolean;
+  rationale: string;
+}
+
+export function getActionPolicy(action: string): ActionPolicy {
+  const normalized = action.trim();
+  if (normalized.length === 0) {
+    throw new MissionDomainError("invalid_input", "action must be a non-empty string.");
+  }
+  if (readOnlyActions.includes(normalized as ReadOnlyAction)) {
+    return {
+      action: normalized,
+      requiresApproval: false,
+      rationale: "Read-only discovery does not change the configured repository or external state.",
+    };
+  }
+  if (consequentialActions.includes(normalized as ConsequentialAction)) {
+    return {
+      action: normalized,
+      requiresApproval: true,
+      rationale: "The action mutates a remote repository and requires explicit human approval.",
+    };
+  }
+  return {
+    action: normalized,
+    requiresApproval: true,
+    rationale: "Unclassified actions fail closed and require explicit human approval.",
+  };
+}
+
+export function requiresHumanApproval(action: string): boolean {
+  return getActionPolicy(action).requiresApproval;
+}
+
 export const deliveryStatuses = ["delivered", "failed"] as const;
 export type DeliveryStatus = (typeof deliveryStatuses)[number];
 
@@ -251,12 +299,15 @@ export interface Approval {
   id: string;
   missionId: string;
   action: string;
+  actionType: string;
   target: string;
   risk: string;
+  rationale: string;
   expectedEffect: string;
   evidenceIds: string[];
   decision: ApprovalDecision;
   createdAt: string;
+  expiresAt: string;
   decidedBy?: string;
   decidedAt?: string;
 }
@@ -364,17 +415,28 @@ export interface RecordReviewInput {
 
 export interface RequestApprovalInput {
   action: string;
+  actionType?: string;
   target: string;
-  risk: string;
+  risk?: string;
+  rationale?: string;
   expectedEffect: string;
   evidenceIds?: string[];
+  expiresAt?: string;
   id?: string;
+}
+
+export interface ActionExecutionInput {
+  action: string;
+  target: string;
+  expectedEffect: string;
+  approvalId?: string;
 }
 
 export interface RecordDeliveryInput {
   status: DeliveryStatus;
   verificationSummary: string;
   reference?: string;
+  approvalId?: string;
   id?: string;
 }
 
@@ -640,6 +702,32 @@ function timestamp(value: unknown, label: string): string {
     return fail("invalid_input", `${label} must be a valid timestamp.`);
   }
   return result;
+}
+
+function normalizeActionType(value: string): string {
+  const slug = value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  if ([
+    "create_pull_request",
+    "create_a_pull_request",
+    "open_pull_request",
+    "open_a_pull_request",
+    "open_the_verified_delivery",
+  ].includes(slug)) {
+    return PRIMARY_CONSEQUENTIAL_ACTION;
+  }
+  return slug;
+}
+
+function defaultApprovalExpiry(createdAt: string): string {
+  return new Date(Date.parse(createdAt) + APPROVAL_EXPIRATION_MS).toISOString();
+}
+
+function approvalIsExpired(approval: Approval, now: string): boolean {
+  return Date.parse(approval.expiresAt) <= Date.parse(now);
 }
 
 function identifier(value: unknown, label: string): string {
@@ -1001,6 +1089,22 @@ function validateReview(value: unknown, label: string): Review {
 
 function validateApproval(value: unknown, label: string): Approval {
   const approval = objectValue(value, label);
+  const action = requiredString(approval.action, `${label}.action`, 500);
+  const actionType = normalizeActionType(
+    optionalString(approval.actionType, `${label}.actionType`, 200) ?? action,
+  );
+  if (actionType.length === 0) {
+    return fail("invalid_input", `${label}.actionType must be a non-empty action type.`);
+  }
+  const risk = optionalString(approval.risk, `${label}.risk`);
+  const rationale = optionalString(approval.rationale, `${label}.rationale`) ?? risk;
+  if (rationale === undefined) {
+    return fail("invalid_input", `${label} needs a rationale for the approval request.`);
+  }
+  const createdAt = timestamp(approval.createdAt, `${label}.createdAt`);
+  const expiresAt = approval.expiresAt === undefined
+    ? defaultApprovalExpiry(createdAt)
+    : timestamp(approval.expiresAt, `${label}.expiresAt`);
   const decidedBy = optionalString(approval.decidedBy, `${label}.decidedBy`, 200);
   const decidedAt =
     approval.decidedAt === undefined
@@ -1016,13 +1120,16 @@ function validateApproval(value: unknown, label: string): Approval {
   const result: Approval = {
     id: identifier(approval.id, `${label}.id`),
     missionId: identifier(approval.missionId, `${label}.missionId`),
-    action: requiredString(approval.action, `${label}.action`, 500),
+    action,
+    actionType,
     target: requiredString(approval.target, `${label}.target`, 2_000),
-    risk: requiredString(approval.risk, `${label}.risk`),
+    risk: risk ?? rationale,
+    rationale,
     expectedEffect: requiredString(approval.expectedEffect, `${label}.expectedEffect`),
     evidenceIds: stringArray(approval.evidenceIds, `${label}.evidenceIds`),
     decision,
-    createdAt: timestamp(approval.createdAt, `${label}.createdAt`),
+    createdAt,
+    expiresAt,
   };
   if (decidedBy !== undefined) {
     result.decidedBy = decidedBy;
@@ -1358,6 +1465,90 @@ function ensureMissionEvidence(state: MissionState, missionId: string, evidenceI
       fail("invalid_input", `Evidence ${evidenceId} does not belong to mission ${missionId}.`);
     }
   }
+}
+
+function ensureApprovedAction(
+  state: MissionState,
+  missionId: string,
+  input: ActionExecutionInput,
+  now: string,
+): Approval | null {
+  const action = normalizeActionType(requiredString(input.action, "action", 200));
+  const policy = getActionPolicy(action);
+  if (!policy.requiresApproval) {
+    return null;
+  }
+  const target = requiredString(input.target, "target", 2_000);
+  const expectedEffect = requiredString(input.expectedEffect, "expectedEffect");
+  const approvalId = input.approvalId === undefined
+    ? undefined
+    : normalizedId(input.approvalId, "approvalId");
+  const approval = approvalId === undefined
+    ? state.approvals
+        .filter((candidate) =>
+          candidate.missionId === missionId &&
+          candidate.actionType === action &&
+          candidate.target === target &&
+          candidate.expectedEffect === expectedEffect,
+        )
+        .at(-1)
+    : state.approvals.find((candidate) =>
+        candidate.id === approvalId && candidate.missionId === missionId,
+      );
+  if (approval === undefined || approval.actionType !== action ||
+      approval.target !== target || approval.expectedEffect !== expectedEffect) {
+    fail(
+      "approval_blocked",
+      `Action ${action} has no matching approval for target ${target}.`,
+    );
+  }
+  if (approval.decision !== "approved") {
+    fail(
+      "approval_blocked",
+      `Action ${action} cannot execute while approval ${approval.id} is ${approval.decision}.`,
+    );
+  }
+  if (approvalIsExpired(approval, now)) {
+    fail("approval_blocked", `Approval ${approval.id} has expired.`);
+  }
+  return approval;
+}
+
+function ensureApprovedDelivery(
+  state: MissionState,
+  missionId: string,
+  approvalId: string | undefined,
+  now: string,
+): Approval {
+  const normalizedApprovalId = approvalId === undefined
+    ? undefined
+    : normalizedId(approvalId, "approvalId");
+  const approval = normalizedApprovalId === undefined
+    ? state.approvals
+        .filter((candidate) =>
+          candidate.missionId === missionId &&
+          candidate.actionType === PRIMARY_CONSEQUENTIAL_ACTION,
+        )
+        .at(-1)
+    : state.approvals.find((candidate) =>
+        candidate.id === normalizedApprovalId && candidate.missionId === missionId,
+      );
+  if (approval === undefined || approval.actionType !== PRIMARY_CONSEQUENTIAL_ACTION) {
+    fail(
+      "approval_blocked",
+      "The verified delivery cannot execute without a matching approval request.",
+    );
+  }
+  if (approval.decision !== "approved") {
+    fail(
+      "approval_blocked",
+      `The verified delivery cannot execute while approval ${approval.id} is ${approval.decision}.`,
+    );
+  }
+  if (approvalIsExpired(approval, now)) {
+    fail("approval_blocked", `Approval ${approval.id} has expired.`);
+  }
+  return approval;
 }
 
 type StructuredHandoffRecord = Handoff & {
@@ -2373,28 +2564,95 @@ export class MissionService {
       const normalizedMissionId = normalizedId(missionId, "missionId");
       const mission = findMission(state, normalizedMissionId);
       ensureOpen(mission);
+      const action = requiredString(input.action, "action", 500);
+      const actionType = normalizeActionType(
+        requiredString(input.actionType ?? action, "actionType", 200),
+      );
+      const rationale = requiredString(input.rationale ?? input.risk, "rationale");
+      const risk = input.risk === undefined
+        ? rationale
+        : requiredString(input.risk, "risk");
       const evidenceIds = input.evidenceIds === undefined
         ? []
         : stringArray(input.evidenceIds, "evidenceIds", 100).map((evidenceId) =>
             normalizedId(evidenceId, "evidenceId"),
-          );
+        );
       ensureMissionEvidence(state, normalizedMissionId, evidenceIds);
       const id = input.id === undefined ? newId("approval") : normalizedId(input.id, "approval.id");
       ensureUniqueEntityId(state, id);
+      const expiresAt = input.expiresAt === undefined
+        ? defaultApprovalExpiry(now)
+        : timestamp(input.expiresAt, "expiresAt");
       const approval: Approval = {
         id,
         missionId: normalizedMissionId,
-        action: requiredString(input.action, "action", 500),
+        action,
+        actionType,
         target: requiredString(input.target, "target", 2_000),
-        risk: requiredString(input.risk, "risk"),
+        risk,
+        rationale,
         expectedEffect: requiredString(input.expectedEffect, "expectedEffect"),
         evidenceIds,
         decision: "pending",
         createdAt: now,
+        expiresAt,
       };
       state.approvals.push(approval);
       return approval;
     });
+  }
+
+  async requestActionApproval(
+    missionId: string,
+    input: RequestApprovalInput,
+  ): Promise<Approval> {
+    const actionType = normalizeActionType(
+      requiredString(input.actionType ?? input.action, "actionType", 200),
+    );
+    if (!getActionPolicy(actionType).requiresApproval) {
+      fail("invalid_input", `Action ${actionType} is read-only and does not require approval.`);
+    }
+    return this.requestApproval(missionId, { ...input, actionType });
+  }
+
+  async authorizeAction(
+    missionId: string,
+    input: ActionExecutionInput,
+  ): Promise<Approval | null> {
+    const state = await this.getState();
+    const normalizedMissionId = normalizedId(missionId, "missionId");
+    const mission = findMission(state, normalizedMissionId);
+    const action = normalizeActionType(requiredString(input.action, "action", 200));
+    if (getActionPolicy(action).requiresApproval) {
+      ensureOpen(mission);
+    }
+    const approval = ensureApprovedAction(
+      state,
+      normalizedMissionId,
+      { ...input, action },
+      this.currentTimestamp(),
+    );
+    return approval === null ? null : clone(approval);
+  }
+
+  async executeProtectedAction<T>(
+    missionId: string,
+    input: ActionExecutionInput,
+    operation: () => Promise<T> | T,
+  ): Promise<T> {
+    if (typeof operation !== "function") {
+      fail("invalid_input", "A protected action needs an execution function.");
+    }
+    await this.authorizeAction(missionId, input);
+    return operation();
+  }
+
+  async executeAction<T>(
+    missionId: string,
+    input: ActionExecutionInput,
+    operation: () => Promise<T> | T,
+  ): Promise<T> {
+    return this.executeProtectedAction(missionId, input, operation);
   }
 
   async decideApproval(
@@ -2415,7 +2673,11 @@ export class MissionService {
       if (approval.decision !== "pending") {
         fail("invalid_transition", `Approval ${approval.id} has already been decided.`);
       }
-      approval.decision = enumValue(input.decision, ["approved", "rejected"], "decision");
+      const decision = enumValue(input.decision, ["approved", "rejected"], "decision");
+      if (decision === "approved" && approvalIsExpired(approval, now)) {
+        fail("approval_blocked", `Approval ${approval.id} has expired and cannot be approved.`);
+      }
+      approval.decision = decision;
       approval.decidedBy = requiredString(input.decidedBy, "decidedBy", 200);
       approval.decidedAt = now;
       return approval;
@@ -2441,15 +2703,7 @@ export class MissionService {
           fail("invalid_transition", "A delivered record requires a mission in verifying state.");
         }
         ensureAllWorkComplete(state, normalizedMissionId);
-        const unapproved = state.approvals.filter(
-          (approval) => approval.missionId === normalizedMissionId && approval.decision !== "approved",
-        );
-        if (unapproved.length > 0) {
-          fail(
-            "approval_blocked",
-            `Delivery is waiting on approvals: ${unapproved.map((approval) => approval.id).join(", ")}.`,
-          );
-        }
+        ensureApprovedDelivery(state, normalizedMissionId, input.approvalId, now);
         if (reference === undefined) {
           fail("invalid_input", "reference is required for a delivered record.");
         }

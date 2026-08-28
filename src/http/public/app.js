@@ -184,7 +184,9 @@ function renderLane(lane, view) {
     ? view.approvals.map((approval) => `
         <article class="work-card">
           <h4>${escapeHtml(approval.action)}</h4>
+          <p><strong>Target:</strong> ${escapeHtml(approval.target)}</p>
           <p>${escapeHtml(approval.expectedEffect)}</p>
+          <p class="work-card-secondary">${escapeHtml(approval.rationale)}</p>
           <div class="work-card-meta">${chip(approval.decision)}</div>
         </article>`).join("")
     : "";

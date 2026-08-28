@@ -13,6 +13,7 @@ import {
   WorkGraphDefinition,
   WorkItem,
   MAX_WORK_ITEM_ACCEPTANCE_CRITERIA,
+  PRIMARY_CONSEQUENTIAL_ACTION,
   validateWorkGraph,
 } from "../domain.js";
 import {
@@ -328,11 +329,15 @@ export interface MissionView {
   approvals: Array<{
     id: string;
     action: string;
+    actionType: string;
     target: string;
     risk: string;
+    rationale: string;
     expectedEffect: string;
+    evidenceIds: string[];
     decision: string;
     createdAt: string;
+    expiresAt: string;
   }>;
   delivery: Array<{
     id: string;
@@ -638,6 +643,7 @@ class MissionController {
       if (mission.status === "executing") {
         await this.missions.transitionMission(PRIMARY_MISSION_ID, "verifying");
       }
+      await this.ensurePrimaryDeliveryApproval();
       return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID);
     } catch (error) {
       await this.blockActiveWork();
@@ -672,6 +678,42 @@ class MissionController {
       checks: draft.checks,
       evidenceIds: draft.evidenceIds,
       executionOrigin: draft.executionOrigin,
+    });
+  }
+
+  private async ensurePrimaryDeliveryApproval(): Promise<void> {
+    const state = await this.missions.getState();
+    const activeRequest = state.approvals.find((approval) =>
+      approval.missionId === PRIMARY_MISSION_ID &&
+      approval.actionType === PRIMARY_CONSEQUENTIAL_ACTION &&
+      ["pending", "approved"].includes(approval.decision) &&
+      Date.parse(approval.expiresAt) > Date.now(),
+    );
+    if (activeRequest !== undefined) {
+      return;
+    }
+    const mission = state.missions.find((item) => item.id === PRIMARY_MISSION_ID);
+    if (mission === undefined) {
+      throw new MissionControlError("Approval could not find the primary mission.");
+    }
+    const target = mission.repository === undefined
+      ? `mission ${mission.id}`
+      : `${mission.repository.owner}/${mission.repository.name}@${mission.repository.ref}`;
+    const evidenceIds = state.evidence
+      .filter((evidence) =>
+        evidence.missionId === PRIMARY_MISSION_ID &&
+        (evidence.source === "mcp" || evidence.source === "sandbox") &&
+        evidence.result === "passed",
+      )
+      .map((evidence) => evidence.id);
+    await this.missions.requestActionApproval(PRIMARY_MISSION_ID, {
+      action: "Open the verified delivery",
+      actionType: PRIMARY_CONSEQUENTIAL_ACTION,
+      target,
+      risk: "A remote repository mutation will create a pull request.",
+      rationale: "A human must authorize the verified change before it is published for review.",
+      expectedEffect: "Open a pull request containing the verified source change for review.",
+      evidenceIds,
     });
   }
 
@@ -1071,11 +1113,15 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
       .map((item) => ({
         id: item.id,
         action: item.action,
+        actionType: item.actionType,
         target: item.target,
         risk: item.risk,
+        rationale: item.rationale,
         expectedEffect: item.expectedEffect,
+        evidenceIds: [...item.evidenceIds],
         decision: item.decision,
         createdAt: item.createdAt,
+        expiresAt: item.expiresAt,
       })),
     delivery: state.deliveries
       .filter((item) => item.missionId === missionId)
