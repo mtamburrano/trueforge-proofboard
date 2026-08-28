@@ -160,9 +160,13 @@ function transitionContractVerifier() {
   };
 }
 
-function delegatedEvents(command, output) {
+function delegatedEvents(
+  command,
+  output,
+  { includeDiff = true, narrationOnly = false, responseType = "tool.response" } = {},
+) {
   const response = (id, callId, result) => ({
-    type: "tool.response",
+    type: responseType,
     id,
     threadId: ORIGIN.threadId,
     toolCallId: callId,
@@ -194,18 +198,31 @@ function delegatedEvents(command, output) {
       threadId: ORIGIN.threadId,
       toolCalls: [
         { id: "call-check", function: { name: "exec", arguments: JSON.stringify({ command }) } },
-        { id: "call-diff", function: { name: "exec", arguments: JSON.stringify({ command: "git diff" }) } },
+        ...(includeDiff
+          ? [{ id: "call-diff", function: { name: "exec", arguments: JSON.stringify({ command: "git diff" }) } }]
+          : []),
       ],
     },
     response("event-check-response", "call-check", "checks complete\n"),
-    response("event-diff-response", "call-diff", output),
+    ...(includeDiff ? [response("event-diff-response", "call-diff", output)] : []),
     {
       type: "thread.done",
       id: "event-thread-done",
       threadId: ORIGIN.threadId,
       state: {
         status: "done",
-        output: { content: JSON.stringify({ decisions: [], openQuestions: [] }) },
+        output: {
+          content: JSON.stringify({
+            decisions: [],
+            openQuestions: [],
+            ...(narrationOnly
+              ? {
+                  filesChanged: ["src/index.ts", "test/index.test.js"],
+                  diffSummary: "The agent says both verified files changed.",
+                }
+              : {}),
+          }),
+        },
       },
     },
     {
@@ -216,7 +233,15 @@ function delegatedEvents(command, output) {
   ];
 }
 
-async function runnerFixture({ command = "npm run typecheck && npm test", output = diffOutput() } = {}) {
+async function runnerFixture({
+  command = "npm run typecheck && npm test",
+  output = diffOutput(),
+  allowedFiles = ["src/index.ts", "test/index.test.js"],
+  includeDiff = true,
+  narrationOnly = false,
+  responseType = "tool.response",
+  run = true,
+} = {}) {
   const missions = new MissionService(new InMemoryMissionRepository(), fixedClock);
   const client = {
     sessions: {
@@ -229,7 +254,11 @@ async function runnerFixture({ command = "npm run typecheck && npm test", output
       async createTurnStream() {
         return {
           async *withMetadata() {
-            for (const event of delegatedEvents(command, output)) {
+            for (const event of delegatedEvents(command, output, {
+              includeDiff,
+              narrationOnly,
+              responseType,
+            })) {
               yield { data: event };
             }
           },
@@ -252,14 +281,17 @@ async function runnerFixture({ command = "npm run typecheck && npm test", output
     acceptanceCriteria: ["The bounded change is checked."],
     requiredChecks: ["typecheck", "test"],
     assignedRole: "implementer",
+    allowedFiles,
     status: "ready",
   });
   await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
-  const result = await runner.runTurn(mission.id, "Implement the bounded change.", {
-    workItemId: workItem.id,
-    delegateToSubagent: true,
-  });
-  return { missions, mission, workItem, result };
+  const result = run
+    ? await runner.runTurn(mission.id, "Implement the bounded change.", {
+        workItemId: workItem.id,
+        delegateToSubagent: true,
+      })
+    : undefined;
+  return { missions, mission, runner, workItem, result };
 }
 
 test("the default reviewer fails closed instead of trusting lexical contract anchors", () => {
@@ -344,14 +376,101 @@ test("an injected contract verifier accepts behavior it executes against the cha
 });
 
 test("shell wrappers cannot satisfy required delegated checks", async () => {
-  for (const command of ["echo npm test", "npm test || true"]) {
-    const { result } = await runnerFixture({ command });
-    assert.deepEqual(
-      result.implementationHandoff.checks.map((check) => [check.name, check.result]),
-      [["typecheck", "not_run"], ["test", "not_run"]],
+  for (const command of [
+    "echo npm test",
+    "npm test || true",
+    "npm run check 2>&1; echo \"EXIT_CODE=$?\"",
+  ]) {
+    const fixture = await runnerFixture({ command, run: false });
+    await assert.rejects(
+      fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
+        workItemId: fixture.workItem.id,
+        delegateToSubagent: true,
+      }),
+      (error) => /unsafe shell command|mask the real exit status/i.test(error.message),
+    );
+    const state = await fixture.missions.getState();
+    assert.equal(state.workItems.find((item) => item.id === fixture.workItem.id).status, "blocked");
+    assert.equal(
+      state.evidence.some((evidence) =>
+        evidence.result === "failed" && evidence.summary.startsWith("Delegated implementation evidence failed:"),
+      ),
+      true,
       command,
     );
   }
+});
+
+test("pending tool responses cannot satisfy delegated proof", async () => {
+  const fixture = await runnerFixture({ responseType: "tool.response_required", run: false });
+
+  await assert.rejects(
+    fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
+      workItemId: fixture.workItem.id,
+      delegateToSubagent: true,
+    }),
+    (error) => /no observed exit-preserving tool execution|was blocked/i.test(error.message),
+  );
+
+  const state = await fixture.missions.getState();
+  assert.equal(state.workItems.find((item) => item.id === fixture.workItem.id).status, "blocked");
+  assert.equal(state.evidence.some((evidence) =>
+    evidence.result === "failed" && evidence.summary.startsWith("Delegated implementation evidence failed:"),
+  ), true);
+});
+
+test("narrated file claims cannot substitute for a delegated content diff", async () => {
+  const fixture = await runnerFixture({ includeDiff: false, narrationOnly: true, run: false });
+
+  await assert.rejects(
+    fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
+      workItemId: fixture.workItem.id,
+      delegateToSubagent: true,
+    }),
+    (error) => /narration-only|content-bearing diff/i.test(error.message),
+  );
+
+  const state = await fixture.missions.getState();
+  const failure = state.evidence.find((evidence) =>
+    evidence.result === "failed" && evidence.summary.startsWith("Delegated implementation evidence failed:"),
+  );
+  assert.ok(failure);
+  assert.equal(state.workItems.find((item) => item.id === fixture.workItem.id).status, "blocked");
+  assert.match(failure.details, /narration-only|content-bearing diff/i);
+});
+
+test("safe working-directory prefixes preserve exit-aware check evidence", async () => {
+  const { result } = await runnerFixture({
+    command: "cd /workspace && npm run typecheck && npm test",
+  });
+
+  assert.deepEqual(result.implementationHandoff.checks.map((check) => [check.name, check.result]), [
+    ["typecheck", "passed"],
+    ["test", "passed"],
+  ]);
+});
+
+test("delegated diffs outside the work-item scope block implementation", async () => {
+  const fixture = await runnerFixture({
+    allowedFiles: ["src/index.ts"],
+    run: false,
+  });
+
+  await assert.rejects(
+    fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
+      workItemId: fixture.workItem.id,
+      delegateToSubagent: true,
+    }),
+    (error) => /outside the allowed scope|test\/index\.test\.js/i.test(error.message),
+  );
+
+  const state = await fixture.missions.getState();
+  const failure = state.evidence.find((evidence) =>
+    evidence.result === "failed" && evidence.summary.startsWith("Delegated implementation evidence failed:"),
+  );
+  assert.ok(failure);
+  assert.match(failure.details, /test\/index\.test\.js/);
+  assert.equal(state.workItems.find((item) => item.id === fixture.workItem.id).status, "blocked");
 });
 
 test("rename evidence uses the new path consistently", async () => {
@@ -361,7 +480,10 @@ test("rename evidence uses the new path consistently", async () => {
     "rename from src/old-name.ts",
     "rename to src/new-name.ts",
   ].join("\n");
-  const { missions, mission, workItem, result } = await runnerFixture({ output });
+  const { missions, mission, workItem, result } = await runnerFixture({
+    output,
+    allowedFiles: ["src/new-name.ts"],
+  });
 
   assert.deepEqual(result.implementationHandoff.filesChanged, ["src/new-name.ts"]);
   const handoff = await missions.recordHandoff(mission.id, {

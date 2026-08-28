@@ -28,6 +28,7 @@ export const DELEGATED_DELIVERY_FIXTURE = Object.freeze({
         dependsOn: [],
         assignedRole: "implementer",
         requiredChecks: ["typecheck", "test"],
+        allowedFiles: ["src/turn-1.ts", "test/turn-1.test.js"],
       },
       {
         id: "proof-loop-dependent",
@@ -37,6 +38,12 @@ export const DELEGATED_DELIVERY_FIXTURE = Object.freeze({
         dependsOn: ["proof-loop-root"],
         assignedRole: "implementer",
         requiredChecks: ["typecheck", "test"],
+        allowedFiles: [
+          "src/turn-2.ts",
+          "test/turn-2.test.js",
+          "src/turn-3.ts",
+          "test/turn-3.test.js",
+        ],
       },
       {
         id: "proof-loop-terminal",
@@ -46,6 +53,7 @@ export const DELEGATED_DELIVERY_FIXTURE = Object.freeze({
         dependsOn: ["proof-loop-dependent"],
         assignedRole: "implementer",
         requiredChecks: ["typecheck", "test"],
+        allowedFiles: ["src/turn-4.ts", "test/turn-4.test.js"],
       },
     ],
   },
@@ -251,6 +259,7 @@ async function runMalformedScenario(repository) {
       {
         ...DELEGATED_DELIVERY_FIXTURE.graph.items[0],
         id: "proof-loop-malformed-root",
+        allowedFiles: ["src/turn-1.ts", "test/turn-1.test.js"],
       },
       {
         ...DELEGATED_DELIVERY_FIXTURE.graph.items[1],
@@ -285,12 +294,13 @@ async function runMalformedScenario(repository) {
   };
 }
 
-function twoNodeScenarioGraph(prefix) {
+function twoNodeScenarioGraph(prefix, rootAttempt = "turn-1") {
   return {
     items: [
       {
         ...DELEGATED_DELIVERY_FIXTURE.graph.items[0],
         id: `${prefix}-root`,
+        allowedFiles: [`src/${rootAttempt}.ts`, `test/${rootAttempt}.test.js`],
       },
       {
         ...DELEGATED_DELIVERY_FIXTURE.graph.items[1],
@@ -384,7 +394,7 @@ async function runBlockedReviewScenario(repository) {
   });
   await missions.transitionMission(mission.id, "planning");
   await missions.transitionMission(mission.id, "executing");
-  await missions.persistWorkGraph(mission.id, twoNodeScenarioGraph("proof-loop-blocked"));
+  await missions.persistWorkGraph(mission.id, twoNodeScenarioGraph("proof-loop-blocked", "turn-1"));
   await runImplementation(missions, runner, mission.id, "proof-loop-blocked-root", "blocked-root");
   const historyBeforeReview = {
     handoffs: (await missions.listHandoffs(mission.id, "proof-loop-blocked-root")).length,

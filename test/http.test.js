@@ -598,11 +598,13 @@ test("run mission uses the runtime adapters and exposes passed proof", async () 
     runner.turnInputs[0].instruction,
     /Changes for this work item remain limited to src\/index\.ts/,
   );
+  assert.match(runner.turnInputs[0].instruction, /Allowed files for this work item: src\/index\.ts/);
   assert.match(runner.turnInputs[1].instruction, /test\/index\.test\.js/);
   assert.match(
     runner.turnInputs[1].instruction,
     /Changes for this work item remain limited to test\/index\.test\.js/,
   );
+  assert.match(runner.turnInputs[1].instruction, /Allowed files for this work item: test\/index\.test\.js/);
   assert.equal(runner.sandboxInputs[0].command, PRIMARY_VERIFICATION_COMMAND);
   assert.match(runner.sandboxInputs[0].command, /node --input-type=module -e/);
   assert.match(runner.sandboxInputs[0].command, /--loader/);
@@ -885,6 +887,7 @@ test("the primary controller persists every injected verifier outcome with revie
             dependsOn: ["primary-inspect"],
             assignedRole: "implementer",
             requiredChecks: ["typecheck", "test"],
+            allowedFiles: ["src/index.ts"],
           },
           {
             id: "controller-verify",

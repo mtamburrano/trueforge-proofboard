@@ -354,6 +354,7 @@ export interface MissionView {
       dependsOn: string[];
       assignedRole?: WorkItem["assignedRole"];
       requiredChecks?: string[];
+      allowedFiles?: string[];
       delegation?: WorkItem["delegation"];
     }>;
   }>;
@@ -433,7 +434,9 @@ function needsPrimaryWorkGraphUpgrade(workItems: WorkItem[]): boolean {
   const requiredChecks = implementer.requiredChecks ?? [];
   return workItems.some((item) => item.acceptanceCriteria.length === 0 || item.assignedRole === undefined) ||
     !requiredChecks.includes("typecheck") ||
-    !requiredChecks.includes("test");
+    !requiredChecks.includes("test") ||
+    implementer.allowedFiles === undefined ||
+    implementer.allowedFiles.length === 0;
 }
 
 function buildLegacyPrimaryWorkGraph(mission: Mission): WorkGraphDefinition {
@@ -461,6 +464,7 @@ function buildLegacyPrimaryWorkGraph(mission: Mission): WorkGraphDefinition {
         dependsOn: [LEGACY_PRIMARY_WORK_ITEM_IDS.inspect],
         assignedRole: "implementer",
         requiredChecks: ["typecheck", "test"],
+        allowedFiles: Object.keys(PRIMARY_VERIFIED_DELIVERY_FILES),
       },
       {
         id: LEGACY_PRIMARY_WORK_ITEM_IDS.verify,
@@ -504,6 +508,7 @@ function compactPrimaryWorkGraph(graph: WorkGraphDefinition): WorkGraphDefinitio
     );
   }
   const requiredChecks = [...new Set(implementers.flatMap((item) => item.requiredChecks ?? []))];
+  const allowedFiles = [...new Set(implementers.flatMap((item) => item.allowedFiles ?? []))];
   const inspection = inspections[0];
   const reviewer = reviewers[0];
   if (inspection === undefined || reviewer === undefined) {
@@ -523,6 +528,7 @@ function compactPrimaryWorkGraph(graph: WorkGraphDefinition): WorkGraphDefinitio
         dependsOn: [LEGACY_PRIMARY_WORK_ITEM_IDS.inspect],
         assignedRole: "implementer",
         ...(requiredChecks.length === 0 ? {} : { requiredChecks }),
+        allowedFiles,
       },
       {
         ...reviewer,
@@ -676,6 +682,7 @@ class MissionController {
             [
               `Execute only this bounded work item: ${implementer.purpose}`,
               `Acceptance criteria: ${implementer.acceptanceCriteria.join(" ")}`,
+              `Allowed files for this work item: ${(implementer.allowedFiles ?? []).join(", ")}`,
               "Use the configured sandbox and verified pinned source.",
               "Do not push, open a pull request, or perform any other remote mutation.",
             ].join(" "),
@@ -1665,6 +1672,7 @@ function lane(id: "plan" | "execute" | "prove" | "approve", label: string, items
       dependsOn: [...item.dependsOn],
       ...(item.assignedRole === undefined ? {} : { assignedRole: item.assignedRole }),
       ...(item.requiredChecks === undefined ? {} : { requiredChecks: [...item.requiredChecks] }),
+      ...(item.allowedFiles === undefined ? {} : { allowedFiles: [...item.allowedFiles] }),
       ...(item.delegation === undefined ? {} : { delegation: { ...item.delegation } }),
     })),
   };
@@ -2004,12 +2012,18 @@ function publicErrorMessage(error: unknown): string {
     if (error.operation.includes("delegate work item")) {
       return sanitizePublicRuntimeError(error.message);
     }
+    if (error.operation.includes("collect implementation evidence")) {
+      return sanitizePublicRuntimeError(error.message);
+    }
     return "The execution runtime is unavailable or could not complete the requested operation.";
   }
   if (error instanceof MissionControlError) {
     return error.message.slice(0, 240);
   }
   if (error instanceof MissionDomainError) {
+    if (/allowed file scope|outside .* scope|exit-preserving|content-bearing diff/i.test(error.message)) {
+      return sanitizePublicRuntimeError(error.message);
+    }
     return error.code === "not_found"
       ? "The requested mission state was not found."
       : "The mission state operation could not be completed.";

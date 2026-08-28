@@ -54,6 +54,53 @@ function delegatedEvents({ malformedCompletion = false, includeThread = true, th
       },
     });
     events.push({
+      type: "model.message",
+      id: "event-proof-model",
+      createdAt: "2026-08-27T12:00:02.500Z",
+      threadId: "thread-subagent",
+      toolCalls: [
+        {
+          id: "call-proof-checks",
+          function: {
+            name: "exec",
+            arguments: JSON.stringify({ command: "npm run typecheck && npm test" }),
+          },
+        },
+        {
+          id: "call-proof-diff",
+          function: { name: "exec", arguments: JSON.stringify({ command: "git diff" }) },
+        },
+      ],
+    });
+    events.push({
+      type: "tool.response",
+      id: "event-proof-checks-response",
+      createdAt: "2026-08-27T12:00:02.600Z",
+      threadId: "thread-subagent",
+      toolCallId: "call-proof-checks",
+      content: JSON.stringify({
+        success: true,
+        response: {
+          exitCode: 0,
+          result: "typecheck passed\ntests passed\n",
+        },
+      }),
+    });
+    events.push({
+      type: "tool.response",
+      id: "event-proof-diff-response",
+      createdAt: "2026-08-27T12:00:02.700Z",
+      threadId: "thread-subagent",
+      toolCallId: "call-proof-diff",
+      content: JSON.stringify({
+        success: true,
+        response: {
+          exitCode: 0,
+          result: "diff --git a/src/index.ts b/src/index.ts\n@@ -1 +1,2 @@\n+export const changed = true;\ndiff --git a/test/index.test.js b/test/index.test.js\n@@ -1 +1,2 @@\n+test(\"changed\", () => {});",
+        },
+      }),
+    });
+    events.push({
       type: "thread.done",
       id: "event-thread-done",
       createdAt: "2026-08-27T12:00:03.000Z",
@@ -125,6 +172,7 @@ async function delegatedFixture({ events = delegatedEvents(), repository = new I
     purpose: "Apply the requested change after inspection.",
     acceptanceCriteria: ["The bounded change is complete."],
     assignedRole: "implementer",
+    allowedFiles: ["src/index.ts", "test/index.test.js"],
     status: "ready",
   });
   await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
@@ -154,6 +202,9 @@ test("native dynamic delegation sends a bounded durable Work Packet and persists
   const prompt = calls.turns[0].request.input[0].content;
   assert.match(prompt, /Work Packet:/);
   assert.match(prompt, /Implement src\/index\.ts/);
+  assert.match(prompt, /allowedFiles/);
+  assert.match(prompt, /may modify only these explicitly allowed repository files/);
+  assert.match(prompt, /git diff -- <allowed file>/);
   assert.match(prompt, /The bounded change is complete/);
   assert.doesNotMatch(prompt, /must not enter the packet/);
   assert.equal(dependency.id, "evidence-dependency");
@@ -265,6 +316,7 @@ test("Work Packets contain only scoped durable state and domain delegation enfor
     acceptanceCriteria: ["Child is complete."],
     dependsOn: [root.id],
     assignedRole: "implementer",
+    allowedFiles: ["src/index.ts"],
   });
   const packet = buildWorkPacket(mission, child, {
     workItems: (await missions.getState()).workItems,

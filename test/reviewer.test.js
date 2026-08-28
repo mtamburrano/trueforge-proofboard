@@ -32,6 +32,7 @@ async function reviewFixture({
   includeDiff = true,
   diffCommand = "git diff",
   diffOutput = "diff --git a/src/index.ts b/src/index.ts\n--- a/src/index.ts\n+++ b/src/index.ts\n@@ -1 +1,2 @@\n before\n+after\ndiff --git a/test/index.test.js b/test/index.test.js\n--- a/test/index.test.js\n+++ b/test/index.test.js\n@@ -1 +1,2 @@\n before\n+after",
+  allowedFiles = ["src/index.ts", "test/index.test.js"],
 } = {}) {
   const missions = new MissionService(repository, fixedClock);
   const mission = await missions.createMission({
@@ -46,6 +47,7 @@ async function reviewFixture({
     acceptanceCriteria: ["The changed state is reviewed with passing checks."],
     requiredChecks: ["typecheck", "test"],
     assignedRole: "implementer",
+    allowedFiles,
     status: "ready",
   });
   await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
@@ -224,6 +226,7 @@ test("deterministic verifier derives acceptance, changes, and blocking from revi
 test("independent review rejects a content diff that contradicts the handoff files", async () => {
   const { missions, mission, workItem } = await reviewFixture({
     diffOutput: "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n before\n+after",
+    allowedFiles: ["src/index.ts", "test/index.test.js", "README.md"],
   });
   const context = await missions.getReviewContext(mission.id, workItem.id);
   const decision = new DeterministicImplementationVerifier().review(context);

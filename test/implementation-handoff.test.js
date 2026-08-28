@@ -9,6 +9,7 @@ import {
   JsonMissionRepository,
   MissionDomainError,
   MissionService,
+  TrueForgeIntegrationError,
   TrueForgeMissionRunner,
 } from "../dist/index.js";
 
@@ -41,6 +42,7 @@ async function delegatedFixture(repository = new InMemoryMissionRepository()) {
     acceptanceCriteria: ["The change is implemented and checked."],
     requiredChecks: ["typecheck", "test"],
     assignedRole: "implementer",
+    allowedFiles: ["src/index.ts", "test/index.test.js"],
     status: "ready",
   });
   await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
@@ -330,6 +332,58 @@ test("valid handoffs correlate every check and origin, then survive reconnect", 
   }
 });
 
+test("a structured handoff cannot authorize a diff outside the explicit file scope", async () => {
+  const { missions, mission, workItem } = await delegatedFixture();
+  const typecheck = await addEvidence(
+    missions,
+    mission.id,
+    "evidence-scope-typecheck",
+    "typecheck_result",
+    "passed",
+    "call-scope-typecheck",
+  );
+  const tests = await addEvidence(
+    missions,
+    mission.id,
+    "evidence-scope-test",
+    "test_result",
+    "passed",
+    "call-scope-test",
+  );
+  const diff = await missions.addEvidence(mission.id, {
+    id: "evidence-scope-diff",
+    workItemId: workItem.id,
+    kind: "diff_summary",
+    result: "passed",
+    source: "trueforge",
+    summary: "The delegated execution returned an out-of-scope diff.",
+    details: JSON.stringify({
+      command: "git diff",
+      output: [
+        "diff --git a/src/index.ts b/src/index.ts",
+        "@@ -1 +1,2 @@",
+        "+after",
+        "diff --git a/README.md b/README.md",
+        "@@ -1 +1,2 @@",
+        "+out of scope",
+      ].join("\n"),
+    }),
+    executionOrigin: { ...ORIGIN, toolCallId: "call-scope-diff" },
+  });
+
+  await assert.rejects(
+    missions.recordHandoff(mission.id, {
+      ...validHandoff({ typecheck: typecheck.id, test: tests.id, diff: diff.id }),
+      id: "handoff-out-of-scope",
+      filesChanged: ["src/index.ts", "README.md"],
+    }),
+    (error) => domainError("invalid_input")(error) && /outside.*scope|README\.md/i.test(error.message),
+  );
+  const state = await missions.getState();
+  assert.equal(state.handoffs.length, 0);
+  assert.equal(state.evidence.find((item) => item.id === diff.id).result, "passed");
+});
+
 test("uncorrelated evidence is rejected atomically while prior history is preserved", async () => {
   const { missions, mission, workItem } = await delegatedFixture();
   const other = await missions.addWorkItem(mission.id, {
@@ -459,6 +513,7 @@ test("TrueForge derives a structured handoff only from delegated tool responses"
     acceptanceCriteria: ["The change is checked."],
     requiredChecks: ["typecheck", "test"],
     assignedRole: "implementer",
+    allowedFiles: ["src/index.ts", "test/index.test.js"],
     status: "ready",
   });
   await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
@@ -521,23 +576,25 @@ test("coordinator-thread checks and diff cannot prove delegated completion", asy
     acceptanceCriteria: ["The child produces correlated checks and a diff."],
     requiredChecks: ["typecheck", "test"],
     assignedRole: "implementer",
+    allowedFiles: ["src/index.ts", "test/index.test.js"],
     status: "ready",
   });
   await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
 
-  const result = await runner.runTurn(
-    mission.id,
-    "Implement the bounded change.",
-    { workItemId: workItem.id, delegateToSubagent: true },
-  );
-
-  assert.equal(result.implementationHandoff, undefined);
   await assert.rejects(
-    missions.transitionWorkItem(mission.id, workItem.id, "ready_for_review"),
-    domainError("invalid_transition"),
+    runner.runTurn(
+      mission.id,
+      "Implement the bounded change.",
+      { workItemId: workItem.id, delegateToSubagent: true },
+    ),
+    (error) => error instanceof TrueForgeIntegrationError &&
+      /observed exit-preserving|was blocked/i.test(error.message),
   );
   const state = await missions.getState();
   assert.equal(state.workItems[0].delegation.status, "completed");
-  assert.equal(state.workItems[0].status, "in_progress");
+  assert.equal(state.workItems[0].status, "blocked");
   assert.equal(state.evidence.some((item) => item.kind === "diff_summary"), false);
+  assert.equal(state.evidence.some((item) =>
+    item.result === "failed" && item.summary.startsWith("Delegated implementation evidence failed:"),
+  ), true);
 });

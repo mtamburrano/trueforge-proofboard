@@ -42,6 +42,7 @@ function graph() {
         acceptanceCriteria: ["The requested behavior is implemented."],
         dependsOn: ["inspect"],
         assignedRole: "implementer",
+        allowedFiles: ["src/index.ts"],
       },
       {
         id: "verify",
@@ -92,6 +93,8 @@ test("the repository planner derives bounded work from verified inspection facts
   ]);
   assert.equal(planned.items.every((item) => item.acceptanceCriteria.length > 0), true);
   assert.match(planned.items[1].purpose, /src\/index\.ts/);
+  assert.deepEqual(planned.items[1].allowedFiles, ["src/index.ts"]);
+  assert.deepEqual(planned.items[2].allowedFiles, ["test/index.test.js"]);
   assert.match(planned.items[0].acceptanceCriteria[0], /sha256:verified/);
 
   const documentationPlan = planner.plan({
@@ -148,6 +151,10 @@ test("the primary objective authorizes both source and verified focused-test sur
   );
   assert.match(implementers[0].purpose, /src\/index\.ts/);
   assert.match(implementers[1].purpose, /test\/index\.test\.js/);
+  assert.deepEqual(implementers.map((item) => item.allowedFiles), [
+    ["src/index.ts"],
+    ["test/index.test.js"],
+  ]);
   assert.deepEqual(
     planned.items.find((item) => item.assignedRole === "reviewer").dependsOn,
     implementers.map((item) => item.id),
@@ -227,6 +234,7 @@ test("invalid planning output fails closed without partially executable state", 
           acceptanceCriteria: ["Never executable."],
           dependsOn: ["cycle-a"],
           assignedRole: "implementer",
+          allowedFiles: ["src/index.ts"],
         },
       ],
     }),
@@ -260,6 +268,7 @@ test("graph-size bounds reject oversized and ambiguous plans", () => {
       acceptanceCriteria: ["The item is bounded."],
       dependsOn: [],
       assignedRole: "implementer",
+      allowedFiles: [`src/file-${index}.ts`],
     })),
   };
   assert.throws(() => validateWorkGraph(oversized), domainError("invalid_input"));

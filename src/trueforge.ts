@@ -218,6 +218,16 @@ export function buildWorkPacket(
   if (workItem.requiredChecks !== undefined) {
     packet.workItem.requiredChecks = [...workItem.requiredChecks];
   }
+  if (workItem.assignedRole === "implementer" &&
+      (workItem.allowedFiles === undefined || workItem.allowedFiles.length === 0)) {
+    throw new MissionDomainError(
+      "invalid_input",
+      `Work item ${workItem.id} cannot be delegated without an explicit allowed file scope.`,
+    );
+  }
+  if (workItem.allowedFiles !== undefined) {
+    packet.workItem.allowedFiles = [...workItem.allowedFiles];
+  }
   const serialized = JSON.stringify(packet);
   if (serialized.length > MAX_WORK_PACKET_BYTES) {
     throw new MissionDomainError(
@@ -235,12 +245,21 @@ export function buildDelegatedTurnInstruction(
   if (instruction.trim().length === 0) {
     throw new MissionDomainError("invalid_input", "Delegated turn instruction must not be empty.");
   }
+  if (packet.workItem.role === "implementer" &&
+      (packet.workItem.allowedFiles === undefined || packet.workItem.allowedFiles.length === 0)) {
+    throw new MissionDomainError(
+      "invalid_input",
+      `Work item ${packet.workItem.id} cannot be delegated without an explicit allowed file scope.`,
+    );
+  }
+  const allowedFiles = packet.workItem.allowedFiles ?? [];
   return [
     "Use TrueForge's native dynamic subagent capability.",
     "Delegate this bounded work item to exactly one dynamic subagent; the parent coordinator must not perform the work itself.",
     `Work Packet: ${JSON.stringify(packet)}`,
     `Coordinator instruction: ${instruction.trim()}`,
-    "The subagent may use only the configured tools and the repository/evidence context in this packet. It must execute every required check, capture a bounded content-bearing git diff, and return control after the subagent finishes.",
+    `The subagent may modify only these explicitly allowed repository files: ${allowedFiles.join(", ")}. Any observed change outside this scope fails the handoff.`,
+    "The subagent may use only the configured tools and the repository/evidence context in this packet. It must execute every required check through an exit-preserving command, capture a bounded content-bearing git diff through the delegated thread's tool restricted to the allowed files (for example, git diff -- <allowed file>), and return control after the subagent finishes.",
     "End with a machine-readable IMPLEMENTATION_HANDOFF object containing decisions and openQuestions. The coordinator will independently correlate changed files and check results to the observed tool responses.",
   ].join("\n");
 }
@@ -250,14 +269,18 @@ export class RepositoryWorkGraphPlanner implements WorkGraphPlanner {
     const objective = planningString(input.mission.objective, "mission objective");
     const inspection = validatePlanningInspection(input.inspection);
     const files = referencedFiles(objective, inspection);
+    if (files.length === 0) {
+      throw new MissionDomainError(
+        "invalid_input",
+        "Verified repository inspection did not identify a bounded file scope for implementation.",
+      );
+    }
     const repositoryLabel = input.mission.repository === undefined
       ? "the verified repository"
       : `${input.mission.repository.owner}/${input.mission.repository.name}@${input.mission.repository.ref}`;
     const inspectionLabel = `${inspection.resourceUri} (${inspection.contentHash})`;
-    const fileScope = files.length === 0 ? "the verified repository surface" : files.join(", ");
-    const implementationScopes = files.length === 0
-      ? [{ id: PRIMARY_WORK_GRAPH_IDS.implement, label: fileScope }]
-      : files.map((file, index) => ({
+    const fileScope = files.join(", ");
+    const implementationScopes = files.map((file, index) => ({
         id: implementationWorkItemId(file, index),
         label: file,
       }));
@@ -272,6 +295,7 @@ export class RepositoryWorkGraphPlanner implements WorkGraphPlanner {
       dependsOn: [PRIMARY_WORK_GRAPH_IDS.inspect],
       assignedRole: "implementer" as const,
       requiredChecks: ["typecheck", "test"],
+      allowedFiles: [scope.label],
     }));
 
     return validateWorkGraph({
@@ -547,6 +571,7 @@ export interface WorkPacket {
     dependencies: Array<{ id: string; status: WorkItem["status"] }>;
     role: NonNullable<WorkItem["assignedRole"]>;
     requiredChecks?: string[];
+    allowedFiles?: string[];
   };
   repository?: { owner: string; name: string; ref: string };
   evidence: Array<{
@@ -1740,7 +1765,7 @@ export class TrueForgeMissionRunner {
     rawEvents: TrueForgeApi.TurnStreamingEvent[],
     runtimeEvidenceIdsByEventId: Map<string, string>,
     delegatedOutput: Record<string, unknown> | undefined,
-  ): Promise<ImplementationHandoffDraft | undefined> {
+  ): Promise<ImplementationHandoffDraft> {
     const executions = observedToolCalls(rawEvents)
       .filter((call) =>
         call.name === "exec" && call.threadId === delegatedThread.threadId
@@ -1753,13 +1778,19 @@ export class TrueForgeMissionRunner {
       .filter((execution): execution is typeof execution & { command: string } =>
         execution.command !== null,
       );
+    const requiredChecks = workItem.requiredChecks ?? [];
     const checkExecutions = executions.filter((execution) =>
       checkNamesForCommand(execution.command).length > 0,
     );
-    const diffExecutions = executions.filter((execution) => isContentDiffCommand(execution.command));
-    if (diffExecutions.length === 0) {
-      return undefined;
-    }
+    const unsafeCheckExecutions = executions.filter((execution) => {
+      const safeNames = checkNamesForCommand(execution.command);
+      const mentionedNames = checkNamesMentionedInCommand(execution.command)
+        .filter((name) => requiredChecks.length === 0 || requiredChecks.includes(name));
+      return safeNames.length === 0 && mentionedNames.length > 0;
+    });
+    const diffExecutions = executions.filter((execution) =>
+      isContentDiffCommand(normalizeSafeWorkingDirectoryPrefix(execution.command)),
+    );
 
     const narrative = implementationHandoffNarrative(delegatedOutput);
     const checkEvidenceIds: string[] = [];
@@ -1799,14 +1830,13 @@ export class TrueForgeMissionRunner {
           name,
           command: execution.command,
           result,
-          required: workItem.requiredChecks?.includes(name) ?? false,
+          required: requiredChecks.length === 0 || requiredChecks.includes(name),
           evidenceIds: supportingEvidenceIds,
           ...(observed?.exitCode === undefined ? {} : { exitCode: observed.exitCode }),
         });
       }
     }
 
-    const requiredChecks = workItem.requiredChecks ?? [];
     for (const name of requiredChecks) {
       if (!latestChecks.has(name)) {
         latestChecks.set(name, {
@@ -1818,8 +1848,31 @@ export class TrueForgeMissionRunner {
         });
       }
     }
-    if (latestChecks.size === 0) {
-      return undefined;
+    const missingChecks = requiredChecks.filter((name) =>
+      latestChecks.get(name)?.result !== "passed",
+    );
+    if (missingChecks.length > 0) {
+      const unsafeExecution = unsafeCheckExecutions.find((execution) =>
+        checkNamesMentionedInCommand(execution.command).some((name) => missingChecks.includes(name)),
+      );
+      const reason = unsafeExecution === undefined
+        ? missingChecks.map((name) => {
+            const check = latestChecks.get(name);
+            return check?.result === "failed"
+              ? `Required check "${name}" failed in observed command "${check.command}"${check.exitCode === undefined ? "." : ` with exit code ${check.exitCode}.`}`
+              : `Required check "${name}" has no observed exit-preserving tool execution.`;
+          }).join(" ")
+        : `Required check(s) ${checkNamesMentionedInCommand(unsafeExecution.command)
+            .filter((name) => missingChecks.includes(name)).join(", ")} used an unsafe shell command "${unsafeExecution.command}" that can mask the real exit status. Use the check directly or only with a safe working-directory prefix.`;
+      return this.failImplementationEvidence(
+        mission,
+        workItem,
+        sessionId,
+        turnId,
+        delegatedThread,
+        reason,
+        executions,
+      );
     }
 
     const successfulDiffExecutions = diffExecutions.flatMap((execution) => {
@@ -1832,18 +1885,68 @@ export class TrueForgeMissionRunner {
         : [];
     });
     if (successfulDiffExecutions.length === 0) {
-      return undefined;
+      return this.failImplementationEvidence(
+        mission,
+        workItem,
+        sessionId,
+        turnId,
+        delegatedThread,
+        diffExecutions.length === 0
+          ? "No observed content-bearing diff tool call was found for the delegated work; narration-only file or diff claims do not count."
+          : "Observed delegated diff commands did not return a successful content-bearing tool result.",
+        executions,
+      );
     }
     const latestDiff = successfulDiffExecutions.at(-1);
     const diffOutput = latestDiff?.observed.output ?? "";
-    const diffCommand = latestDiff?.execution.command ?? "";
+    const diffCommand = normalizeSafeWorkingDirectoryPrefix(latestDiff?.execution.command ?? "");
     const filesChanged = changedFilesFromDiff(diffOutput, diffCommand);
     if (filesChanged.length === 0) {
-      return undefined;
+      return this.failImplementationEvidence(
+        mission,
+        workItem,
+        sessionId,
+        turnId,
+        delegatedThread,
+        "The observed delegated content diff did not identify any changed files.",
+        executions,
+      );
+    }
+    const allowedFiles = workItem.allowedFiles ?? [];
+    if (allowedFiles.length === 0) {
+      return this.failImplementationEvidence(
+        mission,
+        workItem,
+        sessionId,
+        turnId,
+        delegatedThread,
+        "The delegated implementation has no explicit allowed file scope.",
+        executions,
+      );
+    }
+    const outOfScopeFiles = filesChanged.filter((file) => !allowedFiles.includes(file));
+    if (outOfScopeFiles.length > 0) {
+      return this.failImplementationEvidence(
+        mission,
+        workItem,
+        sessionId,
+        turnId,
+        delegatedThread,
+        `The observed delegated diff changes files outside the allowed scope: ${outOfScopeFiles.join(", ")}. Allowed files: ${allowedFiles.join(", ")}.`,
+        executions,
+      );
     }
     const diffSummary = summarizeOutput(diffOutput);
     if (diffSummary.length === 0) {
-      return undefined;
+      return this.failImplementationEvidence(
+        mission,
+        workItem,
+        sessionId,
+        turnId,
+        delegatedThread,
+        "The observed delegated content diff had no bounded summary.",
+        executions,
+      );
     }
     const diffExecution = latestDiff?.execution;
     const diffObserved = latestDiff?.observed;
@@ -1890,6 +1993,54 @@ export class TrueForgeMissionRunner {
         threadId: delegatedThread.threadId,
       },
     };
+  }
+
+  private async failImplementationEvidence(
+    mission: Mission,
+    workItem: WorkItem,
+    sessionId: string,
+    turnId: string,
+    delegatedThread: { threadId: string; owner: string },
+    reason: string,
+    executions: Array<{ command: string }>,
+  ): Promise<never> {
+    const safeReason = sanitizeRuntimeText(reason);
+    let evidenceId: string | undefined;
+    try {
+      const evidence = await this.missions.addEvidence(mission.id, {
+        workItemId: workItem.id,
+        kind: "tool_result",
+        result: "failed",
+        source: "trueforge",
+        summary: `Delegated implementation evidence failed: ${safeReason}`,
+        details: JSON.stringify({
+          reason: safeReason,
+          allowed_files: workItem.allowedFiles ?? [],
+          observed_commands: uniqueStrings(executions.map((execution) => execution.command)).slice(-12),
+        }),
+        executionOrigin: {
+          kind: "trueforge",
+          sessionId,
+          turnId,
+          threadId: delegatedThread.threadId,
+        },
+      });
+      evidenceId = evidence.id;
+    } catch {
+      // Preserve the concrete proof failure even if durable failure recording is unavailable.
+    }
+    try {
+      const current = await this.missions.getWorkItem(mission.id, workItem.id);
+      if (current.status === "in_progress" || current.status === "ready_for_review") {
+        await this.missions.transitionWorkItem(mission.id, workItem.id, "blocked");
+      }
+    } catch {
+      // Preserve the concrete proof failure when the work item cannot be transitioned again.
+    }
+    throw new TrueForgeIntegrationError(
+      "collect implementation evidence",
+      `${safeReason} Work item ${workItem.id} was blocked.${evidenceId === undefined ? "" : ` Recorded failed evidence ${evidenceId}.`}`,
+    );
   }
 
   private async recordInspectionFailure(
@@ -2454,6 +2605,7 @@ function buildContractReviewInstruction(context: ReviewContext): string {
       title: context.workItem.title,
       purpose: context.workItem.purpose,
       acceptanceCriteria: context.workItem.acceptanceCriteria,
+      allowedFiles: context.workItem.allowedFiles ?? [],
     },
     claimedFilesChanged: context.filesChanged,
     actualFilesChanged: context.actualFilesChanged,
@@ -2742,7 +2894,7 @@ function executionCommand(argumentsValue: unknown): string | null {
 }
 
 function checkNamesForCommand(command: string): string[] {
-  const normalized = command.trim().replace(/\s+/g, " ");
+  const normalized = normalizeSafeWorkingDirectoryPrefix(command);
   switch (normalized) {
     case "npm run check":
     case "npm run typecheck && npm test":
@@ -2757,6 +2909,34 @@ function checkNamesForCommand(command: string): string[] {
       return ["test"];
     default:
       return [];
+  }
+}
+
+function checkNamesMentionedInCommand(command: string): string[] {
+  const normalized = command.trim().replace(/\s+/g, " ");
+  const names: string[] = [];
+  if (/(?:^|\s)npm\s+run\s+(?:check|typecheck)(?:\s|$)/.test(normalized) ||
+      /(?:^|\s)tsc\s+--noEmit(?:\s|$)/.test(normalized)) {
+    names.push("typecheck");
+  }
+  if (/(?:^|\s)npm\s+run\s+(?:check|test)(?:\s|$)/.test(normalized) ||
+      /(?:^|\s)npm\s+test(?:\s|$)/.test(normalized) ||
+      /(?:^|\s)node\s+--test(?:\s|$)/.test(normalized)) {
+    names.push("test");
+  }
+  return names;
+}
+
+function normalizeSafeWorkingDirectoryPrefix(command: string): string {
+  let normalized = command.trim().replace(/\s+/g, " ");
+  while (true) {
+    const prefix = normalized.match(
+      /^cd\s+(?:"[^"]*"|'[^']*'|[A-Za-z0-9._~/:+-]+)\s+&&\s+(.+)$/,
+    );
+    if (prefix === null || prefix[1] === undefined) {
+      return normalized;
+    }
+    normalized = prefix[1].trim();
   }
 }
 
@@ -3013,7 +3193,7 @@ interface ParsedExecutionResponse {
 function parseExecutionResponse(
   event: TrueForgeApi.TurnStreamingEvent | undefined,
 ): ParsedExecutionResponse | null {
-  if (event === undefined) {
+  if (event === undefined || event.type !== "tool.response") {
     return null;
   }
   const responseValue = parseMaybeJson(recordValue(event).content);
@@ -3596,6 +3776,13 @@ function verifySandboxReadiness(
     );
   }
   return { ...execution, nodeVersion, npmVersion };
+}
+
+function sanitizeRuntimeText(value: string): string {
+  return value
+    .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s,;]+/gi, "$1[redacted]")
+    .replace(/((?:api[_-]?key|token|password|secret)\s*[:=]\s*)[^\s,;]+/gi, "$1[redacted]")
+    .slice(0, 1_200);
 }
 
 function summarizeOutput(value: string): string {

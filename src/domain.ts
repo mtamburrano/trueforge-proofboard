@@ -32,6 +32,7 @@ export type ExecutionRole = (typeof executionRoles)[number];
 export const MAX_WORK_GRAPH_ITEMS = 8;
 export const MAX_WORK_ITEM_ACCEPTANCE_CRITERIA = 12;
 export const MAX_WORK_ITEM_REQUIRED_CHECKS = 12;
+export const MAX_WORK_ITEM_ALLOWED_FILES = 8;
 export const implementationCheckResults = ["passed", "failed", "not_run"] as const;
 export type ImplementationCheckResult = (typeof implementationCheckResults)[number];
 export const executionOriginKinds = ["trueforge", "mcp", "sandbox", "tool"] as const;
@@ -184,6 +185,7 @@ export interface WorkItem {
   updatedAt: string;
   assignedRole?: ExecutionRole;
   requiredChecks?: string[];
+  allowedFiles?: string[];
   delegation?: WorkItemDelegation;
 }
 
@@ -205,6 +207,7 @@ export interface WorkGraphItem {
   dependsOn: string[];
   assignedRole: ExecutionRole;
   requiredChecks?: string[];
+  allowedFiles?: string[];
 }
 
 export interface WorkGraphDefinition {
@@ -385,6 +388,7 @@ export interface CreateWorkItemInput {
   dependsOn?: string[];
   assignedRole?: ExecutionRole;
   requiredChecks?: string[];
+  allowedFiles?: string[];
   status?: "backlog" | "ready";
 }
 
@@ -575,6 +579,43 @@ function optionalStringArray(
   return value === undefined ? undefined : stringArray(value, label, maxItems);
 }
 
+function filePathArray(
+  value: unknown,
+  label: string,
+): string[] {
+  const files = stringArray(value, label, MAX_WORK_ITEM_ALLOWED_FILES);
+  for (const file of files) {
+    if (
+      file.startsWith("/") ||
+      file.startsWith("\\") ||
+      /^[A-Za-z]:[\\/]/.test(file) ||
+      file.includes("\\") ||
+      file.length > 500 ||
+      file.includes("\u0000") ||
+      /[\u0000-\u001f\u007f]/.test(file) ||
+      file.includes("*") ||
+      file.includes("?") ||
+      file.includes("[") ||
+      file.includes("]") ||
+      /[;|&$`(){}<>"']/.test(file) ||
+      file.split("/").some((segment) => segment.length === 0 || segment === "." || segment === "..")
+    ) {
+      return fail(
+        "invalid_input",
+        `${label} must contain safe repository-relative file paths without traversal or shell wildcards.`,
+      );
+    }
+  }
+  return files;
+}
+
+function optionalFilePathArray(
+  value: unknown,
+  label: string,
+): string[] | undefined {
+  return value === undefined ? undefined : filePathArray(value, label);
+}
+
 function stableGraphId(value: unknown, label: string): string {
   const result = identifier(value, label);
   if (!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(result)) {
@@ -687,6 +728,16 @@ export function validateWorkGraph(value: unknown): WorkGraphDefinition {
       `workGraph.items[${index}].requiredChecks`,
       MAX_WORK_ITEM_REQUIRED_CHECKS,
     );
+    const allowedFiles = optionalFilePathArray(
+      item.allowedFiles,
+      `workGraph.items[${index}].allowedFiles`,
+    );
+    if (assignedRole === "implementer" && (allowedFiles === undefined || allowedFiles.length === 0)) {
+      return fail(
+        "invalid_input",
+        `workGraph.items[${index}].allowedFiles must identify the bounded files an implementer may change.`,
+      );
+    }
     const result: WorkGraphItem = {
       id,
       title: requiredString(item.title, `workGraph.items[${index}].title`, 500),
@@ -707,6 +758,9 @@ export function validateWorkGraph(value: unknown): WorkGraphDefinition {
         );
       }
       result.requiredChecks = requiredChecks;
+    }
+    if (allowedFiles !== undefined) {
+      result.allowedFiles = allowedFiles;
     }
     return result;
   });
@@ -854,6 +908,7 @@ function validateWorkItem(value: unknown, label: string): WorkItem {
     `${label}.requiredChecks`,
     MAX_WORK_ITEM_REQUIRED_CHECKS,
   );
+  const allowedFiles = optionalFilePathArray(workItem.allowedFiles, `${label}.allowedFiles`);
   const rawAcceptanceCriteria = workItem.acceptanceCriteria ?? workItem.acceptanceConditions;
   const acceptanceCriteria = rawAcceptanceCriteria === undefined
     ? []
@@ -881,6 +936,9 @@ function validateWorkItem(value: unknown, label: string): WorkItem {
       return fail("invalid_input", `${label}.requiredChecks must contain at least one check.`);
     }
     result.requiredChecks = requiredChecks;
+  }
+  if (allowedFiles !== undefined) {
+    result.allowedFiles = allowedFiles;
   }
   if (workItem.delegation !== undefined) {
     result.delegation = validateWorkItemDelegation(workItem.delegation, `${label}.delegation`);
@@ -1893,6 +1951,29 @@ function validateStructuredHandoffCorrelation(
     );
   }
 
+  if (isStructuredImplementationWorkItem(workItem) && enforceCurrentDelegation) {
+    const allowedFiles = workItem.allowedFiles;
+    if (allowedFiles === undefined || allowedFiles.length === 0) {
+      return fail(
+        "invalid_input",
+        `Work item ${workItem.id} has no explicit allowed file scope for delegated implementation.`,
+      );
+    }
+    const observedChangedFiles = [...new Set(changedStateEvidence.flatMap((evidence) =>
+      changedFilesFromContentBearingEvidence(evidence) ?? []
+    ))];
+    const outOfScopeFiles = [...new Set([
+      ...handoff.filesChanged,
+      ...observedChangedFiles,
+    ].filter((file) => !allowedFiles.includes(file)))];
+    if (outOfScopeFiles.length > 0) {
+      return fail(
+        "invalid_input",
+        `Handoff ${handoff.id} changes files outside work item ${workItem.id} scope: ${outOfScopeFiles.join(", ")}. Allowed files: ${allowedFiles.join(", ")}.`,
+      );
+    }
+  }
+
   if (handoff.result !== "done") {
     return;
   }
@@ -1944,6 +2025,21 @@ function ensureSuccessfulImplementationHandoff(state: MissionState, workItem: Wo
     .at(-1);
   const structured = latest === undefined ? null : asStructuredHandoff(latest);
   if (latest === undefined || structured === null || latest.result !== "done") {
+    const proofFailure = state.evidence
+      .filter((evidence) =>
+        evidence.missionId === workItem.missionId &&
+        evidence.workItemId === workItem.id &&
+        evidence.source === "trueforge" &&
+        evidence.result === "failed" &&
+        evidence.summary.startsWith("Delegated implementation evidence failed:"),
+      )
+      .at(-1);
+    if (proofFailure !== undefined) {
+      return fail(
+        "invalid_transition",
+        `Work item ${workItem.id} cannot reach review: ${proofFailure.summary}`,
+      );
+    }
     return fail(
       "invalid_transition",
       `Work item ${workItem.id} requires a valid structured implementation handoff before review.`,
@@ -2288,6 +2384,10 @@ export class MissionService {
           updatedAt: now,
           assignedRole: planned.assignedRole,
         };
+        const allowedFiles = planned.allowedFiles ?? prior?.allowedFiles;
+        if (allowedFiles !== undefined) {
+          workItem.allowedFiles = [...allowedFiles];
+        }
         const requiredChecks = planned.requiredChecks ?? prior?.requiredChecks;
         if (requiredChecks !== undefined) {
           workItem.requiredChecks = [...requiredChecks];
@@ -2345,6 +2445,13 @@ export class MissionService {
       ensureDependenciesComplete(state, workItem);
       if (workItem.delegation?.status === "running") {
         fail("invalid_transition", `Work item ${workItem.id} already has a running delegation.`);
+      }
+      if (workItem.assignedRole === "implementer" &&
+          (workItem.allowedFiles === undefined || workItem.allowedFiles.length === 0)) {
+        fail(
+          "invalid_transition",
+          `Work item ${workItem.id} requires an explicit allowed file scope before delegation starts.`,
+        );
       }
       const owner = requiredString(input.owner, "delegation.owner", 200);
       const threadId = requiredString(input.threadId, "delegation.threadId", 200);
@@ -2473,6 +2580,7 @@ export class MissionService {
       if (requiredChecks !== undefined && requiredChecks.length === 0) {
         fail("invalid_input", "requiredChecks must contain at least one check.");
       }
+      const allowedFiles = optionalFilePathArray(input.allowedFiles, "allowedFiles");
       const workItem: WorkItem = {
         id,
         missionId: normalizedMissionId,
@@ -2495,6 +2603,9 @@ export class MissionService {
       }
       if (requiredChecks !== undefined) {
         workItem.requiredChecks = requiredChecks;
+      }
+      if (allowedFiles !== undefined) {
+        workItem.allowedFiles = allowedFiles;
       }
       state.workItems.push(workItem);
       return workItem;
