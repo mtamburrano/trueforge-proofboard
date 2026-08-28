@@ -232,12 +232,14 @@ function lockedCommitEvents(
       repo: "proofboard-demo-fixture",
       sha: LOCKED_FIXTURE_REF,
       detail: "full_patch",
+      perPage: 100,
     },
     sha = LOCKED_FIXTURE_SHA,
     patches = LOCKED_FIXTURE_PATCHES,
     responseContent,
     responseCallId = "call-commit",
     attempts,
+    turnState = { status: "done", requiredActions: [] },
   } = {},
 ) {
   const commitAttempts = attempts ?? [{
@@ -316,7 +318,7 @@ function lockedCommitEvents(
       id: "event-turn-done",
       createdAt: "2026-08-26T16:00:04.000Z",
       threadId: null,
-      state: { status: "done", requiredActions: [] },
+      state: turnState,
     },
   ];
 }
@@ -448,6 +450,7 @@ function deliveryApprovalEvents(turnId, target, readbackOptions = {}) {
         repo: target.repo,
         sha: target.head,
         detail: "full_patch",
+        perPage: 100,
       },
       sha: target.headSha,
       patches: PRIMARY_VERIFIED_DELIVERY_PATCHES,
@@ -1223,6 +1226,7 @@ test("a delivery-head race blocks the approval allow before any protected operat
         repo: target.repo,
         sha: target.head,
         detail: "full_patch",
+        perPage: 100,
       },
       sha: "9cc33b73c4825f7aa5d3b1ce6c5510fc8e1b20f2",
       patches: PRIMARY_VERIFIED_DELIVERY_PATCHES,
@@ -1338,6 +1342,7 @@ test("locked fixture inspection proves direct TrueForge get_commit content and e
   assert.match(calls.turns[0].request.input[0].content, /"repo":"proofboard-demo-fixture"/);
   assert.match(calls.turns[0].request.input[0].content, new RegExp(LOCKED_FIXTURE_REF));
   assert.match(calls.turns[0].request.input[0].content, /"detail":"full_patch"/);
+  assert.match(calls.turns[0].request.input[0].content, /"perPage":100/);
 
   const state = await missions.getState();
   const proof = state.evidence.find((item) => item.id === inspection.evidenceId);
@@ -1347,9 +1352,115 @@ test("locked fixture inspection proves direct TrueForge get_commit content and e
     repo: "proofboard-demo-fixture",
     sha: LOCKED_FIXTURE_REF,
     detail: "full_patch",
+    perPage: 100,
   });
   assert.equal(details.commit_sha, LOCKED_FIXTURE_SHA);
   assert.deepEqual(details.patches, LOCKED_FIXTURE_PATCHES);
+});
+
+test("locked fixture inspection bounds the first MCP read and restores the normal session runtime", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  let unboundedRetryAttempted = false;
+  const { client, calls } = fakeClient((turnId, agentSpec) => {
+    const bounded = agentSpec?.config?.iterationLimit === COORDINATOR_TRUEFORGE_ITERATION_LIMIT &&
+      agentSpec?.model?.params?.parallelToolCalls === false;
+    if (!bounded) {
+      unboundedRetryAttempted = true;
+      return lockedCommitEvents(turnId, {
+        attempts: [
+          {
+            callId: "call-page-one",
+            argumentsValue: {
+              owner: "mtamburrano",
+              repo: "proofboard-demo-fixture",
+              sha: LOCKED_FIXTURE_REF,
+              detail: "full_patch",
+              perPage: 1,
+            },
+            sha: LOCKED_FIXTURE_SHA,
+            patches: LOCKED_FIXTURE_PATCHES,
+          },
+          {
+            callId: "call-corrective-page",
+            argumentsValue: {
+              owner: "mtamburrano",
+              repo: "proofboard-demo-fixture",
+              sha: LOCKED_FIXTURE_REF,
+              detail: "full_patch",
+              perPage: 100,
+            },
+            sha: LOCKED_FIXTURE_SHA,
+            patches: LOCKED_FIXTURE_PATCHES,
+          },
+        ],
+      });
+    }
+    return lockedCommitEvents(turnId, {
+      argumentsValue: {
+        owner: "mtamburrano",
+        repo: "proofboard-demo-fixture",
+        sha: LOCKED_FIXTURE_REF,
+        detail: "full_patch",
+        perPage: 100,
+      },
+      turnState: {
+        status: "error",
+        message: "TrueForge iteration limit reached after the canonical repository read.",
+        requiredActions: [],
+      },
+    });
+  }, { passAgentSpec: true });
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "google-gemini/test-model",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-mcp-bounded-first-read",
+    objective: "Inspect the locked fixture with one deterministic MCP read",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  const inspection = await runner.inspectRepository({ missionId: mission.id });
+
+  assert.equal(inspection.commitSha, LOCKED_FIXTURE_SHA);
+  assert.deepEqual(inspection.patches, LOCKED_FIXTURE_PATCHES);
+  assert.equal(unboundedRetryAttempted, false);
+  assert.equal(calls.turns.length, 1);
+  const observedCalls = calls.turns[0].events
+    .filter((event) => event.type === "model.message.delta")
+    .flatMap((event) => event.toolCalls ?? [])
+    .filter((call) => call.function?.name === "get_commit");
+  assert.equal(observedCalls.length, 1);
+  const observedArguments = calls.turns[0].events
+    .filter((event) => event.type === "model.message.delta")
+    .flatMap((event) => event.toolCalls ?? [])
+    .filter((call) => call.index === 0)
+    .map((call) => call.function?.arguments ?? "")
+    .join("");
+  assert.deepEqual(JSON.parse(observedArguments), {
+    owner: "mtamburrano",
+    repo: "proofboard-demo-fixture",
+    sha: LOCKED_FIXTURE_REF,
+    detail: "full_patch",
+    perPage: 100,
+  });
+  assert.deepEqual(
+    calls.updates.map((update) => update.request.agent.spec.config.iterationLimit),
+    [COORDINATOR_TRUEFORGE_ITERATION_LIMIT, DEFAULT_TRUEFORGE_ITERATION_LIMIT],
+  );
+  assert.equal(calls.updates[0].request.agent.spec.model.params.parallelToolCalls, false);
+  assert.equal(calls.updates[1].request.agent.spec.model.params, undefined);
+  const state = await missions.getState();
+  assert.equal(state.missions[0].trueforgeSessionId, "session-created");
+  assert.equal(state.missions[0].trueforgeTurnId, "turn-1");
+  assert.equal(
+    state.evidence.some((item) => item.summary.includes("deterministic read boundary")),
+    true,
+  );
 });
 
 test("delivery-head inspection accepts a changed commit with the verified implementation diff", async () => {
@@ -1369,10 +1480,11 @@ test("delivery-head inspection accepts a changed commit with the verified implem
       repo: target.repo,
       sha: target.head,
       detail: "full_patch",
+      perPage: 100,
     },
     sha: headSha,
     patches: PRIMARY_VERIFIED_DELIVERY_PATCHES,
-  }));
+  }), { passAgentSpec: true });
   const runner = new TrueForgeMissionRunner(missions, client, {
     model: "google-gemini/test-model",
     mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
@@ -1392,10 +1504,17 @@ test("delivery-head inspection accepts a changed commit with the verified implem
   assert.equal(inspection.commitSha, headSha);
   assert.deepEqual(inspection.patches, PRIMARY_VERIFIED_DELIVERY_PATCHES);
   assert.match(calls.turns[0].request.input[0].content, /proofboard-verified-delivery/);
+  assert.equal(calls.turns[0].agentSpec.config.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
+  assert.equal(calls.turns[0].agentSpec.model.params.parallelToolCalls, false);
+  assert.deepEqual(
+    calls.updates.map((update) => update.request.agent.spec.config.iterationLimit),
+    [COORDINATOR_TRUEFORGE_ITERATION_LIMIT, DEFAULT_TRUEFORGE_ITERATION_LIMIT],
+  );
   const state = await missions.getState();
   const proof = state.evidence.find((item) => item.id === inspection.evidenceId);
   const details = JSON.parse(proof.details);
   assert.equal(details.provenance_kind, "delivery_head");
+  assert.equal(details.arguments.perPage, 100);
   assert.equal(details.baseline_sha, LOCKED_FIXTURE_SHA);
   assert.equal(details.commit_sha, headSha);
 });
@@ -1433,6 +1552,7 @@ test("delivery-head inspection rejects the unchanged baseline and mismatched con
         repo: target.repo,
         sha: target.head,
         detail: "full_patch",
+        perPage: 100,
       },
       sha: fixture.sha,
       patches: fixture.patches,
@@ -1460,7 +1580,7 @@ test("delivery-head inspection rejects the unchanged baseline and mismatched con
   }
 });
 
-test("locked fixture inspection ignores a non-canonical attempt before a canonical call", async () => {
+test("locked fixture inspection rejects a corrective retry after a non-canonical call", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, {
     attempts: [
@@ -1471,6 +1591,7 @@ test("locked fixture inspection ignores a non-canonical attempt before a canonic
           repo: "proofboard-demo-fixture",
           sha: LOCKED_FIXTURE_REF,
           detail: "full_patch",
+          perPage: 1,
         },
         responseContent: "not-json",
         sha: "0000000000000000000000000000000000000000",
@@ -1483,6 +1604,7 @@ test("locked fixture inspection ignores a non-canonical attempt before a canonic
           repo: "proofboard-demo-fixture",
           sha: LOCKED_FIXTURE_REF,
           detail: "full_patch",
+          perPage: 100,
         },
         sha: LOCKED_FIXTURE_SHA,
         patches: LOCKED_FIXTURE_PATCHES,
@@ -1495,7 +1617,7 @@ test("locked fixture inspection ignores a non-canonical attempt before a canonic
   });
   const mission = await runner.createMission({
     id: "mission-mcp-pinned-retry-success",
-    objective: "Ignore a rejected read-only attempt and accept canonical provenance",
+    objective: "Reject a corrective repository read after an initial non-canonical call",
     repository: {
       owner: "mtamburrano",
       name: "proofboard-demo-fixture",
@@ -1503,14 +1625,16 @@ test("locked fixture inspection ignores a non-canonical attempt before a canonic
     },
   });
 
-  const inspection = await runner.inspectRepository({ missionId: mission.id });
-
-  assert.equal(inspection.commitSha, LOCKED_FIXTURE_SHA);
-  assert.deepEqual(inspection.patches, LOCKED_FIXTURE_PATCHES);
+  await assert.rejects(
+    runner.inspectRepository({ missionId: mission.id }),
+    /Expected exactly one canonical get_commit MCP call, found 2/,
+  );
   const state = await missions.getState();
-  const proof = state.evidence.find((item) => item.id === inspection.evidenceId);
-  assert.equal(proof.source, "mcp");
-  assert.equal(proof.result, "passed");
+  assert.equal(state.missions[0].status, "blocked");
+  assert.equal(
+    state.evidence.some((item) => item.source === "mcp" && item.result === "passed"),
+    false,
+  );
 });
 
 test("locked fixture inspection rejects when no canonical get_commit call exists", async () => {
@@ -1615,6 +1739,7 @@ test("locked fixture inspection rejects multiple canonical get_commit calls", as
     repo: "proofboard-demo-fixture",
     sha: LOCKED_FIXTURE_REF,
     detail: "full_patch",
+    perPage: 100,
   };
   const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, {
     attempts: [

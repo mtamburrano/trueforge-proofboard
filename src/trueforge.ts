@@ -113,7 +113,7 @@ const PULL_REQUEST_READ_TOOL_NAME = "pull_request_read";
  */
 export const DEFAULT_TRUEFORGE_ITERATION_LIMIT = 64;
 export const MAX_TRUEFORGE_ITERATION_LIMIT = 1_024;
-/** The coordinator gets one model iteration and one tool call per deterministic sandbox turn. */
+/** Deterministic coordinator reads get one model iteration and one tool call. */
 export const COORDINATOR_TRUEFORGE_ITERATION_LIMIT = 1;
 export const MINIMUM_SANDBOX_NODE_MAJOR_VERSION = 20;
 export const SANDBOX_TOOLCHAIN_READINESS_INTENT =
@@ -579,6 +579,7 @@ export interface RunTurnOptions {
 interface InternalRunTurnOptions extends RunTurnOptions {
   input?: TrueForgeApi.TurnInputItem[];
   coordinatorRuntime?: boolean;
+  coordinatorExpectedToolName?: string;
   delegatedWorkspaceStart?: {
     startTreeRef: string;
     missionStartTreeRef: string;
@@ -1683,12 +1684,15 @@ export class TrueForgeMissionRunner {
       if (input.workItemId !== undefined) {
         inspectionOptions.workItemId = input.workItemId;
       }
-      execution = await this.executeTurn(
+      execution = await this.executeCoordinatorTurn(
         mission.id,
         lockedFixture
           ? buildLockedFixtureInspectionInstruction(mission, mcpServerName)
           : buildRepositoryInspectionInstruction(mission, path as string, mcpServerName, toolName),
-        inspectionOptions,
+        {
+          ...inspectionOptions,
+          coordinatorExpectedToolName: toolName,
+        },
       );
       const verified: VerifiedRepositoryFile | VerifiedRepositoryCommit = lockedFixture
         ? verifyLockedFixtureInspection(execution.rawEvents, mission.repository, mcpServerName)
@@ -1791,10 +1795,10 @@ export class TrueForgeMissionRunner {
         "MCP server name",
       );
       ensureRepositoryMcpConfigured(this.config, mcpServerName, "get_commit");
-      execution = await this.executeTurn(
+      execution = await this.executeCoordinatorTurn(
         mission.id,
         buildDeliveryHeadInspectionInstruction(target, mcpServerName),
-        {},
+        { coordinatorExpectedToolName: "get_commit" },
       );
       const verified = verifyDeliveryHeadInspection(
         execution.rawEvents,
@@ -2238,6 +2242,7 @@ export class TrueForgeMissionRunner {
           event,
           options.coordinatorRuntime === true,
           rawEvents,
+          options.coordinatorExpectedToolName,
         );
         if (evidence !== null) {
           const evidenceInput = {
@@ -3291,7 +3296,7 @@ function buildLockedFixtureInspectionInstruction(
     `Use the configured MCP server ${serverName}.`,
     `Use get_commit with this exact JSON object: ${JSON.stringify(lockedFixtureArguments())}.`,
     `The returned commit must include the exact patches for ${LOCKED_FIXTURE_FILES.join(" and ")}.`,
-    "Ignore any non-canonical read-only attempts; only a correlated response to the exact arguments above is valid provenance.",
+    "Make no other MCP calls. If the first call is missing, malformed, or uses different arguments, stop; never retry with a corrective request.",
     "Use the MCP response as the only source of repository facts; do not use the host filesystem, canned data, or final-answer narration.",
     "Stop after the read.",
   ].join(" ");
@@ -3299,12 +3304,13 @@ function buildLockedFixtureInspectionInstruction(
 
 function deliveryHeadArguments(
   target: PullRequestDeliveryTarget,
-): Record<string, string> {
+): Record<string, unknown> {
   return {
     owner: target.owner,
     repo: target.repo,
     sha: target.head,
     detail: "full_patch",
+    perPage: 100,
   };
 }
 
@@ -3316,6 +3322,7 @@ function buildDeliveryHeadInspectionInstruction(
     `Use the configured MCP server ${serverName}.`,
     `Use get_commit with this exact JSON object: ${JSON.stringify(deliveryHeadArguments(target))}.`,
     `The returned commit must differ from baseline ${PRIMARY_DELIVERY_FIXTURE.baselineSha} and contain the verified delivery patches.`,
+    "Make no other MCP calls and never retry with a corrective request.",
     "Use the MCP response as the only source of delivery-head facts; do not mutate the repository.",
     "Stop after the read.",
   ].join(" ");
@@ -3566,6 +3573,7 @@ interface TurnCompletion {
 
 interface TurnCompletionOptions {
   allowCoordinatorIterationStop?: boolean;
+  expectedToolName?: string;
 }
 
 function turnCompletion(event: TrueForgeApi.TurnStreamingEvent): TurnCompletion {
@@ -3586,6 +3594,7 @@ function turnCompletion(event: TrueForgeApi.TurnStreamingEvent): TurnCompletion 
 function isExpectedCoordinatorIterationStop(
   events: TrueForgeApi.TurnStreamingEvent[],
   completion: TurnCompletion,
+  expectedToolName = "exec",
 ): boolean {
   if (
     (completion.status !== "error" && completion.status !== "cancelled") ||
@@ -3603,11 +3612,18 @@ function isExpectedCoordinatorIterationStop(
   ) {
     return false;
   }
-  const executions = observedToolCalls(events).filter((call) => call.name === "exec");
-  if (executions.length !== 1 || executions[0] === undefined) {
+  const calls = observedToolCalls(events);
+  if (calls.length !== 1 || calls[0] === undefined || calls[0].name !== expectedToolName) {
     return false;
   }
-  const observed = parseExecutionResponse(toolResponseForCall(events, executions[0].id));
+  const response = toolResponseForCall(events, calls[0].id);
+  if (response === undefined) {
+    return false;
+  }
+  if (expectedToolName !== "exec") {
+    return true;
+  }
+  const observed = parseExecutionResponse(response);
   return observed?.success === true && observed.exitCode === 0;
 }
 
@@ -3626,7 +3642,7 @@ function requireCompletedTurn(
   if (completion.status !== "done") {
     if (
       options.allowCoordinatorIterationStop === true &&
-      isExpectedCoordinatorIterationStop(events, completion)
+      isExpectedCoordinatorIterationStop(events, completion, options.expectedToolName)
     ) {
       return;
     }
@@ -4355,12 +4371,13 @@ function isLockedFixtureRepository(
   );
 }
 
-function lockedFixtureArguments(): Record<string, string> {
+function lockedFixtureArguments(): Record<string, unknown> {
   return {
     owner: LOCKED_FIXTURE_OWNER,
     repo: LOCKED_FIXTURE_REPO,
     sha: LOCKED_FIXTURE_REF,
     detail: "full_patch",
+    perPage: 100,
   };
 }
 
@@ -4445,7 +4462,10 @@ function verifyRepositoryInspection(
     return inspectionFailure(`${toolName} MCP returned an unexpected repository path.`);
   }
 
-  requireCompletedTurn(events, "inspect repository", "inspection");
+  requireCompletedTurn(events, "inspect repository", "inspection", {
+    allowCoordinatorIterationStop: true,
+    expectedToolName: toolName,
+  });
   return {
     resourceUri,
     content: fileContent,
@@ -4471,10 +4491,16 @@ function verifyLockedFixtureInspection(
   }
 
   const canonicalArguments = lockedFixtureArguments();
+  const observedCalls = observedToolCalls(events);
   const canonicalCalls = observedToolCalls(events).filter(
     (call) => call.name === "get_commit" && isRecord(call.arguments) &&
       argumentsExactlyMatch(call.arguments, canonicalArguments),
   );
+  if (observedCalls.length !== 1) {
+    return inspectionFailure(
+      `Expected exactly one canonical get_commit MCP call, found ${observedCalls.length}.`,
+    );
+  }
   if (canonicalCalls.length !== 1) {
     return inspectionFailure(
       `Expected exactly one canonical get_commit MCP call, found ${canonicalCalls.length}.`,
@@ -4507,7 +4533,10 @@ function verifyLockedFixtureInspection(
     );
   }
 
-  requireCompletedTurn(events, "inspect repository", "inspection");
+  requireCompletedTurn(events, "inspect repository", "inspection", {
+    allowCoordinatorIterationStop: true,
+    expectedToolName: "get_commit",
+  });
   const content = JSON.stringify({
     sha: verifiedPayload.commitSha,
     files: LOCKED_FIXTURE_FILES.map((filename) => ({
@@ -4540,10 +4569,16 @@ function verifyDeliveryHeadInspection(
     return inspectionFailure(`MCP server ${serverName} was not initialized.`);
   }
   const canonicalArguments = deliveryHeadArguments(target);
+  const observedCalls = observedToolCalls(events);
   const canonicalCalls = observedToolCalls(events).filter(
     (call) => call.name === "get_commit" && isRecord(call.arguments) &&
       argumentsExactlyMatch(call.arguments, canonicalArguments),
   );
+  if (observedCalls.length !== 1) {
+    return inspectionFailure(
+      `Expected exactly one canonical delivery-head get_commit MCP call, found ${observedCalls.length}.`,
+    );
+  }
   if (canonicalCalls.length !== 1) {
     return inspectionFailure(
       `Expected exactly one canonical delivery-head get_commit MCP call, found ${canonicalCalls.length}.`,
@@ -4568,7 +4603,10 @@ function verifyDeliveryHeadInspection(
       "Delivery head must differ from the baseline and exactly match the verified implementation patches.",
     );
   }
-  requireCompletedTurn(events, "inspect delivery head", "inspection");
+  requireCompletedTurn(events, "inspect delivery head", "inspection", {
+    allowCoordinatorIterationStop: true,
+    expectedToolName: "get_commit",
+  });
   const content = JSON.stringify({
     sha: verifiedPayload.commitSha,
     files: Object.entries(verifiedPayload.patches).map(([filename, patch]) => ({
@@ -5130,6 +5168,7 @@ function runtimeEvidence(
   event: TrueForgeApi.TurnStreamingEvent,
   coordinatorRuntime: boolean,
   events: TrueForgeApi.TurnStreamingEvent[],
+  coordinatorExpectedToolName?: string,
 ): RuntimeEvidence | null {
   const details = runtimeDetails(event);
   switch (event.type) {
@@ -5149,13 +5188,19 @@ function runtimeEvidence(
         ? state.requiredActions ?? state.required_actions
         : undefined;
       const requiredActions = Array.isArray(rawRequiredActions) ? rawRequiredActions : null;
-      const boundedStop = coordinatorRuntime && isExpectedCoordinatorIterationStop(events, completion);
+      const boundedStop = coordinatorRuntime && isExpectedCoordinatorIterationStop(
+        events,
+        completion,
+        coordinatorExpectedToolName,
+      );
       const isComplete = status === "done" && requiredActions !== null && requiredActions.length === 0;
       if (boundedStop) {
         return {
           kind: "tool_result",
           result: "informational",
-          summary: "TrueForge stopped the coordinator after the configured one-iteration sandbox boundary.",
+          summary: coordinatorExpectedToolName === undefined || coordinatorExpectedToolName === "exec"
+            ? "TrueForge stopped the coordinator after the configured one-iteration sandbox boundary."
+            : "TrueForge stopped the coordinator after the configured one-iteration deterministic read boundary.",
           details,
         };
       }
