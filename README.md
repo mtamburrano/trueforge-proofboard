@@ -73,8 +73,10 @@ command, exit code, and bounded output summary. The deterministic primary fixtur
 runs its checks from the provisioned project directory.
 
 Before delegated coding starts, the primary mission runs a separate sandbox
-readiness turn. That turn prepares or verifies Node.js 20+ and npm and records a
-specific readiness failure before delegation when the sandbox cannot provide them.
+readiness turn. That turn prepares or verifies Node.js 20+ and npm; on the known
+Debian 12 sandbox it installs the NodeSource 22.x package rather than Debian's
+Node.js 18 package, then records a specific readiness failure before delegation
+if the sandbox still cannot provide them.
 Coding turns use a bounded default of 64 TrueForge iterations; callers can provide
 a lower limit through `TrueForgeMissionConfig.iterationLimit` when their mission
 needs a tighter budget.

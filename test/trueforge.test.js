@@ -623,6 +623,54 @@ function fakeClient(eventFactory = fakeEvents) {
   return { client, calls };
 }
 
+function debian12ProvisionedSandboxEvents(turnId) {
+  const runtime = {
+    distribution: "debian",
+    release: "12",
+    nodeMajor: null,
+    npmVersion: null,
+  };
+  const command = SANDBOX_TOOLCHAIN_READINESS_COMMAND;
+
+  assert.equal(runtime.distribution, "debian");
+  assert.equal(runtime.release, "12");
+  assert.equal(runtime.nodeMajor, null);
+  assert.equal(runtime.npmVersion, null);
+  assert.match(command, /has_supported_node/);
+  assert.match(command, /apt-get update/);
+  assert.match(command, /ca-certificates curl gnupg/);
+  assert.match(command, /curl -fsSL https:\/\/deb\.nodesource\.com\/gpgkey\/nodesource-repo\.gpg\.key/);
+  assert.match(command, /deb\.nodesource\.com\/node_22\.x nodistro main/);
+  assert.match(command, /apt-get install -y -qq --no-install-recommends nodejs/);
+  assert.doesNotMatch(command, /apt-get install -y -qq nodejs npm/);
+  assert.ok(
+    command.indexOf("deb.nodesource.com/node_22.x") <
+      command.indexOf("apt-get install -y -qq --no-install-recommends nodejs"),
+    "NodeSource must be configured before nodejs is installed",
+  );
+
+  // The injected boundary models a clean Debian 12 image: only the explicit
+  // NodeSource provisioning path can transition it from missing to ready.
+  runtime.nodeMajor = 22;
+  runtime.npmVersion = "10.9.2";
+  assert.ok(runtime.nodeMajor >= 20);
+  assert.notEqual(runtime.npmVersion, null);
+
+  return sandboxEvents(turnId, 0, [], {
+    sandboxArguments: {
+      intent: SANDBOX_TOOLCHAIN_READINESS_INTENT,
+      command,
+    },
+    sandboxResult: {
+      success: true,
+      response: {
+        exitCode: 0,
+        result: `TRUEFORGE_TOOLCHAIN_READY node=v${runtime.nodeMajor}.14.0 npm=${runtime.npmVersion}\n`,
+      },
+    },
+  });
+}
+
 test("runner creates a TrueForge session and maps safe runtime evidence", async () => {
   const repository = new InMemoryMissionRepository();
   const missions = new MissionService(repository, () => new Date("2026-08-26T16:00:00.000Z"));
@@ -663,21 +711,9 @@ test("runner creates a TrueForge session and maps safe runtime evidence", async 
   assert.doesNotMatch(serializedState, /do-not-persist|This content should not be persisted/);
 });
 
-test("runner prepares a clean sandbox toolchain before delegated work", async () => {
+test("runner provisions a missing Debian 12 sandbox toolchain before delegated work", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
-  const { client, calls } = fakeClient((turnId) => sandboxEvents(turnId, 0, [], {
-    sandboxArguments: {
-      intent: SANDBOX_TOOLCHAIN_READINESS_INTENT,
-      command: SANDBOX_TOOLCHAIN_READINESS_COMMAND,
-    },
-    sandboxResult: {
-      success: true,
-      response: {
-        exitCode: 0,
-        result: "TRUEFORGE_TOOLCHAIN_READY node=v22.14.0 npm=10.9.2\n",
-      },
-    },
-  }));
+  const { client, calls } = fakeClient(debian12ProvisionedSandboxEvents);
   const runner = new TrueForgeMissionRunner(missions, client, {
     model: "google-gemini/test-model",
   });

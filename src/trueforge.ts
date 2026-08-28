@@ -110,12 +110,30 @@ export const SANDBOX_TOOLCHAIN_READINESS_INTENT =
   "Prepare and verify the sandbox toolchain before coding delegation.";
 const SANDBOX_TOOLCHAIN_REQUIREMENT =
   "Node.js >=20 and npm are required before coding delegation.";
+const SANDBOX_NODE_SOURCE_MAJOR = 22;
+const SANDBOX_NODE_SOURCE_KEY_URL =
+  "https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key";
+const SANDBOX_NODE_SOURCE_REPOSITORY =
+  `https://deb.nodesource.com/node_${SANDBOX_NODE_SOURCE_MAJOR}.x`;
+
+/**
+ * Debian 12/bookworm ships Node.js 18. Add the NodeSource 22.x repository
+ * before installing nodejs so apt cannot satisfy readiness with that package.
+ * The NodeSource nodejs package includes npm; the final marker verifies both.
+ */
 export const SANDBOX_TOOLCHAIN_READINESS_COMMAND = [
   "set -eu",
   "has_supported_node() { command -v node >/dev/null 2>&1 && node -e 'process.exit(Number(process.versions.node.split(\".\")[0]) >= 20 ? 0 : 1)' >/dev/null 2>&1; }",
   "if ! has_supported_node || ! command -v npm >/dev/null 2>&1; then",
   "  if command -v apt-get >/dev/null 2>&1; then",
-  "    apt-get update -qq && apt-get install -y -qq nodejs npm",
+  "    export DEBIAN_FRONTEND=noninteractive",
+  "    apt-get update -qq",
+  "    apt-get install -y -qq --no-install-recommends ca-certificates curl gnupg",
+  "    install -d -m 0755 /etc/apt/keyrings",
+  `    curl -fsSL ${SANDBOX_NODE_SOURCE_KEY_URL} | gpg --dearmor --yes -o /etc/apt/keyrings/nodesource.gpg`,
+  `    printf '%s\\n' 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] ${SANDBOX_NODE_SOURCE_REPOSITORY} nodistro main' > /etc/apt/sources.list.d/nodesource.list`,
+  "    apt-get update -qq",
+  "    apt-get install -y -qq --no-install-recommends nodejs",
   "  else",
     `    printf '%s\\n' '${SANDBOX_TOOLCHAIN_REQUIREMENT} Install them in the sandbox image.' >&2`,
   "    exit 86",
@@ -126,7 +144,7 @@ export const SANDBOX_TOOLCHAIN_READINESS_COMMAND = [
   "  exit 86",
   "fi",
   "printf 'TRUEFORGE_TOOLCHAIN_READY node=%s npm=%s\\n' \"$(node --version)\" \"$(npm --version)\"",
-].join(" ");
+].join("\n");
 
 export const PRIMARY_WORK_GRAPH_IDS = {
   inspect: "primary-inspect",
