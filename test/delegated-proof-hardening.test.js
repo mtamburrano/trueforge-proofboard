@@ -177,14 +177,14 @@ const WORKSPACE_END_TREE = "b".repeat(40);
 function workspaceSnapshotEvents(
   treeRef,
   turnId = "turn-workspace-start",
-  { intent = WORKSPACE_SNAPSHOT_INTENT } = {},
+  { intent = WORKSPACE_SNAPSHOT_INTENT, threadId = "main" } = {},
 ) {
   return [
     { type: "turn.created", id: `${turnId}-created`, turnId, threadId: null, state: { status: "running" } },
     {
       type: "model.message",
       id: `${turnId}-model`,
-      threadId: null,
+      threadId,
       toolCalls: [{
         id: `${turnId}-call-snapshot`,
         function: {
@@ -226,6 +226,7 @@ function workspaceDeltaEvents({
   cumulativeFiles = currentFiles,
   turnId = "turn-workspace-delta",
   intent = WORKSPACE_DELTA_INTENT,
+  threadId = "main",
 } = {}) {
   const command = buildDelegatedWorkspaceDeltaCommand(startTreeRef, missionStartTreeRef);
   const callId = `${turnId}-call-delta`;
@@ -234,7 +235,7 @@ function workspaceDeltaEvents({
     {
       type: "model.message",
       id: `${turnId}-model`,
-      threadId: null,
+      threadId,
       toolCalls: [{
         id: callId,
         function: { name: "exec", arguments: JSON.stringify({ intent, command }) },
@@ -271,6 +272,7 @@ function repositoryPreparationEvents({
   result = `TRUEFORGE_REPOSITORY_READY repository=${repository} sha=${sha} root=${root}\n`,
   turnId = "turn-repository-preparation",
   intent = LOCKED_REPOSITORY_PREPARATION_INTENT,
+  threadId = "main",
 } = {}) {
   const callId = `${turnId}-call-preparation`;
   return [
@@ -279,7 +281,7 @@ function repositoryPreparationEvents({
     {
       type: "model.message",
       id: `${turnId}-model`,
-      threadId: null,
+      threadId,
       toolCalls: [{
         id: callId,
         function: {
@@ -560,6 +562,8 @@ async function runnerFixture({
   workspaceEndTreeRef = WORKSPACE_END_TREE,
   workspaceSnapshotIntent = WORKSPACE_SNAPSHOT_INTENT,
   workspaceDeltaIntent = WORKSPACE_DELTA_INTENT,
+  workspaceSnapshotThreadId = "main",
+  workspaceDeltaThreadId = "main",
   narrationOnly = false,
   responseType = "tool.response",
   run = true,
@@ -587,6 +591,7 @@ async function runnerFixture({
             async *withMetadata() {
               for (const event of workspaceSnapshotEvents(workspaceStartTreeRef, "turn-workspace-start", {
                 intent: workspaceSnapshotIntent,
+                threadId: workspaceSnapshotThreadId,
               })) {
                 yield { data: event };
               }
@@ -603,6 +608,7 @@ async function runnerFixture({
                 currentFiles: workspaceCurrentFiles,
                 cumulativeFiles: workspaceCumulativeFiles,
                 intent: workspaceDeltaIntent,
+                threadId: workspaceDeltaThreadId,
               })) {
                 yield { data: event };
               }
@@ -848,6 +854,46 @@ test("coordinator workspace proof turns request their exact sandbox exec command
   });
 });
 
+test("coordinator workspace proof accepts root main and rejects dynamic child execs", async () => {
+  const accepted = await runnerFixture({
+    workspaceSnapshotThreadId: "main",
+    workspaceDeltaThreadId: "main",
+    run: false,
+  });
+  const acceptedResult = await accepted.runner.runTurn(accepted.mission.id, "Implement the bounded change.", {
+    workItemId: accepted.workItem.id,
+    delegateToSubagent: true,
+  });
+  assert.ok(acceptedResult.implementationHandoff);
+  assert.equal(accepted.turnRequests.length, 3);
+
+  const childSnapshot = await runnerFixture({
+    workspaceSnapshotThreadId: "thread-subagent",
+    run: false,
+  });
+  await assert.rejects(
+    childSnapshot.runner.runTurn(childSnapshot.mission.id, "Implement the bounded change.", {
+      workItemId: childSnapshot.workItem.id,
+      delegateToSubagent: true,
+    }),
+    /workspace start snapshot/i,
+  );
+  assert.equal(childSnapshot.turnRequests.length, 1);
+
+  const childDelta = await runnerFixture({
+    workspaceDeltaThreadId: "thread-subagent",
+    run: false,
+  });
+  await assert.rejects(
+    childDelta.runner.runTurn(childDelta.mission.id, "Implement the bounded change.", {
+      workItemId: childDelta.workItem.id,
+      delegateToSubagent: true,
+    }),
+    /workspace delta/i,
+  );
+  assert.equal(childDelta.turnRequests.length, 3);
+});
+
 test("empty locked fixture sandboxes are prepared before the workspace snapshot and delegation", async () => {
   const fixture = await lockedRepositoryRunnerFixture({
     preparation: {
@@ -914,6 +960,32 @@ test("empty locked fixture sandboxes are prepared before the workspace snapshot 
   assert.match(LOCKED_REPOSITORY_PREPARATION_COMMAND, /git clone --quiet/);
   assert.match(LOCKED_REPOSITORY_PREPARATION_COMMAND, /git checkout --quiet --detach/);
   assert.doesNotMatch(LOCKED_REPOSITORY_PREPARATION_COMMAND, /git push|create_pull_request/);
+});
+
+test("locked repository preparation accepts root main and rejects dynamic child execs", async () => {
+  const accepted = await lockedRepositoryRunnerFixture({
+    preparation: { threadId: "main" },
+  });
+  const acceptedResult = await accepted.runner.runTurn(accepted.mission.id, "Implement the bounded change.", {
+    workItemId: accepted.workItem.id,
+    delegateToSubagent: true,
+  });
+  assert.ok(acceptedResult.implementationHandoff);
+  assert.equal(accepted.turnRequests.length, 4);
+
+  const child = await lockedRepositoryRunnerFixture({
+    preparation: { threadId: "thread-subagent" },
+  });
+  await assert.rejects(
+    child.runner.runTurn(child.mission.id, "Implement the bounded change.", {
+      workItemId: child.workItem.id,
+      delegateToSubagent: true,
+    }),
+    /not coordinator-owned/i,
+  );
+  assert.equal(child.turnRequests.length, 1);
+  const state = await child.missions.getState();
+  assert.equal(state.workItems.find((item) => item.id === child.workItem.id).status, "blocked");
 });
 
 test("coordinator runtime restoration failure blocks delegated coding", async () => {

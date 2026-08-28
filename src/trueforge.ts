@@ -106,6 +106,8 @@ const DELEGATED_WORKSPACE_SNAPSHOT_INTENT =
 const DELEGATED_WORKSPACE_DELTA_INTENT =
   "Capture the coordinator-owned current work-item and cumulative mission workspace deltas after delegated implementation.";
 const MAX_COORDINATOR_EXEC_INTENT_LENGTH = 1_200;
+/** TrueForge emits root-agent model tool calls on the literal `main` thread. */
+const TRUEFORGE_ROOT_THREAD_ID = "main";
 const PULL_REQUEST_READ_TOOL_NAME = "pull_request_read";
 
 /**
@@ -4050,7 +4052,7 @@ function coordinatorWorkspaceExecution(
     return null;
   }
   const execution = executions[0];
-  if (execution === undefined || execution.threadId !== null) {
+  if (execution === undefined || !isCoordinatorRootThread(execution.threadId)) {
     return null;
   }
   const provenance = coordinatorExecProvenance(execution.arguments, expectedCommand);
@@ -4724,6 +4726,10 @@ function coordinatorExecProvenance(
   };
 }
 
+function isCoordinatorRootThread(threadId: string | null): boolean {
+  return threadId === TRUEFORGE_ROOT_THREAD_ID;
+}
+
 function boundedCoordinatorExecIntent(value: unknown): string | null {
   if (
     typeof value !== "string" ||
@@ -4938,7 +4944,7 @@ function verifyLockedRepositoryPreparation(
     );
   }
   const call = executionCalls[0];
-  if (call === undefined || call.threadId !== null) {
+  if (call === undefined || !isCoordinatorRootThread(call.threadId)) {
     return verificationFailure(
       operation,
       "The locked repository preparation call was not coordinator-owned.",

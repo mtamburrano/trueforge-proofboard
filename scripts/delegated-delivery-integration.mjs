@@ -92,7 +92,7 @@ function coordinatorEvents(command, output, turnId, intent = WORKSPACE_SNAPSHOT_
     {
       type: "model.message",
       id: `${turnId}-model`,
-      threadId: null,
+      threadId: "main",
       toolCalls: [{
         id: callId,
         function: { name: "exec", arguments: JSON.stringify({ intent, command }) },
