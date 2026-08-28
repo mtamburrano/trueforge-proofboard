@@ -1,5 +1,11 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
+import { pathToFileURL } from "node:url";
 
 import {
   DeterministicImplementationVerifier,
@@ -26,9 +32,60 @@ const ORIGIN = {
   turnId: "turn-hardening",
   threadId: "thread-hardening",
 };
+const execFileAsync = promisify(execFile);
+const LOCKED_REPOSITORY_REMOTE_URL =
+  `https://github.com/${PRIMARY_DELIVERY_FIXTURE.owner}/${PRIMARY_DELIVERY_FIXTURE.repository}.git`;
 
 function fixedClock() {
   return new Date("2026-08-27T15:00:00.000Z");
+}
+
+async function runLocalGit(args, cwd, env = {}) {
+  return execFileAsync("git", args, {
+    cwd,
+    env: { ...process.env, ...env },
+    maxBuffer: 1024 * 1024,
+  });
+}
+
+async function createLocalRepositoryBoundary() {
+  const root = await mkdtemp(path.join(os.tmpdir(), "trueforge-locked-repository-"));
+  const remotePath = path.join(root, "remote.git");
+  const seedPath = path.join(root, "seed");
+  const workspacePath = path.join(root, "workspace");
+  const gitConfigPath = path.join(root, "gitconfig");
+  const gitEnv = {
+    GIT_CONFIG_GLOBAL: gitConfigPath,
+    GIT_CONFIG_NOSYSTEM: "1",
+  };
+
+  try {
+    await runLocalGit(["init", "--initial-branch=main", seedPath], root);
+    await runLocalGit(["config", "user.email", "test@example.invalid"], seedPath);
+    await runLocalGit(["config", "user.name", "TrueForge Test"], seedPath);
+    await writeFile(path.join(seedPath, "README.md"), "locked repository fixture\n", "utf8");
+    await runLocalGit(["add", "README.md"], seedPath);
+    await runLocalGit(["commit", "-m", "baseline"], seedPath);
+    await runLocalGit(["clone", "--bare", seedPath, remotePath], root);
+    await runLocalGit([
+      "config",
+      "--file",
+      gitConfigPath,
+      `url.${pathToFileURL(remotePath).href}.insteadOf`,
+      LOCKED_REPOSITORY_REMOTE_URL,
+    ], root);
+    await mkdir(workspacePath);
+    const { stdout } = await runLocalGit(["rev-parse", "--verify", "HEAD"], seedPath);
+    return {
+      gitEnv,
+      root,
+      workspacePath: await realpath(workspacePath),
+      baselineSha: stdout.trim(),
+    };
+  } catch (error) {
+    await rm(root, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 function legacyPrimaryState() {
@@ -783,6 +840,62 @@ test("empty locked fixture sandboxes are prepared before the workspace snapshot 
   assert.match(LOCKED_REPOSITORY_PREPARATION_COMMAND, /git clone --quiet/);
   assert.match(LOCKED_REPOSITORY_PREPARATION_COMMAND, /git checkout --quiet --detach/);
   assert.doesNotMatch(LOCKED_REPOSITORY_PREPARATION_COMMAND, /git push|create_pull_request/);
+});
+
+test("real locked repository preparation handles a fresh clone and rejects a dirty worktree", async () => {
+  const boundary = await createLocalRepositoryBoundary();
+  try {
+    const command = LOCKED_REPOSITORY_PREPARATION_COMMAND.replaceAll(
+      PRIMARY_DELIVERY_FIXTURE.baselineSha,
+      boundary.baselineSha,
+    );
+    const prepared = await execFileAsync("sh", ["-c", command], {
+      cwd: boundary.workspacePath,
+      env: { ...process.env, ...boundary.gitEnv },
+      maxBuffer: 1024 * 1024,
+    });
+
+    assert.equal(
+      prepared.stdout.trim(),
+      `TRUEFORGE_REPOSITORY_READY repository=${PRIMARY_DELIVERY_FIXTURE.owner}/${PRIMARY_DELIVERY_FIXTURE.repository} sha=${boundary.baselineSha} root=${boundary.workspacePath}`,
+    );
+    assert.equal(prepared.stderr, "");
+    assert.equal(
+      (await runLocalGit(["rev-parse", "--verify", "HEAD"], boundary.workspacePath, boundary.gitEnv)).stdout.trim(),
+      boundary.baselineSha,
+    );
+    assert.equal(
+      (await runLocalGit(["status", "--porcelain=v1", "--untracked-files=all"], boundary.workspacePath, boundary.gitEnv)).stdout,
+      "",
+    );
+    assert.equal(
+      (await runLocalGit(["rev-parse", "--abbrev-ref", "HEAD"], boundary.workspacePath, boundary.gitEnv)).stdout.trim(),
+      "HEAD",
+    );
+    assert.equal(
+      (await runLocalGit(["config", "--get", "remote.origin.url"], boundary.workspacePath, boundary.gitEnv)).stdout.trim(),
+      LOCKED_REPOSITORY_REMOTE_URL,
+    );
+
+    await writeFile(path.join(boundary.workspacePath, "README.md"), "pre-existing dirty content\n", "utf8");
+    await assert.rejects(
+      execFileAsync("sh", ["-c", command], {
+        cwd: boundary.workspacePath,
+        env: { ...process.env, ...boundary.gitEnv },
+        maxBuffer: 1024 * 1024,
+      }),
+      (error) => {
+        assert.equal(error.code, 86);
+        assert.match(
+          `${error.stdout ?? ""}${error.stderr ?? ""}`,
+          /LOCKED_REPOSITORY_PREPARATION_FAILED existing Git worktree is not clean before checkout\./,
+        );
+        return true;
+      },
+    );
+  } finally {
+    await rm(boundary.root, { recursive: true, force: true });
+  }
 });
 
 test("wrong locked repository identity or baseline blocks before delegation", async () => {
