@@ -520,6 +520,8 @@ function sandboxEvents(
     sandboxId = "sandbox-1",
     includeSandboxCall = true,
     additionalSandboxCalls = [],
+    execThreadId = "main",
+    responseThreadId = "main",
     responseCallId = "call-exec",
     responseContent,
     includeToolResponse = true,
@@ -551,7 +553,7 @@ function sandboxEvents(
       type: "model.message",
       id: "event-model",
       createdAt: "2026-08-26T16:00:02.000Z",
-      threadId: "thread-1",
+      threadId: execThreadId,
       toolCalls: [
         {
           id: "call-exec",
@@ -575,7 +577,7 @@ function sandboxEvents(
       type: "tool.response",
       id: "event-tool-response",
       createdAt: "2026-08-26T16:00:03.000Z",
-      threadId: "thread-1",
+      threadId: responseThreadId,
       toolCallId: responseCallId,
       content: responseContent ?? JSON.stringify(sandboxResult),
     });
@@ -641,7 +643,12 @@ function fakeClient(eventFactory = fakeEvents, { passAgentSpec = false } = {}) {
 
 function debian12ProvisionedSandboxEvents(
   turnId,
-  { intent = SANDBOX_TOOLCHAIN_READINESS_INTENT, turnState } = {},
+  {
+    intent = SANDBOX_TOOLCHAIN_READINESS_INTENT,
+    turnState,
+    execThreadId = "main",
+    responseThreadId = "main",
+  } = {},
 ) {
   const runtime = {
     distribution: "debian",
@@ -687,6 +694,8 @@ function debian12ProvisionedSandboxEvents(
         result: `TRUEFORGE_TOOLCHAIN_READY node=v${runtime.nodeMajor}.14.0 npm=${runtime.npmVersion}\n`,
       },
     },
+    execThreadId,
+    responseThreadId,
     ...(turnState === undefined ? {} : { turnState }),
   });
 }
@@ -811,6 +820,61 @@ test("bounded sandbox readiness accepts a paraphrased exec intent", async () => 
     calls.updates.map((update) => update.request.agent.spec.config.iterationLimit),
     [COORDINATOR_TRUEFORGE_ITERATION_LIMIT, DEFAULT_TRUEFORGE_ITERATION_LIMIT],
   );
+});
+
+test("coordinator sandbox readiness and verification require root main call and response threads", async () => {
+  const cases = [
+    {
+      label: "readiness child exec",
+      operation: "readiness",
+      options: { execThreadId: "thread-subagent" },
+    },
+    {
+      label: "readiness child response",
+      operation: "readiness",
+      options: { responseThreadId: "thread-subagent" },
+    },
+    {
+      label: "verification child exec",
+      operation: "verification",
+      options: { execThreadId: "thread-subagent" },
+    },
+    {
+      label: "verification child response",
+      operation: "verification",
+      options: { responseThreadId: "thread-subagent" },
+    },
+  ];
+
+  for (const [index, fixture] of cases.entries()) {
+    const missions = new MissionService(new InMemoryMissionRepository());
+    const { client } = fakeClient((turnId) => fixture.operation === "readiness"
+      ? debian12ProvisionedSandboxEvents(turnId, fixture.options)
+      : sandboxEvents(turnId, 0, [], fixture.options));
+    const runner = new TrueForgeMissionRunner(missions, client, {
+      model: "google-gemini/test-model",
+    });
+    const mission = await runner.createMission({
+      id: `mission-sandbox-root-thread-${index}`,
+      objective: `Reject ${fixture.label}`,
+    });
+
+    await assert.rejects(
+      fixture.operation === "readiness"
+        ? runner.prepareSandbox({ missionId: mission.id })
+        : runner.runSandboxVerification({ missionId: mission.id, command: "node --test" }),
+      (error) => {
+        assert.match(error.message, /root coordinator thread|coordinator-owned exec sandbox call/i, fixture.label);
+        return true;
+      },
+    );
+    const state = await missions.getState();
+    assert.equal(
+      state.evidence.some((item) => item.source === "sandbox" && item.result === "passed"),
+      false,
+      fixture.label,
+    );
+  }
 });
 
 test("coordinator sandbox turns are runtime-bounded and stop cleanly after the canonical exec", async () => {

@@ -42,6 +42,8 @@ export const executionOriginKinds = ["trueforge", "mcp", "sandbox", "tool"] as c
 export type ExecutionOriginKind = (typeof executionOriginKinds)[number];
 export const delegationStatuses = ["running", "completed", "failed", "interrupted"] as const;
 export type DelegationStatus = (typeof delegationStatuses)[number];
+/** TrueForge emits root-agent tool events on the literal `main` thread. */
+export const TRUEFORGE_ROOT_THREAD_ID = "main" as const;
 
 export const evidenceKinds = [
   "test_result",
@@ -1853,7 +1855,7 @@ function isCoordinatorWorkspaceDeltaEvidence(evidence: Evidence): boolean {
   return evidence.source === "trueforge" &&
     origin?.kind === "trueforge" &&
     origin.turnId !== undefined &&
-    origin.threadId === undefined &&
+    (origin.threadId === undefined || origin.threadId === TRUEFORGE_ROOT_THREAD_ID) &&
     origin.toolCallId !== undefined &&
     parseDelegatedWorkspaceDeltaEvidence(evidence) !== null;
 }

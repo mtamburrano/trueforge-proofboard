@@ -101,7 +101,7 @@ function coordinatorEvents(command, output, turnId, intent = WORKSPACE_SNAPSHOT_
     {
       type: "tool.response",
       id: `${turnId}-response`,
-      threadId: null,
+      threadId: "main",
       toolCallId: callId,
       content: JSON.stringify({ success: true, response: { exitCode: 0, result: output } }),
     },

@@ -16,6 +16,7 @@ import {
   WorkGraphDefinition,
   WorkItem,
   ReviewContext,
+  TRUEFORGE_ROOT_THREAD_ID,
   missionTransitions,
   validateWorkGraph,
 } from "./domain.js";
@@ -106,8 +107,6 @@ const DELEGATED_WORKSPACE_SNAPSHOT_INTENT =
 const DELEGATED_WORKSPACE_DELTA_INTENT =
   "Capture the coordinator-owned current work-item and cumulative mission workspace deltas after delegated implementation.";
 const MAX_COORDINATOR_EXEC_INTENT_LENGTH = 1_200;
-/** TrueForge emits root-agent model tool calls on the literal `main` thread. */
-const TRUEFORGE_ROOT_THREAD_ID = "main";
 const PULL_REQUEST_READ_TOOL_NAME = "pull_request_read";
 
 /**
@@ -3619,12 +3618,19 @@ function isExpectedCoordinatorIterationStop(
   if (calls.length !== 1 || calls[0] === undefined || calls[0].name !== expectedToolName) {
     return false;
   }
-  const response = toolResponseForCall(events, calls[0].id);
+  const call = calls[0];
+  if (expectedToolName === "exec" && !isCoordinatorRootThread(call.threadId)) {
+    return false;
+  }
+  const response = toolResponseForCall(events, call.id);
   if (response === undefined) {
     return false;
   }
   if (expectedToolName !== "exec") {
     return true;
+  }
+  if (!isCoordinatorRootThread(stringOrNull(recordValue(response).threadId ?? recordValue(response).thread_id))) {
+    return false;
   }
   const observed = parseExecutionResponse(response);
   return observed?.success === true && observed.exitCode === 0;
@@ -4063,7 +4069,7 @@ function coordinatorWorkspaceExecution(
   const response = toolResponseForCall(events, execution.id);
   if (
     response === undefined ||
-    stringOrNull(recordValue(response).threadId ?? recordValue(response).thread_id) !== null
+    !isCoordinatorRootThread(stringOrNull(recordValue(response).threadId ?? recordValue(response).thread_id))
   ) {
     return null;
   }
@@ -4835,8 +4841,14 @@ function verifySandboxExecution(
       `Expected exactly one coordinator-owned ${toolName} sandbox call, found ${executionCalls.length}.`,
     );
   }
+  const execution = executionCalls[0];
+  if (execution !== undefined && !isCoordinatorRootThread(execution.threadId)) {
+    return sandboxFailure(
+      `Expected exactly one coordinator-owned ${toolName} sandbox call on the TrueForge root thread.`,
+    );
+  }
   const canonicalCalls = executionCalls.filter(
-    (call) => call.name === toolName &&
+    (call) => isCoordinatorRootThread(call.threadId) &&
       coordinatorExecProvenance(call.arguments, command) !== null,
   );
   if (canonicalCalls.length !== 1) {
@@ -4855,6 +4867,11 @@ function verifySandboxExecution(
   );
   if (response === undefined) {
     return sandboxFailure(`${toolName} sandbox call has no structured response.`);
+  }
+  if (!isCoordinatorRootThread(stringOrNull(recordValue(response).threadId ?? recordValue(response).thread_id))) {
+    return sandboxFailure(
+      `${toolName} sandbox response was not emitted by the TrueForge root coordinator thread.`,
+    );
   }
   const responseValue = parseMaybeJson(recordValue(response).content);
   if (!isRecord(responseValue)) {
@@ -4959,7 +4976,7 @@ function verifyLockedRepositoryPreparation(
   const response = toolResponseForCall(events, call.id);
   if (
     response === undefined ||
-    stringOrNull(recordValue(response).threadId ?? recordValue(response).thread_id) !== null
+    !isCoordinatorRootThread(stringOrNull(recordValue(response).threadId ?? recordValue(response).thread_id))
   ) {
     return verificationFailure(
       operation,
