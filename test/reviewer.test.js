@@ -11,6 +11,10 @@ import {
   MissionDomainError,
   MissionService,
 } from "../dist/index.js";
+import {
+  persistWorkspaceStart,
+  workspaceDeltaEvidenceDetails,
+} from "./delegated-proof-fixture.js";
 
 const ORIGIN = {
   kind: "trueforge",
@@ -25,10 +29,6 @@ function fixedClock() {
 
 function domainError(code) {
   return (error) => error instanceof MissionDomainError && error.code === code;
-}
-
-function changedFilesManifestOutput(files = ["src/index.ts", "test/index.test.js"]) {
-  return `${files.map((file) => ` M ${file}`).join("\u0000")}\u0000`;
 }
 
 async function reviewFixture({
@@ -56,10 +56,10 @@ async function reviewFixture({
     status: "ready",
   });
   await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
-  await missions.startWorkItemDelegation(mission.id, workItem.id, {
-    owner: "bounded-implementer",
-    threadId: ORIGIN.threadId,
+  await persistWorkspaceStart(missions, mission.id, workItem.id, {
+    sessionId: ORIGIN.sessionId,
     turnId: ORIGIN.turnId,
+    threadId: ORIGIN.threadId,
   });
   await missions.completeWorkItemDelegation(mission.id, workItem.id, {
     threadId: ORIGIN.threadId,
@@ -91,13 +91,16 @@ async function reviewFixture({
     result: "passed",
     source: "trueforge",
     summary: "The delegated execution returned the complete changed-file manifest.",
-    details: JSON.stringify({
-      complete_changed_files: true,
-      command: "git status --porcelain=v1 -z --untracked-files=all",
-      output: changedFilesManifestOutput(manifestFiles),
-      changed_files: manifestFiles,
+    details: workspaceDeltaEvidenceDetails({
+      currentFiles: manifestFiles,
+      cumulativeFiles: manifestFiles,
     }),
-    executionOrigin: { ...ORIGIN, toolCallId: "call-review-manifest" },
+    executionOrigin: {
+      kind: "trueforge",
+      sessionId: ORIGIN.sessionId,
+      turnId: "turn-workspace-delta",
+      toolCallId: "call-review-manifest",
+    },
   });
   const evidenceIds = [typecheck.id, tests.id, manifest.id];
   if (includeDiff) {
@@ -305,7 +308,10 @@ test("changes requested returns work to ready while preserving prior attempts an
   assert.equal(state.workItems[0].status, "ready");
   assert.equal(state.handoffs.length, 1);
   assert.equal(state.handoffs[0].id, handoff.id);
-  assert.deepEqual(state.evidence.slice(0, evidenceIds.length).map((item) => item.id), evidenceIds);
+  assert.deepEqual(
+    state.evidence.filter((item) => evidenceIds.includes(item.id)).map((item) => item.id),
+    evidenceIds,
+  );
   assert.equal(state.reviews.length, 1);
   assert.equal(state.reviews[0].id, review.id);
   assert.equal(state.evidence.at(-1).id, review.findingEvidenceId);

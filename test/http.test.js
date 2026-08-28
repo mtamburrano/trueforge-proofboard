@@ -18,6 +18,7 @@ import {
   createMissionHttpApp,
   resolveMissionRuntimeConfig,
 } from "../dist/index.js";
+import { workspaceDeltaEvidenceDetails } from "./delegated-proof-fixture.js";
 
 class TestMissionRunner {
   constructor(
@@ -165,12 +166,17 @@ class TestMissionRunner {
     this.turnInputs.push({ instruction: _instruction, options });
     const turnId = `test-turn-${this.calls.turn}`;
     const threadId = `test-thread-${options.workItemId}`;
+    const treeRef = "a".repeat(40);
+    const endTreeRef = "b".repeat(40);
     await this.missions.attachTrueforgeTurn(missionId, turnId);
     if (this.structuredHandoff) {
+      await this.missions.attachTrueforgeWorkspaceBaseline(missionId, treeRef);
       await this.missions.startWorkItemDelegation(missionId, options.workItemId, {
         owner: "bounded-test-implementer",
         threadId,
         turnId,
+        startTreeRef: treeRef,
+        missionStartTreeRef: treeRef,
       });
     }
     await this.missions.addEvidence(missionId, {
@@ -223,13 +229,19 @@ class TestMissionRunner {
         result: "passed",
         source: "trueforge",
         summary: "Delegated complete changed-file manifest captured.",
-        details: JSON.stringify({
-          complete_changed_files: true,
-          command: "git status --porcelain=v1 -z --untracked-files=all",
-          output: " M src/index.ts\u0000",
-          changed_files: ["src/index.ts"],
+        details: workspaceDeltaEvidenceDetails({
+          startTreeRef: treeRef,
+          missionStartTreeRef: treeRef,
+          endTreeRef,
+          currentFiles: ["src/index.ts"],
+          cumulativeFiles: ["src/index.ts"],
         }),
-        executionOrigin: { ...origin, toolCallId: `call-manifest-${this.calls.turn}` },
+        executionOrigin: {
+          kind: "trueforge",
+          sessionId: "test-session-durable",
+          turnId: `test-proof-delta-${this.calls.turn}`,
+          toolCallId: `call-manifest-${this.calls.turn}`,
+        },
       });
       await this.missions.completeWorkItemDelegation(missionId, options.workItemId, {
         threadId,

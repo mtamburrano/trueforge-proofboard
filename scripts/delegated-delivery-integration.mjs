@@ -5,6 +5,8 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 import {
+  buildDelegatedWorkspaceDeltaCommand,
+  DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
   JsonMissionRepository,
   MissionDomainError,
   MissionService,
@@ -71,6 +73,47 @@ function fakeStream(events) {
       }
     },
   };
+}
+
+const WORKSPACE_BASELINE_TREE = "a".repeat(40);
+
+function treeRefForAttempt(attempt) {
+  return String.fromCharCode("a".charCodeAt(0) + attempt - 1).repeat(40);
+}
+
+function coordinatorEvents(command, output, turnId) {
+  const callId = `${turnId}-call`;
+  return [
+    { type: "turn.created", id: `${turnId}-created`, turnId, threadId: null, state: { status: "running" } },
+    {
+      type: "model.message",
+      id: `${turnId}-model`,
+      threadId: null,
+      toolCalls: [{ id: callId, function: { name: "exec", arguments: JSON.stringify({ command }) } }],
+    },
+    {
+      type: "tool.response",
+      id: `${turnId}-response`,
+      threadId: null,
+      toolCallId: callId,
+      content: JSON.stringify({ success: true, response: { exitCode: 0, result: output } }),
+    },
+    { type: "turn.done", id: `${turnId}-done`, threadId: null, state: { status: "done", requiredActions: [] } },
+  ];
+}
+
+function workspaceDeltaOutput(startTreeRef, missionStartTreeRef, endTreeRef, currentFiles, cumulativeFiles) {
+  const statusOutput = (files) => files.map((file) => `M\t${file}`).join("\n");
+  return [
+    `TRUEFORGE_WORKSPACE_DELTA start=${startTreeRef} mission_start=${missionStartTreeRef} end=${endTreeRef}`,
+    "TRUEFORGE_WORKSPACE_DELTA current_begin",
+    statusOutput(currentFiles),
+    "TRUEFORGE_WORKSPACE_DELTA current_end",
+    "TRUEFORGE_WORKSPACE_DELTA cumulative_begin",
+    statusOutput(cumulativeFiles),
+    "TRUEFORGE_WORKSPACE_DELTA cumulative_end",
+    "",
+  ].join("\n");
 }
 
 function delegatedEvents(attempt, { malformedCompletion = false } = {}) {
@@ -187,6 +230,7 @@ function delegatedEvents(attempt, { malformedCompletion = false } = {}) {
 
 function fakeClient({ sessionId, malformedCompletion = false }) {
   const calls = { create: [], get: [], turns: [] };
+  let turnNumber = 0;
   return {
     calls,
     client: {
@@ -200,8 +244,39 @@ function fakeClient({ sessionId, malformedCompletion = false }) {
           return { data: { id: requestedSessionId } };
         },
         async createTurnStream(requestedSessionId, request) {
-          const attempt = `turn-${calls.turns.length + 1}`;
+          const currentTurnNumber = turnNumber++;
+          const attemptNumber = Math.floor(currentTurnNumber / 3) + 1;
+          const attempt = `turn-${attemptNumber}`;
           calls.turns.push({ sessionId: requestedSessionId, request });
+          if (currentTurnNumber % 3 === 0) {
+            const startTreeRef = treeRefForAttempt(attemptNumber);
+            return fakeStream(coordinatorEvents(
+              DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
+              `TRUEFORGE_WORKSPACE_TREE ${startTreeRef}\n`,
+              `turn-proof-loop-start-${attemptNumber}`,
+            ));
+          }
+          if (currentTurnNumber % 3 === 2) {
+            const startTreeRef = treeRefForAttempt(attemptNumber);
+            const endTreeRef = treeRefForAttempt(attemptNumber + 1);
+            const currentFiles = [`src/${attempt}.ts`, `test/${attempt}.test.js`];
+            const cumulativeFiles = Array.from({ length: attemptNumber }, (_, index) => {
+              const fileAttempt = `turn-${index + 1}`;
+              return [`src/${fileAttempt}.ts`, `test/${fileAttempt}.test.js`];
+            }).flat();
+            const command = buildDelegatedWorkspaceDeltaCommand(startTreeRef, WORKSPACE_BASELINE_TREE);
+            return fakeStream(coordinatorEvents(
+              command,
+              workspaceDeltaOutput(
+                startTreeRef,
+                WORKSPACE_BASELINE_TREE,
+                endTreeRef,
+                currentFiles,
+                cumulativeFiles,
+              ),
+              `turn-proof-loop-delta-${attemptNumber}`,
+            ));
+          }
           return fakeStream(delegatedEvents(attempt, { malformedCompletion }));
         },
       },
@@ -297,7 +372,7 @@ async function runMalformedScenario(repository) {
     domainError("dependency_blocked"),
   );
   assert.equal(state.handoffs.filter((handoff) => handoff.missionId === mission.id).length, 0);
-  assert.equal(calls.turns.length, 1);
+  assert.equal(calls.turns.length, 2);
   return {
     missionId: mission.id,
     rootDelegationStatus: root.delegation.status,
@@ -428,7 +503,7 @@ async function runBlockedReviewScenario(repository) {
   const state = await missions.getState();
   assert.equal(state.handoffs.filter((item) => item.missionId === mission.id).length, historyBeforeReview.handoffs);
   assert.equal(
-    state.evidence.filter((item) => item.missionId === mission.id).length,
+    state.evidence.filter((item) => item.missionId === mission.id && item.workItemId === "proof-loop-blocked-root").length,
     historyBeforeReview.evidence + 1,
   );
   return {

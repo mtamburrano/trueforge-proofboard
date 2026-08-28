@@ -85,12 +85,15 @@ Delegated implementation work is review-gated by a structured handoff. It record
 changed files, a bounded diff summary, each required check and its observed result,
 decisions, open questions, evidence IDs, and the correlated TrueForge session,
 turn, thread, and tool origin. Each implementer also carries an explicit,
-repository-relative allowed-file scope; the delegated child must first return an
-unfiltered, tool-backed complete changed-file manifest from its own thread, then
-use an exit-preserving check command and return a content-bearing diff restricted
-to that scope. The coordinator compares the complete manifest against both the
-allowed files and the scoped diff, so a path-filtered diff cannot hide a forbidden
-change. Narrated file claims, masked shell wrappers, missing tool results, and
+repository-relative allowed-file scope. Before delegated coding, the coordinator
+captures a tool-backed temporary-index tree for both the mission baseline and the
+work-item start state; after the child returns, it captures an unfiltered
+name-status delta from those refs. This covers committed, staged, unstaged, and
+untracked changes, while separating the current work-item delta from cumulative
+mission changes in a reused sandbox. The coordinator compares the current delta
+against the allowed files and the child’s exit-preserving, content-bearing diff,
+then compares the cumulative delta against the union of authorized mission
+scopes. Narrated file claims, masked shell wrappers, missing tool results, and
 out-of-scope diffs are recorded as failed implementation evidence and block the
 work item. Missing, failed, contradictory, or uncorrelated evidence cannot be
 promoted to review; earlier durable evidence remains available for diagnosis.

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import {
-  parseCompleteChangedFilesEvidence,
+  parseDelegatedWorkspaceDeltaEvidence,
   parseContentDiffEvidence,
 } from "./diff.js";
 
@@ -174,6 +174,7 @@ export interface Mission {
   trueforgeSessionId?: string;
   trueforgeTurnId?: string;
   trueforgeSandboxId?: string;
+  trueforgeWorkspaceBaselineTreeRef?: string;
 }
 
 export interface WorkItem {
@@ -200,6 +201,8 @@ export interface WorkItemDelegation {
   updatedAt: string;
   turnId?: string;
   error?: string;
+  startTreeRef?: string;
+  missionStartTreeRef?: string;
 }
 
 export interface WorkGraphItem {
@@ -399,6 +402,8 @@ export interface StartWorkItemDelegationInput {
   owner: string;
   threadId: string;
   turnId?: string;
+  startTreeRef?: string;
+  missionStartTreeRef?: string;
 }
 
 export interface CompleteWorkItemDelegationInput {
@@ -558,6 +563,14 @@ function optionalString(
     return undefined;
   }
   return requiredString(value, label, maxLength);
+}
+
+function optionalTreeRef(value: unknown, label: string): string | undefined {
+  const ref = optionalString(value, label, 100);
+  if (ref !== undefined && !/^[0-9a-fA-F]{40,64}$/.test(ref)) {
+    return fail("invalid_input", `${label} must be a hexadecimal Git tree reference.`);
+  }
+  return ref;
 }
 
 function stringArray(value: unknown, label: string, maxItems = 200): string[] {
@@ -858,6 +871,10 @@ function validateMission(value: unknown, label: string): Mission {
     `${label}.trueforgeSandboxId`,
     200,
   );
+  const trueforgeWorkspaceBaselineTreeRef = optionalTreeRef(
+    mission.trueforgeWorkspaceBaselineTreeRef,
+    `${label}.trueforgeWorkspaceBaselineTreeRef`,
+  );
   const result: Mission = {
     id: identifier(mission.id, `${label}.id`),
     objective: requiredString(mission.objective, `${label}.objective`),
@@ -877,6 +894,9 @@ function validateMission(value: unknown, label: string): Mission {
   if (trueforgeSandboxId !== undefined) {
     result.trueforgeSandboxId = trueforgeSandboxId;
   }
+  if (trueforgeWorkspaceBaselineTreeRef !== undefined) {
+    result.trueforgeWorkspaceBaselineTreeRef = trueforgeWorkspaceBaselineTreeRef;
+  }
   return result;
 }
 
@@ -887,6 +907,17 @@ function validateWorkItemDelegation(
   const delegation = objectValue(value, label);
   const turnId = optionalString(delegation.turnId, `${label}.turnId`, 200);
   const error = optionalString(delegation.error, `${label}.error`, 2_000);
+  const startTreeRef = optionalTreeRef(delegation.startTreeRef, `${label}.startTreeRef`);
+  const missionStartTreeRef = optionalTreeRef(
+    delegation.missionStartTreeRef,
+    `${label}.missionStartTreeRef`,
+  );
+  if ((startTreeRef === undefined) !== (missionStartTreeRef === undefined)) {
+    return fail(
+      "invalid_input",
+      `${label}.startTreeRef and ${label}.missionStartTreeRef must be provided together.`,
+    );
+  }
   const result: WorkItemDelegation = {
     owner: requiredString(delegation.owner, `${label}.owner`, 200),
     threadId: requiredString(delegation.threadId, `${label}.threadId`, 200),
@@ -899,6 +930,10 @@ function validateWorkItemDelegation(
   }
   if (error !== undefined) {
     result.error = error;
+  }
+  if (startTreeRef !== undefined && missionStartTreeRef !== undefined) {
+    result.startTreeRef = startTreeRef;
+    result.missionStartTreeRef = missionStartTreeRef;
   }
   return result;
 }
@@ -1813,6 +1848,16 @@ function isStructuredImplementationWorkItem(workItem: WorkItem): boolean {
   return workItem.assignedRole === "implementer" && workItem.delegation !== undefined;
 }
 
+function isCoordinatorWorkspaceDeltaEvidence(evidence: Evidence): boolean {
+  const origin = evidence.executionOrigin;
+  return evidence.source === "trueforge" &&
+    origin?.kind === "trueforge" &&
+    origin.turnId !== undefined &&
+    origin.threadId === undefined &&
+    origin.toolCallId !== undefined &&
+    parseDelegatedWorkspaceDeltaEvidence(evidence) !== null;
+}
+
 function handoffMatchesCurrentDelegation(workItem: WorkItem, handoff: Handoff): boolean {
   if (!isStructuredImplementationWorkItem(workItem)) {
     return false;
@@ -1868,9 +1913,11 @@ function validateStructuredHandoffCorrelation(
         `Evidence ${evidence.id} belongs to a different execution session than handoff ${handoff.id}.`,
       );
     }
+    const isCoordinatorWorkspaceProof = isCoordinatorWorkspaceDeltaEvidence(evidence);
     if (
       structured.executionOrigin.turnId !== undefined &&
-      evidence.executionOrigin.turnId !== structured.executionOrigin.turnId
+      evidence.executionOrigin.turnId !== structured.executionOrigin.turnId &&
+      !isCoordinatorWorkspaceProof
     ) {
       return fail(
         "invalid_input",
@@ -1947,7 +1994,9 @@ function validateStructuredHandoffCorrelation(
   const changedStateEvidence = linkedEvidence.filter((evidence) =>
     evidence.kind === "diff_summary" || evidence.kind === "file_change"
   );
-  if (changedStateEvidence.some((evidence) => !matchesHandoffOrigin(evidence))) {
+  if (changedStateEvidence.some((evidence) =>
+    !matchesHandoffOrigin(evidence) && !isCoordinatorWorkspaceDeltaEvidence(evidence)
+  )) {
     return fail(
       "invalid_input",
       `Handoff ${handoff.id} uses changed-state evidence from a different execution thread.`,
@@ -1955,19 +2004,21 @@ function validateStructuredHandoffCorrelation(
   }
 
   if (isStructuredImplementationWorkItem(workItem) && enforceCurrentDelegation) {
-    const completeChangedFilesEvidence = linkedEvidence
+    const workspaceDeltaEvidence = linkedEvidence
       .map((evidence) => ({
         evidence,
-        parsed: parseCompleteChangedFilesEvidence(evidence),
+        parsed: isCoordinatorWorkspaceDeltaEvidence(evidence)
+          ? parseDelegatedWorkspaceDeltaEvidence(evidence)
+          : null,
       }))
       .filter((candidate): candidate is typeof candidate & {
         parsed: NonNullable<typeof candidate.parsed>;
       } => candidate.parsed !== null);
-    const completeChangedFiles = completeChangedFilesEvidence.at(-1)?.parsed.filesChanged;
-    if (completeChangedFiles === undefined) {
+    const workspaceDelta = workspaceDeltaEvidence.at(-1)?.parsed;
+    if (workspaceDelta === undefined) {
       return fail(
         "invalid_input",
-        `Handoff ${handoff.id} has no independently observed complete changed-file manifest for delegated implementation.`,
+        `Handoff ${handoff.id} has no coordinator-collected anchored workspace delta for delegated implementation.`,
       );
     }
     const allowedFiles = workItem.allowedFiles;
@@ -1977,35 +2028,72 @@ function validateStructuredHandoffCorrelation(
         `Work item ${workItem.id} has no explicit allowed file scope for delegated implementation.`,
       );
     }
+    const delegation = workItem.delegation;
+    if (
+      delegation?.startTreeRef === undefined ||
+      delegation.missionStartTreeRef === undefined
+    ) {
+      return fail(
+        "invalid_input",
+        `Work item ${workItem.id} has no known per-work-item workspace start state for delegated implementation.`,
+      );
+    }
+    const mission = state.missions.find((candidate) => candidate.id === handoff.missionId);
+    if (
+      mission?.trueforgeWorkspaceBaselineTreeRef === undefined ||
+      workspaceDelta.startTreeRef !== delegation.startTreeRef ||
+      workspaceDelta.missionStartTreeRef !== delegation.missionStartTreeRef ||
+      workspaceDelta.missionStartTreeRef !== mission.trueforgeWorkspaceBaselineTreeRef
+    ) {
+      return fail(
+        "invalid_input",
+        `Handoff ${handoff.id} is not anchored to the persisted mission and work-item workspace start states.`,
+      );
+    }
     const observedChangedFiles = [...new Set(changedStateEvidence.flatMap((evidence) =>
       changedFilesFromContentBearingEvidence(evidence) ?? []
     ))];
-    const outOfScopeFiles = [...new Set([
+    const currentChangedFiles = workspaceDelta.currentChangedFiles;
+    const missionAllowedFiles = [...new Set(state.workItems
+      .filter((item) => item.missionId === handoff.missionId && item.assignedRole === "implementer")
+      .flatMap((item) => item.allowedFiles ?? []))];
+    const itemOutOfScopeFiles = [...new Set([
       ...handoff.filesChanged,
-      ...completeChangedFiles,
+      ...currentChangedFiles,
       ...observedChangedFiles,
     ].filter((file) => !allowedFiles.includes(file)))];
-    if (outOfScopeFiles.length > 0) {
+    if (itemOutOfScopeFiles.length > 0) {
       return fail(
         "invalid_input",
-        `Handoff ${handoff.id} changes files outside work item ${workItem.id} scope: ${outOfScopeFiles.join(", ")}. Allowed files: ${allowedFiles.join(", ")}.`,
+        `Handoff ${handoff.id} changes files outside work item ${workItem.id} scope: ${itemOutOfScopeFiles.join(", ")}. Allowed files: ${allowedFiles.join(", ")}.`,
       );
     }
-    const missingFromScopedDiff = completeChangedFiles.filter((file) => !observedChangedFiles.includes(file));
-    const missingFromCompleteManifest = observedChangedFiles.filter((file) => !completeChangedFiles.includes(file));
-    if (observedChangedFiles.length > 0 &&
-        (missingFromScopedDiff.length > 0 || missingFromCompleteManifest.length > 0)) {
+    const cumulativeOutOfScopeFiles = workspaceDelta.cumulativeChangedFiles.filter((file) =>
+      !missionAllowedFiles.includes(file),
+    );
+    if (cumulativeOutOfScopeFiles.length > 0) {
+      return fail(
+        "invalid_input",
+        `Handoff ${handoff.id} includes cumulative mission changes outside the union of authorized work-item scopes: ${cumulativeOutOfScopeFiles.join(", ")}. Authorized files: ${missionAllowedFiles.join(", ")}.`,
+      );
+    }
+    const missingFromScopedDiff = currentChangedFiles.filter((file) => !observedChangedFiles.includes(file));
+    const missingFromWorkspaceDelta = observedChangedFiles.filter((file) => !currentChangedFiles.includes(file));
+    if (
+      observedChangedFiles.length > 0 &&
+      (missingFromScopedDiff.length > 0 || missingFromWorkspaceDelta.length > 0)
+    ) {
       const differences = [
         ...(missingFromScopedDiff.length === 0
           ? []
           : [`missing from the scoped content diff: ${missingFromScopedDiff.join(", ")}`]),
-        ...(missingFromCompleteManifest.length === 0
+        ...(missingFromWorkspaceDelta.length === 0
           ? []
-          : [`missing from the complete changed-file manifest: ${missingFromCompleteManifest.join(", ")}`]),
+          : [`missing from the coordinator workspace delta: ${missingFromWorkspaceDelta.join(", ")}`]),
       ];
       return fail(
         "invalid_input",
-        `Handoff ${handoff.id} has a complete changed-file manifest that does not match its scoped content diff (${differences.join("; ")}).`,
+        `Handoff ${handoff.id} has a coordinator workspace delta that does not match its scoped content diff (${differences.join("; ")}).`,
       );
     }
   }
@@ -2350,6 +2438,35 @@ export class MissionService {
     });
   }
 
+  async attachTrueforgeWorkspaceBaseline(
+    missionId: string,
+    treeRef: string,
+  ): Promise<Mission> {
+    return this.mutate((state, now) => {
+      const mission = findMission(state, normalizedId(missionId, "missionId"));
+      ensureOpen(mission);
+      const normalizedTreeRef = optionalTreeRef(treeRef, "trueforgeWorkspaceBaselineTreeRef");
+      if (normalizedTreeRef === undefined) {
+        fail(
+          "invalid_input",
+          "trueforgeWorkspaceBaselineTreeRef must be a hexadecimal Git tree reference.",
+        );
+      }
+      if (
+        mission.trueforgeWorkspaceBaselineTreeRef !== undefined &&
+        mission.trueforgeWorkspaceBaselineTreeRef !== normalizedTreeRef
+      ) {
+        fail(
+          "invalid_transition",
+          `Mission ${mission.id} already has a different TrueForge workspace baseline tree reference.`,
+        );
+      }
+      mission.trueforgeWorkspaceBaselineTreeRef = normalizedTreeRef;
+      mission.updatedAt = now;
+      return mission;
+    });
+  }
+
   async persistWorkGraph(missionId: string, graph: unknown): Promise<WorkItem[]> {
     const validatedGraph = validateWorkGraph(graph);
     return this.mutate((state, now) => {
@@ -2492,6 +2609,32 @@ export class MissionService {
       const owner = requiredString(input.owner, "delegation.owner", 200);
       const threadId = requiredString(input.threadId, "delegation.threadId", 200);
       const turnId = optionalString(input.turnId, "delegation.turnId", 200);
+      const startTreeRef = optionalTreeRef(input.startTreeRef, "delegation.startTreeRef");
+      const missionStartTreeRef = optionalTreeRef(
+        input.missionStartTreeRef,
+        "delegation.missionStartTreeRef",
+      );
+      if ((startTreeRef === undefined) !== (missionStartTreeRef === undefined)) {
+        fail(
+          "invalid_input",
+          "delegation.startTreeRef and delegation.missionStartTreeRef must be provided together.",
+        );
+      }
+      if (workItem.assignedRole === "implementer" && startTreeRef === undefined) {
+        fail(
+          "invalid_transition",
+          `Work item ${workItem.id} requires a coordinator-captured workspace start state before delegation starts.`,
+        );
+      }
+      if (
+        missionStartTreeRef !== undefined &&
+        mission.trueforgeWorkspaceBaselineTreeRef !== missionStartTreeRef
+      ) {
+        fail(
+          "invalid_transition",
+          `Work item ${workItem.id} delegation does not match the mission workspace baseline tree reference.`,
+        );
+      }
       workItem.delegation = {
         owner,
         threadId,
@@ -2499,6 +2642,9 @@ export class MissionService {
         startedAt: now,
         updatedAt: now,
         ...(turnId === undefined ? {} : { turnId }),
+        ...(startTreeRef === undefined || missionStartTreeRef === undefined
+          ? {}
+          : { startTreeRef, missionStartTreeRef }),
       };
       workItem.updatedAt = now;
       return workItem;

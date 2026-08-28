@@ -12,7 +12,10 @@ import {
   TrueForgeIntegrationError,
   TrueForgeMissionRunner,
   buildWorkPacket,
+  DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
+  buildDelegatedWorkspaceDeltaCommand,
 } from "../dist/index.js";
+import { workspaceDeltaEvidenceDetails } from "./delegated-proof-fixture.js";
 
 function fixedClock() {
   return new Date("2026-08-27T12:00:00.000Z");
@@ -26,6 +29,38 @@ function fakeStream(events) {
       }
     },
   };
+}
+
+const WORKSPACE_TREE = "a".repeat(40);
+const WORKSPACE_END_TREE = "b".repeat(40);
+
+function coordinatorEvents(command, output, turnId) {
+  const callId = `${turnId}-call`;
+  return [
+    { type: "turn.created", id: `${turnId}-created`, turnId, threadId: null, state: { status: "running" } },
+    {
+      type: "model.message",
+      id: `${turnId}-model`,
+      threadId: null,
+      toolCalls: [{ id: callId, function: { name: "exec", arguments: JSON.stringify({ command }) } }],
+    },
+    {
+      type: "tool.response",
+      id: `${turnId}-response`,
+      threadId: null,
+      toolCallId: callId,
+      content: JSON.stringify({ success: true, response: { exitCode: 0, result: output } }),
+    },
+    { type: "turn.done", id: `${turnId}-done`, threadId: null, state: { status: "done", requiredActions: [] } },
+  ];
+}
+
+function workspaceDeltaFixture() {
+  return JSON.parse(workspaceDeltaEvidenceDetails({
+    startTreeRef: WORKSPACE_TREE,
+    missionStartTreeRef: WORKSPACE_TREE,
+    endTreeRef: WORKSPACE_END_TREE,
+  }));
 }
 
 function delegatedEvents({ malformedCompletion = false, includeThread = true, threadError } = {}) {
@@ -155,6 +190,7 @@ function delegatedEvents({ malformedCompletion = false, includeThread = true, th
 
 function fakeClient(events) {
   const calls = { create: [], turns: [] };
+  let turnNumber = 0;
   return {
     calls,
     client: {
@@ -168,6 +204,22 @@ function fakeClient(events) {
         },
         async createTurnStream(sessionId, request) {
           calls.turns.push({ sessionId, request });
+          const current = turnNumber++;
+          if (current === 0) {
+            return fakeStream(coordinatorEvents(
+              DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
+              `TRUEFORGE_WORKSPACE_TREE ${WORKSPACE_TREE}\n`,
+              "turn-workspace-start",
+            ));
+          }
+          if (current === 2) {
+            const delta = workspaceDeltaFixture();
+            return fakeStream(coordinatorEvents(
+              buildDelegatedWorkspaceDeltaCommand(WORKSPACE_TREE, WORKSPACE_TREE),
+              delta.output,
+              "turn-workspace-delta",
+            ));
+          }
           return fakeStream(events);
         },
       },
@@ -220,12 +272,12 @@ test("native dynamic delegation sends a bounded durable Work Packet and persists
 
   assert.equal(result.turnId, "turn-delegated");
   assert.equal(calls.create[0].agent.spec.config.dynamicSubAgents.enabled, true);
-  const prompt = calls.turns[0].request.input[0].content;
+  const prompt = calls.turns[1].request.input[0].content;
   assert.match(prompt, /Work Packet:/);
   assert.match(prompt, /Implement src\/index\.ts/);
   assert.match(prompt, /allowedFiles/);
   assert.match(prompt, /may modify only these explicitly allowed repository files/);
-  assert.match(prompt, /git status --porcelain=v1 -z --untracked-files=all/);
+  assert.match(prompt, /coordinator independently captures the complete current work-item delta/i);
   assert.match(prompt, /git diff -- <allowed file>/);
   assert.match(prompt, /The bounded change is complete/);
   assert.doesNotMatch(prompt, /must not enter the packet/);
@@ -240,6 +292,8 @@ test("native dynamic delegation sends a bounded durable Work Packet and persists
     startedAt: "2026-08-27T12:00:00.000Z",
     updatedAt: "2026-08-27T12:00:00.000Z",
     turnId: "turn-delegated",
+    startTreeRef: WORKSPACE_TREE,
+    missionStartTreeRef: WORKSPACE_TREE,
   });
   assert.equal(persisted.status, "in_progress");
 });
@@ -366,9 +420,12 @@ test("Work Packets contain only scoped durable state and domain delegation enfor
   await missions.transitionWorkItem(mission.id, root.id, "complete");
   await missions.transitionWorkItem(mission.id, child.id, "ready");
   await missions.transitionWorkItem(mission.id, child.id, "in_progress");
+  await missions.attachTrueforgeWorkspaceBaseline(mission.id, WORKSPACE_TREE);
   const started = await missions.startWorkItemDelegation(mission.id, child.id, {
     owner: "bounded-implementer",
     threadId: "thread-child",
+    startTreeRef: WORKSPACE_TREE,
+    missionStartTreeRef: WORKSPACE_TREE,
   });
   assert.equal(started.delegation.status, "running");
 });

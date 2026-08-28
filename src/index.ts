@@ -11,6 +11,7 @@ export function getProductSummary(): string {
 }
 
 export * from "./domain.js";
+export * from "./diff.js";
 export * from "./fixture.js";
 export * from "./persistence.js";
 export * from "./trueforge.js";

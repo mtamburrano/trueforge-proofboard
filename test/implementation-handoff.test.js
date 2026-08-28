@@ -11,7 +11,13 @@ import {
   MissionService,
   TrueForgeIntegrationError,
   TrueForgeMissionRunner,
+  DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
+  buildDelegatedWorkspaceDeltaCommand,
 } from "../dist/index.js";
+import {
+  persistWorkspaceStart,
+  workspaceDeltaEvidenceDetails,
+} from "./delegated-proof-fixture.js";
 
 const ORIGIN = {
   kind: "trueforge",
@@ -19,12 +25,6 @@ const ORIGIN = {
   turnId: "turn-handoff",
   threadId: "thread-handoff",
 };
-
-const COMPLETE_CHANGED_FILES_COMMAND = "git status --porcelain=v1 -z --untracked-files=all";
-
-function changedFilesManifestOutput(files = ["src/index.ts", "test/index.test.js"]) {
-  return `${files.map((file) => ` M ${file}`).join("\u0000")}\u0000`;
-}
 
 function fixedClock() {
   return new Date("2026-08-27T13:00:00.000Z");
@@ -52,10 +52,10 @@ async function delegatedFixture(repository = new InMemoryMissionRepository()) {
     status: "ready",
   });
   await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
-  await missions.startWorkItemDelegation(mission.id, workItem.id, {
-    owner: "bounded-implementer",
-    threadId: ORIGIN.threadId,
+  await persistWorkspaceStart(missions, mission.id, workItem.id, {
+    sessionId: ORIGIN.sessionId,
     turnId: ORIGIN.turnId,
+    threadId: ORIGIN.threadId,
   });
   await missions.completeWorkItemDelegation(mission.id, workItem.id, {
     threadId: ORIGIN.threadId,
@@ -79,14 +79,15 @@ async function addEvidence(missions, missionId, id, kind, result, toolCallId, or
       }),
     } : {}),
     ...(kind === "file_change" ? {
-      details: JSON.stringify({
-        complete_changed_files: true,
-        command: COMPLETE_CHANGED_FILES_COMMAND,
-        output: changedFilesManifestOutput(),
-        changed_files: ["src/index.ts", "test/index.test.js"],
-      }),
+      details: workspaceDeltaEvidenceDetails(),
+      executionOrigin: {
+        kind: "trueforge",
+        sessionId: ORIGIN.sessionId,
+        turnId: "turn-workspace-delta",
+        toolCallId,
+      },
     } : {}),
-    executionOrigin: { ...origin, toolCallId },
+    ...(kind === "file_change" ? {} : { executionOrigin: { ...origin, toolCallId } }),
   });
 }
 
@@ -138,6 +139,38 @@ function fakeStream(events) {
       }
     },
   };
+}
+
+const WORKSPACE_TREE = "a".repeat(40);
+const WORKSPACE_END_TREE = "b".repeat(40);
+
+function coordinatorEvents(command, output, turnId) {
+  const callId = `${turnId}-call`;
+  return [
+    { type: "turn.created", id: `${turnId}-created`, turnId, threadId: null, state: { status: "running" } },
+    {
+      type: "model.message",
+      id: `${turnId}-model`,
+      threadId: null,
+      toolCalls: [{ id: callId, function: { name: "exec", arguments: JSON.stringify({ command }) } }],
+    },
+    {
+      type: "tool.response",
+      id: `${turnId}-response`,
+      threadId: null,
+      toolCallId: callId,
+      content: JSON.stringify({ success: true, response: { exitCode: 0, result: output } }),
+    },
+    { type: "turn.done", id: `${turnId}-done`, threadId: null, state: { status: "done", requiredActions: [] } },
+  ];
+}
+
+function workspaceDeltaFixture() {
+  return JSON.parse(workspaceDeltaEvidenceDetails({
+    startTreeRef: WORKSPACE_TREE,
+    missionStartTreeRef: WORKSPACE_TREE,
+    endTreeRef: WORKSPACE_END_TREE,
+  }));
 }
 
 function delegatedExecutionEvents({ proofThreadId = ORIGIN.threadId } = {}) {
@@ -407,13 +440,16 @@ test("a structured handoff cannot authorize a diff outside the explicit file sco
     result: "passed",
     source: "trueforge",
     summary: "The delegated execution returned the complete changed-file manifest.",
-    details: JSON.stringify({
-      complete_changed_files: true,
-      command: COMPLETE_CHANGED_FILES_COMMAND,
-      output: changedFilesManifestOutput(["src/index.ts", "README.md"]),
-      changed_files: ["src/index.ts", "README.md"],
+    details: workspaceDeltaEvidenceDetails({
+      currentFiles: ["src/index.ts", "README.md"],
+      cumulativeFiles: ["src/index.ts", "README.md"],
     }),
-    executionOrigin: { ...ORIGIN, toolCallId: "call-scope-manifest" },
+    executionOrigin: {
+      kind: "trueforge",
+      sessionId: ORIGIN.sessionId,
+      turnId: "turn-workspace-delta",
+      toolCallId: "call-scope-manifest",
+    },
   });
 
   await assert.rejects(
@@ -464,7 +500,8 @@ test("uncorrelated evidence is rejected atomically while prior history is preser
     domainError("invalid_input"),
   );
   const state = await missions.getState();
-  assert.deepEqual(state.evidence.map((item) => item.id), [prior.id, unrelated.id]);
+  assert.equal(state.evidence.some((item) => item.id === prior.id), true);
+  assert.equal(state.evidence.some((item) => item.id === unrelated.id), true);
   assert.equal(state.handoffs.length, 0);
 });
 
@@ -492,6 +529,8 @@ test("cross-thread proof is rejected while a prior valid handoff remains durable
     owner: "bounded-implementer",
     threadId: retryOrigin.threadId,
     turnId: retryOrigin.turnId,
+    startTreeRef: "b".repeat(40),
+    missionStartTreeRef: "a".repeat(40),
   });
   await missions.completeWorkItemDelegation(mission.id, workItem.id, {
     threadId: retryOrigin.threadId,
@@ -531,7 +570,7 @@ test("cross-thread proof is rejected while a prior valid handoff remains durable
 
 test("TrueForge derives a structured handoff only from delegated tool responses", async () => {
   const missions = new MissionService(new InMemoryMissionRepository(), fixedClock);
-  const events = delegatedExecutionEvents();
+  let turnNumber = 0;
   const client = {
     sessions: {
       async create() {
@@ -541,7 +580,23 @@ test("TrueForge derives a structured handoff only from delegated tool responses"
         return { data: { id: sessionId } };
       },
       async createTurnStream() {
-        return fakeStream(events);
+        const current = turnNumber++;
+        if (current === 0) {
+          return fakeStream(coordinatorEvents(
+            DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
+            `TRUEFORGE_WORKSPACE_TREE ${WORKSPACE_TREE}\n`,
+            "turn-workspace-start",
+          ));
+        }
+        if (current === 2) {
+          const delta = workspaceDeltaFixture();
+          return fakeStream(coordinatorEvents(
+            buildDelegatedWorkspaceDeltaCommand(WORKSPACE_TREE, WORKSPACE_TREE),
+            delta.output,
+            "turn-workspace-delta",
+          ));
+        }
+        return fakeStream(delegatedExecutionEvents());
       },
     },
   };
@@ -594,7 +649,7 @@ test("TrueForge derives a structured handoff only from delegated tool responses"
 
 test("coordinator-thread checks and diff cannot prove delegated completion", async () => {
   const missions = new MissionService(new InMemoryMissionRepository(), fixedClock);
-  const events = delegatedExecutionEvents({ proofThreadId: "thread-parent" });
+  let turnNumber = 0;
   const client = {
     sessions: {
       async create() {
@@ -604,7 +659,23 @@ test("coordinator-thread checks and diff cannot prove delegated completion", asy
         return { data: { id: sessionId } };
       },
       async createTurnStream() {
-        return fakeStream(events);
+        const current = turnNumber++;
+        if (current === 0) {
+          return fakeStream(coordinatorEvents(
+            DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
+            `TRUEFORGE_WORKSPACE_TREE ${WORKSPACE_TREE}\n`,
+            "turn-workspace-start",
+          ));
+        }
+        if (current === 2) {
+          const delta = workspaceDeltaFixture();
+          return fakeStream(coordinatorEvents(
+            buildDelegatedWorkspaceDeltaCommand(WORKSPACE_TREE, WORKSPACE_TREE),
+            delta.output,
+            "turn-workspace-delta",
+          ));
+        }
+        return fakeStream(delegatedExecutionEvents({ proofThreadId: "thread-parent" }));
       },
     },
   };

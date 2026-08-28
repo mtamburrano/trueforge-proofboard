@@ -20,9 +20,11 @@ import {
   validateWorkGraph,
 } from "./domain.js";
 import {
-  completeChangedFilesFromCommand,
+  buildDelegatedWorkspaceDeltaCommand,
   changedFilesFromDiff,
-  isCompleteChangedFilesCommand,
+  DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
+  parseDelegatedWorkspaceDeltaOutput,
+  parseDelegatedWorkspaceTreeSnapshotOutput,
   isContentDiffCommand,
   isContentDiffOutput,
 } from "./diff.js";
@@ -119,6 +121,7 @@ const SANDBOX_NODE_SOURCE_REPOSITORY =
   `https://deb.nodesource.com/node_${SANDBOX_NODE_SOURCE_MAJOR}.x`;
 export const DELEGATED_COMPLETE_CHANGED_FILES_COMMAND =
   "git status --porcelain=v1 -z --untracked-files=all";
+export { DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND } from "./diff.js";
 
 /**
  * Debian 12/bookworm ships Node.js 18. Add the NodeSource 22.x repository
@@ -263,7 +266,7 @@ export function buildDelegatedTurnInstruction(
     `Work Packet: ${JSON.stringify(packet)}`,
     `Coordinator instruction: ${instruction.trim()}`,
     `The subagent may modify only these explicitly allowed repository files: ${allowedFiles.join(", ")}. Any observed change outside this scope fails the handoff.`,
-    `The subagent may use only the configured tools and the repository/evidence context in this packet. It must execute every required check through an exit-preserving command, first capture the complete changed-file set with the unfiltered delegated-thread command \`${DELEGATED_COMPLETE_CHANGED_FILES_COMMAND}\`, then capture a bounded content-bearing git diff through the delegated thread's tool restricted to the allowed files (for example, git diff -- <allowed file>). The complete changed-file set is independently compared with the scoped diff and allowed files, so omitting a forbidden file from the scoped diff does not hide it. Return control after the subagent finishes.`,
+    "The subagent may use only the configured tools and the repository/evidence context in this packet. It must execute every required check through an exit-preserving command, then capture a bounded content-bearing git diff through the delegated thread's tool restricted to the allowed files (for example, git diff -- <allowed file>). The coordinator independently captures the complete current work-item delta from a pre-delegation sandbox tree and compares it with the scoped diff and both the work-item and mission scopes; do not substitute narration for either proof. Return control after the subagent finishes.",
     "End with a machine-readable IMPLEMENTATION_HANDOFF object containing decisions and openQuestions. The coordinator will independently correlate changed files and check results to the observed tool responses.",
   ].join("\n");
 }
@@ -487,6 +490,10 @@ export interface RunTurnOptions {
 
 interface InternalRunTurnOptions extends RunTurnOptions {
   input?: TrueForgeApi.TurnInputItem[];
+  delegatedWorkspaceStart?: {
+    startTreeRef: string;
+    missionStartTreeRef: string;
+  };
 }
 
 export interface PullRequestDeliveryTarget {
@@ -663,6 +670,33 @@ interface RuntimeEvidence {
 
 interface InternalTurnResult extends TrueForgeTurnResult {
   rawEvents: TrueForgeApi.TurnStreamingEvent[];
+  delegatedThread?: { threadId: string; owner: string };
+  delegatedOutput?: Record<string, unknown>;
+  runtimeEvidenceIdsByEventId: Map<string, string>;
+}
+
+interface DelegatedWorkspaceStart {
+  sessionId: string;
+  turnId: string;
+  treeRef: string;
+  missionStartTreeRef: string;
+  response: TrueForgeApi.TurnStreamingEvent;
+}
+
+interface DelegatedWorkspaceProof {
+  sessionId: string;
+  turnId: string;
+  response: TrueForgeApi.TurnStreamingEvent;
+  evidenceId: string;
+  command: string;
+  output: string;
+  startTreeRef: string;
+  missionStartTreeRef: string;
+  endTreeRef: string;
+  currentChangedFiles: string[];
+  cumulativeChangedFiles: string[];
+  currentDeltaOutput: string;
+  cumulativeDeltaOutput: string;
 }
 
 interface VerifiedRepositoryFile {
@@ -828,15 +862,227 @@ export class TrueForgeMissionRunner {
     instruction: string,
     options: RunTurnOptions = {},
   ): Promise<TrueForgeTurnResult> {
-    const execution = await this.executeTurn(missionId, instruction, options);
+    const delegatedWorkItem = options.delegateToSubagent === true && options.workItemId !== undefined
+      ? await this.missions.getWorkItem(missionId, options.workItemId)
+      : undefined;
+    const workspaceStart = delegatedWorkItem === undefined
+      ? undefined
+      : await this.captureDelegatedWorkspaceStart(missionId, delegatedWorkItem.id, options.previousTurnId);
+    const execution = await this.executeTurn(
+      missionId,
+      instruction,
+      workspaceStart === undefined
+        ? options
+        : {
+            ...options,
+            previousTurnId: workspaceStart.turnId,
+            delegatedWorkspaceStart: {
+              startTreeRef: workspaceStart.treeRef,
+              missionStartTreeRef: workspaceStart.missionStartTreeRef,
+            },
+          },
+    );
+    let implementationHandoff: ImplementationHandoffDraft | undefined;
+    if (
+      delegatedWorkItem !== undefined &&
+      workspaceStart !== undefined &&
+      execution.delegatedThread !== undefined
+    ) {
+      let workspaceProof: DelegatedWorkspaceProof;
+      try {
+        workspaceProof = await this.captureDelegatedWorkspaceDelta(
+          missionId,
+          delegatedWorkItem.id,
+          workspaceStart,
+          execution.turnId,
+        );
+      } catch (error) {
+        return this.failImplementationEvidence(
+          await this.missions.getMission(missionId),
+          delegatedWorkItem,
+          execution.sessionId,
+          execution.turnId,
+          execution.delegatedThread,
+          error instanceof TrueForgeIntegrationError
+            ? error.message
+            : "The coordinator could not verify the complete sandbox delta after delegated work.",
+          observedToolCalls(execution.rawEvents)
+            .filter((call) => call.name === "exec" && call.threadId === execution.delegatedThread?.threadId)
+            .map((call) => ({
+              command: executionCommand(call.arguments) ?? "unparseable delegated exec command",
+            })),
+        );
+      }
+      implementationHandoff = await this.buildImplementationHandoff(
+        await this.missions.getMission(missionId),
+        await this.missions.getWorkItem(missionId, delegatedWorkItem.id),
+        execution.sessionId,
+        execution.turnId,
+        execution.delegatedThread,
+        execution.rawEvents,
+        execution.runtimeEvidenceIdsByEventId,
+        execution.delegatedOutput,
+        workspaceProof,
+      );
+    }
     return {
       sessionId: execution.sessionId,
       turnId: execution.turnId,
       events: execution.events,
-      mission: execution.mission,
-      ...(execution.implementationHandoff === undefined
+      mission: await this.missions.getMission(missionId),
+      ...(implementationHandoff === undefined
         ? {}
-        : { implementationHandoff: execution.implementationHandoff }),
+        : { implementationHandoff }),
+    };
+  }
+
+  private async captureDelegatedWorkspaceStart(
+    missionId: string,
+    workItemId: string,
+    previousTurnId: string | undefined,
+  ): Promise<DelegatedWorkspaceStart> {
+    const execution = await this.executeTurn(
+      missionId,
+      "Capture the coordinator-owned workspace tree before delegated implementation starts.",
+      previousTurnId === undefined ? {} : { previousTurnId },
+    );
+    requireCompletedTurn(execution.rawEvents, "capture workspace start", "workspace snapshot");
+    const coordinatorExecution = coordinatorWorkspaceExecution(
+      execution.rawEvents,
+      DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
+    );
+    if (coordinatorExecution === null) {
+      throw new TrueForgeIntegrationError(
+        "capture workspace start",
+        "The coordinator did not return exactly one successful tool-backed workspace start snapshot.",
+      );
+    }
+    const parsed = parseDelegatedWorkspaceTreeSnapshotOutput(
+      coordinatorExecution.observed.output,
+      coordinatorExecution.command,
+    );
+    if (
+      coordinatorExecution.observed.success !== true ||
+      coordinatorExecution.observed.exitCode !== 0 ||
+      parsed === null
+    ) {
+      throw new TrueForgeIntegrationError(
+        "capture workspace start",
+        "The coordinator workspace start snapshot was not a successful parseable tool result.",
+      );
+    }
+    const mission = await this.missions.getMission(missionId);
+    const missionStartTreeRef = mission.trueforgeWorkspaceBaselineTreeRef ?? parsed.treeRef;
+    await this.missions.attachTrueforgeWorkspaceBaseline(missionId, missionStartTreeRef);
+    await this.missions.addEvidence(missionId, {
+      workItemId,
+      kind: "tool_result",
+      result: "passed",
+      source: "trueforge",
+      summary: "The coordinator captured the per-work-item workspace start tree.",
+      details: JSON.stringify({
+        coordinator_collected: true,
+        workspace_tree_snapshot: true,
+        command: parsed.command,
+        output: parsed.output,
+        tree_ref: parsed.treeRef,
+        mission_start_tree_ref: missionStartTreeRef,
+        exit_code: coordinatorExecution.observed.exitCode,
+      }),
+      executionOrigin: runtimeExecutionOrigin(
+        execution.sessionId,
+        execution.turnId,
+        coordinatorExecution.response,
+      ),
+    });
+    return {
+      sessionId: execution.sessionId,
+      turnId: execution.turnId,
+      treeRef: parsed.treeRef,
+      missionStartTreeRef,
+      response: coordinatorExecution.response,
+    };
+  }
+
+  private async captureDelegatedWorkspaceDelta(
+    missionId: string,
+    workItemId: string,
+    workspaceStart: DelegatedWorkspaceStart,
+    previousTurnId: string,
+  ): Promise<DelegatedWorkspaceProof> {
+    const command = buildDelegatedWorkspaceDeltaCommand(
+      workspaceStart.treeRef,
+      workspaceStart.missionStartTreeRef,
+    );
+    const execution = await this.executeTurn(
+      missionId,
+      "Capture the coordinator-owned current work-item and cumulative mission workspace deltas after delegated implementation.",
+      { previousTurnId },
+    );
+    requireCompletedTurn(execution.rawEvents, "capture workspace delta", "workspace delta");
+    const coordinatorExecution = coordinatorWorkspaceExecution(execution.rawEvents, command);
+    if (coordinatorExecution === null) {
+      throw new TrueForgeIntegrationError(
+        "capture workspace delta",
+        "The coordinator did not return exactly one successful tool-backed workspace delta.",
+      );
+    }
+    const parsed = parseDelegatedWorkspaceDeltaOutput(
+      coordinatorExecution.observed.output,
+      coordinatorExecution.command,
+      workspaceStart.treeRef,
+      workspaceStart.missionStartTreeRef,
+    );
+    if (
+      coordinatorExecution.observed.success !== true ||
+      coordinatorExecution.observed.exitCode !== 0 ||
+      parsed === null
+    ) {
+      throw new TrueForgeIntegrationError(
+        "capture workspace delta",
+        "The coordinator workspace delta was not a successful parseable tool result.",
+      );
+    }
+    const evidence = await this.missions.addEvidence(missionId, {
+      workItemId,
+      kind: "file_change",
+      result: "passed",
+      source: "trueforge",
+      summary: "The coordinator captured the complete anchored workspace delta.",
+      details: JSON.stringify({
+        coordinator_collected: true,
+        workspace_delta: true,
+        command: parsed.command,
+        output: parsed.output,
+        start_tree_ref: parsed.startTreeRef,
+        mission_start_tree_ref: parsed.missionStartTreeRef,
+        end_tree_ref: parsed.endTreeRef,
+        current_changed_files: parsed.currentChangedFiles,
+        cumulative_changed_files: parsed.cumulativeChangedFiles,
+        current_delta_output: parsed.currentDeltaOutput,
+        cumulative_delta_output: parsed.cumulativeDeltaOutput,
+        exit_code: coordinatorExecution.observed.exitCode,
+      }),
+      executionOrigin: runtimeExecutionOrigin(
+        execution.sessionId,
+        execution.turnId,
+        coordinatorExecution.response,
+      ),
+    });
+    return {
+      sessionId: execution.sessionId,
+      turnId: execution.turnId,
+      response: coordinatorExecution.response,
+      evidenceId: evidence.id,
+      command: parsed.command,
+      output: parsed.output,
+      startTreeRef: parsed.startTreeRef,
+      missionStartTreeRef: parsed.missionStartTreeRef,
+      endTreeRef: parsed.endTreeRef,
+      currentChangedFiles: parsed.currentChangedFiles,
+      cumulativeChangedFiles: parsed.cumulativeChangedFiles,
+      currentDeltaOutput: parsed.currentDeltaOutput,
+      cumulativeDeltaOutput: parsed.cumulativeDeltaOutput,
     };
   }
 
@@ -1605,6 +1851,9 @@ export class TrueForgeMissionRunner {
               owner: created.owner,
               threadId: created.threadId,
               ...(turnId === null ? {} : { turnId }),
+              ...(options.delegatedWorkspaceStart === undefined
+                ? {}
+                : options.delegatedWorkspaceStart),
             };
             await this.missions.startWorkItemDelegation(
               mission.id,
@@ -1735,28 +1984,15 @@ export class TrueForgeMissionRunner {
       }
       requireCompletedTurn(rawEvents, "delegate work item", "subagent");
     }
-    const implementationHandoff = options.delegateToSubagent === true &&
-        workItem !== undefined &&
-        delegatedThread !== null &&
-        delegatedStatus === "completed"
-      ? await this.buildImplementationHandoff(
-          mission,
-          workItem,
-          session.sessionId,
-          turnId,
-          delegatedThread,
-          rawEvents,
-          runtimeEvidenceIdsByEventId,
-          delegatedOutput,
-        )
-      : undefined;
     return {
       sessionId: session.sessionId,
       turnId,
       events,
       rawEvents,
       mission: await this.missions.getMission(mission.id),
-      ...(implementationHandoff === undefined ? {} : { implementationHandoff }),
+      ...(delegatedThread === null ? {} : { delegatedThread }),
+      ...(delegatedOutput === undefined ? {} : { delegatedOutput }),
+      runtimeEvidenceIdsByEventId,
     };
   }
 
@@ -1769,6 +2005,7 @@ export class TrueForgeMissionRunner {
     rawEvents: TrueForgeApi.TurnStreamingEvent[],
     runtimeEvidenceIdsByEventId: Map<string, string>,
     delegatedOutput: Record<string, unknown> | undefined,
+    workspaceProof: DelegatedWorkspaceProof,
   ): Promise<ImplementationHandoffDraft> {
     const executions = observedToolCalls(rawEvents)
       .filter((call) =>
@@ -1792,9 +2029,6 @@ export class TrueForgeMissionRunner {
         .filter((name) => requiredChecks.length === 0 || requiredChecks.includes(name));
       return safeNames.length === 0 && mentionedNames.length > 0;
     });
-    const completeChangedFilesExecutions = executions.filter((execution) =>
-      isCompleteChangedFilesCommand(normalizeSafeWorkingDirectoryPrefix(execution.command)),
-    );
     const diffExecutions = executions.filter((execution) =>
       isContentDiffCommand(normalizeSafeWorkingDirectoryPrefix(execution.command)),
     );
@@ -1895,58 +2129,6 @@ export class TrueForgeMissionRunner {
       );
     }
 
-    const successfulCompleteChangedFilesExecutions = completeChangedFilesExecutions.flatMap((execution) => {
-      const observed = parseExecutionResponse(execution.response);
-      const command = normalizeSafeWorkingDirectoryPrefix(execution.command);
-      const filesChanged = observed === null || observed.success !== true || observed.exitCode !== 0
-        ? null
-        : completeChangedFilesFromCommand(observed.output, command);
-      return observed !== null &&
-          observed.success === true &&
-          observed.exitCode === 0 &&
-          filesChanged !== null
-        ? [{ execution, observed, command, filesChanged }]
-        : [];
-    });
-    if (completeChangedFilesExecutions.length === 0) {
-      return this.failImplementationEvidence(
-        mission,
-        workItem,
-        sessionId,
-        turnId,
-        delegatedThread,
-        diffExecutions.length === 0
-          ? "No observed complete changed-file manifest or content-bearing diff was found for the delegated work; narration-only file or diff claims do not count."
-          : `No observed unfiltered complete changed-file manifest was found for the delegated work. The scoped content diff cannot prove the complete changed-file set.`,
-        executions,
-      );
-    }
-    if (successfulCompleteChangedFilesExecutions.length === 0) {
-      return this.failImplementationEvidence(
-        mission,
-        workItem,
-        sessionId,
-        turnId,
-        delegatedThread,
-        "Observed complete changed-file manifest commands did not return a successful parseable tool result.",
-        executions,
-      );
-    }
-    const latestCompleteChangedFiles = successfulCompleteChangedFilesExecutions.at(-1);
-    const completeChangedFiles = latestCompleteChangedFiles?.filesChanged ?? [];
-    const manifestOutOfScopeFiles = completeChangedFiles.filter((file) => !allowedFiles.includes(file));
-    if (manifestOutOfScopeFiles.length > 0) {
-      return this.failImplementationEvidence(
-        mission,
-        workItem,
-        sessionId,
-        turnId,
-        delegatedThread,
-        `The independently observed complete changed-file manifest includes files outside the allowed scope: ${manifestOutOfScopeFiles.join(", ")}. Allowed files: ${allowedFiles.join(", ")}.`,
-        executions,
-      );
-    }
-
     const successfulDiffExecutions = diffExecutions.flatMap((execution) => {
       const observed = parseExecutionResponse(execution.response);
       return observed !== null &&
@@ -1984,16 +2166,17 @@ export class TrueForgeMissionRunner {
         executions,
       );
     }
-    const missingFromScopedDiff = completeChangedFiles.filter((file) => !filesChanged.includes(file));
-    const missingFromCompleteManifest = filesChanged.filter((file) => !completeChangedFiles.includes(file));
-    if (missingFromScopedDiff.length > 0 || missingFromCompleteManifest.length > 0) {
+    const currentChangedFiles = workspaceProof.currentChangedFiles;
+    const missingFromScopedDiff = currentChangedFiles.filter((file) => !filesChanged.includes(file));
+    const missingFromWorkspaceDelta = filesChanged.filter((file) => !currentChangedFiles.includes(file));
+    if (missingFromScopedDiff.length > 0 || missingFromWorkspaceDelta.length > 0) {
       const differences = [
         ...(missingFromScopedDiff.length === 0
           ? []
           : [`missing from the scoped content diff: ${missingFromScopedDiff.join(", ")}`]),
-        ...(missingFromCompleteManifest.length === 0
+        ...(missingFromWorkspaceDelta.length === 0
           ? []
-          : [`missing from the complete changed-file manifest: ${missingFromCompleteManifest.join(", ")}`]),
+          : [`missing from the coordinator workspace delta: ${missingFromWorkspaceDelta.join(", ")}`]),
       ];
       return this.failImplementationEvidence(
         mission,
@@ -2001,7 +2184,47 @@ export class TrueForgeMissionRunner {
         sessionId,
         turnId,
         delegatedThread,
-        `The complete changed-file manifest does not match the scoped content diff (${differences.join("; ")}).`,
+        `The coordinator workspace delta does not match the scoped content diff (${differences.join("; ")}).`,
+        executions,
+      );
+    }
+    const allowedMissionFiles = uniqueStrings((await this.missions.getState()).workItems
+      .filter((item) => item.missionId === mission.id && item.assignedRole === "implementer")
+      .flatMap((item) => item.allowedFiles ?? []));
+    const itemOutOfScopeFiles = currentChangedFiles.filter((file) => !allowedFiles.includes(file));
+    if (itemOutOfScopeFiles.length > 0) {
+      return this.failImplementationEvidence(
+        mission,
+        workItem,
+        sessionId,
+        turnId,
+        delegatedThread,
+        `The coordinator workspace delta includes files outside the allowed scope: ${itemOutOfScopeFiles.join(", ")}. Allowed files: ${allowedFiles.join(", ")}.`,
+        executions,
+      );
+    }
+    const cumulativeOutOfScopeFiles = workspaceProof.cumulativeChangedFiles.filter((file) =>
+      !allowedMissionFiles.includes(file),
+    );
+    if (cumulativeOutOfScopeFiles.length > 0) {
+      return this.failImplementationEvidence(
+        mission,
+        workItem,
+        sessionId,
+        turnId,
+        delegatedThread,
+        `The coordinator cumulative workspace delta includes files outside the union of authorized mission scopes: ${cumulativeOutOfScopeFiles.join(", ")}. Authorized files: ${allowedMissionFiles.join(", ")}.`,
+        executions,
+      );
+    }
+    if (!sameFileSet(currentChangedFiles, filesChanged)) {
+      return this.failImplementationEvidence(
+        mission,
+        workItem,
+        sessionId,
+        turnId,
+        delegatedThread,
+        "The coordinator workspace delta does not exactly match the delegated content diff.",
         executions,
       );
     }
@@ -2029,23 +2252,6 @@ export class TrueForgeMissionRunner {
         executions,
       );
     }
-    const manifestExecution = latestCompleteChangedFiles?.execution;
-    const manifestObserved = latestCompleteChangedFiles?.observed;
-    const manifestEvidence = await this.missions.addEvidence(mission.id, {
-      workItemId: workItem.id,
-      kind: "file_change",
-      result: "passed",
-      source: "trueforge",
-      summary: "The delegated execution returned an unfiltered complete changed-file manifest.",
-      details: JSON.stringify({
-        complete_changed_files: true,
-        command: latestCompleteChangedFiles?.command,
-        output: manifestObserved?.output ?? "",
-        changed_files: completeChangedFiles,
-        exit_code: manifestObserved?.exitCode,
-      }),
-      executionOrigin: runtimeExecutionOrigin(sessionId, turnId, manifestExecution?.response),
-    });
     const diffExecution = latestDiff?.execution;
     const diffObserved = latestDiff?.observed;
     const diffEvidence = await this.missions.addEvidence(mission.id, {
@@ -2082,7 +2288,7 @@ export class TrueForgeMissionRunner {
       evidenceIds: uniqueStrings([
         ...delegatedRuntimeEvidenceIds,
         ...checkEvidenceIds,
-        manifestEvidence.id,
+        workspaceProof.evidenceId,
         diffEvidence.id,
       ]),
       executionOrigin: {
@@ -3289,6 +3495,41 @@ interface ParsedExecutionResponse {
   output: string;
 }
 
+interface CoordinatorWorkspaceExecution {
+  command: string;
+  response: TrueForgeApi.TurnStreamingEvent;
+  observed: ParsedExecutionResponse;
+}
+
+function coordinatorWorkspaceExecution(
+  events: TrueForgeApi.TurnStreamingEvent[],
+  expectedCommand: string,
+): CoordinatorWorkspaceExecution | null {
+  const executions = observedToolCalls(events).filter((call) =>
+    call.name === "exec" && call.threadId === null,
+  );
+  if (executions.length !== 1) {
+    return null;
+  }
+  const execution = executions[0];
+  if (execution === undefined) {
+    return null;
+  }
+  const command = normalizeSafeWorkingDirectoryPrefix(executionCommand(execution.arguments) ?? "");
+  if (command !== normalizeSafeWorkingDirectoryPrefix(expectedCommand)) {
+    return null;
+  }
+  const response = toolResponseForCall(events, execution.id);
+  if (
+    response === undefined ||
+    stringOrNull(recordValue(response).threadId ?? recordValue(response).thread_id) !== null
+  ) {
+    return null;
+  }
+  const observed = parseExecutionResponse(response);
+  return observed === null ? null : { command, response, observed };
+}
+
 function parseExecutionResponse(
   event: TrueForgeApi.TurnStreamingEvent | undefined,
 ): ParsedExecutionResponse | null {
@@ -3312,6 +3553,15 @@ function parseExecutionResponse(
     exitCode: response.exitCode,
     output: response.result,
   };
+}
+
+function sameFileSet(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) {
+    return false;
+  }
+  const leftSet = new Set(left);
+  const rightSet = new Set(right);
+  return leftSet.size === rightSet.size && [...leftSet].every((file) => rightSet.has(file));
 }
 
 function uniqueStrings(values: string[]): string[] {

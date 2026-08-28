@@ -12,8 +12,11 @@ import {
   PRIMARY_REPOSITORY,
   RepositoryWorkGraphPlanner,
   TrueForgeMissionRunner,
+  DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
+  buildDelegatedWorkspaceDeltaCommand,
   createMissionHttpApp,
 } from "../dist/index.js";
+import { workspaceDeltaEvidenceDetails } from "./delegated-proof-fixture.js";
 
 const ORIGIN = {
   kind: "trueforge",
@@ -103,6 +106,87 @@ function changedFilesManifestOutput(files = ["src/index.ts", "test/index.test.js
   return `${files.map((file) => ` M ${file}`).join("\u0000")}\u0000`;
 }
 
+const WORKSPACE_START_TREE = "a".repeat(40);
+const WORKSPACE_END_TREE = "b".repeat(40);
+
+function workspaceSnapshotEvents(treeRef, turnId = "turn-workspace-start") {
+  return [
+    { type: "turn.created", id: `${turnId}-created`, turnId, threadId: null, state: { status: "running" } },
+    {
+      type: "model.message",
+      id: `${turnId}-model`,
+      threadId: null,
+      toolCalls: [{
+        id: `${turnId}-call-snapshot`,
+        function: { name: "exec", arguments: JSON.stringify({ command: DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND }) },
+      }],
+    },
+    {
+      type: "tool.response",
+      id: `${turnId}-response`,
+      threadId: null,
+      toolCallId: `${turnId}-call-snapshot`,
+      content: JSON.stringify({ success: true, response: { exitCode: 0, result: `TRUEFORGE_WORKSPACE_TREE ${treeRef}\n` } }),
+    },
+    { type: "turn.done", id: `${turnId}-done`, threadId: null, state: { status: "done", requiredActions: [] } },
+  ];
+}
+
+function workspaceDeltaOutput(startTreeRef, missionStartTreeRef, endTreeRef, currentFiles, cumulativeFiles) {
+  const statusOutput = (files) => files.map((file) => `M\t${file}`).join("\n");
+  return [
+    `TRUEFORGE_WORKSPACE_DELTA start=${startTreeRef} mission_start=${missionStartTreeRef} end=${endTreeRef}`,
+    "TRUEFORGE_WORKSPACE_DELTA current_begin",
+    statusOutput(currentFiles),
+    "TRUEFORGE_WORKSPACE_DELTA current_end",
+    "TRUEFORGE_WORKSPACE_DELTA cumulative_begin",
+    statusOutput(cumulativeFiles),
+    "TRUEFORGE_WORKSPACE_DELTA cumulative_end",
+    "",
+  ].join("\n");
+}
+
+function workspaceDeltaEvents({
+  startTreeRef = WORKSPACE_START_TREE,
+  missionStartTreeRef = WORKSPACE_START_TREE,
+  endTreeRef = WORKSPACE_END_TREE,
+  currentFiles = ["src/index.ts", "test/index.test.js"],
+  cumulativeFiles = currentFiles,
+  turnId = "turn-workspace-delta",
+} = {}) {
+  const command = buildDelegatedWorkspaceDeltaCommand(startTreeRef, missionStartTreeRef);
+  const callId = `${turnId}-call-delta`;
+  return [
+    { type: "turn.created", id: `${turnId}-created`, turnId, threadId: null, state: { status: "running" } },
+    {
+      type: "model.message",
+      id: `${turnId}-model`,
+      threadId: null,
+      toolCalls: [{ id: callId, function: { name: "exec", arguments: JSON.stringify({ command }) } }],
+    },
+    {
+      type: "tool.response",
+      id: `${turnId}-response`,
+      threadId: null,
+      toolCallId: callId,
+      content: JSON.stringify({
+        success: true,
+        response: {
+          exitCode: 0,
+          result: workspaceDeltaOutput(
+            startTreeRef,
+            missionStartTreeRef,
+            endTreeRef,
+            currentFiles,
+            cumulativeFiles,
+          ),
+        },
+      }),
+    },
+    { type: "turn.done", id: `${turnId}-done`, threadId: null, state: { status: "done", requiredActions: [] } },
+  ];
+}
+
 function transitionContractVerifier() {
   return {
     reviewContract(context) {
@@ -173,6 +257,7 @@ function delegatedEvents(
     includeManifest = true,
     manifestCommand = "git status --porcelain=v1 -z --untracked-files=all",
     manifestOutput = changedFilesManifestOutput(),
+    extraToolCalls = [],
     narrationOnly = false,
     responseType = "tool.response",
   } = {},
@@ -210,6 +295,10 @@ function delegatedEvents(
       threadId: ORIGIN.threadId,
       toolCalls: [
         { id: "call-check", function: { name: "exec", arguments: JSON.stringify({ command }) } },
+        ...extraToolCalls.map((extra, index) => ({
+          id: extra.id ?? `call-extra-${index}`,
+          function: { name: "exec", arguments: JSON.stringify({ command: extra.command }) },
+        })),
         ...(includeManifest
           ? [{ id: "call-manifest", function: { name: "exec", arguments: JSON.stringify({ command: manifestCommand }) } }]
           : []),
@@ -219,6 +308,11 @@ function delegatedEvents(
       ],
     },
     response("event-check-response", "call-check", "checks complete\n"),
+    ...extraToolCalls.map((extra, index) => response(
+      `event-extra-response-${index}`,
+      extra.id ?? `call-extra-${index}`,
+      extra.output ?? "command completed\n",
+    )),
     ...(includeManifest ? [response("event-manifest-response", "call-manifest", manifestOutput)] : []),
     ...(includeDiff ? [response("event-diff-response", "call-diff", output)] : []),
     {
@@ -258,11 +352,17 @@ async function runnerFixture({
   includeManifest = true,
   manifestCommand = "git status --porcelain=v1 -z --untracked-files=all",
   manifestOutput,
+  extraToolCalls = [],
+  workspaceCurrentFiles = ["src/index.ts", "test/index.test.js"],
+  workspaceCumulativeFiles = workspaceCurrentFiles,
+  workspaceStartTreeRef = WORKSPACE_START_TREE,
+  workspaceEndTreeRef = WORKSPACE_END_TREE,
   narrationOnly = false,
   responseType = "tool.response",
   run = true,
 } = {}) {
   const missions = new MissionService(new InMemoryMissionRepository(), fixedClock);
+  let turnNumber = 0;
   const client = {
     sessions: {
       async create() {
@@ -272,6 +372,32 @@ async function runnerFixture({
         return { data: { id: sessionId } };
       },
       async createTurnStream() {
+        const currentTurnNumber = turnNumber;
+        turnNumber += 1;
+        if (currentTurnNumber === 0) {
+          return {
+            async *withMetadata() {
+              for (const event of workspaceSnapshotEvents(workspaceStartTreeRef)) {
+                yield { data: event };
+              }
+            },
+          };
+        }
+        if (currentTurnNumber === 2) {
+          return {
+            async *withMetadata() {
+              for (const event of workspaceDeltaEvents({
+                startTreeRef: workspaceStartTreeRef,
+                missionStartTreeRef: workspaceStartTreeRef,
+                endTreeRef: workspaceEndTreeRef,
+                currentFiles: workspaceCurrentFiles,
+                cumulativeFiles: workspaceCumulativeFiles,
+              })) {
+                yield { data: event };
+              }
+            },
+          };
+        }
         return {
           async *withMetadata() {
             for (const event of delegatedEvents(command, output, {
@@ -280,6 +406,7 @@ async function runnerFixture({
               includeManifest,
               manifestCommand,
               manifestOutput: manifestOutput ?? changedFilesManifestOutput(),
+              extraToolCalls,
               narrationOnly,
               responseType,
             })) {
@@ -502,7 +629,8 @@ test("a path-filtered delegated diff cannot hide a forbidden changed file", asyn
     allowedFiles: ["src/index.ts"],
     diffCommand: "git diff -- src/index.ts",
     output: diffOutput(["src/index.ts"]),
-    manifestOutput: changedFilesManifestOutput(["src/index.ts", "test/index.test.js"]),
+    workspaceCurrentFiles: ["src/index.ts", "test/index.test.js"],
+    workspaceCumulativeFiles: ["src/index.ts", "test/index.test.js"],
     run: false,
   });
 
@@ -511,7 +639,7 @@ test("a path-filtered delegated diff cannot hide a forbidden changed file", asyn
       workItemId: fixture.workItem.id,
       delegateToSubagent: true,
     }),
-    (error) => /complete changed-file manifest includes files outside.*test\/index\.test\.js/i.test(error.message),
+    (error) => /coordinator workspace delta|scoped content diff/i.test(error.message) && /test\/index\.test\.js/i.test(error.message),
   );
 
   const state = await fixture.missions.getState();
@@ -524,6 +652,207 @@ test("a path-filtered delegated diff cannot hide a forbidden changed file", asyn
   assert.equal(state.workItems.find((item) => item.id === fixture.workItem.id).status, "blocked");
 });
 
+test("a forbidden file committed before the child manifest is still captured by the coordinator", async () => {
+  const fixture = await runnerFixture({
+    allowedFiles: ["src/index.ts"],
+    diffCommand: "git diff -- src/index.ts",
+    output: diffOutput(["src/index.ts"]),
+    manifestOutput: changedFilesManifestOutput(["src/index.ts"]),
+    workspaceCurrentFiles: ["src/index.ts", "README.md"],
+    workspaceCumulativeFiles: ["src/index.ts", "README.md"],
+    extraToolCalls: [{
+      id: "call-commit-forbidden",
+      command: "git add -- README.md && git commit -m hidden-forbidden-change",
+      output: "[fixture hidden-forbidden-change] committed README.md\n",
+    }],
+    run: false,
+  });
+
+  await assert.rejects(
+    fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
+      workItemId: fixture.workItem.id,
+      delegateToSubagent: true,
+    }),
+    (error) => /coordinator workspace delta|scoped content diff/i.test(error.message) &&
+      /README\.md/.test(error.message),
+  );
+
+  const state = await fixture.missions.getState();
+  const failure = state.evidence.find((evidence) =>
+    evidence.result === "failed" && evidence.summary.startsWith("Delegated implementation evidence failed:"),
+  );
+  assert.ok(failure);
+  assert.match(failure.details, /README\.md/);
+  assert.equal(state.workItems.find((item) => item.id === fixture.workItem.id).status, "blocked");
+});
+
+async function runSequentialWorkspaceScenario({ forbiddenOnSecond = false } = {}) {
+  const missions = new MissionService(new InMemoryMissionRepository(), fixedClock);
+  let turnNumber = 0;
+  const sourceFile = "src/index.ts";
+  const testFile = "test/index.test.js";
+  const client = {
+    sessions: {
+      async create() {
+        return { data: { id: ORIGIN.sessionId } };
+      },
+      async get(sessionId) {
+        return { data: { id: sessionId } };
+      },
+      async createTurnStream() {
+        const current = turnNumber++;
+        const itemNumber = Math.floor(current / 3) + 1;
+        const startTreeRef = String.fromCharCode("a".charCodeAt(0) + itemNumber - 1).repeat(40);
+        const missionStartTreeRef = WORKSPACE_START_TREE;
+        if (current % 3 === 0) {
+          return {
+            async *withMetadata() {
+              for (const event of workspaceSnapshotEvents(startTreeRef, `turn-sequential-start-${itemNumber}`)) {
+                yield { data: event };
+              }
+            },
+          };
+        }
+        if (current % 3 === 2) {
+          const currentFiles = itemNumber === 1
+            ? [sourceFile]
+            : forbiddenOnSecond
+            ? [testFile, "README.md"]
+            : [testFile];
+          const cumulativeFiles = itemNumber === 1
+            ? [sourceFile]
+            : [sourceFile, ...currentFiles];
+          return {
+            async *withMetadata() {
+              for (const event of workspaceDeltaEvents({
+                startTreeRef,
+                missionStartTreeRef,
+                endTreeRef: String.fromCharCode("a".charCodeAt(0) + itemNumber).repeat(40),
+                currentFiles,
+                cumulativeFiles,
+                turnId: `turn-sequential-delta-${itemNumber}`,
+              })) {
+                yield { data: event };
+              }
+            },
+          };
+        }
+        const file = itemNumber === 1 ? sourceFile : testFile;
+        return {
+          async *withMetadata() {
+            for (const event of delegatedEvents(
+              "npm run typecheck && npm test",
+              diffOutput([file]),
+              { includeManifest: false },
+            )) {
+              yield { data: event };
+            }
+          },
+        };
+      },
+    },
+  };
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "local/sequential-fixture",
+    dynamicSubAgents: true,
+  });
+  const mission = await runner.createMission({
+    id: forbiddenOnSecond ? "mission-sequential-forbidden" : "mission-sequential-safe",
+    objective: "Prove sequential delegated workspace deltas.",
+  });
+  const sourceItem = await missions.addWorkItem(mission.id, {
+    id: "work-sequential-source",
+    title: "Implement the source change",
+    purpose: "Change only the source file.",
+    acceptanceCriteria: ["The source change is checked."],
+    requiredChecks: ["typecheck", "test"],
+    assignedRole: "implementer",
+    allowedFiles: [sourceFile],
+    status: "ready",
+  });
+  const testItem = await missions.addWorkItem(mission.id, {
+    id: "work-sequential-test",
+    title: "Implement the focused test change",
+    purpose: "Change only the focused test file.",
+    acceptanceCriteria: ["The focused test change is checked."],
+    requiredChecks: ["typecheck", "test"],
+    assignedRole: "implementer",
+    allowedFiles: [testFile],
+    status: "ready",
+  });
+  const completeItem = async (workItem) => {
+    await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
+    const execution = await runner.runTurn(mission.id, "Implement this sequential bounded item.", {
+      workItemId: workItem.id,
+      delegateToSubagent: true,
+    });
+    const draft = execution.implementationHandoff;
+    assert.ok(draft);
+    await missions.recordHandoff(mission.id, {
+      workItemId: workItem.id,
+      result: "done",
+      summary: "The sequential fixture item returned anchored proof.",
+      filesChanged: draft.filesChanged,
+      testsRun: [...new Set(draft.checks.map((check) => check.command))],
+      decisions: draft.decisions,
+      openQuestions: draft.openQuestions,
+      memoryImpact: "medium",
+      diffSummary: draft.diffSummary,
+      checks: draft.checks,
+      evidenceIds: draft.evidenceIds,
+      executionOrigin: draft.executionOrigin,
+    });
+    await missions.transitionWorkItem(mission.id, workItem.id, "ready_for_review");
+    await missions.reviewWorkItem(mission.id, {
+      workItemId: workItem.id,
+      outcome: "accepted",
+      reviewer: "independent-sequential-verifier",
+      summary: "The sequential fixture item was independently verified.",
+      finding: "No blocking findings.",
+    });
+    return execution;
+  };
+  const first = await completeItem(sourceItem);
+  let secondError;
+  try {
+    await completeItem(testItem);
+  } catch (error) {
+    secondError = error;
+  }
+  return { missions, mission, sourceItem, testItem, first, secondError };
+}
+
+test("sequential source then test items ignore the first accepted delta in the reused sandbox", async () => {
+  const result = await runSequentialWorkspaceScenario();
+  assert.equal(result.secondError, undefined);
+  const state = await result.missions.getState();
+  assert.deepEqual(state.workItems.map((item) => item.status), ["complete", "complete"]);
+  const secondProof = state.evidence.find((evidence) =>
+    evidence.workItemId === result.testItem.id && evidence.kind === "file_change",
+  );
+  assert.ok(secondProof);
+  const details = JSON.parse(secondProof.details);
+  assert.deepEqual(details.current_changed_files, ["test/index.test.js"]);
+  assert.deepEqual(details.cumulative_changed_files, ["src/index.ts", "test/index.test.js"]);
+});
+
+test("a forbidden change introduced by the second item fails its anchored delta", async () => {
+  const result = await runSequentialWorkspaceScenario({ forbiddenOnSecond: true });
+  assert.ok(result.secondError);
+  assert.match(result.secondError.message, /README\.md|coordinator workspace delta|scoped content diff/i);
+  const state = await result.missions.getState();
+  assert.equal(state.workItems.find((item) => item.id === result.sourceItem.id).status, "complete");
+  assert.equal(state.workItems.find((item) => item.id === result.testItem.id).status, "blocked");
+  assert.equal(state.handoffs.filter((handoff) => handoff.workItemId === result.testItem.id).length, 0);
+  const failure = state.evidence.find((evidence) =>
+    evidence.workItemId === result.testItem.id &&
+    evidence.result === "failed" &&
+    evidence.summary.startsWith("Delegated implementation evidence failed:"),
+  );
+  assert.ok(failure);
+  assert.match(failure.details, /README\.md/);
+});
+
 test("rename evidence uses the new path consistently", async () => {
   const output = [
     "diff --git a/src/old-name.ts b/src/new-name.ts",
@@ -534,7 +863,8 @@ test("rename evidence uses the new path consistently", async () => {
   const { missions, mission, workItem, result } = await runnerFixture({
     output,
     allowedFiles: ["src/new-name.ts"],
-    manifestOutput: "R  src/new-name.ts\u0000src/old-name.ts\u0000",
+    workspaceCurrentFiles: ["src/new-name.ts"],
+    workspaceCumulativeFiles: ["src/new-name.ts"],
   });
 
   assert.deepEqual(result.implementationHandoff.filesChanged, ["src/new-name.ts"]);
@@ -824,11 +1154,16 @@ class LegacyPrimaryRunner {
     this.turn += 1;
     const turnId = `legacy-turn-${this.turn}`;
     const threadId = `legacy-thread-${this.turn}`;
+    const treeRef = "a".repeat(40);
+    const endTreeRef = "b".repeat(40);
     await this.missions.attachTrueforgeTurn(missionId, turnId);
+    await this.missions.attachTrueforgeWorkspaceBaseline(missionId, treeRef);
     await this.missions.startWorkItemDelegation(missionId, options.workItemId, {
       owner: "legacy-implementer",
       threadId,
       turnId,
+      startTreeRef: treeRef,
+      missionStartTreeRef: treeRef,
     });
     await this.missions.addEvidence(missionId, {
       workItemId: options.workItemId,
@@ -876,13 +1211,17 @@ class LegacyPrimaryRunner {
       result: "passed",
       source: "trueforge",
       summary: "The delegated complete changed-file manifest was captured.",
-      details: JSON.stringify({
-        complete_changed_files: true,
-        command: "git status --porcelain=v1 -z --untracked-files=all",
-        output: " M src/index.ts\u0000 M test/index.test.js\u0000",
-        changed_files: ["src/index.ts", "test/index.test.js"],
+      details: workspaceDeltaEvidenceDetails({
+        startTreeRef: treeRef,
+        missionStartTreeRef: treeRef,
+        endTreeRef,
       }),
-      executionOrigin: { ...origin, toolCallId: `legacy-manifest-${this.turn}` },
+      executionOrigin: {
+        kind: "trueforge",
+        sessionId: "legacy-session",
+        turnId: `legacy-proof-turn-${this.turn}`,
+        toolCallId: `legacy-manifest-${this.turn}`,
+      },
     });
     await this.missions.completeWorkItemDelegation(missionId, options.workItemId, {
       threadId,
