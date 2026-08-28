@@ -28,7 +28,7 @@ function fakeStream(events) {
   };
 }
 
-function delegatedEvents({ malformedCompletion = false, includeThread = true } = {}) {
+function delegatedEvents({ malformedCompletion = false, includeThread = true, threadError } = {}) {
   const events = [
     {
       type: "turn.created",
@@ -61,7 +61,8 @@ function delegatedEvents({ malformedCompletion = false, includeThread = true } =
       title: "Bounded implementer",
       state: malformedCompletion
         ? { status: "done" }
-        : {
+        : threadError === undefined
+        ? {
             status: "done",
             output: {
               type: "model.message",
@@ -70,7 +71,8 @@ function delegatedEvents({ malformedCompletion = false, includeThread = true } =
               threadId: "thread-subagent",
               content: "The bounded work completed.",
             },
-          },
+          }
+        : { status: "error", error: threadError },
     });
   }
   events.push({
@@ -216,6 +218,31 @@ test("malformed or missing native subagent completion fails closed", async () =>
   item = state.workItems.find((candidate) => candidate.id === missing.workItem.id);
   assert.equal(item.status, "in_progress");
   assert.equal(item.delegation, undefined);
+});
+
+test("native subagent error reasons remain durable and visible", async () => {
+  const reason = "Agent loop stopped after the sandbox runtime reported npm was unavailable.";
+  const failed = await delegatedFixture({
+    events: delegatedEvents({ threadError: reason }),
+  });
+
+  await assert.rejects(
+    failed.runner.runTurn(failed.mission.id, "Delegate the bounded change.", {
+      workItemId: failed.workItem.id,
+      delegateToSubagent: true,
+    }),
+    (error) => error instanceof TrueForgeIntegrationError && error.message.includes(reason),
+  );
+
+  const state = await failed.missions.getState();
+  const item = state.workItems.find((candidate) => candidate.id === failed.workItem.id);
+  assert.equal(item.delegation.status, "failed");
+  assert.equal(item.delegation.error, reason);
+  const threadFailure = state.evidence.find((evidence) =>
+    evidence.summary.includes(reason)
+  );
+  assert.ok(threadFailure, "the concrete thread error should be recorded as runtime evidence");
+  assert.match(threadFailure.details, new RegExp(reason.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
 
 test("Work Packets contain only scoped durable state and domain delegation enforces readiness", async () => {

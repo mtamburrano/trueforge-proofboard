@@ -2,10 +2,15 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  DEFAULT_TRUEFORGE_ITERATION_LIMIT,
   InMemoryMissionRepository,
+  MAX_TRUEFORGE_ITERATION_LIMIT,
   MissionService,
   PRIMARY_VERIFIED_DELIVERY_PATCHES,
+  SANDBOX_TOOLCHAIN_READINESS_COMMAND,
+  SANDBOX_TOOLCHAIN_READINESS_INTENT,
   TrueForgeMissionRunner,
+  buildMissionAgentSpec,
 } from "../dist/index.js";
 
 const LOCKED_FIXTURE_SHA = "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b";
@@ -656,6 +661,60 @@ test("runner creates a TrueForge session and maps safe runtime evidence", async 
   assert.equal(state.evidence.every((item) => item.workItemId === workItem.id), true);
   const serializedState = JSON.stringify(state);
   assert.doesNotMatch(serializedState, /do-not-persist|This content should not be persisted/);
+});
+
+test("runner prepares a clean sandbox toolchain before delegated work", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client, calls } = fakeClient((turnId) => sandboxEvents(turnId, 0, [], {
+    sandboxArguments: {
+      intent: SANDBOX_TOOLCHAIN_READINESS_INTENT,
+      command: SANDBOX_TOOLCHAIN_READINESS_COMMAND,
+    },
+    sandboxResult: {
+      success: true,
+      response: {
+        exitCode: 0,
+        result: "TRUEFORGE_TOOLCHAIN_READY node=v22.14.0 npm=10.9.2\n",
+      },
+    },
+  }));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "google-gemini/test-model",
+  });
+  const mission = await runner.createMission({
+    id: "mission-sandbox-preparation",
+    objective: "Prepare the sandbox before coding delegation",
+  });
+
+  const result = await runner.prepareSandbox({ missionId: mission.id });
+
+  assert.equal(result.nodeVersion, "v22.14.0");
+  assert.equal(result.npmVersion, "10.9.2");
+  assert.equal(result.sandboxId, "sandbox-1");
+  assert.equal(calls.turns.length, 1);
+  assert.match(calls.turns[0].request.input[0].content, /before any coding delegation/);
+  assert.match(calls.turns[0].request.input[0].content, /TRUEFORGE_TOOLCHAIN_READY/);
+  const state = await missions.getState();
+  const readiness = state.evidence.find((item) => item.id === result.evidenceId);
+  assert.equal(readiness.source, "sandbox");
+  assert.equal(readiness.result, "passed");
+  assert.match(readiness.summary, /Node\.js v22\.14\.0 and npm 10\.9\.2/);
+});
+
+test("mission agent specs use a bounded non-twelve default iteration limit", () => {
+  assert.equal(DEFAULT_TRUEFORGE_ITERATION_LIMIT, 64);
+  assert.equal(
+    buildMissionAgentSpec({ model: "google-gemini/test-model" }).config.iterationLimit,
+    DEFAULT_TRUEFORGE_ITERATION_LIMIT,
+  );
+  assert.equal(
+    buildMissionAgentSpec({ model: "google-gemini/test-model", iterationLimit: 24 }).config.iterationLimit,
+    24,
+  );
+  assert.throws(
+    () => buildMissionAgentSpec({ model: "google-gemini/test-model", iterationLimit: MAX_TRUEFORGE_ITERATION_LIMIT + 1 }),
+    /between 1 and 1024/,
+  );
 });
 
 test("runner performs an independent bounded contract review", async () => {

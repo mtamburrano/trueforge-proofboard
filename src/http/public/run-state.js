@@ -47,6 +47,7 @@
     function run() {
       if (activeRun !== null) return activeRun;
 
+      options.onRunStart?.(latestView);
       options.onRunningChange?.(true, latestView);
       const request = Promise.resolve().then(() => options.start());
       startPolling();

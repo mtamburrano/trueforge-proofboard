@@ -99,6 +99,35 @@ const LOCKED_FIXTURE_PATCHES = {
 const SANDBOX_VERIFICATION_INTENT = "Run the requested verification command in the sandbox.";
 const PULL_REQUEST_READ_TOOL_NAME = "pull_request_read";
 
+/**
+ * Keep enough room for a bounded coding turn while reserving a finite upper
+ * bound for malformed or looping agent behavior.
+ */
+export const DEFAULT_TRUEFORGE_ITERATION_LIMIT = 64;
+export const MAX_TRUEFORGE_ITERATION_LIMIT = 1_024;
+export const MINIMUM_SANDBOX_NODE_MAJOR_VERSION = 20;
+export const SANDBOX_TOOLCHAIN_READINESS_INTENT =
+  "Prepare and verify the sandbox toolchain before coding delegation.";
+const SANDBOX_TOOLCHAIN_REQUIREMENT =
+  "Node.js >=20 and npm are required before coding delegation.";
+export const SANDBOX_TOOLCHAIN_READINESS_COMMAND = [
+  "set -eu",
+  "has_supported_node() { command -v node >/dev/null 2>&1 && node -e 'process.exit(Number(process.versions.node.split(\".\")[0]) >= 20 ? 0 : 1)' >/dev/null 2>&1; }",
+  "if ! has_supported_node || ! command -v npm >/dev/null 2>&1; then",
+  "  if command -v apt-get >/dev/null 2>&1; then",
+  "    apt-get update -qq && apt-get install -y -qq nodejs npm",
+  "  else",
+    `    printf '%s\\n' '${SANDBOX_TOOLCHAIN_REQUIREMENT} Install them in the sandbox image.' >&2`,
+  "    exit 86",
+  "  fi",
+  "fi",
+  "if ! has_supported_node || ! command -v npm >/dev/null 2>&1; then",
+  `  printf '%s\\n' '${SANDBOX_TOOLCHAIN_REQUIREMENT} The sandbox could not prepare them.' >&2`,
+  "  exit 86",
+  "fi",
+  "printf 'TRUEFORGE_TOOLCHAIN_READY node=%s npm=%s\\n' \"$(node --version)\" \"$(npm --version)\"",
+].join(" ");
+
 export const PRIMARY_WORK_GRAPH_IDS = {
   inspect: "primary-inspect",
   implement: "primary-implement",
@@ -518,6 +547,20 @@ export interface SandboxVerificationInput {
   toolName?: string;
 }
 
+export interface SandboxPreparationInput {
+  missionId: string;
+}
+
+export interface SandboxPreparationResult {
+  sessionId: string;
+  turnId: string;
+  nodeVersion: string;
+  npmVersion: string;
+  sandboxId?: string;
+  evidenceId: string;
+  mission: Mission;
+}
+
 export interface SandboxVerificationResult {
   sessionId: string;
   turnId: string;
@@ -602,6 +645,11 @@ interface VerifiedSandboxExecution {
   sandboxId?: string;
 }
 
+interface VerifiedSandboxReadiness extends VerifiedSandboxExecution {
+  nodeVersion: string;
+  npmVersion: string;
+}
+
 export class TrueForgeIntegrationError extends Error {
   readonly operation: string;
 
@@ -630,6 +678,17 @@ export function buildMissionAgentSpec(
   if (config.model.trim().length === 0) {
     throw new MissionDomainError("invalid_input", "TrueForge model must not be empty.");
   }
+  const iterationLimit = config.iterationLimit ?? DEFAULT_TRUEFORGE_ITERATION_LIMIT;
+  if (
+    !Number.isInteger(iterationLimit) ||
+    iterationLimit < 1 ||
+    iterationLimit > MAX_TRUEFORGE_ITERATION_LIMIT
+  ) {
+    throw new MissionDomainError(
+      "invalid_input",
+      `TrueForge iterationLimit must be an integer between 1 and ${MAX_TRUEFORGE_ITERATION_LIMIT}.`,
+    );
+  }
   const spec: TrueForgeApi.AgentSpec = {
     model: { name: config.model },
     instructions: config.instructions ?? defaultInstructions,
@@ -638,7 +697,7 @@ export function buildMissionAgentSpec(
       dynamicSubAgents: { enabled: config.dynamicSubAgents ?? false },
       askUserQuestions: { enabled: false },
       generativeUi: { enabled: false },
-      iterationLimit: config.iterationLimit ?? 12,
+      iterationLimit,
     },
   };
   spec.mcpServers = config.mcpServers ?? [defaultRepositoryMcpServer(config)];
@@ -1237,6 +1296,77 @@ export class TrueForgeMissionRunner {
     }
   }
 
+  async prepareSandbox(
+    input: SandboxPreparationInput,
+  ): Promise<SandboxPreparationResult> {
+    const mission = await this.missions.getMission(input.missionId);
+    try {
+      const toolName = canonicalSandboxToolName(undefined, this.config.sandboxToolName);
+      const preparationOptions: RunTurnOptions = {};
+      if (mission.trueforgeSandboxId !== undefined) {
+        if (mission.trueforgeTurnId === undefined) {
+          throw new TrueForgeIntegrationError(
+            "prepare sandbox",
+            "The persisted sandbox identity has no durable predecessor turn.",
+          );
+        }
+        preparationOptions.previousTurnId = mission.trueforgeTurnId;
+      }
+      const execution = await this.executeTurn(
+        mission.id,
+        buildSandboxPreparationInstruction(mission, toolName),
+        preparationOptions,
+      );
+      const verified = verifySandboxReadiness(
+        execution.rawEvents,
+        SANDBOX_TOOLCHAIN_READINESS_INTENT,
+        SANDBOX_TOOLCHAIN_READINESS_COMMAND,
+        toolName,
+        mission.trueforgeSandboxId,
+      );
+      const evidence = await this.missions.addEvidence(mission.id, {
+        kind: "tool_result",
+        result: "passed",
+        source: "sandbox",
+        summary: `Sandbox toolchain is ready with Node.js ${verified.nodeVersion} and npm ${verified.npmVersion}.`,
+        details: JSON.stringify({
+          tool: toolName,
+          intent: SANDBOX_TOOLCHAIN_READINESS_INTENT,
+          command: SANDBOX_TOOLCHAIN_READINESS_COMMAND,
+          node_version: verified.nodeVersion,
+          npm_version: verified.npmVersion,
+          ...(verified.sandboxId === undefined ? {} : { sandbox_id: verified.sandboxId }),
+        }),
+        executionOrigin: {
+          kind: "sandbox",
+          sessionId: execution.sessionId,
+          turnId: execution.turnId,
+        },
+      });
+      return {
+        sessionId: execution.sessionId,
+        turnId: execution.turnId,
+        nodeVersion: verified.nodeVersion,
+        npmVersion: verified.npmVersion,
+        ...(verified.sandboxId === undefined ? {} : { sandboxId: verified.sandboxId }),
+        evidenceId: evidence.id,
+        mission: await this.missions.getMission(mission.id),
+      };
+    } catch (error) {
+      await this.recordSandboxPreparationFailure(mission.id, error);
+      if (error instanceof TrueForgeIntegrationError && error.operation === "prepare sandbox") {
+        throw error;
+      }
+      const reason = error instanceof TrueForgeIntegrationError
+        ? error.message
+        : "The sandbox toolchain could not be prepared or verified.";
+      throw new TrueForgeIntegrationError(
+        "prepare sandbox",
+        `Sandbox toolchain readiness failed: ${SANDBOX_TOOLCHAIN_REQUIREMENT} ${reason}`,
+      );
+    }
+  }
+
   async runSandboxVerification(
     input: SandboxVerificationInput,
   ): Promise<SandboxVerificationResult> {
@@ -1369,6 +1499,7 @@ export class TrueForgeMissionRunner {
     let turnId: string | null = null;
     let delegatedThread: { threadId: string; owner: string } | null = null;
     let delegatedStatus: "completed" | "failed" | "interrupted" | null = null;
+    let delegatedError: string | undefined;
     let delegatedOutput: Record<string, unknown> | undefined;
     const runtimeEvidenceIdsByEventId = new Map<string, string>();
     try {
@@ -1454,9 +1585,10 @@ export class TrueForgeMissionRunner {
               );
               delegatedStatus = "completed";
             } else if (completed.status === "error") {
+              delegatedError = completed.error;
               const delegationInput = {
                 threadId: delegatedThread.threadId,
-                error: "The native TrueForge subagent returned an error.",
+                error: completed.error,
                 ...(turnId === null ? {} : { turnId }),
               };
               await this.missions.failWorkItemDelegation(
@@ -1551,7 +1683,7 @@ export class TrueForgeMissionRunner {
       if (delegatedStatus === "failed") {
         throw new TrueForgeIntegrationError(
           "delegate work item",
-          "The native TrueForge subagent failed to complete the work item.",
+          `The native TrueForge subagent failed: ${delegatedError ?? "the runtime returned no error reason."}`,
         );
       }
       requireCompletedTurn(rawEvents, "delegate work item", "subagent");
@@ -1815,6 +1947,31 @@ export class TrueForgeMissionRunner {
         throw error;
       }
       throw new TrueForgeIntegrationError(operation, `TrueForge ${operation} failed.`);
+    }
+  }
+
+  private async recordSandboxPreparationFailure(
+    missionId: string,
+    error: unknown,
+  ): Promise<void> {
+    const message = error instanceof TrueForgeIntegrationError
+      ? error.message
+      : "The sandbox toolchain could not be prepared or verified.";
+    try {
+      await this.missions.addEvidence(missionId, {
+        kind: "tool_result",
+        result: "failed",
+        source: "sandbox",
+        summary: "Sandbox toolchain readiness failed; coding delegation did not start.",
+        details: JSON.stringify({
+          tool: "exec",
+          intent: SANDBOX_TOOLCHAIN_READINESS_INTENT,
+          command: SANDBOX_TOOLCHAIN_READINESS_COMMAND,
+          reason: message,
+        }),
+      });
+    } catch {
+      // Preserve the original readiness error if durable failure evidence cannot be recorded.
     }
   }
 
@@ -2251,6 +2408,24 @@ function buildSandboxVerificationInstruction(
   ].join(" ");
 }
 
+function buildSandboxPreparationInstruction(
+  mission: Mission,
+  toolName: string,
+): string {
+  return [
+    `Prepare the configured sandbox for mission ${mission.id} before any coding delegation.`,
+    `Call the sandbox tool ${toolName} exactly once with this JSON object: ${JSON.stringify({
+      intent: SANDBOX_TOOLCHAIN_READINESS_INTENT,
+      command: SANDBOX_TOOLCHAIN_READINESS_COMMAND,
+    })}.`,
+    mission.trueforgeSandboxId === undefined
+      ? "Record the sandbox identity before executing the command."
+      : `Reuse the persisted sandbox ${mission.trueforgeSandboxId} and do not create a replacement sandbox.`,
+    "Do not run the command on the host, do not use a different execution tool, and do not fabricate the result.",
+    "Return the structured sandbox response after the toolchain is prepared and verified.",
+  ].join(" ");
+}
+
 function buildSandboxVerificationIntent(): string {
   return SANDBOX_VERIFICATION_INTENT;
 }
@@ -2429,17 +2604,19 @@ function sandboxFailure(message: string): never {
 interface TurnCompletion {
   status: string | null;
   requiredActions: unknown[] | null;
+  error: string | null;
 }
 
 function turnCompletion(event: TrueForgeApi.TurnStreamingEvent): TurnCompletion {
   const state = recordValue(event).state;
   if (!isRecord(state)) {
-    return { status: null, requiredActions: null };
+    return { status: null, requiredActions: null, error: null };
   }
   const rawRequiredActions = state.requiredActions ?? state.required_actions;
   return {
     status: stringOrNull(state.status),
     requiredActions: Array.isArray(rawRequiredActions) ? rawRequiredActions : null,
+    error: safeRuntimeError(state.error),
   };
 }
 
@@ -2455,7 +2632,12 @@ function requireCompletedTurn(
   }
   const completion = turnCompletion(done);
   if (completion.status !== "done") {
-    return verificationFailure(operation, `TrueForge ${subject} turn did not finish successfully.`);
+    return verificationFailure(
+      operation,
+      completion.error === null
+        ? `TrueForge ${subject} turn did not finish successfully.`
+        : `TrueForge ${subject} turn failed: ${completion.error}`,
+    );
   }
   if (completion.requiredActions === null) {
     return verificationFailure(operation, `TrueForge ${subject} turn did not include required actions.`);
@@ -3363,6 +3545,41 @@ function verifySandboxExecution(
   };
 }
 
+function verifySandboxReadiness(
+  events: TrueForgeApi.TurnStreamingEvent[],
+  intent: string,
+  command: string,
+  toolName: string,
+  expectedSandboxId?: string,
+): VerifiedSandboxReadiness {
+  const execution = verifySandboxExecution(
+    events,
+    intent,
+    command,
+    toolName,
+    expectedSandboxId,
+  );
+  const match = execution.stdout.match(
+    /TRUEFORGE_TOOLCHAIN_READY\s+node=(v\d+\.\d+\.\d+)\s+npm=(\d+\.\d+\.\d+)/,
+  );
+  if (match === null || match[1] === undefined || match[2] === undefined) {
+    throw new TrueForgeIntegrationError(
+      "prepare sandbox",
+      "Sandbox toolchain readiness did not report Node.js and npm versions.",
+    );
+  }
+  const nodeVersion = match[1];
+  const npmVersion = match[2];
+  const nodeMajor = Number(nodeVersion.slice(1).split(".")[0]);
+  if (!Number.isInteger(nodeMajor) || nodeMajor < MINIMUM_SANDBOX_NODE_MAJOR_VERSION) {
+    throw new TrueForgeIntegrationError(
+      "prepare sandbox",
+      `Sandbox toolchain requires Node.js >=${MINIMUM_SANDBOX_NODE_MAJOR_VERSION}; observed ${nodeVersion}.`,
+    );
+  }
+  return { ...execution, nodeVersion, npmVersion };
+}
+
 function summarizeOutput(value: string): string {
   const normalized = value.trim();
   return normalized.length <= 4_000
@@ -3449,7 +3666,7 @@ function parseSubagentCreatedEvent(
 
 function parseSubagentDoneEvent(
   event: TrueForgeApi.TurnStreamingEvent,
-): { threadId: string; status: "done"; output: Record<string, unknown> } | { threadId: string; status: "error" } | null {
+): { threadId: string; status: "done"; output: Record<string, unknown> } | { threadId: string; status: "error"; error: string } | null {
   const record = recordValue(event);
   const threadId = stringOrNull(record.threadId ?? record.thread_id);
   const state = record.state;
@@ -3461,11 +3678,22 @@ function parseSubagentDoneEvent(
     return isRecord(state.output) ? { threadId, status, output: state.output } : null;
   }
   if (status === "error") {
-    return typeof state.error === "string" && state.error.trim().length > 0
-      ? { threadId, status }
-      : null;
+    const error = safeRuntimeError(state.error);
+    return error === null
+      ? null
+      : { threadId, status, error };
   }
   return null;
+}
+
+function safeRuntimeError(value: unknown): string | null {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return null;
+  }
+  return value.trim()
+    .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s,;]+/gi, "$1[redacted]")
+    .replace(/((?:api[_-]?key|token|password|secret)\s*[:=]\s*)[^\s,;]+/gi, "$1[redacted]")
+    .slice(0, 2_000);
 }
 
 function stringOrNull(value: unknown): string | null {
@@ -3511,8 +3739,12 @@ function runtimeDetails(event: TrueForgeApi.TurnStreamingEvent): string {
   };
   if (event.type === "turn.done" || event.type === "thread.done") {
     const state = record.state;
-    if (state !== null && typeof state === "object" && !Array.isArray(state)) {
-      details.status = stringOrNull((state as Record<string, unknown>).status);
+    if (isRecord(state)) {
+      details.status = stringOrNull(state.status);
+      const error = safeRuntimeError(state.error);
+      if (error !== null) {
+        details.error = error;
+      }
     }
   }
   if (event.type === "model.message") {
@@ -3546,12 +3778,15 @@ function runtimeEvidence(event: TrueForgeApi.TurnStreamingEvent): RuntimeEvidenc
     case "turn.done": {
       const state = recordValue(event).state;
       const status = isRecord(state) ? stringOrNull(state.status) ?? "unknown" : "unknown";
+      const error = isRecord(state) ? safeRuntimeError(state.error) : null;
       const rawRequiredActions = isRecord(state)
         ? state.requiredActions ?? state.required_actions
         : undefined;
       const requiredActions = Array.isArray(rawRequiredActions) ? rawRequiredActions : null;
       const isComplete = status === "done" && requiredActions !== null && requiredActions.length === 0;
-      const summary = requiredActions === null
+      const summary = error !== null
+        ? `TrueForge turn finished with status ${status}: ${error}`
+        : requiredActions === null
         ? `TrueForge turn finished with status ${status}; required actions were not provided.`
         : requiredActions.length === 0
         ? `TrueForge turn finished with status ${status}.`
@@ -3627,12 +3862,15 @@ function runtimeEvidence(event: TrueForgeApi.TurnStreamingEvent): RuntimeEvidenc
         details,
       };
     case "thread.done": {
-      const status = stringOrNull(recordValue(event).state &&
-        (recordValue(event).state as Record<string, unknown>).status) ?? "unknown";
+      const state = recordValue(event).state;
+      const status = isRecord(state) ? stringOrNull(state.status) ?? "unknown" : "unknown";
+      const error = isRecord(state) ? safeRuntimeError(state.error) : null;
       return {
         kind: "tool_result",
         result: status === "done" ? "passed" : "failed",
-        summary: `TrueForge thread finished with status ${status}.`,
+        summary: error === null
+          ? `TrueForge thread finished with status ${status}.`
+          : `TrueForge thread finished with status ${status}: ${error}`,
         details,
       };
     }

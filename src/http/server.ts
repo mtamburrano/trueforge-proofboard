@@ -23,6 +23,7 @@ import {
   RepositoryInspectionInput,
   RepositoryWorkGraphPlanner,
   PullRequestDeliveryTarget,
+  SandboxPreparationInput,
   SandboxVerificationInput,
   TrueForgeDeliveryApproval,
   TrueForgeIntegrationError,
@@ -151,6 +152,7 @@ export interface MissionRunner {
     instruction: string,
     options: { workItemId: string; delegateToSubagent?: boolean },
   ): Promise<TrueForgeTurnResult>;
+  prepareSandbox?(input: SandboxPreparationInput): Promise<unknown>;
   runSandboxVerification(input: SandboxVerificationInput): Promise<unknown>;
   requestPullRequestApproval(
     missionId: string,
@@ -337,6 +339,7 @@ export interface MissionView {
     total: number;
     passedEvidence: number;
     failedEvidence: number;
+    execution: "not_started" | "running" | "passed" | "failed";
     verification: "not_started" | "running" | "passed" | "failed";
   };
   lanes: Array<{
@@ -659,6 +662,12 @@ class MissionController {
         throw new MissionControlError(
           "Planning must produce bounded implementation and verification work.",
         );
+      }
+      if (
+        this.runner.prepareSandbox !== undefined &&
+        implementers.some((item) => item.status !== "complete")
+      ) {
+        await this.runner.prepareSandbox({ missionId: PRIMARY_MISSION_ID });
       }
       for (const implementer of implementers) {
         await this.executeWork(implementer.id, async () => {
@@ -1465,6 +1474,37 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
   const passedEvidence = evidence.filter((item) => item.result === "passed").length;
   const failedEvidence = evidence.filter((item) => item.result === "failed").length;
   const completed = workItems.filter((item) => item.status === "complete").length;
+  const implementationItems = workItems.filter((item) => item.assignedRole === "implementer");
+  const reviewerItems = workItems.filter((item) => item.assignedRole === "reviewer");
+  const latestSandboxPreparation = [...missionEvidence].reverse().find((item) =>
+    item.source === "sandbox" &&
+    item.workItemId === undefined &&
+    item.summary.startsWith("Sandbox toolchain readiness")
+  );
+  const implementationExecutionFailed = implementationItems.some((item) =>
+    item.status === "blocked" ||
+    item.delegation?.status === "failed" ||
+    item.delegation?.status === "interrupted"
+  );
+  const executionComplete = implementationItems.length > 0 &&
+    implementationItems.every((item) => item.status === "complete");
+  const executionFailed = implementationExecutionFailed || (
+    !executionComplete && latestSandboxPreparation?.result === "failed"
+  );
+  const executionRunning = implementationItems.some((item) =>
+    item.status === "in_progress" || item.status === "ready_for_review"
+  ) || (
+    !executionComplete &&
+    !executionFailed &&
+    (mission.status === "planning" || mission.status === "executing")
+  );
+  const execution = executionFailed
+    ? "failed"
+    : executionComplete
+    ? "passed"
+    : executionRunning
+    ? "running"
+    : "not_started";
   const repositoryProof = latestProofResultForRole(
     missionEvidence,
     workItems,
@@ -1479,14 +1519,14 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
   );
   const currentProofFailed = repositoryProof === "failed" || sandboxProof === "failed";
   const currentProofPassed = repositoryProof === "passed" && sandboxProof === "passed";
-  const verification = mission.status === "failed" || mission.status === "blocked"
+  const verificationRunning = reviewerItems.some((item) =>
+    item.status === "in_progress" || item.status === "ready_for_review"
+  ) || mission.status === "verifying";
+  const verification = currentProofFailed
     ? "failed"
     : (["awaiting_approval", "verifying", "delivered"].includes(mission.status)) && currentProofPassed
     ? "passed"
-    : currentProofFailed
-    ? "failed"
-    : workItems.some((item) => item.status === "in_progress" || item.status === "ready_for_review")
-      || mission.status === "planning" || mission.status === "executing"
+    : verificationRunning
     ? "running"
     : "not_started";
 
@@ -1516,6 +1556,7 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
       total: workItems.length,
       passedEvidence,
       failedEvidence,
+      execution,
       verification,
     },
     lanes: [
@@ -1954,8 +1995,14 @@ function publicErrorMessage(error: unknown): string {
     if (error.operation.includes("inspect repository")) {
       return "Repository inspection failed. Check the configured runtime and repository connector.";
     }
+    if (error.operation.includes("prepare sandbox")) {
+      return sanitizePublicRuntimeError(error.message);
+    }
     if (error.operation.includes("sandbox")) {
       return "Sandbox verification failed. Check the configured runtime and sandbox provider.";
+    }
+    if (error.operation.includes("delegate work item")) {
+      return sanitizePublicRuntimeError(error.message);
     }
     return "The execution runtime is unavailable or could not complete the requested operation.";
   }
@@ -1968,6 +2015,13 @@ function publicErrorMessage(error: unknown): string {
       : "The mission state operation could not be completed.";
   }
   return "Mission Control could not complete the requested operation.";
+}
+
+function sanitizePublicRuntimeError(message: string): string {
+  return message
+    .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s,;]+/gi, "$1[redacted]")
+    .replace(/((?:api[_-]?key|token|password|secret)\s*[:=]\s*)[^\s,;]+/gi, "$1[redacted]")
+    .slice(0, 240);
 }
 
 const INDEX_HTML = `<!doctype html>

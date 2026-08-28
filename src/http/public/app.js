@@ -107,6 +107,10 @@ function showMessage(kind, text) {
   }
 }
 
+function clearMessage() {
+  messageRegion.replaceChildren();
+}
+
 function renderEmpty() {
   app.innerHTML = `
     <section class="empty-state panel">
@@ -134,6 +138,8 @@ function renderMission(view) {
     : "Run mission";
   const verificationClass = view.progress.verification === "failed" ? "bad" :
     view.progress.verification === "passed" ? "good" : "";
+  const executionClass = view.progress.execution === "failed" ? "bad" :
+    view.progress.execution === "passed" ? "good" : "";
 
   app.innerHTML = `
     <section class="mission-header panel" aria-labelledby="mission-objective">
@@ -159,6 +165,7 @@ function renderMission(view) {
       <div class="metric"><span class="metric-label">Work complete</span><span class="metric-value">${view.progress.complete} / ${view.progress.total}</span></div>
       <div class="metric"><span class="metric-label">Verified evidence</span><span class="metric-value good">${view.progress.passedEvidence}</span></div>
       <div class="metric"><span class="metric-label">Failed checks</span><span class="metric-value ${view.progress.failedEvidence ? "bad" : ""}">${view.progress.failedEvidence}</span></div>
+      <div class="metric"><span class="metric-label">Execution</span><span class="metric-value ${executionClass}">${escapeHtml(humanLabel(view.progress.execution))}</span></div>
       <div class="metric"><span class="metric-label">Verification</span><span class="metric-value ${verificationClass}">${escapeHtml(humanLabel(view.progress.verification))}</span></div>
     </section>
 
@@ -383,9 +390,12 @@ runCoordinator = MissionRunState.createRunCoordinator({
   start: () => api("/api/mission/run", { method: "POST" }),
   refresh: () => api("/api/mission"),
   onState: (view) => renderMission(view),
+  onRunStart: () => clearMessage(),
   onRunningChange: (running, view) => {
     if (view) renderMission(view);
-    if (running) setConnection("connected", "Mission running");
+    if (running) {
+      setConnection("connected", "Mission running");
+    }
   },
 });
 

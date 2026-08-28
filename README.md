@@ -72,6 +72,13 @@ same proof boundary to the canonical sandbox `exec` tool, recording the exact
 command, exit code, and bounded output summary. The deterministic primary fixture
 runs its checks from the provisioned project directory.
 
+Before delegated coding starts, the primary mission runs a separate sandbox
+readiness turn. That turn prepares or verifies Node.js 20+ and npm and records a
+specific readiness failure before delegation when the sandbox cannot provide them.
+Coding turns use a bounded default of 64 TrueForge iterations; callers can provide
+a lower limit through `TrueForgeMissionConfig.iterationLimit` when their mission
+needs a tighter budget.
+
 Delegated implementation work is review-gated by a structured handoff. It records
 changed files, a bounded diff summary, each required check and its observed result,
 decisions, open questions, evidence IDs, and the correlated TrueForge session,

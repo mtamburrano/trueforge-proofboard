@@ -24,6 +24,7 @@ class TestMissionRunner {
     missions,
     {
       failSandbox = false,
+      sandboxPreparationError = false,
       secretInspectionError = false,
       createGate,
       structuredHandoff = false,
@@ -34,6 +35,7 @@ class TestMissionRunner {
   ) {
     this.missions = missions;
     this.failSandbox = failSandbox;
+    this.sandboxPreparationError = sandboxPreparationError;
     this.secretInspectionError = secretInspectionError;
     this.createGate = createGate;
     this.structuredHandoff = structuredHandoff;
@@ -41,6 +43,8 @@ class TestMissionRunner {
     this.deliveryHeadSha = deliveryHeadSha;
     this.deliveryHeadPatches = deliveryHeadPatches;
     this.sandboxInputs = [];
+    this.preparationInputs = [];
+    this.operationLog = [];
     this.turnInputs = [];
     this.deliveryCalls = { requested: [], resolved: [], protectedOperations: 0 };
     this.calls = { create: 0, inspect: 0, headInspect: 0, turn: 0, sandbox: 0 };
@@ -58,6 +62,7 @@ class TestMissionRunner {
   }
 
   async inspectRepository(input) {
+    this.operationLog.push("inspect");
     this.calls.inspect += 1;
     if (this.secretInspectionError) {
       throw new TrueForgeIntegrationError(
@@ -111,6 +116,7 @@ class TestMissionRunner {
   }
 
   async inspectDeliveryHead(input) {
+    this.operationLog.push("head-inspect");
     this.calls.headInspect += 1;
     const target = input.target;
     const resourceUri = `repo://${target.owner}/${target.repo}/sha/${this.deliveryHeadSha}`;
@@ -154,6 +160,7 @@ class TestMissionRunner {
   }
 
   async runTurn(missionId, _instruction, options) {
+    this.operationLog.push("delegate");
     this.calls.turn += 1;
     this.turnInputs.push({ instruction: _instruction, options });
     const turnId = `test-turn-${this.calls.turn}`;
@@ -251,6 +258,7 @@ class TestMissionRunner {
   }
 
   async runSandboxVerification(input) {
+    this.operationLog.push("verify-sandbox");
     this.calls.sandbox += 1;
     this.sandboxInputs.push(input);
     if (this.failSandbox) {
@@ -288,6 +296,27 @@ class TestMissionRunner {
       }),
     });
     return { evidenceId: evidence.id };
+  }
+
+  async prepareSandbox(input) {
+    this.operationLog.push("prepare-sandbox");
+    this.preparationInputs.push(input);
+    if (this.sandboxPreparationError) {
+      await this.missions.addEvidence(input.missionId, {
+        kind: "tool_result",
+        result: "failed",
+        source: "sandbox",
+        summary: "Sandbox toolchain readiness failed; coding delegation did not start.",
+        details: JSON.stringify({
+          command: "sandbox toolchain readiness",
+          reason: "Node.js >=20 and npm are required before coding delegation.",
+        }),
+      });
+      throw new TrueForgeIntegrationError(
+        "prepare sandbox",
+        "Sandbox toolchain readiness failed: Node.js >=20 and npm are required before coding delegation.",
+      );
+    }
   }
 
   async requestPullRequestApproval(missionId, target) {
@@ -356,6 +385,9 @@ test("initial mission route and static application assets load", async () => {
   assert.match(scriptBody, /data-source=/);
   assert.match(scriptBody, /data-result=/);
   assert.match(scriptBody, /Runtime narration never appears in this panel/);
+  assert.match(scriptBody, /Execution/);
+  assert.match(scriptBody, /onRunStart/);
+  assert.match(scriptBody, /clearMessage\(\)/);
   assert.match(scriptBody, /Approve exact action/);
   assert.match(scriptBody, /Rejected\. The protected repository operation was not executed/);
   assert.match(scriptBody, /Cancelled\. The protected repository operation was not executed/);
@@ -528,6 +560,7 @@ test("run mission uses the runtime adapters and exposes passed proof", async () 
   const payload = await json(response);
   assert.equal(payload.mission.mission.status, "awaiting_approval");
   assert.equal(payload.mission.progress.complete, 4);
+  assert.equal(payload.mission.progress.execution, "passed");
   assert.equal(payload.mission.progress.verification, "passed");
   assert.deepEqual(payload.mission.evidence.map((item) => item.source).sort(), ["mcp", "mcp", "sandbox"]);
   assert.equal(payload.mission.approvals.length, 1);
@@ -548,6 +581,13 @@ test("run mission uses the runtime adapters and exposes passed proof", async () 
   );
   assert.equal(runner.deliveryCalls.requested.length, 1);
   assert.equal(runner.deliveryCalls.protectedOperations, 0);
+  assert.deepEqual(runner.preparationInputs, [{ missionId: PRIMARY_MISSION_ID }]);
+  assert.deepEqual(runner.operationLog.slice(0, 4), [
+    "inspect",
+    "prepare-sandbox",
+    "delegate",
+    "delegate",
+  ]);
   assert.deepEqual(runner.calls, { create: 1, inspect: 1, headInspect: 1, turn: 2, sandbox: 1 });
   assert.deepEqual(
     runner.turnInputs.map((input) => input.options.workItemId),
@@ -747,6 +787,7 @@ test("failed sandbox proof remains visibly failed and blocks the mission", async
   assert.equal(response.status, 502);
   const payload = await json(response);
   assert.equal(payload.mission.mission.status, "blocked");
+  assert.equal(payload.mission.progress.execution, "passed");
   assert.equal(payload.mission.progress.verification, "failed");
   const sandbox = payload.mission.evidence.find((item) => item.source === "sandbox");
   assert.equal(sandbox.result, "failed");
@@ -754,6 +795,47 @@ test("failed sandbox proof remains visibly failed and blocks the mission", async
   assert.equal(payload.mission.evidence.some(
     (item) => item.source === "sandbox" && item.result === "passed",
   ), false);
+});
+
+test("sandbox readiness failure blocks before delegation and stays distinct from verification", async () => {
+  const { app, runner } = testApp(new InMemoryMissionRepository(), {
+    sandboxPreparationError: true,
+  });
+
+  const response = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(response.status, 502);
+  const payload = await json(response);
+  assert.equal(payload.mission.mission.status, "blocked");
+  assert.equal(payload.mission.progress.execution, "failed");
+  assert.equal(payload.mission.progress.verification, "not_started");
+  assert.match(payload.message, /Node\.js >=20 and npm are required/);
+  assert.equal(runner.turnInputs.length, 0);
+  assert.deepEqual(runner.operationLog, ["inspect", "prepare-sandbox"]);
+  assert.equal(
+    payload.mission.evidence.some((item) =>
+      item.source === "sandbox" && item.result === "failed" &&
+      /toolchain readiness failed/.test(item.summary)
+    ),
+    true,
+  );
+});
+
+test("a readiness retry preserves history and reaches coding without a stale execution failure", async () => {
+  const { app, runner } = testApp(new InMemoryMissionRepository(), {
+    sandboxPreparationError: true,
+  });
+
+  const failed = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(failed.status, 502);
+  runner.sandboxPreparationError = false;
+
+  const retried = await json(await app.request("/api/mission/run", { method: "POST" }));
+  assert.equal(retried.mission.mission.status, "awaiting_approval");
+  assert.equal(retried.mission.progress.execution, "passed");
+  assert.equal(retried.mission.progress.verification, "passed");
+  assert.equal(retried.mission.progress.failedEvidence, 1);
+  assert.equal(runner.turnInputs.length, 2);
+  assert.equal(runner.preparationInputs.length, 2);
 });
 
 test("a successful retry uses current proof while preserving historical failure", async () => {
