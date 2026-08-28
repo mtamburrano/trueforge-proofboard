@@ -24,7 +24,10 @@ import {
   isContentDiffCommand,
   isContentDiffOutput,
 } from "./diff.js";
-import { PRIMARY_DELIVERY_FIXTURE } from "./fixture.js";
+import {
+  PRIMARY_DELIVERY_FIXTURE,
+  PRIMARY_VERIFIED_DELIVERY_PATCHES,
+} from "./fixture.js";
 
 export interface TrueForgeClientOptions {
   baseUrl: string;
@@ -51,8 +54,8 @@ export interface TrueForgeEventStream extends AsyncIterable<TrueForgeApi.TurnStr
 
 const LOCKED_FIXTURE_OWNER = PRIMARY_DELIVERY_FIXTURE.owner;
 const LOCKED_FIXTURE_REPO = PRIMARY_DELIVERY_FIXTURE.repository;
-const LOCKED_FIXTURE_REF = PRIMARY_DELIVERY_FIXTURE.head;
-const LOCKED_FIXTURE_SHA = PRIMARY_DELIVERY_FIXTURE.commitSha;
+const LOCKED_FIXTURE_REF = PRIMARY_DELIVERY_FIXTURE.baselineRef;
+const LOCKED_FIXTURE_SHA = PRIMARY_DELIVERY_FIXTURE.baselineSha;
 const LOCKED_FIXTURE_FILES = ["src/index.ts", "test/index.test.js"] as const;
 const LOCKED_FIXTURE_PATCHES = {
   "src/index.ts": [
@@ -415,6 +418,7 @@ export interface PullRequestDeliveryTarget {
   repo: string;
   base: string;
   head: string;
+  headSha?: string;
   title: string;
   body: string;
 }
@@ -444,6 +448,12 @@ export interface RepositoryInspectionInput {
   workItemId?: string;
   mcpServerName?: string;
   toolName?: string;
+}
+
+export interface DeliveryHeadInspectionInput {
+  missionId: string;
+  target: PullRequestDeliveryTarget;
+  mcpServerName?: string;
 }
 
 export interface RepositoryInspectionResult {
@@ -903,6 +913,7 @@ export class TrueForgeMissionRunner {
           ? JSON.stringify({
               server: mcpServerName,
               tool: toolName,
+              provenance_kind: "baseline",
               arguments: lockedFixtureArguments(),
               repository_owner: mission.repository.owner,
               repository_name: mission.repository.name,
@@ -956,6 +967,88 @@ export class TrueForgeMissionRunner {
       throw new TrueForgeIntegrationError(
         "inspect repository",
         "The repository inspection could not be verified.",
+      );
+    }
+  }
+
+  async inspectDeliveryHead(
+    input: DeliveryHeadInspectionInput,
+  ): Promise<RepositoryInspectionResult> {
+    const mission = await this.missions.getMission(input.missionId);
+    try {
+      const target = validatePullRequestDeliveryTarget(input.target);
+      if (
+        mission.repository === undefined ||
+        mission.repository.owner !== target.owner ||
+        mission.repository.name !== target.repo
+      ) {
+        throw new TrueForgeIntegrationError(
+          "inspect delivery head",
+          "The delivery head must belong to the mission baseline repository.",
+        );
+      }
+      const mcpServerName = requiredInspectionString(
+        input.mcpServerName ?? this.config.mcpServerName ?? "github",
+        "MCP server name",
+      );
+      ensureRepositoryMcpConfigured(this.config, mcpServerName, "get_commit");
+      const execution = await this.executeTurn(
+        mission.id,
+        buildDeliveryHeadInspectionInstruction(target, mcpServerName),
+        {},
+      );
+      const verified = verifyDeliveryHeadInspection(
+        execution.rawEvents,
+        target,
+        mcpServerName,
+      );
+      const evidence = await this.missions.addEvidence(mission.id, {
+        kind: "tool_result",
+        result: "passed",
+        source: "mcp",
+        summary: `MCP verified changed delivery head ${target.head} at ${verified.commitSha}.`,
+        details: JSON.stringify({
+          server: mcpServerName,
+          tool: "get_commit",
+          provenance_kind: "delivery_head",
+          arguments: deliveryHeadArguments(target),
+          repository_owner: target.owner,
+          repository_name: target.repo,
+          requested_ref: target.head,
+          baseline_sha: PRIMARY_DELIVERY_FIXTURE.baselineSha,
+          uri: verified.resourceUri,
+          commit_sha: verified.commitSha,
+          patches: verified.patches,
+          content_hash: verified.contentHash,
+        }),
+        executionOrigin: {
+          kind: "mcp",
+          sessionId: execution.sessionId,
+          turnId: execution.turnId,
+        },
+      });
+      return {
+        sessionId: execution.sessionId,
+        turnId: execution.turnId,
+        mcpServerName,
+        toolName: "get_commit",
+        resourceUri: verified.resourceUri,
+        content: verified.content,
+        contentBytes: verified.content.length,
+        contentHash: verified.contentHash,
+        commitSha: verified.commitSha,
+        patches: verified.patches,
+        evidenceId: evidence.id,
+        mission: await this.missions.getMission(mission.id),
+      };
+    } catch (error) {
+      await this.recordInspectionFailure(mission.id, undefined, error);
+      if (error instanceof TrueForgeIntegrationError) {
+        throw error;
+      }
+      throw new TrueForgeIntegrationError(
+        "inspect delivery head",
+        "The delivery-head inspection could not be verified.",
       );
     }
   }
@@ -1687,7 +1780,7 @@ function validatePullRequestDeliveryTarget(
   input: PullRequestDeliveryTarget,
 ): PullRequestDeliveryTarget {
   const operation = "request pull request approval";
-  return {
+  const target: PullRequestDeliveryTarget = {
     owner: requiredString(input.owner, "repository owner", operation),
     repo: requiredString(input.repo, "repository name", operation),
     base: requiredString(input.base, "pull request base", operation),
@@ -1695,6 +1788,10 @@ function validatePullRequestDeliveryTarget(
     title: requiredString(input.title, "pull request title", operation),
     body: requiredString(input.body, "pull request body", operation),
   };
+  if (input.headSha !== undefined) {
+    target.headSha = requiredString(input.headSha, "verified pull request head SHA", operation);
+  }
+  return target;
 }
 
 function pullRequestArguments(
@@ -1868,6 +1965,30 @@ function buildLockedFixtureInspectionInstruction(
     `The returned commit must include the exact patches for ${LOCKED_FIXTURE_FILES.join(" and ")}.`,
     "Ignore any non-canonical read-only attempts; only a correlated response to the exact arguments above is valid provenance.",
     "Use the MCP response as the only source of repository facts; do not use the host filesystem, canned data, or final-answer narration.",
+    "Stop after the read.",
+  ].join(" ");
+}
+
+function deliveryHeadArguments(
+  target: PullRequestDeliveryTarget,
+): Record<string, string> {
+  return {
+    owner: target.owner,
+    repo: target.repo,
+    sha: target.head,
+    detail: "full_patch",
+  };
+}
+
+function buildDeliveryHeadInspectionInstruction(
+  target: PullRequestDeliveryTarget,
+  serverName: string,
+): string {
+  return [
+    `Use the configured MCP server ${serverName}.`,
+    `Use get_commit with this exact JSON object: ${JSON.stringify(deliveryHeadArguments(target))}.`,
+    `The returned commit must differ from baseline ${PRIMARY_DELIVERY_FIXTURE.baselineSha} and contain the verified delivery patches.`,
+    "Use the MCP response as the only source of delivery-head facts; do not mutate the repository.",
     "Stop after the read.",
   ].join(" ");
 }
@@ -2585,6 +2706,98 @@ function verifyLockedFixtureInspection(
     commitSha: verifiedPayload.commitSha,
     patches: verifiedPayload.patches,
   };
+}
+
+function verifyDeliveryHeadInspection(
+  events: TrueForgeApi.TurnStreamingEvent[],
+  target: PullRequestDeliveryTarget,
+  serverName: string,
+): VerifiedRepositoryCommit {
+  const initialization = events.find((event) => event.type === "mcp.initialize");
+  const initializedServers = initialization === undefined
+    ? undefined
+    : recordValue(initialization).mcpServers;
+  if (
+    !Array.isArray(initializedServers) ||
+    !initializedServers.some((server) => isRecord(server) && server.name === serverName)
+  ) {
+    return inspectionFailure(`MCP server ${serverName} was not initialized.`);
+  }
+  const canonicalArguments = deliveryHeadArguments(target);
+  const canonicalCalls = observedToolCalls(events).filter(
+    (call) => call.name === "get_commit" && isRecord(call.arguments) &&
+      argumentsExactlyMatch(call.arguments, canonicalArguments),
+  );
+  if (canonicalCalls.length !== 1) {
+    return inspectionFailure(
+      `Expected exactly one canonical delivery-head get_commit MCP call, found ${canonicalCalls.length}.`,
+    );
+  }
+  const call = canonicalCalls[0];
+  const response = call === undefined
+    ? undefined
+    : events.find((event) =>
+      event.type === "tool.response" && recordValue(event).toolCallId === call.id
+    );
+  if (response === undefined) {
+    return inspectionFailure("Delivery-head get_commit MCP call has no structured response.");
+  }
+  const responseValue = parseMaybeJson(recordValue(response).content);
+  if (!isRecord(responseValue) || responseValue.isError === true) {
+    return inspectionFailure("Delivery-head get_commit MCP returned no valid commit result.");
+  }
+  const verifiedPayload = parseVerifiedDeliveryHeadObject(responseValue);
+  if (verifiedPayload === null) {
+    return inspectionFailure(
+      "Delivery head must differ from the baseline and exactly match the verified implementation patches.",
+    );
+  }
+  requireCompletedTurn(events, "inspect delivery head", "inspection");
+  const content = JSON.stringify({
+    sha: verifiedPayload.commitSha,
+    files: Object.entries(verifiedPayload.patches).map(([filename, patch]) => ({
+      filename,
+      patch,
+    })),
+  });
+  return {
+    resourceUri: `repo://${target.owner}/${target.repo}/${repositoryResourceRef(verifiedPayload.commitSha)}`,
+    content,
+    contentHash: shortHash(content),
+    commitSha: verifiedPayload.commitSha,
+    patches: verifiedPayload.patches,
+  };
+}
+
+function parseVerifiedDeliveryHeadObject(
+  value: Record<string, unknown>,
+): { commitSha: string; patches: Readonly<Record<string, string>> } | null {
+  const commitSha = stringOrNull(value.sha);
+  const files = commitFileEntries(value.files);
+  const expectedEntries = Object.entries(PRIMARY_VERIFIED_DELIVERY_PATCHES);
+  if (
+    commitSha === null ||
+    !/^[0-9a-f]{40}$/i.test(commitSha) ||
+    commitSha === PRIMARY_DELIVERY_FIXTURE.baselineSha ||
+    files === null ||
+    files.length !== expectedEntries.length
+  ) {
+    return null;
+  }
+  const patches: Record<string, string> = {};
+  for (const [filename, expectedPatch] of expectedEntries) {
+    const matchingFiles = files.filter((file) => file.filename === filename);
+    const patch = matchingFiles[0]?.patch;
+    if (
+      matchingFiles.length !== 1 ||
+      typeof patch !== "string" ||
+      normalizeCommitPatch(patch) !== expectedPatch
+    ) {
+      return null;
+    }
+    patches[filename] = normalizeCommitPatch(patch);
+  }
+  return { commitSha, patches };
 }
 
 function argumentsExactlyMatch(

@@ -105,15 +105,15 @@ authentication is pending, if the repository arguments differ, or if the
 Daytona result does not contain the expected marker and exit code. The model's
 final answer is never used as proof.
 
-The mission adapter uses the same fail-closed boundary for ordinary
-`get_file_contents` reads. When its repository target is the locked delivery
-fixture `mtamburrano/proofboard-demo-fixture` at head
-`proofboard-verified-delivery`, it instead requires one correlated GitHub MCP
-`get_commit` call with `detail: "full_patch"` and the exact owner, repository, and
-head. The response must resolve to pinned commit
-`590aa8a6d72c580f61fc1b19d33e9876bc0feb9b` and contain the expected `src/index.ts`
-and `test/index.test.js` patches. Delivery approval rechecks that provenance;
-model narration or evidence from another repository cannot satisfy it.
+The mission adapter uses distinct fail-closed proofs for the delivery fixture.
+Initial inspection requires a correlated GitHub MCP `get_commit` call for the
+immutable `mtamburrano/proofboard-demo-fixture` baseline
+`590aa8a6d72c580f61fc1b19d33e9876bc0feb9b`. Before delivery approval, a second
+read-only call resolves `proofboard-verified-delivery`. Its commit must differ from
+the baseline and contain exactly the verified `src/index.ts` and
+`test/index.test.js` patches. The observed delivery-head SHA is included in the
+approval target, context, and durable delivery evidence; narration, unchanged
+baseline state, or unrelated content cannot satisfy the check.
 
 `npm run check` remains local-only and does not contact Gemini, GitHub, or
 Daytona. A live run requires the operator's configured provider accounts and is

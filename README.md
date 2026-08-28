@@ -85,14 +85,15 @@ handoff, correlated checks, and a durable finding. It can accept the work, reque
 changes back to an executable state, or block it; every prior handoff and proof
 record remains available across those outcomes.
 
-For the deterministic delivery fixture, `inspectRepository` resolves
-`mtamburrano/proofboard-demo-fixture` head `proofboard-verified-delivery` with the
-GitHub MCP `get_commit` tool and `detail: "full_patch"`. Evidence is accepted only
-when that head resolves to pinned commit
-`590aa8a6d72c580f61fc1b19d33e9876bc0feb9b` with the expected `src/index.ts` and
-`test/index.test.js` patches. Delivery approval rechecks the repository, head,
-resolved commit, and resource URI against the same fixture contract. The regular
-`get_file_contents` resource contract remains fail-closed for other targets.
+For the deterministic delivery fixture, `inspectRepository` first proves the
+immutable `mtamburrano/proofboard-demo-fixture` baseline at commit
+`590aa8a6d72c580f61fc1b19d33e9876bc0feb9b`. After implementation and sandbox
+verification, a separate read-only `get_commit` call resolves head
+`proofboard-verified-delivery`. Delivery approval is available only when that head
+has a different commit identity and its exact patches match the verified
+`src/index.ts` and `test/index.test.js` change. The observed head SHA is bound into
+the approval and delivery records. Ordinary repository reads remain fail-closed
+for other targets.
 
 Configure the TrueForge model, GitHub MCP connector, and sandbox provider in the
 local TrueForge UI as described in [`docs/trueforge-smoke.md`](docs/trueforge-smoke.md).

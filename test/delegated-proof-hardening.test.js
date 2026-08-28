@@ -6,6 +6,7 @@ import {
   InMemoryMissionRepository,
   MissionService,
   PRIMARY_DELIVERY_FIXTURE,
+  PRIMARY_VERIFIED_DELIVERY_PATCHES,
   PRIMARY_MISSION_ID,
   PRIMARY_MISSION_OBJECTIVE,
   PRIMARY_REPOSITORY,
@@ -572,7 +573,7 @@ class LegacyPrimaryRunner {
   }
 
   async inspectRepository(input) {
-    const resourceUri = `repo://${PRIMARY_DELIVERY_FIXTURE.owner}/${PRIMARY_DELIVERY_FIXTURE.repository}/sha/${PRIMARY_DELIVERY_FIXTURE.commitSha}`;
+    const resourceUri = `repo://${PRIMARY_DELIVERY_FIXTURE.owner}/${PRIMARY_DELIVERY_FIXTURE.repository}/sha/${PRIMARY_DELIVERY_FIXTURE.baselineSha}`;
     const evidence = await this.missions.addEvidence(input.missionId, {
       id: "legacy-inspection-proof",
       workItemId: input.workItemId,
@@ -583,28 +584,65 @@ class LegacyPrimaryRunner {
       details: JSON.stringify({
         server: "github",
         tool: "get_commit",
+        provenance_kind: "baseline",
         arguments: {
           owner: PRIMARY_DELIVERY_FIXTURE.owner,
           repo: PRIMARY_DELIVERY_FIXTURE.repository,
-          sha: PRIMARY_DELIVERY_FIXTURE.head,
+          sha: PRIMARY_DELIVERY_FIXTURE.baselineRef,
           detail: "full_patch",
         },
         repository_owner: PRIMARY_DELIVERY_FIXTURE.owner,
         repository_name: PRIMARY_DELIVERY_FIXTURE.repository,
-        requested_ref: PRIMARY_DELIVERY_FIXTURE.head,
+        requested_ref: PRIMARY_DELIVERY_FIXTURE.baselineRef,
         uri: resourceUri,
-        commit_sha: PRIMARY_DELIVERY_FIXTURE.commitSha,
+        commit_sha: PRIMARY_DELIVERY_FIXTURE.baselineSha,
       }),
     });
     return {
       evidenceId: evidence.id,
       resourceUri,
       contentHash: "legacy-content-hash",
-      commitSha: PRIMARY_DELIVERY_FIXTURE.commitSha,
+      commitSha: PRIMARY_DELIVERY_FIXTURE.baselineSha,
       patches: {
         "src/index.ts": "@@ verified source",
         "test/index.test.js": "@@ verified tests",
       },
+    };
+  }
+
+  async inspectDeliveryHead(input) {
+    const commitSha = "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1";
+    const resourceUri = `repo://${input.target.owner}/${input.target.repo}/sha/${commitSha}`;
+    const evidence = await this.missions.addEvidence(input.missionId, {
+      kind: "tool_result",
+      result: "passed",
+      source: "mcp",
+      summary: "The changed fixture delivery head was inspected.",
+      details: JSON.stringify({
+        server: "github",
+        tool: "get_commit",
+        provenance_kind: "delivery_head",
+        arguments: {
+          owner: input.target.owner,
+          repo: input.target.repo,
+          sha: input.target.head,
+          detail: "full_patch",
+        },
+        repository_owner: input.target.owner,
+        repository_name: input.target.repo,
+        requested_ref: input.target.head,
+        baseline_sha: PRIMARY_DELIVERY_FIXTURE.baselineSha,
+        uri: resourceUri,
+        commit_sha: commitSha,
+        patches: PRIMARY_VERIFIED_DELIVERY_PATCHES,
+      }),
+    });
+    return {
+      evidenceId: evidence.id,
+      resourceUri,
+      contentHash: "legacy-delivery-head-content-hash",
+      commitSha,
+      patches: PRIMARY_VERIFIED_DELIVERY_PATCHES,
     };
   }
 

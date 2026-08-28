@@ -5,7 +5,10 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { PRIMARY_VERIFICATION_COMMAND } from "../dist/index.js";
+import {
+  PRIMARY_VERIFICATION_COMMAND,
+  PRIMARY_VERIFIED_DELIVERY_FILES,
+} from "../dist/index.js";
 
 const BASELINE_SOURCE = "export const deliveryStages = [\"Plan\", \"Execute\", \"Prove\", \"Approve\"];";
 const BASELINE_DIST = "export const deliveryStages = [\"Plan\", \"Execute\", \"Prove\", \"Approve\"];";
@@ -30,18 +33,19 @@ const HELPER_SOURCE = [
   "  return stage === \"Plan\" ? \"Execute\" : stage === \"Execute\" ? \"Prove\" : stage === \"Prove\" ? \"Approve\" : null;",
   "}",
 ].join("\n");
-const COMPLETE_TESTS = [
-  "import assert from \"node:assert/strict\";",
-  "import test from \"node:test\";",
-  "import { getNextDeliveryStage } from \"../dist/index.js\";",
-  "test(\"getNextDeliveryStage covers every transition\", () => {",
-  "  assert.equal(getNextDeliveryStage(\"Plan\"), \"Execute\");",
-  "  assert.equal(getNextDeliveryStage(\"Execute\"), \"Prove\");",
-  "  assert.equal(getNextDeliveryStage(\"Prove\"), \"Approve\");",
-  "  assert.equal(getNextDeliveryStage(\"Approve\"), null);",
-  "});",
+const VERIFIED_DELIVERY_DIST = [
+  "export const productName = \"TrueForge Proof Board\";",
+  "export const productThesis = \"Verified autonomous software delivery\";",
+  "export const deliveryStages = [\"Plan\", \"Execute\", \"Prove\", \"Approve\"];",
+  "export function getNextDeliveryStage(stage) {",
+  "  const index = deliveryStages.indexOf(stage);",
+  "  if (index === -1 || index === deliveryStages.length - 1) return null;",
+  "  return deliveryStages[index + 1] ?? null;",
+  "}",
+  "export function getProductSummary() {",
+  "  return `${productName}: ${productThesis} — ${deliveryStages.join(\" → \")}`;",
+  "}",
 ].join("\n");
-
 test("mission verification rejects the unchanged baseline", async () => {
   const result = await runVerificationFixture({
     source: BASELINE_SOURCE,
@@ -88,9 +92,9 @@ test("mission verification rejects top-level calls without assertions", async ()
 
 test("mission verification accepts helper behavior with focused transition tests", async () => {
   const result = await runVerificationFixture({
-    source: HELPER_SOURCE,
-    dist: HELPER_SOURCE,
-    tests: COMPLETE_TESTS,
+    source: PRIMARY_VERIFIED_DELIVERY_FILES["src/index.ts"],
+    dist: VERIFIED_DELIVERY_DIST,
+    tests: PRIMARY_VERIFIED_DELIVERY_FILES["test/index.test.js"],
   });
 
   assert.equal(result.status, 0, result.stderr + result.stdout);

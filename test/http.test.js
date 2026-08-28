@@ -10,6 +10,7 @@ import {
   JsonMissionRepository,
   MissionService,
   PRIMARY_DELIVERY_FIXTURE,
+  PRIMARY_VERIFIED_DELIVERY_PATCHES,
   PRIMARY_MISSION_ID,
   PRIMARY_MISSION_OBJECTIVE,
   PRIMARY_VERIFICATION_COMMAND,
@@ -27,6 +28,8 @@ class TestMissionRunner {
       createGate,
       structuredHandoff = false,
       inspectionRepository = PRIMARY_DELIVERY_FIXTURE,
+      deliveryHeadSha = "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1",
+      deliveryHeadPatches = PRIMARY_VERIFIED_DELIVERY_PATCHES,
     } = {},
   ) {
     this.missions = missions;
@@ -35,10 +38,12 @@ class TestMissionRunner {
     this.createGate = createGate;
     this.structuredHandoff = structuredHandoff;
     this.inspectionRepository = inspectionRepository;
+    this.deliveryHeadSha = deliveryHeadSha;
+    this.deliveryHeadPatches = deliveryHeadPatches;
     this.sandboxInputs = [];
     this.turnInputs = [];
     this.deliveryCalls = { requested: [], resolved: [], protectedOperations: 0 };
-    this.calls = { create: 0, inspect: 0, turn: 0, sandbox: 0 };
+    this.calls = { create: 0, inspect: 0, headInspect: 0, turn: 0, sandbox: 0 };
   }
 
   async createMission(input) {
@@ -61,7 +66,7 @@ class TestMissionRunner {
       );
     }
     const target = this.inspectionRepository;
-    const resourceUri = `repo://${target.owner}/${target.repository}/sha/${target.commitSha}`;
+    const resourceUri = `repo://${target.owner}/${target.repository}/sha/${target.baselineSha}`;
     const evidence = await this.missions.addEvidence(input.missionId, {
       workItemId: input.workItemId,
       kind: "tool_result",
@@ -71,17 +76,18 @@ class TestMissionRunner {
       details: JSON.stringify({
         server: "github",
         tool: "get_commit",
+        provenance_kind: "baseline",
         arguments: {
           owner: target.owner,
           repo: target.repository,
-          sha: target.head,
+          sha: target.baselineRef,
           detail: "full_patch",
         },
         repository_owner: target.owner,
         repository_name: target.repository,
-        requested_ref: target.head,
+        requested_ref: target.baselineRef,
         uri: resourceUri,
-        commit_sha: target.commitSha,
+        commit_sha: target.baselineSha,
         content_hash: "fixture-content-hash",
         token: "must-not-reach-browser",
         authorization: "Bearer must-not-reach-browser",
@@ -96,11 +102,54 @@ class TestMissionRunner {
       evidenceId: evidence.id,
       resourceUri,
       contentHash: "fixture-content-hash",
-      commitSha: target.commitSha,
+      commitSha: target.baselineSha,
       patches: {
         "src/index.ts": "@@ verified source",
         "test/index.test.js": "@@ verified focused tests",
       },
+    };
+  }
+
+  async inspectDeliveryHead(input) {
+    this.calls.headInspect += 1;
+    const target = input.target;
+    const resourceUri = `repo://${target.owner}/${target.repo}/sha/${this.deliveryHeadSha}`;
+    const evidence = await this.missions.addEvidence(input.missionId, {
+      kind: "tool_result",
+      result: "passed",
+      source: "mcp",
+      summary: `The changed delivery head was verified at ${this.deliveryHeadSha}.`,
+      details: JSON.stringify({
+        server: "github",
+        tool: "get_commit",
+        provenance_kind: "delivery_head",
+        arguments: {
+          owner: target.owner,
+          repo: target.repo,
+          sha: target.head,
+          detail: "full_patch",
+        },
+        repository_owner: target.owner,
+        repository_name: target.repo,
+        requested_ref: target.head,
+        baseline_sha: PRIMARY_DELIVERY_FIXTURE.baselineSha,
+        uri: resourceUri,
+        commit_sha: this.deliveryHeadSha,
+        patches: this.deliveryHeadPatches,
+        content_hash: "verified-delivery-head-content-hash",
+      }),
+      executionOrigin: {
+        kind: "mcp",
+        sessionId: "test-session-durable",
+        turnId: "test-delivery-head-turn",
+      },
+    });
+    return {
+      evidenceId: evidence.id,
+      resourceUri,
+      contentHash: "verified-delivery-head-content-hash",
+      commitSha: this.deliveryHeadSha,
+      patches: this.deliveryHeadPatches,
     };
   }
 
@@ -479,18 +528,26 @@ test("run mission uses the runtime adapters and exposes passed proof", async () 
   assert.equal(payload.mission.mission.status, "awaiting_approval");
   assert.equal(payload.mission.progress.complete, 4);
   assert.equal(payload.mission.progress.verification, "passed");
-  assert.deepEqual(payload.mission.evidence.map((item) => item.source).sort(), ["mcp", "sandbox"]);
+  assert.deepEqual(payload.mission.evidence.map((item) => item.source).sort(), ["mcp", "mcp", "sandbox"]);
   assert.equal(payload.mission.approvals.length, 1);
   assert.equal(payload.mission.approvals[0].actionType, "create_pull_request");
-  assert.equal(payload.mission.approvals[0].target, "mtamburrano/proofboard-demo-fixture base=main head=proofboard-verified-delivery");
+  assert.equal(
+    payload.mission.approvals[0].target,
+    "mtamburrano/proofboard-demo-fixture base=main head=proofboard-verified-delivery@8bb22a62b3714f699204cb0d5c440fcb7f0a09e1",
+  );
   assert.match(payload.mission.approvals[0].expectedEffect, /proofboard-demo-fixture/);
   assert.match(payload.mission.approvals[0].rationale, /human/);
   assert.equal(payload.mission.approvals[0].evidenceIds.length > 0, true);
   assert.equal(payload.mission.approvals[0].executionContext.sessionId, "test-session-durable");
   assert.equal(payload.mission.approvals[0].executionContext.toolCallId, "test-create-pull-request-call");
+  assert.equal(payload.mission.approvals[0].executionContext.headSha, "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1");
+  assert.notEqual(
+    payload.mission.approvals[0].executionContext.headSha,
+    PRIMARY_DELIVERY_FIXTURE.baselineSha,
+  );
   assert.equal(runner.deliveryCalls.requested.length, 1);
   assert.equal(runner.deliveryCalls.protectedOperations, 0);
-  assert.deepEqual(runner.calls, { create: 1, inspect: 1, turn: 2, sandbox: 1 });
+  assert.deepEqual(runner.calls, { create: 1, inspect: 1, headInspect: 1, turn: 2, sandbox: 1 });
   assert.deepEqual(
     runner.turnInputs.map((input) => input.options.workItemId),
     ["primary-implement-1-src-index-ts", "primary-implement-2-test-index-test-js"],
@@ -520,8 +577,8 @@ test("unrelated repository evidence cannot authorize the configured delivery tar
     inspectionRepository: {
       owner: "mtamburrano",
       repository: "trueforge-proofboard",
-      head: "unrelated-head",
-      commitSha: PRIMARY_DELIVERY_FIXTURE.commitSha,
+      baselineRef: PRIMARY_DELIVERY_FIXTURE.baselineRef,
+      baselineSha: PRIMARY_DELIVERY_FIXTURE.baselineSha,
     },
   });
 
@@ -532,6 +589,35 @@ test("unrelated repository evidence cannot authorize the configured delivery tar
   assert.equal(payload.mission.approvals.length, 0);
   assert.equal(runner.deliveryCalls.requested.length, 0);
   assert.equal(runner.deliveryCalls.protectedOperations, 0);
+});
+
+test("an unchanged baseline head cannot authorize delivery", async () => {
+  const { app, runner } = testApp(new InMemoryMissionRepository(), {
+    deliveryHeadSha: PRIMARY_DELIVERY_FIXTURE.baselineSha,
+  });
+
+  const response = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(response.status, 502);
+  const payload = await json(response);
+  assert.equal(payload.mission.approvals.length, 0);
+  assert.equal(runner.calls.headInspect, 1);
+  assert.equal(runner.deliveryCalls.requested.length, 0);
+});
+
+test("a delivery head whose diff differs from verified work cannot authorize delivery", async () => {
+  const { app, runner } = testApp(new InMemoryMissionRepository(), {
+    deliveryHeadPatches: {
+      ...PRIMARY_VERIFIED_DELIVERY_PATCHES,
+      "src/index.ts": `${PRIMARY_VERIFIED_DELIVERY_PATCHES["src/index.ts"]}\n+unverified change`,
+    },
+  });
+
+  const response = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(response.status, 502);
+  const payload = await json(response);
+  assert.equal(payload.mission.approvals.length, 0);
+  assert.equal(runner.calls.headInspect, 1);
+  assert.equal(runner.deliveryCalls.requested.length, 0);
 });
 
 test("a persisted approval cannot outlive the repository provenance that authorized it", async () => {
@@ -608,6 +694,7 @@ test("approving the exact pending delivery records one correlated pull request r
     repositoryName: "proofboard-demo-fixture",
     base: "main",
     head: "proofboard-verified-delivery",
+    headSha: "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1",
   });
   assert.equal(payload.mission.delivery[0].executionOrigin.sessionId, "test-session-durable");
   assert.equal(payload.mission.delivery[0].executionOrigin.turnId, "test-delivery-result-turn");
@@ -672,7 +759,7 @@ test("a successful retry uses current proof while preserving historical failure"
       .sort(),
     ["failed", "passed"],
   );
-  assert.deepEqual(runner.calls, { create: 1, inspect: 1, turn: 2, sandbox: 2 });
+  assert.deepEqual(runner.calls, { create: 1, inspect: 1, headInspect: 1, turn: 2, sandbox: 2 });
 });
 
 test("the primary controller persists every injected verifier outcome with review history", async () => {

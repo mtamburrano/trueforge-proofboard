@@ -324,6 +324,7 @@ export interface ApprovalExecutionContext {
   repositoryName: string;
   base: string;
   head: string;
+  headSha?: string;
   title: string;
   body: string;
 }
@@ -335,6 +336,7 @@ export interface PullRequestReference {
   repositoryName: string;
   base: string;
   head: string;
+  headSha?: string;
 }
 
 export interface Delivery {
@@ -1182,7 +1184,7 @@ function validateApprovalExecutionContext(
   label: string,
 ): ApprovalExecutionContext {
   const context = objectValue(value, label);
-  return {
+  const result: ApprovalExecutionContext = {
     sessionId: identifier(context.sessionId, `${label}.sessionId`),
     turnId: identifier(context.turnId, `${label}.turnId`),
     threadId: identifier(context.threadId, `${label}.threadId`),
@@ -1196,6 +1198,10 @@ function validateApprovalExecutionContext(
     title: requiredString(context.title, `${label}.title`, 500),
     body: requiredString(context.body, `${label}.body`, 4_000),
   };
+  if (context.headSha !== undefined) {
+    result.headSha = requiredString(context.headSha, `${label}.headSha`, 500);
+  }
+  return result;
 }
 
 function validatePullRequestReference(value: unknown, label: string): PullRequestReference {
@@ -1207,7 +1213,7 @@ function validatePullRequestReference(value: unknown, label: string): PullReques
   ) {
     return fail("invalid_input", `${label}.number must be a positive integer.`);
   }
-  const result = {
+  const result: PullRequestReference = {
     number: pullRequest.number,
     url: requiredString(pullRequest.url, `${label}.url`, 2_000),
     repositoryOwner: requiredString(
@@ -1223,6 +1229,9 @@ function validatePullRequestReference(value: unknown, label: string): PullReques
     base: requiredString(pullRequest.base, `${label}.base`, 500),
     head: requiredString(pullRequest.head, `${label}.head`, 500),
   };
+  if (pullRequest.headSha !== undefined) {
+    result.headSha = requiredString(pullRequest.headSha, `${label}.headSha`, 500);
+  }
   try {
     const url = new URL(result.url);
     const expectedPath = `/${result.repositoryOwner}/${result.repositoryName}/pull/${result.number}`;
@@ -1507,6 +1516,7 @@ export function validateMissionState(value: unknown): MissionState {
           context.repositoryName !== delivery.pullRequest.repositoryName ||
           context.base !== delivery.pullRequest.base ||
           context.head !== delivery.pullRequest.head ||
+          context.headSha !== delivery.pullRequest.headSha ||
           context.sessionId !== delivery.executionOrigin.sessionId ||
           context.threadId !== delivery.executionOrigin.threadId ||
           context.toolCallId !== delivery.executionOrigin.toolCallId
@@ -2920,6 +2930,7 @@ export class MissionService {
           context.repositoryName !== pullRequest.repositoryName ||
           context.base !== pullRequest.base ||
           context.head !== pullRequest.head ||
+          context.headSha !== pullRequest.headSha ||
           executionOrigin.kind !== "mcp" ||
           context.sessionId !== executionOrigin.sessionId ||
           context.threadId !== executionOrigin.threadId ||

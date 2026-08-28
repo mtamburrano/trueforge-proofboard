@@ -4,11 +4,12 @@ import test from "node:test";
 import {
   InMemoryMissionRepository,
   MissionService,
+  PRIMARY_VERIFIED_DELIVERY_PATCHES,
   TrueForgeMissionRunner,
 } from "../dist/index.js";
 
 const LOCKED_FIXTURE_SHA = "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b";
-const LOCKED_FIXTURE_REF = "proofboard-verified-delivery";
+const LOCKED_FIXTURE_REF = LOCKED_FIXTURE_SHA;
 const SANDBOX_VERIFICATION_INTENT = "Run the requested verification command in the sandbox.";
 const LOCKED_FIXTURE_PATCHES = {
   "src/index.ts": [
@@ -881,6 +882,114 @@ test("locked fixture inspection proves direct TrueForge get_commit content and e
   });
   assert.equal(details.commit_sha, LOCKED_FIXTURE_SHA);
   assert.deepEqual(details.patches, LOCKED_FIXTURE_PATCHES);
+});
+
+test("delivery-head inspection accepts a changed commit with the verified implementation diff", async () => {
+  const headSha = "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1";
+  const target = {
+    owner: "mtamburrano",
+    repo: "proofboard-demo-fixture",
+    base: "main",
+    head: "proofboard-verified-delivery",
+    title: "Verified fixture delivery",
+    body: "Verified fixture delivery body.",
+  };
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client, calls } = fakeClient((turnId) => lockedCommitEvents(turnId, {
+    argumentsValue: {
+      owner: target.owner,
+      repo: target.repo,
+      sha: target.head,
+      detail: "full_patch",
+    },
+    sha: headSha,
+    patches: PRIMARY_VERIFIED_DELIVERY_PATCHES,
+  }));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "google-gemini/test-model",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-delivery-head-success",
+    objective: "Verify the changed delivery head",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  const inspection = await runner.inspectDeliveryHead({ missionId: mission.id, target });
+
+  assert.equal(inspection.commitSha, headSha);
+  assert.deepEqual(inspection.patches, PRIMARY_VERIFIED_DELIVERY_PATCHES);
+  assert.match(calls.turns[0].request.input[0].content, /proofboard-verified-delivery/);
+  const state = await missions.getState();
+  const proof = state.evidence.find((item) => item.id === inspection.evidenceId);
+  const details = JSON.parse(proof.details);
+  assert.equal(details.provenance_kind, "delivery_head");
+  assert.equal(details.baseline_sha, LOCKED_FIXTURE_SHA);
+  assert.equal(details.commit_sha, headSha);
+});
+
+test("delivery-head inspection rejects the unchanged baseline and mismatched content", async () => {
+  const target = {
+    owner: "mtamburrano",
+    repo: "proofboard-demo-fixture",
+    base: "main",
+    head: "proofboard-verified-delivery",
+    title: "Verified fixture delivery",
+    body: "Verified fixture delivery body.",
+  };
+  const cases = [
+    {
+      label: "unchanged baseline",
+      sha: LOCKED_FIXTURE_SHA,
+      patches: PRIMARY_VERIFIED_DELIVERY_PATCHES,
+    },
+    {
+      label: "mismatched content",
+      sha: "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1",
+      patches: {
+        ...PRIMARY_VERIFIED_DELIVERY_PATCHES,
+        "src/index.ts": `${PRIMARY_VERIFIED_DELIVERY_PATCHES["src/index.ts"]}\n+unverified change`,
+      },
+    },
+  ];
+
+  for (const fixture of cases) {
+    const missions = new MissionService(new InMemoryMissionRepository());
+    const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, {
+      argumentsValue: {
+        owner: target.owner,
+        repo: target.repo,
+        sha: target.head,
+        detail: "full_patch",
+      },
+      sha: fixture.sha,
+      patches: fixture.patches,
+    }));
+    const runner = new TrueForgeMissionRunner(missions, client, {
+      model: "google-gemini/test-model",
+      mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+    });
+    const mission = await runner.createMission({
+      id: `mission-delivery-head-${fixture.label.replaceAll(" ", "-")}`,
+      objective: "Reject invalid delivery-head provenance",
+      repository: {
+        owner: "mtamburrano",
+        name: "proofboard-demo-fixture",
+        ref: LOCKED_FIXTURE_REF,
+      },
+    });
+
+    await assert.rejects(
+      runner.inspectDeliveryHead({ missionId: mission.id, target }),
+      /Delivery head must differ from the baseline and exactly match the verified implementation patches/,
+      fixture.label,
+    );
+    assert.equal((await missions.getMission(mission.id)).status, "blocked");
+  }
 });
 
 test("locked fixture inspection ignores a non-canonical attempt before a canonical call", async () => {

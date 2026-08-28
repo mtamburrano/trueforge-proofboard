@@ -19,6 +19,7 @@ import {
 } from "../domain.js";
 import {
   buildPreflightWorkGraph,
+  DeliveryHeadInspectionInput,
   RepositoryInspectionInput,
   RepositoryWorkGraphPlanner,
   PullRequestDeliveryTarget,
@@ -31,7 +32,11 @@ import {
   WorkGraphPlanner,
 } from "../trueforge.js";
 import { parseContentDiffEvidence } from "../diff.js";
-import { PRIMARY_DELIVERY_FIXTURE } from "../fixture.js";
+import {
+  PRIMARY_DELIVERY_FIXTURE,
+  PRIMARY_VERIFIED_DELIVERY_FILES,
+  PRIMARY_VERIFIED_DELIVERY_PATCHES,
+} from "../fixture.js";
 
 export const PRIMARY_MISSION_ID = "primary-mission";
 export const PRIMARY_MISSION_OBJECTIVE =
@@ -39,7 +44,7 @@ export const PRIMARY_MISSION_OBJECTIVE =
 export const PRIMARY_REPOSITORY = {
   owner: PRIMARY_DELIVERY_FIXTURE.owner,
   name: PRIMARY_DELIVERY_FIXTURE.repository,
-  ref: PRIMARY_DELIVERY_FIXTURE.head,
+  ref: PRIMARY_DELIVERY_FIXTURE.baselineRef,
 } as const;
 
 export const PRIMARY_DELIVERY_TARGET: PullRequestDeliveryTarget = {
@@ -121,6 +126,9 @@ export const PRIMARY_MISSION_VERIFICATION_SCRIPT = [
   '  assert.ok(mutatedStages.has(transition[0]), "transition " + transition[0] + " was not exercised during mutation verification");',
   '  assert.notEqual(mutationRun.status, 0, "focused test did not enforce transition " + transition[0] + " -> " + transition[1]);',
   '}',
+  `const expectedDeliveryFiles = ${JSON.stringify(PRIMARY_VERIFIED_DELIVERY_FILES)};`,
+  'assert.equal(source, expectedDeliveryFiles["src/index.ts"], "verified source differs from the delivery-head content contract");',
+  'assert.equal(await readFile("test/index.test.js", "utf8"), expectedDeliveryFiles["test/index.test.js"], "verified tests differ from the delivery-head content contract");',
   '  console.log("Mission transition verification passed.");',
   '} finally {',
   '  await rm(directory, { recursive: true, force: true });',
@@ -137,6 +145,7 @@ export interface MissionRunner {
     repository: { owner: string; name: string; ref: string };
   }): Promise<Mission>;
   inspectRepository(input: RepositoryInspectionInput): Promise<unknown>;
+  inspectDeliveryHead(input: DeliveryHeadInspectionInput): Promise<unknown>;
   runTurn(
     missionId: string,
     instruction: string,
@@ -738,7 +747,7 @@ class MissionController {
       Date.parse(approval.expiresAt) > Date.now(),
     );
     if (activeRequest !== undefined) {
-      requireApprovalRepositoryProof(state, activeRequest, PRIMARY_DELIVERY_TARGET);
+      requireApprovalRepositoryProof(state, activeRequest);
       return;
     }
     const plannerIds = new Set(
@@ -768,7 +777,21 @@ class MissionController {
     if (mission === undefined) {
       throw new MissionControlError("The primary mission is missing from durable state.");
     }
-    requireRepositoryProofForDelivery(mission, repositoryProof, PRIMARY_DELIVERY_TARGET);
+    requireBaselineRepositoryProof(mission, repositoryProof);
+    const deliveryHeadResult = await this.runner.inspectDeliveryHead({
+      missionId: PRIMARY_MISSION_ID,
+      target: PRIMARY_DELIVERY_TARGET,
+    });
+    const deliveryState = await this.missions.getState();
+    const { evidence: deliveryHeadProof, headSha } = deliveryHeadProofFromResult(
+      deliveryHeadResult,
+      deliveryState,
+    );
+    const deliveryTarget: PullRequestDeliveryTarget = {
+      ...PRIMARY_DELIVERY_TARGET,
+      headSha,
+    };
+    requireDeliveryHeadProof(deliveryHeadProof, deliveryTarget);
     const acceptedReviewEvidenceIds = state.reviews
       .filter((review) =>
         review.missionId === PRIMARY_MISSION_ID && review.outcome === "accepted"
@@ -776,21 +799,22 @@ class MissionController {
       .map((review) => review.findingEvidenceId);
     const evidenceIds = [
       repositoryProof.id,
+      deliveryHeadProof.id,
       sandboxProof.id,
       ...acceptedReviewEvidenceIds,
     ];
     const pending = await this.runner.requestPullRequestApproval(
       PRIMARY_MISSION_ID,
-      PRIMARY_DELIVERY_TARGET,
+      deliveryTarget,
     );
-    const target = pullRequestApprovalTarget(PRIMARY_DELIVERY_TARGET);
+    const target = pullRequestApprovalTarget(deliveryTarget);
     await this.missions.requestActionApproval(PRIMARY_MISSION_ID, {
       action: "Open the verified delivery",
       actionType: PRIMARY_CONSEQUENTIAL_ACTION,
       target,
       risk: "A remote repository mutation will create a pull request.",
       rationale: "A human must authorize the verified change before it is published for review.",
-      expectedEffect: pullRequestExpectedEffect(PRIMARY_DELIVERY_TARGET),
+      expectedEffect: pullRequestExpectedEffect(deliveryTarget),
       evidenceIds,
       executionContext: approvalExecutionContext(pending),
     });
@@ -807,8 +831,12 @@ class MissionController {
     if (approval === undefined) {
       throw new MissionDomainError("not_found", "The requested approval was not found.");
     }
-    requireApprovalRepositoryProof(state, approval, PRIMARY_DELIVERY_TARGET);
+    requireApprovalRepositoryProof(state, approval);
     const pending = deliveryApprovalFromState(approval);
+    const approvedHeadSha = pending.target.headSha;
+    if (approvedHeadSha === undefined) {
+      throw new MissionControlError("The approved delivery has no verified head identity.");
+    }
     await this.missions.decideApproval(PRIMARY_MISSION_ID, approval.id, {
       decision,
       decidedBy: "mission-operator",
@@ -860,6 +888,7 @@ class MissionController {
         repository: `${PRIMARY_DELIVERY_TARGET.owner}/${PRIMARY_DELIVERY_TARGET.repo}`,
         base: PRIMARY_DELIVERY_TARGET.base,
         head: PRIMARY_DELIVERY_TARGET.head,
+        head_sha: approvedHeadSha,
         pull_request_number: result.number,
         pull_request_url: result.url,
         approval_id: approval.id,
@@ -884,6 +913,7 @@ class MissionController {
         repositoryName: PRIMARY_DELIVERY_TARGET.repo,
         base: PRIMARY_DELIVERY_TARGET.base,
         head: PRIMARY_DELIVERY_TARGET.head,
+        headSha: approvedHeadSha,
       },
       executionOrigin: {
         kind: "mcp",
@@ -1051,17 +1081,19 @@ class MissionController {
 }
 
 function pullRequestApprovalTarget(target: PullRequestDeliveryTarget): string {
-  return `${target.owner}/${target.repo} base=${target.base} head=${target.head}`;
+  const verifiedHead = target.headSha === undefined ? target.head : `${target.head}@${target.headSha}`;
+  return `${target.owner}/${target.repo} base=${target.base} head=${verifiedHead}`;
 }
 
 function pullRequestExpectedEffect(target: PullRequestDeliveryTarget): string {
-  return `Open one pull request in ${target.owner}/${target.repo} from ${target.head} into ${target.base}; do not merge or mutate any other repository state.`;
+  const verifiedHead = target.headSha === undefined ? target.head : `${target.head} at ${target.headSha}`;
+  return `Open one pull request in ${target.owner}/${target.repo} from verified head ${verifiedHead} into ${target.base}; do not merge or mutate any other repository state.`;
 }
 
 function approvalExecutionContext(
   pending: TrueForgeDeliveryApproval,
 ): NonNullable<Approval["executionContext"]> {
-  return {
+  const context: NonNullable<Approval["executionContext"]> = {
     sessionId: pending.sessionId,
     turnId: pending.turnId,
     threadId: pending.threadId,
@@ -1075,83 +1107,165 @@ function approvalExecutionContext(
     title: pending.target.title,
     body: pending.target.body,
   };
+  if (pending.target.headSha !== undefined) {
+    context.headSha = pending.target.headSha;
+  }
+  return context;
 }
 
-function requireRepositoryProofForDelivery(
+function evidenceDetails(evidence: Evidence): Record<string, unknown> | null {
+  if (evidence.details === undefined) {
+    return null;
+  }
+  try {
+    const details = JSON.parse(evidence.details) as unknown;
+    return isRecord(details) ? details : null;
+  } catch {
+    return null;
+  }
+}
+
+function requireBaselineRepositoryProof(
   mission: Mission,
   evidence: Evidence,
-  target: PullRequestDeliveryTarget,
 ): void {
   const repository = mission.repository;
   if (
     repository === undefined ||
-    repository.owner !== target.owner ||
-    repository.name !== target.repo ||
-    repository.ref !== target.head
+    repository.owner !== PRIMARY_DELIVERY_FIXTURE.owner ||
+    repository.name !== PRIMARY_DELIVERY_FIXTURE.repository ||
+    repository.ref !== PRIMARY_DELIVERY_FIXTURE.baselineRef
   ) {
     throw new MissionControlError(
-      "Delivery approval requires the mission repository and inspected ref to match the pull request repository and head.",
+      "Delivery approval requires the mission to start from the pinned fixture baseline.",
     );
   }
-  if (evidence.details === undefined) {
-    throw new MissionControlError(
-      "Delivery approval requires structured repository provenance for the pull request head.",
-    );
-  }
-  let details: unknown;
-  try {
-    details = JSON.parse(evidence.details) as unknown;
-  } catch {
-    details = null;
-  }
-  const argumentsValue = isRecord(details) && isRecord(details.arguments)
+  const details = evidenceDetails(evidence);
+  const argumentsValue = details !== null && isRecord(details.arguments)
     ? details.arguments
     : null;
   const expectedUri =
-    `repo://${target.owner}/${target.repo}/sha/${PRIMARY_DELIVERY_FIXTURE.commitSha}`;
+    `repo://${repository.owner}/${repository.name}/sha/${PRIMARY_DELIVERY_FIXTURE.baselineSha}`;
   if (
-    !isRecord(details) ||
+    details === null ||
     argumentsValue === null ||
     details.tool !== "get_commit" ||
-    details.repository_owner !== target.owner ||
-    details.repository_name !== target.repo ||
-    details.requested_ref !== target.head ||
-    details.commit_sha !== PRIMARY_DELIVERY_FIXTURE.commitSha ||
+    details.provenance_kind !== "baseline" ||
+    details.repository_owner !== repository.owner ||
+    details.repository_name !== repository.name ||
+    details.requested_ref !== repository.ref ||
+    details.commit_sha !== PRIMARY_DELIVERY_FIXTURE.baselineSha ||
     details.uri !== expectedUri ||
-    argumentsValue.owner !== target.owner ||
-    argumentsValue.repo !== target.repo ||
-    argumentsValue.sha !== target.head ||
+    argumentsValue.owner !== repository.owner ||
+    argumentsValue.repo !== repository.name ||
+    argumentsValue.sha !== repository.ref ||
     argumentsValue.detail !== "full_patch"
   ) {
     throw new MissionControlError(
-      "Delivery approval rejected repository evidence that does not prove the configured pull request head at its pinned commit.",
+      "Delivery approval rejected evidence that does not prove the pinned baseline commit.",
     );
   }
+}
+
+function requireDeliveryHeadProof(
+  evidence: Evidence,
+  target: PullRequestDeliveryTarget,
+): void {
+  const details = evidenceDetails(evidence);
+  const argumentsValue = details !== null && isRecord(details.arguments)
+    ? details.arguments
+    : null;
+  const patches = details !== null && isRecord(details.patches) ? details.patches : null;
+  const expectedPatchEntries = Object.entries(PRIMARY_VERIFIED_DELIVERY_PATCHES);
+  const headSha = target.headSha;
+  const patchesMatch = patches !== null &&
+    Object.keys(patches).length === expectedPatchEntries.length &&
+    expectedPatchEntries.every(([filename, patch]) => patches[filename] === patch);
+  if (
+    headSha === undefined ||
+    !/^[0-9a-f]{40}$/i.test(headSha) ||
+    headSha === PRIMARY_DELIVERY_FIXTURE.baselineSha ||
+    details === null ||
+    argumentsValue === null ||
+    details.tool !== "get_commit" ||
+    details.provenance_kind !== "delivery_head" ||
+    details.repository_owner !== target.owner ||
+    details.repository_name !== target.repo ||
+    details.requested_ref !== target.head ||
+    details.baseline_sha !== PRIMARY_DELIVERY_FIXTURE.baselineSha ||
+    details.commit_sha !== headSha ||
+    details.uri !== `repo://${target.owner}/${target.repo}/sha/${headSha}` ||
+    argumentsValue.owner !== target.owner ||
+    argumentsValue.repo !== target.repo ||
+    argumentsValue.sha !== target.head ||
+    argumentsValue.detail !== "full_patch" ||
+    !patchesMatch
+  ) {
+    throw new MissionControlError(
+      "Delivery approval rejected a head that is unchanged from baseline or does not match the verified implementation.",
+    );
+  }
+}
+
+function deliveryHeadProofFromResult(
+  result: unknown,
+  state: MissionState,
+): { evidence: Evidence; headSha: string } {
+  if (!isRecord(result) || typeof result.evidenceId !== "string" || typeof result.commitSha !== "string") {
+    throw new MissionControlError("Delivery-head inspection returned no structured commit proof.");
+  }
+  const evidence = state.evidence.find((item) =>
+    item.id === result.evidenceId &&
+    item.missionId === PRIMARY_MISSION_ID &&
+    item.source === "mcp" &&
+    item.result === "passed"
+  );
+  if (evidence === undefined) {
+    throw new MissionControlError("Delivery-head inspection evidence is not durable mission proof.");
+  }
+  return { evidence, headSha: result.commitSha };
 }
 
 function requireApprovalRepositoryProof(
   state: MissionState,
   approval: Approval,
-  target: PullRequestDeliveryTarget,
 ): void {
   const mission = state.missions.find((item) => item.id === approval.missionId);
-  const evidence = state.evidence.find((item) =>
+  const baselineEvidence = state.evidence.find((item) =>
     approval.evidenceIds.includes(item.id) &&
     item.missionId === approval.missionId &&
     item.source === "mcp" &&
-    item.result === "passed"
+    item.result === "passed" &&
+    evidenceDetails(item)?.provenance_kind === "baseline"
   );
-  if (mission === undefined || evidence === undefined) {
+  const headEvidence = state.evidence.find((item) =>
+    approval.evidenceIds.includes(item.id) &&
+    item.missionId === approval.missionId &&
+    item.source === "mcp" &&
+    item.result === "passed" &&
+    evidenceDetails(item)?.provenance_kind === "delivery_head"
+  );
+  const context = approval.executionContext;
+  if (mission === undefined || baselineEvidence === undefined || headEvidence === undefined || context?.headSha === undefined) {
     throw new MissionControlError(
-      "Delivery approval requires its own passed repository provenance evidence.",
+      "Delivery approval requires separate baseline and verified delivery-head provenance.",
     );
   }
-  requireRepositoryProofForDelivery(mission, evidence, target);
+  requireBaselineRepositoryProof(mission, baselineEvidence);
+  requireDeliveryHeadProof(headEvidence, {
+    owner: context.repositoryOwner,
+    repo: context.repositoryName,
+    base: context.base,
+    head: context.head,
+    headSha: context.headSha,
+    title: context.title,
+    body: context.body,
+  });
 }
 
 function deliveryApprovalFromState(approval: Approval): TrueForgeDeliveryApproval {
   const context = approval.executionContext;
-  if (!isPrimaryDeliveryApproval(approval) || context === undefined) {
+  if (!isPrimaryDeliveryApproval(approval) || context?.headSha === undefined) {
     throw new MissionControlError(
       "The persisted approval is not correlated to the exact fixture pull request action.",
     );
@@ -1163,17 +1277,25 @@ function deliveryApprovalFromState(approval: Approval): TrueForgeDeliveryApprova
     toolCallId: context.toolCallId,
     serverName: context.serverName,
     toolName: "create_pull_request",
-    target: { ...PRIMARY_DELIVERY_TARGET },
+    target: { ...PRIMARY_DELIVERY_TARGET, headSha: context.headSha },
   };
 }
 
 function isPrimaryDeliveryApproval(approval: Approval): boolean {
   const context = approval.executionContext;
+  if (
+    context === undefined ||
+    context.headSha === undefined ||
+    !/^[0-9a-f]{40}$/i.test(context.headSha) ||
+    context.headSha === PRIMARY_DELIVERY_FIXTURE.baselineSha
+  ) {
+    return false;
+  }
+  const target = { ...PRIMARY_DELIVERY_TARGET, headSha: context.headSha };
   return (
     approval.actionType === PRIMARY_CONSEQUENTIAL_ACTION &&
-    approval.target === pullRequestApprovalTarget(PRIMARY_DELIVERY_TARGET) &&
-    approval.expectedEffect === pullRequestExpectedEffect(PRIMARY_DELIVERY_TARGET) &&
-    context !== undefined &&
+    approval.target === pullRequestApprovalTarget(target) &&
+    approval.expectedEffect === pullRequestExpectedEffect(target) &&
     context.toolName === PRIMARY_CONSEQUENTIAL_ACTION &&
     context.repositoryOwner === PRIMARY_DELIVERY_TARGET.owner &&
     context.repositoryName === PRIMARY_DELIVERY_TARGET.repo &&
