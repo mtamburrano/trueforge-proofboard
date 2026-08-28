@@ -2903,32 +2903,32 @@ export class MissionService {
         if (reference === undefined) {
           fail("invalid_input", "reference is required for a delivered record.");
         }
-        if (pullRequest !== undefined && reference !== pullRequest.url) {
+        if (pullRequest === undefined || executionOrigin === undefined) {
+          fail(
+            "invalid_input",
+            "A delivered record requires the canonical pull request result and execution origin.",
+          );
+        }
+        if (reference !== pullRequest.url) {
           fail("invalid_input", "Delivered pull request URL must match the delivery reference.");
         }
-        if (pullRequest !== undefined || executionOrigin !== undefined) {
-          if (pullRequest === undefined || executionOrigin === undefined) {
-            fail(
-              "invalid_input",
-              "A correlated pull request delivery needs both the pull request and execution origin.",
-            );
-          }
-          const context = approvedDelivery.executionContext;
-          if (
-            context === undefined ||
-            context.repositoryOwner !== pullRequest.repositoryOwner ||
-            context.repositoryName !== pullRequest.repositoryName ||
-            context.base !== pullRequest.base ||
-            context.head !== pullRequest.head ||
-            context.sessionId !== executionOrigin.sessionId ||
-            context.threadId !== executionOrigin.threadId ||
-            context.toolCallId !== executionOrigin.toolCallId
-          ) {
-            fail(
-              "approval_blocked",
-              "The pull request result is not correlated to the approved TrueForge tool call.",
-            );
-          }
+        const context = approvedDelivery.executionContext;
+        if (
+          context === undefined ||
+          context.toolName !== PRIMARY_CONSEQUENTIAL_ACTION ||
+          context.repositoryOwner !== pullRequest.repositoryOwner ||
+          context.repositoryName !== pullRequest.repositoryName ||
+          context.base !== pullRequest.base ||
+          context.head !== pullRequest.head ||
+          executionOrigin.kind !== "mcp" ||
+          context.sessionId !== executionOrigin.sessionId ||
+          context.threadId !== executionOrigin.threadId ||
+          context.toolCallId !== executionOrigin.toolCallId
+        ) {
+          fail(
+            "approval_blocked",
+            "The pull request result is not correlated to the approved TrueForge tool call.",
+          );
         }
       } else if (!["executing", "awaiting_approval", "verifying", "blocked"].includes(mission.status)) {
         fail("invalid_transition", `A failed delivery cannot be recorded from ${mission.status} state.`);

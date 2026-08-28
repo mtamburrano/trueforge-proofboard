@@ -31,21 +31,22 @@ import {
   WorkGraphPlanner,
 } from "../trueforge.js";
 import { parseContentDiffEvidence } from "../diff.js";
+import { PRIMARY_DELIVERY_FIXTURE } from "../fixture.js";
 
 export const PRIMARY_MISSION_ID = "primary-mission";
 export const PRIMARY_MISSION_OBJECTIVE =
   "Add a backwards-compatible getNextDeliveryStage(stage) helper to src/index.ts. It returns the next stage for Plan, Execute, and Prove, returns null for terminal Approve, preserves the existing identity exports, and includes focused tests for every transition.";
 export const PRIMARY_REPOSITORY = {
-  owner: "mtamburrano",
-  name: "trueforge-proofboard",
-  ref: "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b",
+  owner: PRIMARY_DELIVERY_FIXTURE.owner,
+  name: PRIMARY_DELIVERY_FIXTURE.repository,
+  ref: PRIMARY_DELIVERY_FIXTURE.head,
 } as const;
 
 export const PRIMARY_DELIVERY_TARGET: PullRequestDeliveryTarget = {
-  owner: "mtamburrano",
-  repo: "proofboard-demo-fixture",
-  base: "main",
-  head: "proofboard-verified-delivery",
+  owner: PRIMARY_DELIVERY_FIXTURE.owner,
+  repo: PRIMARY_DELIVERY_FIXTURE.repository,
+  base: PRIMARY_DELIVERY_FIXTURE.base,
+  head: PRIMARY_DELIVERY_FIXTURE.head,
   title: "Add the verified delivery-stage helper",
   body: "Adds the backwards-compatible delivery-stage helper and focused transition coverage verified by the Proof Board mission.",
 };
@@ -737,6 +738,7 @@ class MissionController {
       Date.parse(approval.expiresAt) > Date.now(),
     );
     if (activeRequest !== undefined) {
+      requireApprovalRepositoryProof(state, activeRequest, PRIMARY_DELIVERY_TARGET);
       return;
     }
     const plannerIds = new Set(
@@ -762,6 +764,11 @@ class MissionController {
         "Delivery approval requires current passed repository and sandbox proof.",
       );
     }
+    const mission = state.missions.find((item) => item.id === PRIMARY_MISSION_ID);
+    if (mission === undefined) {
+      throw new MissionControlError("The primary mission is missing from durable state.");
+    }
+    requireRepositoryProofForDelivery(mission, repositoryProof, PRIMARY_DELIVERY_TARGET);
     const acceptedReviewEvidenceIds = state.reviews
       .filter((review) =>
         review.missionId === PRIMARY_MISSION_ID && review.outcome === "accepted"
@@ -800,6 +807,7 @@ class MissionController {
     if (approval === undefined) {
       throw new MissionDomainError("not_found", "The requested approval was not found.");
     }
+    requireApprovalRepositoryProof(state, approval, PRIMARY_DELIVERY_TARGET);
     const pending = deliveryApprovalFromState(approval);
     await this.missions.decideApproval(PRIMARY_MISSION_ID, approval.id, {
       decision,
@@ -1067,6 +1075,78 @@ function approvalExecutionContext(
     title: pending.target.title,
     body: pending.target.body,
   };
+}
+
+function requireRepositoryProofForDelivery(
+  mission: Mission,
+  evidence: Evidence,
+  target: PullRequestDeliveryTarget,
+): void {
+  const repository = mission.repository;
+  if (
+    repository === undefined ||
+    repository.owner !== target.owner ||
+    repository.name !== target.repo ||
+    repository.ref !== target.head
+  ) {
+    throw new MissionControlError(
+      "Delivery approval requires the mission repository and inspected ref to match the pull request repository and head.",
+    );
+  }
+  if (evidence.details === undefined) {
+    throw new MissionControlError(
+      "Delivery approval requires structured repository provenance for the pull request head.",
+    );
+  }
+  let details: unknown;
+  try {
+    details = JSON.parse(evidence.details) as unknown;
+  } catch {
+    details = null;
+  }
+  const argumentsValue = isRecord(details) && isRecord(details.arguments)
+    ? details.arguments
+    : null;
+  const expectedUri =
+    `repo://${target.owner}/${target.repo}/sha/${PRIMARY_DELIVERY_FIXTURE.commitSha}`;
+  if (
+    !isRecord(details) ||
+    argumentsValue === null ||
+    details.tool !== "get_commit" ||
+    details.repository_owner !== target.owner ||
+    details.repository_name !== target.repo ||
+    details.requested_ref !== target.head ||
+    details.commit_sha !== PRIMARY_DELIVERY_FIXTURE.commitSha ||
+    details.uri !== expectedUri ||
+    argumentsValue.owner !== target.owner ||
+    argumentsValue.repo !== target.repo ||
+    argumentsValue.sha !== target.head ||
+    argumentsValue.detail !== "full_patch"
+  ) {
+    throw new MissionControlError(
+      "Delivery approval rejected repository evidence that does not prove the configured pull request head at its pinned commit.",
+    );
+  }
+}
+
+function requireApprovalRepositoryProof(
+  state: MissionState,
+  approval: Approval,
+  target: PullRequestDeliveryTarget,
+): void {
+  const mission = state.missions.find((item) => item.id === approval.missionId);
+  const evidence = state.evidence.find((item) =>
+    approval.evidenceIds.includes(item.id) &&
+    item.missionId === approval.missionId &&
+    item.source === "mcp" &&
+    item.result === "passed"
+  );
+  if (mission === undefined || evidence === undefined) {
+    throw new MissionControlError(
+      "Delivery approval requires its own passed repository provenance evidence.",
+    );
+  }
+  requireRepositoryProofForDelivery(mission, evidence, target);
 }
 
 function deliveryApprovalFromState(approval: Approval): TrueForgeDeliveryApproval {

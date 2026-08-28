@@ -9,6 +9,7 @@ import {
   DEFAULT_TRUEFORGE_MODEL,
   JsonMissionRepository,
   MissionService,
+  PRIMARY_DELIVERY_FIXTURE,
   PRIMARY_MISSION_ID,
   PRIMARY_MISSION_OBJECTIVE,
   PRIMARY_VERIFICATION_COMMAND,
@@ -20,13 +21,20 @@ import {
 class TestMissionRunner {
   constructor(
     missions,
-    { failSandbox = false, secretInspectionError = false, createGate, structuredHandoff = false } = {},
+    {
+      failSandbox = false,
+      secretInspectionError = false,
+      createGate,
+      structuredHandoff = false,
+      inspectionRepository = PRIMARY_DELIVERY_FIXTURE,
+    } = {},
   ) {
     this.missions = missions;
     this.failSandbox = failSandbox;
     this.secretInspectionError = secretInspectionError;
     this.createGate = createGate;
     this.structuredHandoff = structuredHandoff;
+    this.inspectionRepository = inspectionRepository;
     this.sandboxInputs = [];
     this.turnInputs = [];
     this.deliveryCalls = { requested: [], resolved: [], protectedOperations: 0 };
@@ -52,6 +60,8 @@ class TestMissionRunner {
         "Provider unavailable: Authorization: Bearer live-token API_KEY=live-key PASSWORD=live-password",
       );
     }
+    const target = this.inspectionRepository;
+    const resourceUri = `repo://${target.owner}/${target.repository}/sha/${target.commitSha}`;
     const evidence = await this.missions.addEvidence(input.missionId, {
       workItemId: input.workItemId,
       kind: "tool_result",
@@ -61,17 +71,32 @@ class TestMissionRunner {
       details: JSON.stringify({
         server: "github",
         tool: "get_commit",
-        commit_sha: "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b",
+        arguments: {
+          owner: target.owner,
+          repo: target.repository,
+          sha: target.head,
+          detail: "full_patch",
+        },
+        repository_owner: target.owner,
+        repository_name: target.repository,
+        requested_ref: target.head,
+        uri: resourceUri,
+        commit_sha: target.commitSha,
         content_hash: "fixture-content-hash",
         token: "must-not-reach-browser",
         authorization: "Bearer must-not-reach-browser",
       }),
+      executionOrigin: {
+        kind: "mcp",
+        sessionId: "test-session-durable",
+        turnId: "test-inspection-turn",
+      },
     });
     return {
       evidenceId: evidence.id,
-      resourceUri: "repo://mtamburrano/trueforge-proofboard/590aa8a6d72c580f61fc1b19d33e9876bc0feb9b/commit",
+      resourceUri,
       contentHash: "fixture-content-hash",
-      commitSha: "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b",
+      commitSha: target.commitSha,
       patches: {
         "src/index.ts": "@@ verified source",
         "test/index.test.js": "@@ verified focused tests",
@@ -488,6 +513,48 @@ test("run mission uses the runtime adapters and exposes passed proof", async () 
 
   const serialized = JSON.stringify(payload);
   assert.doesNotMatch(serialized, /must-not-reach-browser|provider_secret/);
+});
+
+test("unrelated repository evidence cannot authorize the configured delivery target", async () => {
+  const { app, runner } = testApp(new InMemoryMissionRepository(), {
+    inspectionRepository: {
+      owner: "mtamburrano",
+      repository: "trueforge-proofboard",
+      head: "unrelated-head",
+      commitSha: PRIMARY_DELIVERY_FIXTURE.commitSha,
+    },
+  });
+
+  const response = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(response.status, 502);
+  const payload = await json(response);
+  assert.equal(payload.mission.mission.status, "blocked");
+  assert.equal(payload.mission.approvals.length, 0);
+  assert.equal(runner.deliveryCalls.requested.length, 0);
+  assert.equal(runner.deliveryCalls.protectedOperations, 0);
+});
+
+test("a persisted approval cannot outlive the repository provenance that authorized it", async () => {
+  const initial = testApp();
+  const run = await json(await initial.app.request("/api/mission/run", { method: "POST" }));
+  const approval = run.mission.approvals[0];
+  const staleState = await initial.missions.getState();
+  const repositoryProof = staleState.evidence.find((item) => item.source === "mcp");
+  const details = JSON.parse(repositoryProof.details);
+  details.repository_name = "unrelated-repository";
+  details.arguments.repo = "unrelated-repository";
+  repositoryProof.details = JSON.stringify(details);
+
+  const recovered = testApp(new InMemoryMissionRepository(staleState));
+  const response = await recovered.app.request(`/api/mission/approvals/${approval.id}`, {
+    method: "POST",
+    body: JSON.stringify({ decision: "approved" }),
+  });
+  assert.equal(response.status, 502);
+  const payload = await json(response);
+  assert.equal(payload.mission.approvals[0].decision, "pending");
+  assert.equal(payload.mission.delivery.length, 0);
+  assert.equal(recovered.runner.deliveryCalls.protectedOperations, 0);
 });
 
 test("rejecting or cancelling the exact pending delivery invokes no protected operation", async () => {

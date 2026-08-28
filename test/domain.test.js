@@ -339,6 +339,40 @@ test("mission lifecycle stores typed evidence, handoffs, approvals, and delivery
     decidedBy: "human-reviewer",
   });
   await service.transitionMission(mission.id, "verifying");
+  await assert.rejects(
+    service.recordDelivery(mission.id, {
+      status: "delivered",
+      reference: "https://github.com/example/proof-board/pull/999",
+      verificationSummary: "An arbitrary reference must not count as delivery proof.",
+      approvalId: approval.id,
+    }),
+    domainError("invalid_input"),
+  );
+  assert.equal((await service.getMission(mission.id)).status, "verifying");
+  await assert.rejects(
+    service.recordDelivery(mission.id, {
+      status: "delivered",
+      reference: "https://github.com/example/proof-board/pull/1",
+      verificationSummary: "A result from another tool call must not count as delivery proof.",
+      approvalId: approval.id,
+      pullRequest: {
+        number: 1,
+        url: "https://github.com/example/proof-board/pull/1",
+        repositoryOwner: "example",
+        repositoryName: "proof-board",
+        base: "main",
+        head: "verified-delivery",
+      },
+      executionOrigin: {
+        kind: "mcp",
+        sessionId: "session-delivery",
+        turnId: "turn-unrelated-result",
+        threadId: "thread-delivery",
+        toolCallId: "call-unrelated",
+      },
+    }),
+    domainError("approval_blocked"),
+  );
   const delivery = await service.recordDelivery(mission.id, {
     id: "delivery-lifecycle",
     status: "delivered",

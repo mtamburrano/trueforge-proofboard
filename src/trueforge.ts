@@ -24,6 +24,7 @@ import {
   isContentDiffCommand,
   isContentDiffOutput,
 } from "./diff.js";
+import { PRIMARY_DELIVERY_FIXTURE } from "./fixture.js";
 
 export interface TrueForgeClientOptions {
   baseUrl: string;
@@ -48,9 +49,10 @@ export interface TrueForgeEventStream extends AsyncIterable<TrueForgeApi.TurnStr
   withMetadata?: () => AsyncIterable<{ data: TrueForgeApi.TurnStreamingEvent }>;
 }
 
-const LOCKED_FIXTURE_OWNER = "mtamburrano";
-const LOCKED_FIXTURE_REPO = "trueforge-proofboard";
-const LOCKED_FIXTURE_SHA = "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b";
+const LOCKED_FIXTURE_OWNER = PRIMARY_DELIVERY_FIXTURE.owner;
+const LOCKED_FIXTURE_REPO = PRIMARY_DELIVERY_FIXTURE.repository;
+const LOCKED_FIXTURE_REF = PRIMARY_DELIVERY_FIXTURE.head;
+const LOCKED_FIXTURE_SHA = PRIMARY_DELIVERY_FIXTURE.commitSha;
 const LOCKED_FIXTURE_FILES = ["src/index.ts", "test/index.test.js"] as const;
 const LOCKED_FIXTURE_PATCHES = {
   "src/index.ts": [
@@ -902,6 +904,10 @@ export class TrueForgeMissionRunner {
               server: mcpServerName,
               tool: toolName,
               arguments: lockedFixtureArguments(),
+              repository_owner: mission.repository.owner,
+              repository_name: mission.repository.name,
+              requested_ref: mission.repository.ref,
+              uri: verified.resourceUri,
               commit_sha: verified.commitSha,
               patches: verified.patches,
               content_hash: verified.contentHash,
@@ -2408,7 +2414,7 @@ function isLockedFixtureRepository(
   return (
     repository.owner === LOCKED_FIXTURE_OWNER &&
     repository.name === LOCKED_FIXTURE_REPO &&
-    (repository.ref === LOCKED_FIXTURE_SHA || repository.ref === `sha/${LOCKED_FIXTURE_SHA}`)
+    repository.ref === LOCKED_FIXTURE_REF
   );
 }
 
@@ -2416,7 +2422,7 @@ function lockedFixtureArguments(): Record<string, string> {
   return {
     owner: LOCKED_FIXTURE_OWNER,
     repo: LOCKED_FIXTURE_REPO,
-    sha: LOCKED_FIXTURE_SHA,
+    sha: LOCKED_FIXTURE_REF,
     detail: "full_patch",
   };
 }

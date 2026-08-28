@@ -8,6 +8,7 @@ import {
 } from "../dist/index.js";
 
 const LOCKED_FIXTURE_SHA = "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b";
+const LOCKED_FIXTURE_REF = "proofboard-verified-delivery";
 const SANDBOX_VERIFICATION_INTENT = "Run the requested verification command in the sandbox.";
 const LOCKED_FIXTURE_PATCHES = {
   "src/index.ts": [
@@ -220,8 +221,8 @@ function lockedCommitEvents(
   {
     argumentsValue = {
       owner: "mtamburrano",
-      repo: "trueforge-proofboard",
-      sha: LOCKED_FIXTURE_SHA,
+      repo: "proofboard-demo-fixture",
+      sha: LOCKED_FIXTURE_REF,
       detail: "full_patch",
     },
     sha = LOCKED_FIXTURE_SHA,
@@ -851,8 +852,8 @@ test("locked fixture inspection proves direct TrueForge get_commit content and e
     objective: "Inspect the locked repository fixture by commit",
     repository: {
       owner: "mtamburrano",
-      name: "trueforge-proofboard",
-      ref: LOCKED_FIXTURE_SHA,
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
     },
   });
 
@@ -865,8 +866,8 @@ test("locked fixture inspection proves direct TrueForge get_commit content and e
   assert.deepEqual(inspection.patches, LOCKED_FIXTURE_PATCHES);
   assert.match(calls.turns[0].request.input[0].content, /get_commit with this exact JSON object/);
   assert.match(calls.turns[0].request.input[0].content, /"owner":"mtamburrano"/);
-  assert.match(calls.turns[0].request.input[0].content, /"repo":"trueforge-proofboard"/);
-  assert.match(calls.turns[0].request.input[0].content, new RegExp(LOCKED_FIXTURE_SHA));
+  assert.match(calls.turns[0].request.input[0].content, /"repo":"proofboard-demo-fixture"/);
+  assert.match(calls.turns[0].request.input[0].content, new RegExp(LOCKED_FIXTURE_REF));
   assert.match(calls.turns[0].request.input[0].content, /"detail":"full_patch"/);
 
   const state = await missions.getState();
@@ -874,8 +875,8 @@ test("locked fixture inspection proves direct TrueForge get_commit content and e
   const details = JSON.parse(proof.details);
   assert.deepEqual(details.arguments, {
     owner: "mtamburrano",
-    repo: "trueforge-proofboard",
-    sha: LOCKED_FIXTURE_SHA,
+    repo: "proofboard-demo-fixture",
+    sha: LOCKED_FIXTURE_REF,
     detail: "full_patch",
   });
   assert.equal(details.commit_sha, LOCKED_FIXTURE_SHA);
@@ -890,8 +891,8 @@ test("locked fixture inspection ignores a non-canonical attempt before a canonic
         callId: "call-non-canonical",
         argumentsValue: {
           owner: "mtambuarano",
-          repo: "trueforge-proofboard",
-          sha: LOCKED_FIXTURE_SHA,
+          repo: "proofboard-demo-fixture",
+          sha: LOCKED_FIXTURE_REF,
           detail: "full_patch",
         },
         responseContent: "not-json",
@@ -902,8 +903,8 @@ test("locked fixture inspection ignores a non-canonical attempt before a canonic
         callId: "call-canonical",
         argumentsValue: {
           owner: "mtamburrano",
-          repo: "trueforge-proofboard",
-          sha: LOCKED_FIXTURE_SHA,
+          repo: "proofboard-demo-fixture",
+          sha: LOCKED_FIXTURE_REF,
           detail: "full_patch",
         },
         sha: LOCKED_FIXTURE_SHA,
@@ -920,8 +921,8 @@ test("locked fixture inspection ignores a non-canonical attempt before a canonic
     objective: "Ignore a rejected read-only attempt and accept canonical provenance",
     repository: {
       owner: "mtamburrano",
-      name: "trueforge-proofboard",
-      ref: LOCKED_FIXTURE_SHA,
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
     },
   });
 
@@ -943,8 +944,8 @@ test("locked fixture inspection rejects when no canonical get_commit call exists
         callId: "call-non-canonical",
         argumentsValue: {
           owner: "mtambuarano",
-          repo: "trueforge-proofboard",
-          sha: LOCKED_FIXTURE_SHA,
+          repo: "proofboard-demo-fixture",
+          sha: LOCKED_FIXTURE_REF,
           detail: "full_patch",
         },
         sha: LOCKED_FIXTURE_SHA,
@@ -961,8 +962,8 @@ test("locked fixture inspection rejects when no canonical get_commit call exists
     objective: "Reject a non-canonical locked fixture inspection",
     repository: {
       owner: "mtamburrano",
-      name: "trueforge-proofboard",
-      ref: LOCKED_FIXTURE_SHA,
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
     },
   });
 
@@ -982,8 +983,8 @@ test("locked fixture inspection rejects multiple canonical get_commit calls", as
   const missions = new MissionService(new InMemoryMissionRepository());
   const canonicalArguments = {
     owner: "mtamburrano",
-    repo: "trueforge-proofboard",
-    sha: LOCKED_FIXTURE_SHA,
+    repo: "proofboard-demo-fixture",
+    sha: LOCKED_FIXTURE_REF,
     detail: "full_patch",
   };
   const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, {
@@ -1011,8 +1012,8 @@ test("locked fixture inspection rejects multiple canonical get_commit calls", as
     objective: "Reject ambiguous canonical repository provenance",
     repository: {
       owner: "mtamburrano",
-      name: "trueforge-proofboard",
-      ref: LOCKED_FIXTURE_SHA,
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
     },
   });
 
@@ -1046,8 +1047,8 @@ test("locked fixture inspection rejects a wrong SHA or expected patch", async ()
     objective: "Reject an unverified locked fixture result",
     repository: {
       owner: "mtamburrano",
-      name: "trueforge-proofboard",
-      ref: LOCKED_FIXTURE_SHA,
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
     },
   });
 
@@ -1099,8 +1100,8 @@ test("locked fixture inspection rejects malformed, error, and uncorrelated respo
       objective: "Reject an invalid locked fixture response",
       repository: {
         owner: "mtamburrano",
-        name: "trueforge-proofboard",
-        ref: LOCKED_FIXTURE_SHA,
+        name: "proofboard-demo-fixture",
+        ref: LOCKED_FIXTURE_REF,
       },
     });
 

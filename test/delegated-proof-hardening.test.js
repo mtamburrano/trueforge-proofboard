@@ -5,6 +5,7 @@ import {
   DeterministicImplementationVerifier,
   InMemoryMissionRepository,
   MissionService,
+  PRIMARY_DELIVERY_FIXTURE,
   PRIMARY_MISSION_ID,
   PRIMARY_MISSION_OBJECTIVE,
   PRIMARY_REPOSITORY,
@@ -571,6 +572,7 @@ class LegacyPrimaryRunner {
   }
 
   async inspectRepository(input) {
+    const resourceUri = `repo://${PRIMARY_DELIVERY_FIXTURE.owner}/${PRIMARY_DELIVERY_FIXTURE.repository}/sha/${PRIMARY_DELIVERY_FIXTURE.commitSha}`;
     const evidence = await this.missions.addEvidence(input.missionId, {
       id: "legacy-inspection-proof",
       workItemId: input.workItemId,
@@ -578,12 +580,27 @@ class LegacyPrimaryRunner {
       result: "passed",
       source: "mcp",
       summary: "The pinned repository was inspected.",
+      details: JSON.stringify({
+        server: "github",
+        tool: "get_commit",
+        arguments: {
+          owner: PRIMARY_DELIVERY_FIXTURE.owner,
+          repo: PRIMARY_DELIVERY_FIXTURE.repository,
+          sha: PRIMARY_DELIVERY_FIXTURE.head,
+          detail: "full_patch",
+        },
+        repository_owner: PRIMARY_DELIVERY_FIXTURE.owner,
+        repository_name: PRIMARY_DELIVERY_FIXTURE.repository,
+        requested_ref: PRIMARY_DELIVERY_FIXTURE.head,
+        uri: resourceUri,
+        commit_sha: PRIMARY_DELIVERY_FIXTURE.commitSha,
+      }),
     });
     return {
       evidenceId: evidence.id,
-      resourceUri: "repo://mtamburrano/trueforge-proofboard/590aa8a6d72c580f61fc1b19d33e9876bc0feb9b/commit",
+      resourceUri,
       contentHash: "legacy-content-hash",
-      commitSha: "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b",
+      commitSha: PRIMARY_DELIVERY_FIXTURE.commitSha,
       patches: {
         "src/index.ts": "@@ verified source",
         "test/index.test.js": "@@ verified tests",
