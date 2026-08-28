@@ -123,6 +123,13 @@ function delegatedEvents(attempt, { malformedCompletion = false } = {}) {
           },
         },
         {
+          id: `call-manifest-${attempt}`,
+          function: {
+            name: "exec",
+            arguments: JSON.stringify({ command: "git status --porcelain=v1 -z --untracked-files=all" }),
+          },
+        },
+        {
           id: `call-diff-${attempt}`,
           function: {
             name: "exec",
@@ -135,6 +142,11 @@ function delegatedEvents(attempt, { malformedCompletion = false } = {}) {
       `event-check-response-${attempt}`,
       `call-check-${attempt}`,
       "typecheck passed\ntests passed\n",
+    ),
+    response(
+      `event-manifest-response-${attempt}`,
+      `call-manifest-${attempt}`,
+      ` M ${sourceFile}\u0000 M ${testFile}\u0000`,
     ),
     response(
       `event-diff-response-${attempt}`,

@@ -11,7 +11,28 @@ export interface ParsedContentDiffEvidence {
   outputTruncated: boolean;
 }
 
+export interface CompleteChangedFilesEvidenceLike {
+  kind: string;
+  result: string;
+  details?: string;
+}
+
+export interface ParsedCompleteChangedFilesEvidence {
+  command: string;
+  output: string;
+  filesChanged: string[];
+}
+
 const metadataOnlyDiffFlags = /(?:^|\s)--(?:stat|shortstat|numstat|name-only|name-status|summary|check)(?:\s|$)/;
+const completeChangedFilesStatusOptions = [
+  "--porcelain=v1",
+  "--short",
+].map((format) => [format, "--untracked-files=all"].sort().join(" "));
+const completeChangedFilesStatusOptionsWithNul = [
+  "--porcelain=v1",
+  "-z",
+  "--untracked-files=all",
+].sort().join(" ");
 
 export function isContentDiffCommand(command: string): boolean {
   const normalized = normalizeCommand(command);
@@ -25,6 +46,103 @@ export function isContentDiffOutput(output: string): boolean {
       (/^similarity index\s+\d+%$/m.test(output) &&
         /^rename from\s+.+$/m.test(output) &&
         /^rename to\s+.+$/m.test(output)));
+}
+
+export function isCompleteChangedFilesCommand(command: string): boolean {
+  const normalized = normalizeCommand(command);
+  if (!normalized.startsWith("git status ")) {
+    return false;
+  }
+  const options = normalized.slice("git status ".length).split(" ").sort().join(" ");
+  return completeChangedFilesStatusOptions.includes(options) ||
+    options === completeChangedFilesStatusOptionsWithNul;
+}
+
+export function completeChangedFilesFromCommand(
+  output: string,
+  command: string,
+): string[] | null {
+  const normalized = normalizeCommand(command);
+  if (!isCompleteChangedFilesCommand(normalized) || output.length > 12_000) {
+    return null;
+  }
+  const usesNul = normalized.split(" ").includes("-z");
+  const records = usesNul
+    ? output.split("\u0000")
+    : output.replace(/\r\n/g, "\n").split("\n");
+  const files: string[] = [];
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index];
+    if (record === undefined || record.length === 0) {
+      continue;
+    }
+    if (record.length < 4 || record[2] !== " " || !validStatusCode(record.slice(0, 2))) {
+      return null;
+    }
+    const status = record.slice(0, 2);
+    let file = record.slice(3);
+    if (file.length === 0) {
+      return null;
+    }
+    const isRenameOrCopy = status.includes("R") || status.includes("C");
+    if (usesNul && isRenameOrCopy) {
+      const source = records[index + 1];
+      if (source === undefined || source.length === 0) {
+        return null;
+      }
+      index += 1;
+    } else if (!usesNul && isRenameOrCopy) {
+      const separator = file.lastIndexOf(" -> ");
+      if (separator <= 0 || separator + 4 >= file.length) {
+        return null;
+      }
+      file = file.slice(separator + 4);
+    }
+    files.push(file);
+  }
+  return uniqueStrings(files);
+}
+
+export function parseCompleteChangedFilesEvidence(
+  evidence: CompleteChangedFilesEvidenceLike,
+): ParsedCompleteChangedFilesEvidence | null {
+  if (
+    evidence.kind !== "file_change" ||
+    evidence.result !== "passed" ||
+    evidence.details === undefined
+  ) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(evidence.details) as unknown;
+  } catch {
+    return null;
+  }
+  if (!isRecord(parsed) || parsed.complete_changed_files !== true ||
+      typeof parsed.command !== "string" || typeof parsed.output !== "string" ||
+      !Array.isArray(parsed.changed_files)) {
+    return null;
+  }
+  const observedFiles = completeChangedFilesFromCommand(parsed.output, parsed.command);
+  if (observedFiles === null) {
+    return null;
+  }
+  const manifest = uniqueStrings(parsed.changed_files.filter(
+    (value): value is string => typeof value === "string" && value.trim().length > 0,
+  ));
+  if (
+    manifest.length !== parsed.changed_files.length ||
+    manifest.length !== observedFiles.length ||
+    manifest.some((file, index) => file !== observedFiles[index])
+  ) {
+    return null;
+  }
+  return {
+    command: normalizeCommand(parsed.command),
+    output: parsed.output,
+    filesChanged: manifest,
+  };
 }
 
 export function changedFilesFromDiff(output: string, command?: string): string[] {
@@ -183,6 +301,10 @@ function decodeGitPath(value: string): string {
 
 function normalizeCommand(value: string): string {
   return value.trim().replace(/\s+/g, " ");
+}
+
+function validStatusCode(value: string): boolean {
+  return /^[ MADRCUTUXB?!]{2}$/.test(value);
 }
 
 function uniqueStrings(values: string[]): string[] {

@@ -99,6 +99,10 @@ function diffOutput(files = ["src/index.ts", "test/index.test.js"]) {
   ].join("\n")).join("\n");
 }
 
+function changedFilesManifestOutput(files = ["src/index.ts", "test/index.test.js"]) {
+  return `${files.map((file) => ` M ${file}`).join("\u0000")}\u0000`;
+}
+
 function transitionContractVerifier() {
   return {
     reviewContract(context) {
@@ -163,7 +167,15 @@ function transitionContractVerifier() {
 function delegatedEvents(
   command,
   output,
-  { includeDiff = true, narrationOnly = false, responseType = "tool.response" } = {},
+  {
+    includeDiff = true,
+    diffCommand = "git diff",
+    includeManifest = true,
+    manifestCommand = "git status --porcelain=v1 -z --untracked-files=all",
+    manifestOutput = changedFilesManifestOutput(),
+    narrationOnly = false,
+    responseType = "tool.response",
+  } = {},
 ) {
   const response = (id, callId, result) => ({
     type: responseType,
@@ -198,12 +210,16 @@ function delegatedEvents(
       threadId: ORIGIN.threadId,
       toolCalls: [
         { id: "call-check", function: { name: "exec", arguments: JSON.stringify({ command }) } },
+        ...(includeManifest
+          ? [{ id: "call-manifest", function: { name: "exec", arguments: JSON.stringify({ command: manifestCommand }) } }]
+          : []),
         ...(includeDiff
-          ? [{ id: "call-diff", function: { name: "exec", arguments: JSON.stringify({ command: "git diff" }) } }]
+          ? [{ id: "call-diff", function: { name: "exec", arguments: JSON.stringify({ command: diffCommand }) } }]
           : []),
       ],
     },
     response("event-check-response", "call-check", "checks complete\n"),
+    ...(includeManifest ? [response("event-manifest-response", "call-manifest", manifestOutput)] : []),
     ...(includeDiff ? [response("event-diff-response", "call-diff", output)] : []),
     {
       type: "thread.done",
@@ -238,6 +254,10 @@ async function runnerFixture({
   output = diffOutput(),
   allowedFiles = ["src/index.ts", "test/index.test.js"],
   includeDiff = true,
+  diffCommand = "git diff",
+  includeManifest = true,
+  manifestCommand = "git status --porcelain=v1 -z --untracked-files=all",
+  manifestOutput,
   narrationOnly = false,
   responseType = "tool.response",
   run = true,
@@ -256,6 +276,10 @@ async function runnerFixture({
           async *withMetadata() {
             for (const event of delegatedEvents(command, output, {
               includeDiff,
+              diffCommand,
+              includeManifest,
+              manifestCommand,
+              manifestOutput: manifestOutput ?? changedFilesManifestOutput(),
               narrationOnly,
               responseType,
             })) {
@@ -473,6 +497,33 @@ test("delegated diffs outside the work-item scope block implementation", async (
   assert.equal(state.workItems.find((item) => item.id === fixture.workItem.id).status, "blocked");
 });
 
+test("a path-filtered delegated diff cannot hide a forbidden changed file", async () => {
+  const fixture = await runnerFixture({
+    allowedFiles: ["src/index.ts"],
+    diffCommand: "git diff -- src/index.ts",
+    output: diffOutput(["src/index.ts"]),
+    manifestOutput: changedFilesManifestOutput(["src/index.ts", "test/index.test.js"]),
+    run: false,
+  });
+
+  await assert.rejects(
+    fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
+      workItemId: fixture.workItem.id,
+      delegateToSubagent: true,
+    }),
+    (error) => /complete changed-file manifest includes files outside.*test\/index\.test\.js/i.test(error.message),
+  );
+
+  const state = await fixture.missions.getState();
+  const failure = state.evidence.find((evidence) =>
+    evidence.result === "failed" && evidence.summary.startsWith("Delegated implementation evidence failed:"),
+  );
+  assert.ok(failure);
+  assert.match(failure.details, /test\/index\.test\.js/);
+  assert.equal(state.evidence.some((evidence) => evidence.kind === "diff_summary"), false);
+  assert.equal(state.workItems.find((item) => item.id === fixture.workItem.id).status, "blocked");
+});
+
 test("rename evidence uses the new path consistently", async () => {
   const output = [
     "diff --git a/src/old-name.ts b/src/new-name.ts",
@@ -483,6 +534,7 @@ test("rename evidence uses the new path consistently", async () => {
   const { missions, mission, workItem, result } = await runnerFixture({
     output,
     allowedFiles: ["src/new-name.ts"],
+    manifestOutput: "R  src/new-name.ts\u0000src/old-name.ts\u0000",
   });
 
   assert.deepEqual(result.implementationHandoff.filesChanged, ["src/new-name.ts"]);
@@ -818,6 +870,20 @@ class LegacyPrimaryRunner {
       ].join("\n") }),
       executionOrigin: { ...origin, toolCallId: `legacy-diff-${this.turn}` },
     });
+    const manifest = await this.missions.addEvidence(missionId, {
+      workItemId: options.workItemId,
+      kind: "file_change",
+      result: "passed",
+      source: "trueforge",
+      summary: "The delegated complete changed-file manifest was captured.",
+      details: JSON.stringify({
+        complete_changed_files: true,
+        command: "git status --porcelain=v1 -z --untracked-files=all",
+        output: " M src/index.ts\u0000 M test/index.test.js\u0000",
+        changed_files: ["src/index.ts", "test/index.test.js"],
+      }),
+      executionOrigin: { ...origin, toolCallId: `legacy-manifest-${this.turn}` },
+    });
     await this.missions.completeWorkItemDelegation(missionId, options.workItemId, {
       threadId,
       turnId,
@@ -850,7 +916,7 @@ class LegacyPrimaryRunner {
         ],
         decisions: [],
         openQuestions: [],
-        evidenceIds: [typecheck.id, tests.id, diff.id],
+        evidenceIds: [typecheck.id, tests.id, manifest.id, diff.id],
         executionOrigin: origin,
       },
     };

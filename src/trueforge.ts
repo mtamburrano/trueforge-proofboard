@@ -20,7 +20,9 @@ import {
   validateWorkGraph,
 } from "./domain.js";
 import {
+  completeChangedFilesFromCommand,
   changedFilesFromDiff,
+  isCompleteChangedFilesCommand,
   isContentDiffCommand,
   isContentDiffOutput,
 } from "./diff.js";
@@ -115,6 +117,8 @@ const SANDBOX_NODE_SOURCE_KEY_URL =
   "https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key";
 const SANDBOX_NODE_SOURCE_REPOSITORY =
   `https://deb.nodesource.com/node_${SANDBOX_NODE_SOURCE_MAJOR}.x`;
+export const DELEGATED_COMPLETE_CHANGED_FILES_COMMAND =
+  "git status --porcelain=v1 -z --untracked-files=all";
 
 /**
  * Debian 12/bookworm ships Node.js 18. Add the NodeSource 22.x repository
@@ -259,7 +263,7 @@ export function buildDelegatedTurnInstruction(
     `Work Packet: ${JSON.stringify(packet)}`,
     `Coordinator instruction: ${instruction.trim()}`,
     `The subagent may modify only these explicitly allowed repository files: ${allowedFiles.join(", ")}. Any observed change outside this scope fails the handoff.`,
-    "The subagent may use only the configured tools and the repository/evidence context in this packet. It must execute every required check through an exit-preserving command, capture a bounded content-bearing git diff through the delegated thread's tool restricted to the allowed files (for example, git diff -- <allowed file>), and return control after the subagent finishes.",
+    `The subagent may use only the configured tools and the repository/evidence context in this packet. It must execute every required check through an exit-preserving command, first capture the complete changed-file set with the unfiltered delegated-thread command \`${DELEGATED_COMPLETE_CHANGED_FILES_COMMAND}\`, then capture a bounded content-bearing git diff through the delegated thread's tool restricted to the allowed files (for example, git diff -- <allowed file>). The complete changed-file set is independently compared with the scoped diff and allowed files, so omitting a forbidden file from the scoped diff does not hide it. Return control after the subagent finishes.`,
     "End with a machine-readable IMPLEMENTATION_HANDOFF object containing decisions and openQuestions. The coordinator will independently correlate changed files and check results to the observed tool responses.",
   ].join("\n");
 }
@@ -1788,6 +1792,9 @@ export class TrueForgeMissionRunner {
         .filter((name) => requiredChecks.length === 0 || requiredChecks.includes(name));
       return safeNames.length === 0 && mentionedNames.length > 0;
     });
+    const completeChangedFilesExecutions = executions.filter((execution) =>
+      isCompleteChangedFilesCommand(normalizeSafeWorkingDirectoryPrefix(execution.command)),
+    );
     const diffExecutions = executions.filter((execution) =>
       isContentDiffCommand(normalizeSafeWorkingDirectoryPrefix(execution.command)),
     );
@@ -1875,6 +1882,71 @@ export class TrueForgeMissionRunner {
       );
     }
 
+    const allowedFiles = workItem.allowedFiles ?? [];
+    if (allowedFiles.length === 0) {
+      return this.failImplementationEvidence(
+        mission,
+        workItem,
+        sessionId,
+        turnId,
+        delegatedThread,
+        "The delegated implementation has no explicit allowed file scope.",
+        executions,
+      );
+    }
+
+    const successfulCompleteChangedFilesExecutions = completeChangedFilesExecutions.flatMap((execution) => {
+      const observed = parseExecutionResponse(execution.response);
+      const command = normalizeSafeWorkingDirectoryPrefix(execution.command);
+      const filesChanged = observed === null || observed.success !== true || observed.exitCode !== 0
+        ? null
+        : completeChangedFilesFromCommand(observed.output, command);
+      return observed !== null &&
+          observed.success === true &&
+          observed.exitCode === 0 &&
+          filesChanged !== null
+        ? [{ execution, observed, command, filesChanged }]
+        : [];
+    });
+    if (completeChangedFilesExecutions.length === 0) {
+      return this.failImplementationEvidence(
+        mission,
+        workItem,
+        sessionId,
+        turnId,
+        delegatedThread,
+        diffExecutions.length === 0
+          ? "No observed complete changed-file manifest or content-bearing diff was found for the delegated work; narration-only file or diff claims do not count."
+          : `No observed unfiltered complete changed-file manifest was found for the delegated work. The scoped content diff cannot prove the complete changed-file set.`,
+        executions,
+      );
+    }
+    if (successfulCompleteChangedFilesExecutions.length === 0) {
+      return this.failImplementationEvidence(
+        mission,
+        workItem,
+        sessionId,
+        turnId,
+        delegatedThread,
+        "Observed complete changed-file manifest commands did not return a successful parseable tool result.",
+        executions,
+      );
+    }
+    const latestCompleteChangedFiles = successfulCompleteChangedFilesExecutions.at(-1);
+    const completeChangedFiles = latestCompleteChangedFiles?.filesChanged ?? [];
+    const manifestOutOfScopeFiles = completeChangedFiles.filter((file) => !allowedFiles.includes(file));
+    if (manifestOutOfScopeFiles.length > 0) {
+      return this.failImplementationEvidence(
+        mission,
+        workItem,
+        sessionId,
+        turnId,
+        delegatedThread,
+        `The independently observed complete changed-file manifest includes files outside the allowed scope: ${manifestOutOfScopeFiles.join(", ")}. Allowed files: ${allowedFiles.join(", ")}.`,
+        executions,
+      );
+    }
+
     const successfulDiffExecutions = diffExecutions.flatMap((execution) => {
       const observed = parseExecutionResponse(execution.response);
       return observed !== null &&
@@ -1912,15 +1984,24 @@ export class TrueForgeMissionRunner {
         executions,
       );
     }
-    const allowedFiles = workItem.allowedFiles ?? [];
-    if (allowedFiles.length === 0) {
+    const missingFromScopedDiff = completeChangedFiles.filter((file) => !filesChanged.includes(file));
+    const missingFromCompleteManifest = filesChanged.filter((file) => !completeChangedFiles.includes(file));
+    if (missingFromScopedDiff.length > 0 || missingFromCompleteManifest.length > 0) {
+      const differences = [
+        ...(missingFromScopedDiff.length === 0
+          ? []
+          : [`missing from the scoped content diff: ${missingFromScopedDiff.join(", ")}`]),
+        ...(missingFromCompleteManifest.length === 0
+          ? []
+          : [`missing from the complete changed-file manifest: ${missingFromCompleteManifest.join(", ")}`]),
+      ];
       return this.failImplementationEvidence(
         mission,
         workItem,
         sessionId,
         turnId,
         delegatedThread,
-        "The delegated implementation has no explicit allowed file scope.",
+        `The complete changed-file manifest does not match the scoped content diff (${differences.join("; ")}).`,
         executions,
       );
     }
@@ -1948,6 +2029,23 @@ export class TrueForgeMissionRunner {
         executions,
       );
     }
+    const manifestExecution = latestCompleteChangedFiles?.execution;
+    const manifestObserved = latestCompleteChangedFiles?.observed;
+    const manifestEvidence = await this.missions.addEvidence(mission.id, {
+      workItemId: workItem.id,
+      kind: "file_change",
+      result: "passed",
+      source: "trueforge",
+      summary: "The delegated execution returned an unfiltered complete changed-file manifest.",
+      details: JSON.stringify({
+        complete_changed_files: true,
+        command: latestCompleteChangedFiles?.command,
+        output: manifestObserved?.output ?? "",
+        changed_files: completeChangedFiles,
+        exit_code: manifestObserved?.exitCode,
+      }),
+      executionOrigin: runtimeExecutionOrigin(sessionId, turnId, manifestExecution?.response),
+    });
     const diffExecution = latestDiff?.execution;
     const diffObserved = latestDiff?.observed;
     const diffEvidence = await this.missions.addEvidence(mission.id, {
@@ -1984,6 +2082,7 @@ export class TrueForgeMissionRunner {
       evidenceIds: uniqueStrings([
         ...delegatedRuntimeEvidenceIds,
         ...checkEvidenceIds,
+        manifestEvidence.id,
         diffEvidence.id,
       ]),
       executionOrigin: {

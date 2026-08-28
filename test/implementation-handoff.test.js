@@ -20,6 +20,12 @@ const ORIGIN = {
   threadId: "thread-handoff",
 };
 
+const COMPLETE_CHANGED_FILES_COMMAND = "git status --porcelain=v1 -z --untracked-files=all";
+
+function changedFilesManifestOutput(files = ["src/index.ts", "test/index.test.js"]) {
+  return `${files.map((file) => ` M ${file}`).join("\u0000")}\u0000`;
+}
+
 function fixedClock() {
   return new Date("2026-08-27T13:00:00.000Z");
 }
@@ -69,7 +75,15 @@ async function addEvidence(missions, missionId, id, kind, result, toolCallId, or
     ...(kind === "diff_summary" ? {
       details: JSON.stringify({
         command: "git diff",
-        output: "diff --git a/src/index.ts b/src/index.ts\n--- a/src/index.ts\n+++ b/src/index.ts\n@@ -1 +1,2 @@\n before\n+after",
+        output: "diff --git a/src/index.ts b/src/index.ts\n--- a/src/index.ts\n+++ b/src/index.ts\n@@ -1 +1,2 @@\n before\n+after\ndiff --git a/test/index.test.js b/test/index.test.js\n--- a/test/index.test.js\n+++ b/test/index.test.js\n@@ -1 +1,2 @@\n before\n+after",
+      }),
+    } : {}),
+    ...(kind === "file_change" ? {
+      details: JSON.stringify({
+        complete_changed_files: true,
+        command: COMPLETE_CHANGED_FILES_COMMAND,
+        output: changedFilesManifestOutput(),
+        changed_files: ["src/index.ts", "test/index.test.js"],
       }),
     } : {}),
     executionOrigin: { ...origin, toolCallId },
@@ -106,7 +120,12 @@ function validHandoff(evidenceIds, result = "done") {
         exitCode: 0,
       },
     ],
-    evidenceIds: [evidenceIds.typecheck, evidenceIds.test, evidenceIds.diff],
+    evidenceIds: [
+      evidenceIds.typecheck,
+      evidenceIds.test,
+      ...(evidenceIds.manifest === undefined ? [] : [evidenceIds.manifest]),
+      evidenceIds.diff,
+    ],
     executionOrigin: { ...ORIGIN },
   };
 }
@@ -160,10 +179,12 @@ function delegatedExecutionEvents({ proofThreadId = ORIGIN.threadId } = {}) {
       threadId: proofThreadId,
       toolCalls: [
         { id: "call-checks", function: { name: "exec", arguments: JSON.stringify({ command: "npm run typecheck && npm test" }) } },
+        { id: "call-manifest", function: { name: "exec", arguments: JSON.stringify({ command: "git status --porcelain=v1 -z --untracked-files=all" }) } },
         { id: "call-diff", function: { name: "exec", arguments: JSON.stringify({ command: "git diff" }) } },
       ],
     },
     response("event-check-response", "call-checks", "typecheck passed\ntests passed\n"),
+    response("event-manifest-response", "call-manifest", " M src/index.ts\u0000 M test/index.test.js\u0000"),
     response("event-diff-response", "call-diff", "diff --git a/src/index.ts b/src/index.ts\nindex 1111111..2222222 100644\n--- a/src/index.ts\n+++ b/src/index.ts\n@@ -1 +1,2 @@\n export const value = 1;\n+export const next = 2;\ndiff --git a/test/index.test.js b/test/index.test.js\nindex 3333333..4444444 100644\n--- a/test/index.test.js\n+++ b/test/index.test.js\n@@ -1 +1,2 @@\n test(\"value\", () => {});\n+test(\"next\", () => {});") ,
     {
       type: "thread.done",
@@ -240,10 +261,18 @@ test("failed required checks remain durable but cannot produce a successful hand
     "passed",
     "call-diff",
   );
+  const manifest = await addEvidence(
+    missions,
+    mission.id,
+    "evidence-manifest",
+    "file_change",
+    "passed",
+    "call-manifest",
+  );
 
   await assert.rejects(
     missions.recordHandoff(mission.id, {
-      ...validHandoff({ typecheck: typecheck.id, test: testEvidence.id, diff: diff.id }, "done"),
+      ...validHandoff({ typecheck: typecheck.id, test: testEvidence.id, diff: diff.id, manifest: manifest.id }, "done"),
       id: "handoff-failed-required",
       checks: [
         {
@@ -268,7 +297,7 @@ test("failed required checks remain durable but cannot produce a successful hand
   );
 
   const partial = await missions.recordHandoff(mission.id, {
-    ...validHandoff({ typecheck: typecheck.id, test: testEvidence.id, diff: diff.id }, "partial"),
+    ...validHandoff({ typecheck: typecheck.id, test: testEvidence.id, diff: diff.id, manifest: manifest.id }, "partial"),
     id: "handoff-partial",
     checks: [
       {
@@ -306,6 +335,7 @@ test("valid handoffs correlate every check and origin, then survive reconnect", 
       typecheck: (await addEvidence(first.missions, first.mission.id, "evidence-typecheck", "typecheck_result", "passed", "call-typecheck")).id,
       test: (await addEvidence(first.missions, first.mission.id, "evidence-test", "test_result", "passed", "call-test")).id,
       diff: (await addEvidence(first.missions, first.mission.id, "evidence-diff-valid", "diff_summary", "passed", "call-diff")).id,
+      manifest: (await addEvidence(first.missions, first.mission.id, "evidence-manifest-valid", "file_change", "passed", "call-manifest")).id,
     };
     const handoff = await first.missions.recordHandoff(
       first.mission.id,
@@ -370,10 +400,25 @@ test("a structured handoff cannot authorize a diff outside the explicit file sco
     }),
     executionOrigin: { ...ORIGIN, toolCallId: "call-scope-diff" },
   });
+  const manifest = await missions.addEvidence(mission.id, {
+    id: "evidence-scope-manifest",
+    workItemId: workItem.id,
+    kind: "file_change",
+    result: "passed",
+    source: "trueforge",
+    summary: "The delegated execution returned the complete changed-file manifest.",
+    details: JSON.stringify({
+      complete_changed_files: true,
+      command: COMPLETE_CHANGED_FILES_COMMAND,
+      output: changedFilesManifestOutput(["src/index.ts", "README.md"]),
+      changed_files: ["src/index.ts", "README.md"],
+    }),
+    executionOrigin: { ...ORIGIN, toolCallId: "call-scope-manifest" },
+  });
 
   await assert.rejects(
     missions.recordHandoff(mission.id, {
-      ...validHandoff({ typecheck: typecheck.id, test: tests.id, diff: diff.id }),
+      ...validHandoff({ typecheck: typecheck.id, test: tests.id, diff: diff.id, manifest: manifest.id }),
       id: "handoff-out-of-scope",
       filesChanged: ["src/index.ts", "README.md"],
     }),
@@ -429,6 +474,7 @@ test("cross-thread proof is rejected while a prior valid handoff remains durable
     typecheck: (await addEvidence(missions, mission.id, "evidence-prior-typecheck", "typecheck_result", "passed", "call-prior-typecheck")).id,
     test: (await addEvidence(missions, mission.id, "evidence-prior-test", "test_result", "passed", "call-prior-test")).id,
     diff: (await addEvidence(missions, mission.id, "evidence-prior-diff", "diff_summary", "passed", "call-prior-diff")).id,
+    manifest: (await addEvidence(missions, mission.id, "evidence-prior-manifest", "file_change", "passed", "call-prior-manifest")).id,
   };
   const prior = await missions.recordHandoff(mission.id, {
     ...validHandoff(priorIds),
@@ -455,6 +501,7 @@ test("cross-thread proof is rejected while a prior valid handoff remains durable
     typecheck: (await addEvidence(missions, mission.id, "evidence-retry-typecheck", "typecheck_result", "passed", "call-retry-typecheck", parentOrigin)).id,
     test: (await addEvidence(missions, mission.id, "evidence-retry-test", "test_result", "passed", "call-retry-test", parentOrigin)).id,
     diff: (await addEvidence(missions, mission.id, "evidence-retry-diff", "diff_summary", "passed", "call-retry-diff", parentOrigin)).id,
+    manifest: (await addEvidence(missions, mission.id, "evidence-retry-manifest", "file_change", "passed", "call-retry-manifest", parentOrigin)).id,
   };
   const childRuntime = await addEvidence(
     missions,

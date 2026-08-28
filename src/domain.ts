@@ -1,6 +1,9 @@
 import { randomUUID } from "node:crypto";
 
-import { parseContentDiffEvidence } from "./diff.js";
+import {
+  parseCompleteChangedFilesEvidence,
+  parseContentDiffEvidence,
+} from "./diff.js";
 
 export const missionStatuses = [
   "draft",
@@ -1952,6 +1955,21 @@ function validateStructuredHandoffCorrelation(
   }
 
   if (isStructuredImplementationWorkItem(workItem) && enforceCurrentDelegation) {
+    const completeChangedFilesEvidence = linkedEvidence
+      .map((evidence) => ({
+        evidence,
+        parsed: parseCompleteChangedFilesEvidence(evidence),
+      }))
+      .filter((candidate): candidate is typeof candidate & {
+        parsed: NonNullable<typeof candidate.parsed>;
+      } => candidate.parsed !== null);
+    const completeChangedFiles = completeChangedFilesEvidence.at(-1)?.parsed.filesChanged;
+    if (completeChangedFiles === undefined) {
+      return fail(
+        "invalid_input",
+        `Handoff ${handoff.id} has no independently observed complete changed-file manifest for delegated implementation.`,
+      );
+    }
     const allowedFiles = workItem.allowedFiles;
     if (allowedFiles === undefined || allowedFiles.length === 0) {
       return fail(
@@ -1964,12 +1982,30 @@ function validateStructuredHandoffCorrelation(
     ))];
     const outOfScopeFiles = [...new Set([
       ...handoff.filesChanged,
+      ...completeChangedFiles,
       ...observedChangedFiles,
     ].filter((file) => !allowedFiles.includes(file)))];
     if (outOfScopeFiles.length > 0) {
       return fail(
         "invalid_input",
         `Handoff ${handoff.id} changes files outside work item ${workItem.id} scope: ${outOfScopeFiles.join(", ")}. Allowed files: ${allowedFiles.join(", ")}.`,
+      );
+    }
+    const missingFromScopedDiff = completeChangedFiles.filter((file) => !observedChangedFiles.includes(file));
+    const missingFromCompleteManifest = observedChangedFiles.filter((file) => !completeChangedFiles.includes(file));
+    if (observedChangedFiles.length > 0 &&
+        (missingFromScopedDiff.length > 0 || missingFromCompleteManifest.length > 0)) {
+      const differences = [
+        ...(missingFromScopedDiff.length === 0
+          ? []
+          : [`missing from the scoped content diff: ${missingFromScopedDiff.join(", ")}`]),
+        ...(missingFromCompleteManifest.length === 0
+          ? []
+          : [`missing from the complete changed-file manifest: ${missingFromCompleteManifest.join(", ")}`]),
+      ];
+      return fail(
+        "invalid_input",
+        `Handoff ${handoff.id} has a complete changed-file manifest that does not match its scoped content diff (${differences.join("; ")}).`,
       );
     }
   }

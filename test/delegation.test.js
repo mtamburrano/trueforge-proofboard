@@ -67,6 +67,13 @@ function delegatedEvents({ malformedCompletion = false, includeThread = true, th
           },
         },
         {
+          id: "call-proof-manifest",
+          function: {
+            name: "exec",
+            arguments: JSON.stringify({ command: "git status --porcelain=v1 -z --untracked-files=all" }),
+          },
+        },
+        {
           id: "call-proof-diff",
           function: { name: "exec", arguments: JSON.stringify({ command: "git diff" }) },
         },
@@ -83,6 +90,20 @@ function delegatedEvents({ malformedCompletion = false, includeThread = true, th
         response: {
           exitCode: 0,
           result: "typecheck passed\ntests passed\n",
+        },
+      }),
+    });
+    events.push({
+      type: "tool.response",
+      id: "event-proof-manifest-response",
+      createdAt: "2026-08-27T12:00:02.650Z",
+      threadId: "thread-subagent",
+      toolCallId: "call-proof-manifest",
+      content: JSON.stringify({
+        success: true,
+        response: {
+          exitCode: 0,
+          result: " M src/index.ts\u0000 M test/index.test.js\u0000",
         },
       }),
     });
@@ -204,6 +225,7 @@ test("native dynamic delegation sends a bounded durable Work Packet and persists
   assert.match(prompt, /Implement src\/index\.ts/);
   assert.match(prompt, /allowedFiles/);
   assert.match(prompt, /may modify only these explicitly allowed repository files/);
+  assert.match(prompt, /git status --porcelain=v1 -z --untracked-files=all/);
   assert.match(prompt, /git diff -- <allowed file>/);
   assert.match(prompt, /The bounded change is complete/);
   assert.doesNotMatch(prompt, /must not enter the packet/);

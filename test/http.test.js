@@ -217,6 +217,20 @@ class TestMissionRunner {
         }),
         executionOrigin: { ...origin, toolCallId: `call-diff-${this.calls.turn}` },
       });
+      const manifest = await this.missions.addEvidence(missionId, {
+        workItemId: options.workItemId,
+        kind: "file_change",
+        result: "passed",
+        source: "trueforge",
+        summary: "Delegated complete changed-file manifest captured.",
+        details: JSON.stringify({
+          complete_changed_files: true,
+          command: "git status --porcelain=v1 -z --untracked-files=all",
+          output: " M src/index.ts\u0000",
+          changed_files: ["src/index.ts"],
+        }),
+        executionOrigin: { ...origin, toolCallId: `call-manifest-${this.calls.turn}` },
+      });
       await this.missions.completeWorkItemDelegation(missionId, options.workItemId, {
         threadId,
         turnId,
@@ -242,7 +256,7 @@ class TestMissionRunner {
             exitCode: 0,
           },
         ],
-        evidenceIds: [typecheck.id, tests.id, diff.id],
+        evidenceIds: [typecheck.id, tests.id, manifest.id, diff.id],
         decisions: [],
         openQuestions: [],
         executionOrigin: origin,

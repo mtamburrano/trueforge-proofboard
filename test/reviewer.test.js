@@ -27,12 +27,17 @@ function domainError(code) {
   return (error) => error instanceof MissionDomainError && error.code === code;
 }
 
+function changedFilesManifestOutput(files = ["src/index.ts", "test/index.test.js"]) {
+  return `${files.map((file) => ` M ${file}`).join("\u0000")}\u0000`;
+}
+
 async function reviewFixture({
   repository = new InMemoryMissionRepository(),
   includeDiff = true,
   diffCommand = "git diff",
   diffOutput = "diff --git a/src/index.ts b/src/index.ts\n--- a/src/index.ts\n+++ b/src/index.ts\n@@ -1 +1,2 @@\n before\n+after\ndiff --git a/test/index.test.js b/test/index.test.js\n--- a/test/index.test.js\n+++ b/test/index.test.js\n@@ -1 +1,2 @@\n before\n+after",
   allowedFiles = ["src/index.ts", "test/index.test.js"],
+  manifestFiles = ["src/index.ts", "test/index.test.js"],
 } = {}) {
   const missions = new MissionService(repository, fixedClock);
   const mission = await missions.createMission({
@@ -79,7 +84,22 @@ async function reviewFixture({
     summary: "The tests passed in the delegated execution.",
     executionOrigin: { ...ORIGIN, toolCallId: "call-review-test" },
   });
-  const evidenceIds = [typecheck.id, tests.id];
+  const manifest = await missions.addEvidence(mission.id, {
+    id: "evidence-review-manifest",
+    workItemId: workItem.id,
+    kind: "file_change",
+    result: "passed",
+    source: "trueforge",
+    summary: "The delegated execution returned the complete changed-file manifest.",
+    details: JSON.stringify({
+      complete_changed_files: true,
+      command: "git status --porcelain=v1 -z --untracked-files=all",
+      output: changedFilesManifestOutput(manifestFiles),
+      changed_files: manifestFiles,
+    }),
+    executionOrigin: { ...ORIGIN, toolCallId: "call-review-manifest" },
+  });
+  const evidenceIds = [typecheck.id, tests.id, manifest.id];
   if (includeDiff) {
     const diff = await missions.addEvidence(mission.id, {
       id: "evidence-review-diff",
@@ -227,6 +247,7 @@ test("independent review rejects a content diff that contradicts the handoff fil
   const { missions, mission, workItem } = await reviewFixture({
     diffOutput: "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n before\n+after",
     allowedFiles: ["src/index.ts", "test/index.test.js", "README.md"],
+    manifestFiles: ["README.md"],
   });
   const context = await missions.getReviewContext(mission.id, workItem.id);
   const decision = new DeterministicImplementationVerifier().review(context);
