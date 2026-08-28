@@ -1467,6 +1467,18 @@ function ensureMissionEvidence(state: MissionState, missionId: string, evidenceI
   }
 }
 
+function ensureApprovalEvidence(state: MissionState, approval: Approval): void {
+  if (approval.evidenceIds.length === 0) {
+    fail("approval_blocked", `Approval ${approval.id} has no supporting evidence.`);
+  }
+  for (const evidenceId of approval.evidenceIds) {
+    const evidence = state.evidence.find((item) => item.id === evidenceId);
+    if (evidence === undefined || evidence.missionId !== approval.missionId) {
+      fail("approval_blocked", `Approval ${approval.id} references invalid supporting evidence.`);
+    }
+  }
+}
+
 function ensureApprovedAction(
   state: MissionState,
   missionId: string,
@@ -1511,6 +1523,7 @@ function ensureApprovedAction(
   if (approvalIsExpired(approval, now)) {
     fail("approval_blocked", `Approval ${approval.id} has expired.`);
   }
+  ensureApprovalEvidence(state, approval);
   return approval;
 }
 
@@ -1548,6 +1561,7 @@ function ensureApprovedDelivery(
   if (approvalIsExpired(approval, now)) {
     fail("approval_blocked", `Approval ${approval.id} has expired.`);
   }
+  ensureApprovalEvidence(state, approval);
   return approval;
 }
 
@@ -2577,6 +2591,9 @@ export class MissionService {
         : stringArray(input.evidenceIds, "evidenceIds", 100).map((evidenceId) =>
             normalizedId(evidenceId, "evidenceId"),
         );
+      if (getActionPolicy(actionType).requiresApproval && evidenceIds.length === 0) {
+        fail("invalid_input", "A consequential approval request needs supporting evidence.");
+      }
       ensureMissionEvidence(state, normalizedMissionId, evidenceIds);
       const id = input.id === undefined ? newId("approval") : normalizedId(input.id, "approval.id");
       ensureUniqueEntityId(state, id);

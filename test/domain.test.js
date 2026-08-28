@@ -168,7 +168,71 @@ test("malformed approval requests fail before persistence", async () => {
     }),
     domainError("invalid_input"),
   );
+  await assert.rejects(
+    service.requestActionApproval(mission.id, {
+      action: "create_pull_request",
+      target: "example/proof-board@main",
+      rationale: "A remote mutation needs explicit approval.",
+      expectedEffect: "Open a pull request.",
+    }),
+    domainError("invalid_input"),
+  );
+  await assert.rejects(
+    service.requestActionApproval(mission.id, {
+      action: "create_pull_request",
+      target: "example/proof-board@main",
+      rationale: "A remote mutation needs explicit approval.",
+      expectedEffect: "Open a pull request.",
+      evidenceIds: [],
+    }),
+    domainError("invalid_input"),
+  );
   assert.deepEqual((await service.getState()).approvals, []);
+});
+
+test("legacy evidence-less approvals load but cannot authorize protected actions", async () => {
+  const service = new MissionService(new InMemoryMissionRepository(), fixedClock);
+  const mission = await service.createMission({
+    id: "mission-legacy-approval",
+    objective: "Keep legacy approval state fail closed",
+  });
+  const evidence = await service.addEvidence(mission.id, {
+    id: "evidence-legacy-approval",
+    kind: "test_result",
+    result: "passed",
+    source: "sandbox",
+    summary: "The delivery checks passed.",
+  });
+  const approval = await service.requestActionApproval(mission.id, {
+    id: "approval-legacy-without-evidence",
+    action: "create_pull_request",
+    target: "example/proof-board@main",
+    rationale: "A remote mutation needs explicit approval.",
+    expectedEffect: "Open a pull request.",
+    evidenceIds: [evidence.id],
+  });
+  await service.decideApproval(mission.id, approval.id, {
+    decision: "approved",
+    decidedBy: "human-reviewer",
+  });
+
+  const legacyState = await service.getState();
+  legacyState.approvals[0].evidenceIds = [];
+  const reloaded = new MissionService(new InMemoryMissionRepository(legacyState), fixedClock);
+  let executions = 0;
+
+  await assert.rejects(
+    reloaded.executeProtectedAction(mission.id, {
+      action: "create_pull_request",
+      target: "example/proof-board@main",
+      expectedEffect: "Open a pull request.",
+      approvalId: approval.id,
+    }, () => {
+      executions += 1;
+    }),
+    domainError("approval_blocked"),
+  );
+  assert.equal(executions, 0);
 });
 
 test("work-item transitions enforce dependencies and a finite state machine", async () => {
