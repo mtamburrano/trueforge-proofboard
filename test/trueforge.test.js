@@ -2009,6 +2009,137 @@ test("locked fixture inspection proves direct TrueForge get_commit content and e
   assert.deepEqual(details.patches, LOCKED_FIXTURE_PATCHES);
 });
 
+test("locked fixture inspection accepts safe page-one pagination after an iteration-limit stop", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const liveArguments = {
+    detail: "full_patch",
+    owner: "mtamburrano",
+    page: 1,
+    perPage: 100,
+    repo: "proofboard-demo-fixture",
+    sha: LOCKED_FIXTURE_SHA,
+  };
+  const iterationLimitMessage = "TrueForge iteration limit reached after the canonical repository read.";
+  const { client, calls } = fakeClient((turnId, agentSpec) => {
+    assert.equal(agentSpec?.config?.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
+    assert.equal(agentSpec?.model?.params?.parallel_tool_calls, false);
+    return lockedCommitEvents(turnId, {
+      argumentsValue: liveArguments,
+      turnState: {
+        status: "error",
+        message: iterationLimitMessage,
+        requiredActions: [],
+      },
+    });
+  }, { passAgentSpec: true });
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-4-mini",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-mcp-safe-page-one",
+    objective: "Accept the exact pinned repository read with safe page-one pagination",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  const inspection = await runner.inspectRepository({ missionId: mission.id });
+
+  assert.equal(inspection.commitSha, LOCKED_FIXTURE_SHA);
+  assert.deepEqual(inspection.patches, LOCKED_FIXTURE_PATCHES);
+  assert.equal(calls.turns.length, 1);
+  const observedCalls = calls.turns[0].events
+    .filter((event) => event.type === "model.message.delta")
+    .flatMap((event) => event.toolCalls ?? [])
+    .filter((call) => call.function?.name === "get_commit");
+  assert.equal(observedCalls.length, 1);
+  const observedArguments = calls.turns[0].events
+    .filter((event) => event.type === "model.message.delta")
+    .flatMap((event) => event.toolCalls ?? [])
+    .filter((call) => call.index === 0)
+    .map((call) => call.function?.arguments ?? "")
+    .join("");
+  assert.deepEqual(JSON.parse(observedArguments), liveArguments);
+  const completion = calls.turns[0].events.find((event) => event.type === "turn.done");
+  assert.deepEqual(completion?.state, {
+    status: "error",
+    message: iterationLimitMessage,
+    requiredActions: [],
+  });
+  const state = await missions.getState();
+  const proof = state.evidence.find((item) => item.id === inspection.evidenceId);
+  assert.ok(proof);
+  assert.equal(proof.result, "passed");
+  assert.equal(JSON.parse(proof.details).commit_sha, LOCKED_FIXTURE_SHA);
+  assert.deepEqual(JSON.parse(proof.details).patches, LOCKED_FIXTURE_PATCHES);
+});
+
+test("locked fixture inspection rejects unsafe page pagination and unrelated arguments", async () => {
+  const cases = [
+    {
+      label: "unsafe page",
+      argumentsValue: {
+        owner: "mtamburrano",
+        repo: "proofboard-demo-fixture",
+        sha: LOCKED_FIXTURE_SHA,
+        detail: "full_patch",
+        page: 2,
+        perPage: 100,
+      },
+    },
+    {
+      label: "unrelated argument",
+      argumentsValue: {
+        owner: "mtamburrano",
+        repo: "proofboard-demo-fixture",
+        sha: LOCKED_FIXTURE_SHA,
+        detail: "full_patch",
+        page: 1,
+        perPage: 100,
+        path: "src/index.ts",
+      },
+    },
+  ];
+  const expectedReason = "Expected exactly one canonical get_commit MCP call, found 0 semantically canonical calls; observed 1 total tool call.";
+
+  for (const [index, fixture] of cases.entries()) {
+    const missions = new MissionService(new InMemoryMissionRepository());
+    const { client, calls } = fakeClient((turnId) => lockedCommitEvents(turnId, {
+      argumentsValue: fixture.argumentsValue,
+    }));
+    const runner = new TrueForgeMissionRunner(missions, client, {
+      model: "openai/gpt-5-4-mini",
+      mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+    });
+    const mission = await runner.createMission({
+      id: `mission-mcp-invalid-optional-argument-${index}`,
+      objective: `Reject ${fixture.label} on the pinned repository read`,
+      repository: {
+        owner: "mtamburrano",
+        name: "proofboard-demo-fixture",
+        ref: LOCKED_FIXTURE_REF,
+      },
+    });
+
+    await assert.rejects(
+      runner.inspectRepository({ missionId: mission.id }),
+      new RegExp(expectedReason.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+      fixture.label,
+    );
+    assert.equal(calls.turns.length, 1, fixture.label);
+    const state = await missions.getState();
+    assert.equal(state.missions[0].status, "blocked", fixture.label);
+    assert.equal(
+      state.evidence.some((item) => item.source === "mcp" && item.result === "passed"),
+      false,
+      fixture.label,
+    );
+  }
+});
+
 test("locked fixture inspection bounds the first MCP read and restores the normal session runtime", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
   let unboundedRetryAttempted = false;
@@ -2452,7 +2583,7 @@ test("failed repository inspection preserves its exact verification reason and b
     },
   });
 
-  const expectedReason = "Expected exactly one canonical get_commit MCP call, found 0.";
+  const expectedReason = "Expected exactly one canonical get_commit MCP call, found 0 semantically canonical calls; observed 1 total tool call.";
   await assert.rejects(
     runner.inspectRepository({ missionId: mission.id }),
     new RegExp(expectedReason.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),

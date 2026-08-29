@@ -5260,16 +5260,16 @@ function verifyLockedFixtureInspection(
   const observedCalls = observedToolCalls(events);
   const canonicalCalls = observedToolCalls(events).filter(
     (call) => call.name === "get_commit" && isRecord(call.arguments) &&
-      argumentsExactlyMatch(call.arguments, canonicalArguments),
+      lockedFixtureArgumentsMatch(call.arguments, canonicalArguments),
   );
   if (observedCalls.length !== 1) {
     return inspectionFailure(
-      `Expected exactly one canonical get_commit MCP call, found ${observedCalls.length}.`,
+      `Expected exactly one canonical get_commit MCP call, found ${observedCalls.length} observed tool calls (${canonicalCalls.length} semantically canonical).`,
     );
   }
   if (canonicalCalls.length !== 1) {
     return inspectionFailure(
-      `Expected exactly one canonical get_commit MCP call, found ${canonicalCalls.length}.`,
+      `Expected exactly one canonical get_commit MCP call, found ${canonicalCalls.length} semantically canonical calls; observed ${observedCalls.length} total tool call.`,
     );
   }
   const call = canonicalCalls[0];
@@ -5431,6 +5431,22 @@ function argumentsExactlyMatch(
     actualKeys.every((key, index) => key === expectedKeys[index]) &&
     Object.entries(expected).every(([key, value]) => actual[key] === value)
   );
+}
+
+function lockedFixtureArgumentsMatch(
+  actual: Record<string, unknown>,
+  expected: Record<string, unknown>,
+): boolean {
+  if (
+    Object.prototype.hasOwnProperty.call(actual, "page") &&
+    actual.page !== 1
+  ) {
+    return false;
+  }
+  const withoutOptionalPage = Object.fromEntries(
+    Object.entries(actual).filter(([key]) => key !== "page"),
+  );
+  return argumentsExactlyMatch(withoutOptionalPage, expected);
 }
 
 interface CoordinatorExecProvenance {
