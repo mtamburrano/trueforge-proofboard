@@ -14,6 +14,11 @@ test("queue safety and recovery gate proves human authorization, current evidenc
   assert.equal(summary.semanticRework.protectedOperations, 1);
   assert.equal(summary.proofFailure.status, "proving");
   assert.equal(summary.proofFailure.attempts, 2);
+  assert.equal(summary.proofInfrastructureRetry.status, "awaiting_approval");
+  assert.equal(summary.proofInfrastructureRetry.attempts, 1);
+  assert.equal(summary.proofInfrastructureRetry.codingTurns, 1);
+  assert.equal(summary.proofInfrastructureRetry.proofCalls, 2);
+  assert.equal(summary.proofInfrastructureRetry.evidencePreserved, true);
   assert.equal(summary.staleCorrelation.staleEvidenceBlocked, true);
   assert.equal(summary.staleCorrelation.currentFindingBlocked, true);
   assert.equal(summary.rejectedApproval.status, "blocked");

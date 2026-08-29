@@ -117,6 +117,7 @@ export interface MissionHttpOptions {
   planner?: WorkGraphPlanner;
   verifier?: ImplementationVerifier;
   semanticVerifier?: SemanticContractVerifier;
+  model?: string;
 }
 
 export interface ImplementationReviewDecision {
@@ -270,7 +271,7 @@ export interface ActivityView {
   summary: string;
   createdAt: string;
   workItemId?: string;
-  category: "session" | "runtime" | "repository" | "sandbox" | "narration";
+  category: "session" | "runtime" | "repository" | "sandbox" | "narration" | "approval" | "delivery";
 }
 
 export interface MissionView {
@@ -283,7 +284,7 @@ export interface MissionView {
     updatedAt: string;
     repository?: { owner: string; name: string; ref: string };
     deliveryTarget?: { owner: string; repo: string; base: string; head: string };
-    execution: { connected: boolean; resumed: boolean; sandboxId?: string };
+    execution: { connected: boolean; resumed: boolean; sandboxId?: string; model?: string };
   };
   progress: {
     complete: number;
@@ -528,12 +529,13 @@ class MissionController {
     private readonly runner: MissionRunner,
     private readonly planner: WorkGraphPlanner = new RepositoryWorkGraphPlanner(),
     private readonly verifier: ImplementationVerifier = new DeterministicImplementationVerifier(),
+    private readonly model?: string,
   ) {}
 
   async getPrimaryMission(): Promise<MissionView | null> {
     const state = await this.missions.getState();
     return state.missions.some((mission) => mission.id === PRIMARY_MISSION_ID)
-      ? mapMissionState(state, PRIMARY_MISSION_ID)
+      ? mapMissionState(state, PRIMARY_MISSION_ID, this.model)
       : null;
   }
 
@@ -558,7 +560,7 @@ class MissionController {
     const existing = await this.getPrimaryMission();
     if (existing !== null) {
       await this.ensureWorkItems();
-      return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID);
+      return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID, this.model);
     }
 
     await this.runner.createMission({
@@ -567,7 +569,7 @@ class MissionController {
       repository: PRIMARY_REPOSITORY,
     });
     await this.ensureWorkItems();
-    return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID);
+    return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID, this.model);
   }
 
   runPrimaryMission(): Promise<MissionView> {
@@ -661,7 +663,7 @@ class MissionController {
           );
         }
       }
-      return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID);
+      return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID, this.model);
     } catch (error) {
       await this.recordMissionFailure(error);
       await this.blockActiveWork(error);
@@ -736,6 +738,10 @@ class MissionController {
       });
       await this.recordImplementationHandoff(handoff, workItem.id);
     } catch (error) {
+      if (isRetryableProofInfrastructureFailure(error)) {
+        await this.recordRetryableProofFailure(workItem.id, error);
+        return;
+      }
       if (!isRecoverableImplementationProofFailure(error)) {
         throw error;
       }
@@ -775,6 +781,34 @@ class MissionController {
     await this.missions.transitionSystemWorkItem(PRIMARY_MISSION_ID, workItemId, "changes_requested", {
       trigger: "proof",
       reason,
+    });
+  }
+
+  private async recordRetryableProofFailure(
+    workItemId: string,
+    error: unknown,
+  ): Promise<void> {
+    const reason = missionFailureReason(error);
+    await this.missions.addEvidence(PRIMARY_MISSION_ID, {
+      workItemId,
+      kind: "tool_result",
+      result: "failed",
+      source: "system",
+      summary: "Independent proof infrastructure failed; the current implementation remains in Proving for retry.",
+      details: JSON.stringify({
+        failure_layer: "tool",
+        failure_category: "sandbox",
+        failure_class: "infrastructure",
+        failure_reason_category: error instanceof TrueForgeIntegrationError
+          ? error.failureCategory
+          : "transport",
+        retryable: true,
+        phase: "deterministic-proof",
+        reason,
+        ...(error instanceof TrueForgeIntegrationError
+          ? { operation: error.operation }
+          : {}),
+      }),
     });
   }
 
@@ -1035,7 +1069,8 @@ class MissionController {
         evidence.workItemId === implementation.id &&
         evidence.attempt === implementation.attempt &&
         ["sandbox", "reviewer"].includes(evidence.source) &&
-        evidence.result === "failed"
+        evidence.result === "failed" &&
+        !isRetryableProofInfrastructureEvidence(evidence)
       )
     ) {
       throw new MissionControlError(
@@ -1269,7 +1304,7 @@ class MissionController {
       await this.blockPrimaryDelivery(
         `The operator ${decision} the protected delivery action; no pull request was created.`,
       );
-      return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID);
+      return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID, this.model);
     }
 
     try {
@@ -1491,7 +1526,7 @@ class MissionController {
       PRIMARY_MISSION_ID,
       deliveryAttemptRecord.attempt.id,
     );
-    return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID);
+      return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID, this.model);
   }
 
   private async blockPrimaryDelivery(reason: unknown): Promise<void> {
@@ -1752,6 +1787,15 @@ function evidenceDetails(evidence: Evidence): Record<string, unknown> | null {
   }
 }
 
+function isRetryableProofInfrastructureEvidence(evidence: Evidence): boolean {
+  const details = evidenceDetails(evidence);
+  return evidence.result === "failed" &&
+    details?.retryable === true &&
+    details.failure_class === "infrastructure" &&
+    (details.phase === "deterministic-proof" ||
+      details.proof_mode === IMPLEMENTATION_PROOF_MODE);
+}
+
 function latestEvidenceForAttempt(
   evidence: Evidence[],
   workItemId: string,
@@ -1922,7 +1966,8 @@ function requireCurrentDeliveryApprovalCorrelation(
     evidence.workItemId === workItem.id &&
     evidence.attempt === workItem.attempt &&
     ["sandbox", "reviewer"].includes(evidence.source) &&
-    evidence.result === "failed",
+    evidence.result === "failed" &&
+    !isRetryableProofInfrastructureEvidence(evidence),
   );
   if (currentFinding !== undefined) {
     throw new MissionControlError(
@@ -2187,7 +2232,7 @@ function verifiedInspectionFromResult(
   return inspection;
 }
 
-export function mapMissionState(state: MissionState, missionId: string): MissionView {
+export function mapMissionState(state: MissionState, missionId: string, model?: string): MissionView {
   const mission = state.missions.find((item) => item.id === missionId);
   if (mission === undefined) {
     throw new MissionDomainError("not_found", `Mission ${missionId} was not found.`);
@@ -2204,7 +2249,7 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
   if (mission.trueforgeSessionId !== undefined) {
     activity.push({
       id: `session-${mission.id}`,
-      actor: "TrueForge",
+      actor: mission.trueforgeTurnId === undefined ? "TrueForge session" : "TrueForge recovery",
       result: "active",
       summary: mission.trueforgeTurnId === undefined
         ? "Execution session connected."
@@ -2212,8 +2257,42 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
       createdAt: mission.updatedAt,
       category: "session",
     });
-    activity.sort(newestFirst);
   }
+  state.approvals
+    .filter((item) => item.missionId === missionId)
+    .forEach((item) => {
+      const result: ActivityView["result"] = item.decision === "pending"
+        ? "active"
+        : item.decision === "approved"
+        ? "passed"
+        : "failed";
+      const decision = item.decision === "pending"
+        ? "awaits a human decision"
+        : `${item.decision} by ${item.decidedBy ?? "the operator"}`;
+      activity.push({
+        id: `approval-${item.id}`,
+        actor: "Proof Board approval checkpoint",
+        result,
+        summary: `Protected approval checkpoint: ${item.action} for ${item.target} ${decision}.`,
+        createdAt: item.decidedAt ?? item.createdAt,
+        ...(item.workItemId === undefined ? {} : { workItemId: item.workItemId }),
+        category: "approval",
+      });
+    });
+  state.deliveries
+    .filter((item) => item.missionId === missionId)
+    .forEach((item) => {
+      activity.push({
+        id: `delivery-${item.id}`,
+        actor: "Delivery read-back",
+        result: item.status === "delivered" ? "passed" : "failed",
+        summary: `Delivery read-back ${item.status}: ${item.verificationSummary}`,
+        createdAt: item.createdAt,
+        ...(item.workItemId === undefined ? {} : { workItemId: item.workItemId }),
+        category: "delivery",
+      });
+    });
+  activity.sort(newestFirst);
   const passedEvidence = evidence.filter((item) => item.result === "passed").length;
   const failedEvidence = evidence.filter((item) => item.result === "failed").length;
   const completed = workItems.filter((item) => ["done", "complete"].includes(item.status)).length;
@@ -2282,6 +2361,7 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
     execution: {
       connected: mission.trueforgeSessionId !== undefined,
       resumed: mission.trueforgeTurnId !== undefined,
+      ...(model === undefined ? {} : { model }),
     },
     deliveryTarget: {
       owner: PRIMARY_DELIVERY_TARGET.owner,
@@ -2550,14 +2630,16 @@ function safeEvidenceMetadata(evidence: Evidence): Record<string, string | numbe
 }
 
 function mapActivity(evidence: Evidence): ActivityView {
+  const details = evidenceDetails(evidence);
+  const mcpServer = typeof details?.server === "string" ? details.server.toLowerCase() : "";
   const actor = evidence.source === "mcp"
-    ? "Repository MCP"
+    ? mcpServer === "github" ? "GitHub MCP read" : "Repository MCP read"
     : evidence.source === "sandbox"
-    ? "Sandbox"
+    ? "Proof Board verification · Daytona sandbox"
     : evidence.source === "trueforge"
-    ? "TrueForge"
+    ? "TrueForge activity"
     : evidence.source === "agent"
-    ? "Agent report"
+    ? "Subagent delegation"
     : evidence.source[0]?.toUpperCase() + evidence.source.slice(1);
   const category = evidence.source === "mcp"
     ? "repository"
@@ -2645,6 +2727,7 @@ export function createMissionHttpApp(options: MissionHttpOptions) {
     options.runner,
     options.planner,
     options.verifier ?? new DeterministicImplementationVerifier(semanticVerifier),
+    options.model,
   );
   return {
     request(path: string, init?: RequestInit) {
@@ -2965,11 +3048,19 @@ function missionFailureReason(error: unknown): string {
 
 function isRecoverableImplementationProofFailure(error: unknown): boolean {
   if (error instanceof TrueForgeIntegrationError) {
-    return error.operation === "prove implementation" ||
-      error.operation === "run sandbox verification";
+    return !error.retryable &&
+      (error.operation === "prove implementation" ||
+        error.operation === "run sandbox verification");
   }
   return error instanceof MissionDomainError &&
     (error.code === "invalid_input" || error.code === "invalid_transition");
+}
+
+function isRetryableProofInfrastructureFailure(error: unknown): boolean {
+  return error instanceof TrueForgeIntegrationError &&
+    error.retryable &&
+    (error.operation === "prove implementation" ||
+      error.operation === "run sandbox verification");
 }
 
 function missionFailureClassification(error: unknown): {
@@ -2977,6 +3068,9 @@ function missionFailureClassification(error: unknown): {
   category: DiagnosticFailureCategory;
 } {
   if (error instanceof TrueForgeIntegrationError) {
+    if (error.retryable) {
+      return { layer: "tool", category: "sandbox" };
+    }
     const operation = error.operation.toLowerCase();
     if (operation.includes("inspect") || operation.includes("repository")) {
       return { layer: "tool", category: "mcp" };
@@ -3005,23 +3099,23 @@ const INDEX_HTML = `<!doctype html>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta name="theme-color" content="#08090a">
-    <title>Mission Control · TrueForge</title>
+    <title>Proof Board · TrueForge</title>
     <link rel="stylesheet" href="/public/style.css">
     <script src="/public/run-state.js" defer></script>
     <script src="/public/app.js" defer></script>
   </head>
   <body>
     <header class="topbar">
-      <a class="product-mark" href="/" aria-label="TrueForge Mission Control home">
+      <a class="product-mark" href="/" aria-label="TrueForge Proof Board home">
         <span class="product-glyph" aria-hidden="true">TF</span>
-        <span>MISSION CONTROL</span>
+        <span>PROOF BOARD</span>
       </a>
-      <p class="topbar-thesis">Plan <span>→</span> Execute <span>→</span> Prove <span>→</span> Approve</p>
+      <p class="topbar-thesis">Queue <span>→</span> Execute <span>→</span> Prove <span>→</span> Approve</p>
       <span id="connection-state" class="connection-state">Connecting</span>
     </header>
     <main id="app" class="mission-shell" aria-live="polite">
       <section class="boot-state panel">
-        <p class="eyebrow">Mission Control</p>
+        <p class="eyebrow">Proof Board</p>
         <h1>Loading durable mission state…</h1>
       </section>
     </main>

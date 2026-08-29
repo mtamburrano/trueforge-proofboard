@@ -34,6 +34,21 @@ test("Proof Board UI declares the queue columns and system-owned boundary", () =
   assert.match(appScript, /system-owned/);
 });
 
+test("Proof Board UI explains the queue mental model and elevates the primary contract", () => {
+  assert.match(appScript, /const QUEUE_FLOW = Object\.freeze/);
+  assert.match(appScript, /One queue\. Two human gates\./);
+  assert.match(appScript, /Backlog → Ready/);
+  assert.match(appScript, /In Progress → Proving/);
+  assert.match(appScript, /Changes Requested → Ready/);
+  assert.match(appScript, /Awaiting Approval → Delivering → Done/);
+  assert.match(appScript, /data-primary-ticket="\$\{isPrimary\}"/);
+  assert.match(appScript, /Gate 1 · Queue authorization/);
+  assert.match(appScript, /Gate 2 · Consequential delivery/);
+  assert.match(styleSheet, /\.queue-flow\s*\{/);
+  assert.match(styleSheet, /\.ticket-card\.primary-ticket\s*\{/);
+  assert.match(styleSheet, /\.checkpoint-delivery-gate\s*\{/);
+});
+
 test("Proof Board UI keeps durable polling, drawer, activity, proof, and approval affordances", () => {
   assert.match(appScript, /setInterval\(pollMission, POLL_INTERVAL_MS\)/);
   assert.match(appScript, /expected_revision: currentView\.revision/);
@@ -47,6 +62,20 @@ test("Proof Board UI keeps durable polling, drawer, activity, proof, and approva
   assert.match(appScript, /Retired by/);
   assert.match(appScript, /item\.workItemId === ticket\.id/);
   assert.match(appScript, /Deterministic proof/);
+  assert.match(appScript, /Agent activity/);
+  assert.match(appScript, /Measured proof/);
+  assert.match(appScript, /Model/);
+  assert.match(appScript, /Real execution trail/);
+  assert.match(appScript, /GitHub MCP reads/);
+  assert.match(appScript, /Daytona sandbox work/);
+  assert.match(appScript, /Subagent delegation/);
+  assert.match(appScript, /Reconnect \/ recovery/);
+  assert.match(appScript, /Protected approval checkpoint/);
+  assert.match(appScript, /Delivery read-back/);
+  assert.match(appScript, /Show execution provenance/);
+  assert.match(appScript, /Proof Board verification owns deterministic status/);
+  assert.match(appScript, /verified head SHA/);
+  assert.match(appScript, /Diff context/);
   assert.match(appScript, /Approve exact action/);
   assert.match(appScript, /Second human gate/);
   assert.match(appScript, /Human approval recorded/);
@@ -59,6 +88,10 @@ test("Proof Board UI keeps durable polling, drawer, activity, proof, and approva
   assert.match(styleSheet, /\.ticket-column\.is-drag-over/);
   assert.match(styleSheet, /\.attempt-card/);
   assert.match(styleSheet, /\.drawer-rework/);
+  assert.match(styleSheet, /\.runtime-facts/);
+  assert.match(styleSheet, /\.proof-check-list/);
+  assert.match(styleSheet, /\.provenance-strip/);
+  assert.match(styleSheet, /\.activity-details/);
 });
 
 test("ticket cards open a non-blocking drawer while queue transitions stay in the drawer", () => {
@@ -101,7 +134,7 @@ test("mission view correlates card activity and evidence to the durable ticket",
     summary: "Deterministic sandbox check passed.",
   });
 
-  const app = createMissionHttpApp({ missions, runner: {} });
+  const app = createMissionHttpApp({ missions, runner: {}, model: "openai/test-proof-model" });
   const response = await app.request("/api/mission");
   assert.equal(response.status, 200);
   const payload = await response.json();
@@ -110,4 +143,5 @@ test("mission view correlates card activity and evidence to the durable ticket",
   assert.equal(payload.mission.evidence[0].workItemId, ticket.id);
   assert.equal(payload.mission.activity[0].workItemId, ticket.id);
   assert.equal(payload.mission.mission.deliveryTarget.base, "main");
+  assert.equal(payload.mission.mission.execution.model, "openai/test-proof-model");
 });

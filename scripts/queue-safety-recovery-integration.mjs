@@ -25,11 +25,13 @@ const FIXED_NOW = () => new Date("2099-01-01T00:00:00.000Z");
 
 function createSharedHarness({
   proofFailuresRemaining = 0,
+  infrastructureFailuresRemaining = 0,
   deliveryHeadShaSequence = [DELIVERY_HEAD_SHA],
   deliveryResultHeadSha = DELIVERY_HEAD_SHA,
 } = {}) {
   return {
     proofFailuresRemaining,
+    infrastructureFailuresRemaining,
     deliveryHeadShaSequence: [...deliveryHeadShaSequence],
     deliveryResultHeadSha,
     calls: {
@@ -163,6 +165,35 @@ class QueueSafetyRunner {
       threadId: `queue-safety-proof-thread-${proofAttempt}`,
       toolCallId: `queue-safety-proof-call-${proofAttempt}`,
     };
+    if (this.shared.infrastructureFailuresRemaining > 0) {
+      this.shared.infrastructureFailuresRemaining -= 1;
+      await this.missions.addEvidence(input.missionId, {
+        workItemId: input.workItemId,
+        kind: "tool_result",
+        result: "failed",
+        source: "sandbox",
+        summary: "The direct proof provider was temporarily unavailable.",
+        details: JSON.stringify({
+          proof_mode: IMPLEMENTATION_PROOF_MODE,
+          failure_layer: "tool",
+          failure_category: "sandbox",
+          failure_class: "infrastructure",
+          failure_reason_category: "network",
+          retryable: true,
+          reason: "provider connection failed",
+        }),
+        executionOrigin: proofOrigin,
+      });
+      throw new TrueForgeIntegrationError(
+        "prove implementation",
+        "Direct proof provider connection failed.",
+        {
+          failureClass: "infrastructure",
+          failureCategory: "network",
+          retryable: true,
+        },
+      );
+    }
     if (this.shared.proofFailuresRemaining > 0) {
       this.shared.proofFailuresRemaining -= 1;
       await this.missions.addEvidence(input.missionId, {
@@ -749,6 +780,67 @@ async function runProofFailureScenario(directory) {
   };
 }
 
+async function runProofInfrastructureRetryScenario(directory) {
+  const statePath = path.join(directory, "proof-infrastructure-retry.json");
+  const shared = createSharedHarness({ infrastructureFailuresRemaining: 1 });
+  const first = testApp(new JsonMissionRepository(statePath), shared);
+  const prepared = await preparePendingApprovalButStopAtProof(first.app);
+  const failed = await runMission(first.app);
+  const failedTicket = ticketFor(failed.mission, "implementer");
+  assert.equal(failedTicket.status, "proving");
+  assert.equal(failedTicket.attempt, 1);
+  assert.equal(failed.mission.approvals.length, 0);
+  assert.equal(failed.mission.handoffs.length, 0);
+  assert.equal(failed.mission.reviews.length, 0);
+  assert.equal(shared.calls.turn, 1);
+  assert.equal(shared.calls.proof, 1);
+
+  const failedState = await first.missions.getState();
+  const retryFinding = failedState.evidence.find((item) =>
+    item.workItemId === failedTicket.id &&
+    item.source === "system" &&
+    item.result === "failed" &&
+    JSON.parse(item.details).retryable === true,
+  );
+  assert.ok(retryFinding, "The provider failure must survive as durable retry evidence.");
+  const failedEvidenceCount = failedState.evidence.length;
+
+  const reconnectMissions = new MissionService(new JsonMissionRepository(statePath), FIXED_NOW);
+  const reconnectApp = createMissionHttpApp({
+    missions: reconnectMissions,
+    runner: new QueueSafetyRunner(reconnectMissions, shared),
+    verifier: acceptedVerifier(),
+  });
+  const reconnected = await missionView(reconnectApp);
+  const reconnectedTicket = ticketFor(reconnected, "implementer");
+  assert.equal(reconnectedTicket.status, "proving");
+  assert.equal(reconnectedTicket.claim.trueforgeSessionId, SESSION_ID);
+  assert.equal(reconnectedTicket.claim.trueforgeSandboxId, SANDBOX_ID);
+
+  const recovered = await runMission(reconnectApp);
+  const recoveredTicket = ticketFor(recovered.mission, "implementer");
+  assert.equal(recoveredTicket.status, "awaiting_approval");
+  assert.equal(recoveredTicket.attempt, 1);
+  assert.equal(shared.calls.turn, 1);
+  assert.equal(shared.calls.proof, 2);
+  assert.equal(recovered.mission.handoffs.length, 1);
+  assert.equal(recovered.mission.reviews.length, 1);
+  assert.equal(recovered.mission.approvals.length, 1);
+  const recoveredState = await reconnectMissions.getState();
+  assert.ok(recoveredState.evidence.length > failedEvidenceCount);
+  assert.equal(recoveredState.evidence.some((item) => item.id === retryFinding.id), true);
+
+  return {
+    flow: "proof infrastructure failure → reconnect → Proving retry without coding",
+    status: recoveredTicket.status,
+    attempts: recoveredTicket.attempt,
+    codingTurns: shared.calls.turn,
+    proofCalls: shared.calls.proof,
+    evidencePreserved: true,
+    preparedStatus: prepared.status,
+  };
+}
+
 async function preparePendingApprovalButStopAtProof(app) {
   await createPrimary(app);
   let current = await missionView(app);
@@ -879,6 +971,7 @@ export async function runQueueSafetyRecoveryIntegration() {
   try {
     const semanticRework = await runSemanticReworkRecoveryScenario(directory);
     const proofFailure = await runProofFailureScenario(directory);
+    const proofInfrastructureRetry = await runProofInfrastructureRetryScenario(directory);
     const staleCorrelation = await runOlderEvidenceAndCurrentFindingScenarios(directory);
     const rejectedApproval = await runRejectedApprovalScenario(directory);
     const readbackMismatch = await runReadbackMismatchScenario(directory);
@@ -886,12 +979,14 @@ export async function runQueueSafetyRecoveryIntegration() {
       temporaryState: "isolated temporary JSON repositories; removed after the run",
       semanticRework,
       proofFailure,
+      proofInfrastructureRetry,
       staleCorrelation,
       rejectedApproval,
       readbackMismatch,
       remoteMutations: [
         semanticRework.remoteMutations,
         proofFailure.remoteMutations,
+        proofInfrastructureRetry.remoteMutations ?? 0,
         rejectedApproval.remoteMutations,
         readbackMismatch.remoteMutations,
       ].reduce((total, count) => total + count, 0),

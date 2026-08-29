@@ -19,5 +19,8 @@
   "devDependencies": {
     "@truefoundry/trueforge-sdk": "0.1.3",
     "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "@daytona/sdk": "^0.207.0"
   }
 }

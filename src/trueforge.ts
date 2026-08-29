@@ -922,13 +922,41 @@ interface ImplementationProofMeasurement {
   error?: string;
 }
 
+export type TrueForgeFailureClass = "implementation" | "infrastructure";
+export type TrueForgeFailureCategory =
+  | "verification"
+  | "configuration"
+  | "authentication"
+  | "network"
+  | "transport"
+  | "identity"
+  | "runtime";
+
+export interface TrueForgeIntegrationErrorOptions {
+  failureClass?: TrueForgeFailureClass;
+  failureCategory?: TrueForgeFailureCategory;
+  retryable?: boolean;
+}
+
 export class TrueForgeIntegrationError extends Error {
   readonly operation: string;
+  readonly failureClass: TrueForgeFailureClass;
+  readonly failureCategory: TrueForgeFailureCategory;
+  readonly retryable: boolean;
 
-  constructor(operation: string, message: string) {
+  constructor(
+    operation: string,
+    message: string,
+    options: TrueForgeIntegrationErrorOptions = {},
+  ) {
     super(message);
     this.name = "TrueForgeIntegrationError";
     this.operation = operation;
+    this.retryable = options.retryable ?? options.failureClass === "infrastructure";
+    this.failureClass = options.failureClass ??
+      (this.retryable ? "infrastructure" : "implementation");
+    this.failureCategory = options.failureCategory ??
+      (this.failureClass === "infrastructure" ? "transport" : "verification");
   }
 }
 
@@ -1540,14 +1568,20 @@ export class TrueForgeMissionRunner {
         },
       };
     } catch (error) {
-      const reason = error instanceof TrueForgeIntegrationError
-        ? error.message
-        : "Independent final-state proof failed.";
-      await this.recordImplementationProofFailure(mission.id, workItem.id, reason, measurements);
-      if (error instanceof TrueForgeIntegrationError) {
-        throw error;
-      }
-      throw new TrueForgeIntegrationError("prove implementation", reason);
+      const proofError = error instanceof TrueForgeIntegrationError
+        ? error
+        : new TrueForgeIntegrationError(
+            "prove implementation",
+            "Independent final-state proof failed.",
+          );
+      await this.recordImplementationProofFailure(
+        mission.id,
+        workItem.id,
+        proofError.message,
+        measurements,
+        proofError,
+      );
+      throw proofError;
     }
   }
 
@@ -1564,6 +1598,11 @@ export class TrueForgeMissionRunner {
       throw new TrueForgeIntegrationError(
         "prove implementation",
         "Agentic execution did not leave a persisted TrueForge session, sandbox, and predecessor turn for independent proof.",
+        {
+          failureClass: "infrastructure",
+          failureCategory: "configuration",
+          retryable: true,
+        },
       );
     }
     const sandboxExecutor = this.config.sandboxExecutor;
@@ -1571,6 +1610,11 @@ export class TrueForgeMissionRunner {
       throw new TrueForgeIntegrationError(
         "prove implementation",
         "Direct sandbox execution is required for implementation proof, but no sandbox executor is configured.",
+        {
+          failureClass: "infrastructure",
+          failureCategory: "configuration",
+          retryable: true,
+        },
       );
     }
 
@@ -1587,31 +1631,65 @@ export class TrueForgeMissionRunner {
       throw new TrueForgeIntegrationError(
         "prove implementation",
         `Direct sandbox execution failed: ${sanitizeRuntimeText(reason)}`,
+        proofInfrastructureErrorOptions(error),
       );
     }
+    const executionRecord = isRecord(execution) ? execution : undefined;
+    const observedSandboxId = executionRecord?.sandboxId;
+    const returnedSandboxId = typeof observedSandboxId === "string"
+      ? observedSandboxId
+      : undefined;
+    const exitCode = executionRecord?.exitCode;
+    const stdout = executionRecord?.stdout;
     if (
-      (execution.sandboxId !== undefined && execution.sandboxId !== mission.trueforgeSandboxId) ||
-      !Number.isInteger(execution.exitCode) ||
-      typeof execution.stdout !== "string"
+      executionRecord === undefined ||
+      (observedSandboxId !== undefined && typeof observedSandboxId !== "string") ||
+      typeof exitCode !== "number" ||
+      !Number.isInteger(exitCode) ||
+      typeof stdout !== "string"
     ) {
       throw new TrueForgeIntegrationError(
         "prove implementation",
         "Direct sandbox execution returned an invalid or different sandbox result.",
+        {
+          failureClass: "infrastructure",
+          failureCategory: returnedSandboxId === undefined ||
+            returnedSandboxId === mission.trueforgeSandboxId
+            ? "transport"
+            : "identity",
+          retryable: true,
+        },
       );
     }
-    if (execution.stdout.length > MAX_IMPLEMENTATION_PROOF_OUTPUT_LENGTH) {
+    if (returnedSandboxId !== undefined && returnedSandboxId !== mission.trueforgeSandboxId) {
+      throw new TrueForgeIntegrationError(
+        "prove implementation",
+        "Direct sandbox execution returned an invalid or different sandbox result.",
+        {
+          failureClass: "infrastructure",
+          failureCategory: "identity",
+          retryable: true,
+        },
+      );
+    }
+    if (stdout.length > MAX_IMPLEMENTATION_PROOF_OUTPUT_LENGTH) {
       throw new TrueForgeIntegrationError(
         "prove implementation",
         `Direct sandbox execution exceeded the ${MAX_IMPLEMENTATION_PROOF_OUTPUT_LENGTH}-character output bound.`,
+        {
+          failureClass: "infrastructure",
+          failureCategory: "transport",
+          retryable: true,
+        },
       );
     }
     const sandboxId = execution.sandboxId ?? mission.trueforgeSandboxId;
     return {
       sessionId: mission.trueforgeSessionId,
       verified: {
-        exitCode: execution.exitCode,
-        stdout: execution.stdout,
-        outputSummary: summarizeOutput(execution.stdout),
+        exitCode,
+        stdout,
+        outputSummary: summarizeOutput(stdout),
         observedExecCount: 1,
         sandboxId,
       },
@@ -3735,6 +3813,7 @@ export class TrueForgeMissionRunner {
     workItemId: string,
     reason: string,
     measurements: readonly ImplementationProofMeasurement[] = [],
+    error?: TrueForgeIntegrationError,
   ): Promise<void> {
     const safeReason = sanitizeRuntimeText(reason);
     try {
@@ -3745,8 +3824,12 @@ export class TrueForgeMissionRunner {
         source: "sandbox",
         summary: `Independent final-state proof failed: ${safeReason}`,
         details: JSON.stringify({
-          failure_layer: "proof",
+          failure_layer: "tool",
           failure_category: "sandbox",
+          failure_class: error?.failureClass ?? "implementation",
+          failure_reason_category: error?.failureCategory ?? "verification",
+          retryable: error?.retryable ?? false,
+          phase: "deterministic-proof",
           proof_mode: IMPLEMENTATION_PROOF_MODE,
           reason: safeReason,
           measurements,
@@ -4560,6 +4643,39 @@ function boundedContractReviewText(value: unknown, maxLength: number): value is 
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function proofInfrastructureErrorOptions(
+  error: unknown,
+): TrueForgeIntegrationErrorOptions {
+  if (error instanceof TrueForgeIntegrationError) {
+    return {
+      failureClass: error.failureClass,
+      failureCategory: error.failureCategory,
+      retryable: error.retryable,
+    };
+  }
+  const record = isRecord(error) ? error : undefined;
+  const failureCategory = trueForgeFailureCategory(record?.failureCategory) ??
+    trueForgeFailureCategory(record?.failure_reason_category) ??
+    "transport";
+  return {
+    failureClass: "infrastructure",
+    failureCategory,
+    retryable: true,
+  };
+}
+
+function trueForgeFailureCategory(value: unknown): TrueForgeFailureCategory | undefined {
+  return value === "verification" ||
+    value === "configuration" ||
+    value === "authentication" ||
+    value === "network" ||
+    value === "transport" ||
+    value === "identity" ||
+    value === "runtime"
+    ? value
+    : undefined;
 }
 
 function verificationFailure(operation: string, message: string): never {

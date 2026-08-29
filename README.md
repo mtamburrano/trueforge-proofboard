@@ -73,10 +73,10 @@ structured resource. Failed or incomplete MCP evidence blocks the mission; it is
 never replaced with canned repository content. `runSandboxVerification` applies the
 same proof boundary to the canonical sandbox `exec` tool, recording the exact
 command, exit code, and bounded output summary. Implementation proof runs its
-authoritative measurements through a direct Daytona toolbox request addressed
-to the persisted sandbox ID; it never asks a model to select or invoke a proof
+authoritative measurements through the official Daytona SDK, retrieving the
+exact persisted sandbox ID; it never asks a model to select or invoke a proof
 command. Set the server-only `DAYTONA_API_KEY` (and optionally
-`DAYTONA_TOOLBOX_BASE_URL`) when running the HTTP app. Without that executor,
+`DAYTONA_API_URL`) when running the HTTP app. Without that executor,
 implementation proof fails closed and records the missing integration. The
 deterministic primary fixture runs its checks from the provisioned project directory.
 

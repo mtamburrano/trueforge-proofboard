@@ -28,6 +28,7 @@ class TestMissionRunner {
     missions,
     {
       failSandbox = false,
+      sandboxInfrastructureFailure = false,
       secretInspectionError = false,
       createGate,
       reconciliationResult = "found",
@@ -39,6 +40,7 @@ class TestMissionRunner {
   ) {
     this.missions = missions;
     this.failSandbox = failSandbox;
+    this.sandboxInfrastructureFailure = sandboxInfrastructureFailure;
     this.secretInspectionError = secretInspectionError;
     this.createGate = createGate;
     this.reconciliationResult = reconciliationResult;
@@ -198,18 +200,37 @@ class TestMissionRunner {
     this.calls.sandbox += 1;
     this.sandboxInputs.push(input);
     const origin = { kind: "sandbox", sessionId: "test-session-durable" };
-    if (this.failSandbox) {
+    if (this.failSandbox || this.sandboxInfrastructureFailure) {
       await this.missions.addEvidence(input.missionId, {
         workItemId: input.workItemId,
         kind: "test_result",
         result: "failed",
         source: "sandbox",
         summary: "Independent final-state proof failed.",
-        details: JSON.stringify({ command: PRIMARY_VERIFICATION_COMMAND, exit_code: 1 }),
+        details: JSON.stringify({
+          command: PRIMARY_VERIFICATION_COMMAND,
+          exit_code: 1,
+          ...(this.sandboxInfrastructureFailure
+            ? {
+                proof_mode: IMPLEMENTATION_PROOF_MODE,
+                phase: "deterministic-proof",
+                failure_class: "infrastructure",
+                failure_reason_category: "network",
+                retryable: true,
+              }
+            : {}),
+        }),
       });
       throw new TrueForgeIntegrationError(
         "prove implementation",
         "Independent authoritative test exited with code 1.",
+        this.sandboxInfrastructureFailure
+          ? {
+              failureClass: "infrastructure",
+              failureCategory: "network",
+              retryable: true,
+            }
+          : undefined,
       );
     }
     const workItem = await this.missions.getWorkItem(input.missionId, input.workItemId);
@@ -527,7 +548,7 @@ test("initial mission route and static application assets load", async () => {
   assert.equal(page.status, 200);
   assert.match(page.headers.get("content-type"), /text\/html/);
   const pageBody = await page.text();
-  assert.match(pageBody, /MISSION CONTROL/);
+  assert.match(pageBody, /PROOF BOARD/);
   assert.match(pageBody, /run-state\.js[\s\S]+app\.js/);
   assert.match(page.headers.get("content-security-policy"), /default-src 'self'/);
 
@@ -799,6 +820,8 @@ test("API maps persisted proof separately from runtime narration and redacts sec
   assert.equal(payload.mission.evidence.find((item) => item.source === "mcp").metadata.commitSha, "durable-commit");
   assert.equal(payload.mission.evidence.find((item) => item.source === "sandbox").metadata.exitCode, 1);
   assert.equal(payload.mission.activity.some((item) => item.category === "narration"), true);
+  assert.equal(payload.mission.activity.find((item) => item.category === "repository").actor, "GitHub MCP read");
+  assert.equal(payload.mission.activity.find((item) => item.category === "sandbox").actor, "Proof Board verification · Daytona sandbox");
   assert.equal(payload.mission.evidence.some((item) => item.summary.includes("Free-form")), false);
   assert.equal(payload.mission.progress.verification, "failed");
 
@@ -953,6 +976,61 @@ test("run mission performs deterministic proof and independent review after codi
   assert.equal(state.evidence.some((item) =>
     item.workItemId === implementTicket.id && item.source === "sandbox" && item.attempt === 1
   ), true);
+});
+
+test("proof infrastructure failure retries Proving without another coding turn", async () => {
+  const { app, runner, missions } = testApp(new InMemoryMissionRepository(), {
+    sandboxInfrastructureFailure: true,
+  });
+
+  await app.request("/api/mission", { method: "POST" });
+  let current = await json(await app.request("/api/mission"));
+  const inspectTicket = current.mission.tickets.find((item) => item.assignedRole === "planner");
+  await authorizeTicket(app, inspectTicket.id);
+  await app.request("/api/mission/run", { method: "POST" });
+
+  current = await json(await app.request("/api/mission"));
+  const implementTicket = current.mission.tickets.find((item) => item.assignedRole === "implementer");
+  await authorizeTicket(app, implementTicket.id);
+  await app.request("/api/mission/run", { method: "POST" });
+
+  const failedProof = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(failedProof.status, 200);
+  const proving = await json(failedProof);
+  const provingTicket = proving.mission.tickets.find((item) => item.id === implementTicket.id);
+  assert.equal(provingTicket.status, "proving");
+  assert.equal(provingTicket.attempt, 1);
+  assert.equal(proving.mission.approvals.length, 0);
+  assert.equal(proving.mission.handoffs.length, 0);
+  assert.equal(proving.mission.reviews.length, 0);
+  assert.equal(runner.calls.turn, 1);
+  assert.equal(runner.calls.sandbox, 1);
+
+  const failedState = await missions.getState();
+  const retryEvidence = failedState.evidence.find((item) =>
+    item.workItemId === implementTicket.id &&
+    item.source === "system" &&
+    item.result === "failed" &&
+    JSON.parse(item.details).retryable === true,
+  );
+  assert.ok(retryEvidence, "A retryable proof failure must be durably recorded.");
+  assert.equal(JSON.parse(retryEvidence.details).failure_class, "infrastructure");
+
+  runner.sandboxInfrastructureFailure = false;
+  const recoveredProof = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(recoveredProof.status, 200);
+  const recovered = await json(recoveredProof);
+  const recoveredTicket = recovered.mission.tickets.find((item) => item.id === implementTicket.id);
+  assert.equal(recoveredTicket.status, "awaiting_approval");
+  assert.equal(recoveredTicket.attempt, 1);
+  assert.equal(recoveredTicket.claim.trueforgeSessionId, "test-session-durable");
+  assert.equal(recoveredTicket.claim.trueforgeSandboxId, "test-sandbox-durable");
+  assert.equal(runner.calls.turn, 1);
+  assert.equal(runner.calls.sandbox, 2);
+  assert.equal(recovered.mission.handoffs.length, 1);
+  assert.equal(recovered.mission.reviews.length, 1);
+  assert.equal(recovered.mission.approvals.length, 1);
+  assert.equal((await missions.getState()).evidence.some((item) => item.id === retryEvidence.id), true);
 });
 
 test("delivery approval refuses a green handoff without the direct proof marker", async () => {

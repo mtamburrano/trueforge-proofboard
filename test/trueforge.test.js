@@ -14,10 +14,13 @@ import {
   SANDBOX_TOOLCHAIN_PROOF_COMMAND,
   SANDBOX_TOOLCHAIN_READINESS_COMMAND,
   SANDBOX_TOOLCHAIN_READINESS_INTENT,
+  TrueForgeIntegrationError,
   TrueForgeMissionRunner,
   buildCoordinatorAgentSpec,
   buildMissionAgentSpec,
   createDaytonaSandboxExecutor,
+  DaytonaSandboxExecutionError,
+  resolveDaytonaSandboxId,
 } from "../dist/index.js";
 
 const LOCKED_FIXTURE_SHA = "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b";
@@ -3194,90 +3197,126 @@ test("independent implementation proof rejects out-of-scope final changes before
   ), true);
 });
 
-test("direct Daytona proof execution targets the requested sandbox without a TrueForge turn", async () => {
-  const requests = [];
-  const executor = createDaytonaSandboxExecutor({
-    apiKey: "daytona-test-secret",
-    toolboxBaseUrl: "https://proxy.example/toolbox/",
-    commandTimeoutSeconds: 17,
-    fetch: async (url, init) => {
-      requests.push({ url: String(url), init });
+test("direct Daytona proof execution resolves the exact persisted sandbox through the SDK", async () => {
+  const getRequests = [];
+  const executeRequests = [];
+  const daytona = {
+    async get(sandboxId) {
+      getRequests.push(sandboxId);
       return {
-        ok: true,
-        status: 200,
-        async json() {
-          return { exitCode: 0, result: "proof output\n" };
+        id: sandboxId,
+        process: {
+          async executeCommand(command, cwd, env, timeout) {
+            executeRequests.push({ command, cwd, env, timeout });
+            return { exitCode: 0, result: "proof output\n" };
+          },
         },
       };
     },
+  };
+  const executor = createDaytonaSandboxExecutor({
+    daytona,
+    commandTimeoutSeconds: 17,
   });
 
   const result = await executor.execute({
-    sandboxId: "sandbox/persisted",
+    sandboxId: "v1:daytona:raw-persisted-id",
     command: "git status --porcelain=v1",
     cwd: "/proof",
   });
 
-  assert.equal(requests.length, 1);
-  assert.equal(
-    requests[0].url,
-    "https://proxy.example/toolbox/sandbox%2Fpersisted/process/execute",
-  );
-  assert.equal(requests[0].init.method, "POST");
-  assert.equal(requests[0].init.headers.Authorization, "Bearer daytona-test-secret");
-  assert.deepEqual(JSON.parse(requests[0].init.body), {
+  assert.deepEqual(getRequests, ["raw-persisted-id"]);
+  assert.deepEqual(executeRequests, [{
     command: "git status --porcelain=v1",
     cwd: "/proof",
+    env: undefined,
     timeout: 17,
-  });
+  }]);
   assert.deepEqual(result, {
-    sandboxId: "sandbox/persisted",
+    sandboxId: "v1:daytona:raw-persisted-id",
     exitCode: 0,
     stdout: "proof output\n",
   });
 });
 
-test("Daytona rejects bearer-authenticated HTTP endpoints unless loopback development is explicit", async () => {
+test("Daytona sandbox references reject an unknown provider namespace and classify auth failures", async () => {
   assert.throws(
-    () => createDaytonaSandboxExecutor({
-      apiKey: "daytona-test-secret",
-      toolboxBaseUrl: "http://proxy.example/toolbox",
-      fetch: async () => ({ ok: true, status: 200, async json() { return { exitCode: 0, result: "" }; } }),
-    }),
-    /must use HTTPS/i,
+    () => resolveDaytonaSandboxId("v1:other:raw-persisted-id"),
+    /unsupported provider namespace/i,
   );
-  assert.throws(
-    () => createDaytonaSandboxExecutor({
-      apiKey: "daytona-test-secret",
-      toolboxBaseUrl: "http://127.0.0.1:8080/toolbox",
-      fetch: async () => ({ ok: true, status: 200, async json() { return { exitCode: 0, result: "" }; } }),
-    }),
-    /must use HTTPS/i,
-  );
-
-  const requests = [];
   const executor = createDaytonaSandboxExecutor({
-    apiKey: "daytona-test-secret",
-    toolboxBaseUrl: "http://127.0.0.1:8080/toolbox",
-    allowInsecureLoopbackForDevelopment: true,
-    fetch: async (url, init) => {
-      requests.push({ url: String(url), init });
-      return {
-        ok: true,
-        status: 200,
-        async json() {
-          return { exitCode: 0, result: "loopback proof\n" };
-        },
-      };
+    daytona: {
+      async get() {
+        const error = new Error("Authorization: Bearer live-token");
+        error.name = "DaytonaAuthenticationError";
+        error.statusCode = 401;
+        throw error;
+      },
     },
   });
-  const result = await executor.execute({
-    sandboxId: "sandbox-loopback",
-    command: "true",
+  await assert.rejects(
+    executor.execute({ sandboxId: "v1:daytona:raw-persisted-id", command: "true" }),
+    (error) => error instanceof DaytonaSandboxExecutionError &&
+      error.retryable === true &&
+      error.failureClass === "infrastructure" &&
+      error.failureCategory === "authentication" &&
+      !error.message.includes("live-token"),
+  );
+});
+
+test("direct proof marks sandbox transport failures retryable without changing the proof commands", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client, calls } = fakeClient();
+  const sandboxExecutor = {
+    calls: [],
+    async execute(request) {
+      this.calls.push(request);
+      throw new Error("connection reset by peer");
+    },
+  };
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-4-mini",
+    sandboxExecutor,
   });
-  assert.equal(requests.length, 1);
-  assert.match(requests[0].url, /^http:\/\/127\.0\.0\.1:8080\/toolbox\//);
-  assert.equal(result.stdout, "loopback proof\n");
+  const mission = await runner.createMission({
+    id: "mission-retryable-proof-transport",
+    objective: "Classify provider transport failure as retryable proof infrastructure.",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_SHA,
+    },
+  });
+  const workItem = await missions.addWorkItem(mission.id, {
+    id: "work-retryable-proof-transport",
+    title: "Measure the verified implementation",
+    purpose: "Prove the implementation from the persisted sandbox.",
+    acceptanceCriteria: ["Provider transport failures remain retryable."],
+    assignedRole: "implementer",
+    requiredChecks: ["typecheck", "test"],
+    allowedFiles: ["src/index.ts"],
+    status: "ready",
+  });
+  await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
+  await missions.attachTrueforgeTurn(mission.id, "turn-retryable-proof-transport");
+  await missions.attachTrueforgeSandbox(mission.id, "v1:daytona:raw-proof-sandbox");
+
+  await assert.rejects(
+    runner.proveImplementation({ missionId: mission.id, workItemId: workItem.id }),
+    (error) => error instanceof TrueForgeIntegrationError &&
+      error.retryable === true &&
+      error.failureClass === "infrastructure" &&
+      error.failureCategory === "transport",
+  );
+  assert.equal(calls.turns.length, 0);
+  assert.equal(sandboxExecutor.calls.length, 1);
+  const state = await missions.getState();
+  const failure = state.evidence.find((item) => item.result === "failed");
+  assert.ok(failure);
+  const details = JSON.parse(failure.details);
+  assert.equal(details.retryable, true);
+  assert.equal(details.failure_class, "infrastructure");
+  assert.equal(details.failure_reason_category, "transport");
 });
 
 test("sandbox verification persists the command, output summary, and exit status", async () => {
