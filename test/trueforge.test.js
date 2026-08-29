@@ -3160,7 +3160,7 @@ test("sandbox verification rejects incomplete or unsafe proof", async () => {
           cwd: "/tmp",
         },
       },
-      error: /cwd must be omitted or exactly "\/".*\/tmp/,
+      error: /cwd is not permitted for generic sandbox verification.*\/tmp/,
     },
     {
       label: "provider working directory",
@@ -3171,7 +3171,7 @@ test("sandbox verification rejects incomplete or unsafe proof", async () => {
           cwd: "/workspace",
         },
       },
-      error: /cwd must be omitted or exactly "\/".*\/workspace/,
+      error: /cwd is not permitted for generic sandbox verification.*\/workspace/,
     },
     {
       label: "malformed arguments",
@@ -3179,7 +3179,7 @@ test("sandbox verification rejects incomplete or unsafe proof", async () => {
       error: /arguments were not a JSON object/,
     },
     {
-      label: "root working directory",
+      label: "root working directory on generic command",
       options: {
         sandboxArguments: {
           intent: SANDBOX_VERIFICATION_INTENT,
@@ -3187,7 +3187,7 @@ test("sandbox verification rejects incomplete or unsafe proof", async () => {
           cwd: "/",
         },
       },
-      expectedSuccess: true,
+      error: /cwd is not permitted for generic sandbox verification.*\//,
     },
     {
       label: "unexpected environment",

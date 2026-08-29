@@ -1448,6 +1448,7 @@ export class TrueForgeMissionRunner {
         command,
         toolName,
         mission.trueforgeSandboxId,
+        true,
       ),
     };
   }
@@ -5513,7 +5514,9 @@ function coordinatorExecArgumentFailureReason(
       const observedCwd = typeof argumentsValue.cwd === "string"
         ? JSON.stringify(argumentsValue.cwd)
         : "a non-string value";
-      return `cwd must be omitted or exactly "/" for anchored proof (observed ${observedCwd})`;
+      return allowRootCwd
+        ? `cwd must be omitted or exactly "/" for anchored proof (observed ${observedCwd})`
+        : `cwd is not permitted for generic sandbox verification (observed ${observedCwd})`;
     }
     return `unsupported extra argument${unsupportedKeys.length === 1 ? "" : "s"}: ${unsupportedKeys.join(", ")}`;
   }
@@ -5933,6 +5936,7 @@ function verifySandboxExecution(
   command: string,
   toolName: string,
   expectedSandboxId?: string,
+  allowRootCwd = false,
 ): VerifiedSandboxExecution {
   if (toolName !== "exec") {
     return sandboxFailure("Sandbox verification requires the canonical TrueForge exec tool.");
@@ -5955,9 +5959,9 @@ function verifySandboxExecution(
       `Expected exactly one canonical ${toolName} sandbox call, found 0 observed exec calls; no coordinator exec was emitted.`,
     );
   }
-  if (coordinatorExecProvenance(execution.arguments, command, {}, true, true) === null) {
+  if (coordinatorExecProvenance(execution.arguments, command, {}, true, allowRootCwd) === null) {
     return sandboxFailure(
-      `${toolName} sandbox call was observed but its arguments were not canonical: ${coordinatorExecArgumentFailureReason(execution.arguments, command, true)}.`,
+      `${toolName} sandbox call was observed but its arguments were not canonical: ${coordinatorExecArgumentFailureReason(execution.arguments, command, allowRootCwd)}.`,
     );
   }
   const call = execution;
