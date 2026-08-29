@@ -8,6 +8,7 @@ import {
   MAX_TRUEFORGE_ITERATION_LIMIT,
   MissionService,
   PRIMARY_VERIFIED_DELIVERY_PATCHES,
+  SANDBOX_SETUP_EXEC_LIMIT,
   SANDBOX_SETUP_ITERATION_LIMIT,
   SANDBOX_TOOLCHAIN_PROOF_COMMAND,
   SANDBOX_TOOLCHAIN_READINESS_COMMAND,
@@ -649,6 +650,7 @@ function sandboxSetupEvents(
   {
     commands = ["apt-get update", "apt-get install -y nodejs npm"],
     exitCodes = [1, 0],
+    outputs = exitCodes.map((exitCode) => exitCode === 0 ? "setup complete\n" : "setup failed\n"),
     intents = commands.map((command) => `Prepare the sandbox with ${command}.`),
     execThreadId = "main",
     responseThreadId = "main",
@@ -657,6 +659,7 @@ function sandboxSetupEvents(
   } = {},
 ) {
   assert.equal(commands.length, exitCodes.length);
+  assert.equal(commands.length, outputs.length);
   assert.equal(commands.length, intents.length);
   const events = [
     {
@@ -701,7 +704,7 @@ function sandboxSetupEvents(
           success: true,
           response: {
             exitCode: exitCodes[index],
-            result: exitCodes[index] === 0 ? "setup complete\n" : "setup failed\n",
+            result: outputs[index],
           },
         }),
       },
@@ -847,6 +850,11 @@ test("runner provisions a missing Debian 12 sandbox toolchain before delegated w
   assert.equal(calls.updates[1].request.agent.spec.model.params, undefined);
   assert.match(calls.turns[0].request.input[0].content, /before any coding delegation/);
   assert.match(calls.turns[0].request.input[0].content, /bounded setup\/mutation/);
+  assert.match(calls.turns[0].request.input[0].content, /separate budget of at most 4 sequential exec calls/);
+  assert.match(calls.turns[0].request.input[0].content, /model-iteration budget for this phase is 5/);
+  assert.match(calls.turns[0].request.input[0].content, /Debian 12\/bookworm/);
+  assert.match(calls.turns[0].request.input[0].content, /NodeSource 22\.x/);
+  assert.match(calls.turns[0].request.input[0].content, /do not treat a successful setup command or narration as proof/);
   assert.doesNotMatch(calls.turns[0].request.input[0].content, /TRUEFORGE_TOOLCHAIN_PROOF/);
   assert.match(calls.turns[1].request.input[0].content, /TRUEFORGE_TOOLCHAIN_PROOF/);
   assert.deepEqual(sandboxInstructionArguments(calls.turns[1].request), {
@@ -986,7 +994,94 @@ test("sandbox setup budget exhaustion fails closed before deterministic proof", 
   assert.ok(failure);
   assert.match(failure.details, /bounded-setup/);
   assert.match(failure.details, /observed_exec_count.*4/);
-  assert.match(failure.details, /budget exhaustion|iteration limit/i);
+  assert.match(failure.details, /model iteration budget exhaustion|iteration limit/i);
+});
+
+test("bounded setup accepts its four-exec maximum with a separate completion iteration", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const setupCommands = Array.from(
+    { length: SANDBOX_SETUP_EXEC_LIMIT },
+    (_, index) => `echo setup-${index + 1}`,
+  );
+  const { client, calls } = fakeClient((turnId, agentSpec) => {
+    if (agentSpec?.config?.iterationLimit === SANDBOX_SETUP_ITERATION_LIMIT) {
+      return sandboxSetupEvents(turnId, {
+        commands: setupCommands,
+        exitCodes: [1, 0, 0, 0],
+      });
+    }
+    assert.equal(agentSpec?.config?.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
+    return sandboxToolchainProofEvents(turnId);
+  }, { passAgentSpec: true });
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "google-gemini/test-model",
+  });
+  const mission = await runner.createMission({
+    id: "mission-sandbox-setup-max-exec-boundary",
+    objective: "Accept a setup turn at its independent exec maximum",
+  });
+
+  const result = await runner.prepareSandbox({ missionId: mission.id });
+
+  assert.equal(result.nodeVersion, "v22.14.0");
+  assert.equal(calls.turns.length, 2);
+  assert.equal(calls.turns[0].events.filter((event) => event.type === "tool.response").length, SANDBOX_SETUP_EXEC_LIMIT);
+  assert.deepEqual(
+    calls.updates.map((update) => update.request.agent.spec.config.iterationLimit),
+    [SANDBOX_SETUP_ITERATION_LIMIT, DEFAULT_TRUEFORGE_ITERATION_LIMIT, COORDINATOR_TRUEFORGE_ITERATION_LIMIT, DEFAULT_TRUEFORGE_ITERATION_LIMIT],
+  );
+  const setupEvidence = (await missions.getState()).evidence.find((item) =>
+    item.summary.includes("Bounded sandbox toolchain setup completed"),
+  );
+  assert.ok(setupEvidence);
+  assert.match(setupEvidence.details, /"observed_exec_count":4/);
+});
+
+test("Debian 12 setup guidance recovers from stock Node 18 before independent proof", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const setupCommands = [
+    "node --version && npm --version",
+    "apt-get update && apt-get install -y ca-certificates curl gnupg",
+    "curl -fsSL https://deb.nodesource.com/setup_22.x | bash -",
+    "node --version && npm --version",
+  ];
+  const { client, calls } = fakeClient((turnId, agentSpec) =>
+    agentSpec?.config?.iterationLimit === SANDBOX_SETUP_ITERATION_LIMIT
+      ? sandboxSetupEvents(turnId, {
+          commands: setupCommands,
+          exitCodes: [0, 0, 0, 0],
+          outputs: [
+            "v18.20.4\n10.8.2\n",
+            "apt prerequisites installed\n",
+            "NodeSource 22.x configured\n",
+            "v22.14.0\n10.9.2\n",
+          ],
+        })
+      : sandboxToolchainProofEvents(turnId),
+  { passAgentSpec: true });
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "google-gemini/test-model",
+  });
+  const mission = await runner.createMission({
+    id: "mission-sandbox-debian-12-node18-recovery",
+    objective: "Recover a Debian 12 stock Node.js runtime before coding",
+  });
+
+  const result = await runner.prepareSandbox({ missionId: mission.id });
+
+  assert.equal(result.nodeVersion, "v22.14.0");
+  assert.equal(result.npmVersion, "10.9.2");
+  assert.equal(calls.turns.length, 2);
+  const setupInstruction = calls.turns[0].request.input[0].content;
+  assert.match(setupInstruction, /Debian 12\/bookworm/);
+  assert.match(setupInstruction, /stock apt nodejs is Node\.js 18/);
+  assert.match(setupInstruction, /NodeSource 22\.x/);
+  assert.match(setupInstruction, /Inspect both versions again after installation/);
+  assert.match(setupInstruction, /narration as proof/);
+  assert.deepEqual(sandboxInstructionArguments(calls.turns[1].request), {
+    intent: SANDBOX_TOOLCHAIN_READINESS_INTENT,
+    command: SANDBOX_TOOLCHAIN_PROOF_COMMAND,
+  });
 });
 
 test("coordinator sandbox readiness and verification require root main call and response threads", async () => {

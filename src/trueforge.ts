@@ -121,7 +121,11 @@ export const MAX_TRUEFORGE_ITERATION_LIMIT = 1_024;
 /** Deterministic coordinator operations get one model iteration and one tool call. */
 export const COORDINATOR_TRUEFORGE_ITERATION_LIMIT = 1;
 /** Setup may observe and correct a failed sandbox command, but remains finite. */
-export const SANDBOX_SETUP_ITERATION_LIMIT = 4;
+export const SANDBOX_SETUP_EXEC_LIMIT = 4;
+/** Compatibility alias for callers that name the setup bound as a count. */
+export const SANDBOX_SETUP_MAX_EXEC_COUNT = SANDBOX_SETUP_EXEC_LIMIT;
+/** TrueForge consumes one model iteration per model call, including the final response. */
+export const SANDBOX_SETUP_ITERATION_LIMIT = SANDBOX_SETUP_EXEC_LIMIT + 1;
 export const MINIMUM_SANDBOX_NODE_MAJOR_VERSION = 20;
 export const SANDBOX_TOOLCHAIN_READINESS_INTENT =
   "Prepare and verify the sandbox toolchain before coding delegation.";
@@ -129,30 +133,27 @@ export const LOCKED_REPOSITORY_PREPARATION_INTENT =
   "Prepare and verify the locked repository before delegated workspace proof.";
 const SANDBOX_TOOLCHAIN_REQUIREMENT =
   "Node.js >=20 and npm are required before coding delegation.";
+const SANDBOX_NODE_SOURCE_MAJOR = 22;
+const SANDBOX_NODE_SOURCE_SETUP_URL =
+  `https://deb.nodesource.com/setup_${SANDBOX_NODE_SOURCE_MAJOR}.x`;
 export const DELEGATED_COMPLETE_CHANGED_FILES_COMMAND =
   "git status --porcelain=v1 -z --untracked-files=all";
 export { DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND } from "./diff.js";
 
 /**
- * The setup command is intentionally supplied by the bounded setup agent. It
- * may iterate over local sandbox preparation without making a long command a
- * model-reconstruction contract. The proof command below is the only
- * coordinator-owned repository command and is read-only.
+ * Setup is intentionally supplied by the bounded setup agent. The proof is a
+ * short raw measurement; its facts are normalized and validated in TypeScript.
  */
 export const LOCKED_REPOSITORY_PROOF_COMMAND = [
   "set -eu",
   "unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE",
-  "remote_url=\"$(git config --get remote.origin.url)\"",
-  "remote_identity=\"$(printf '%s' \"$remote_url\" | sed -E 's#^(https://github\\.com/|ssh://git@github\\.com/|git@github\\.com:)##; s#\\.git$##; s#/$##')\"",
-  "repository_root=\"$(git rev-parse --show-toplevel)\"",
-  "head_sha=\"$(git rev-parse --verify HEAD)\"",
-  "worktree_status=\"$(git status --porcelain=v1 --untracked-files=all)\"",
-  "symbolic_head=\"$(git symbolic-ref --short -q HEAD || true)\"",
-  "clean=false",
-  "if [ -z \"$worktree_status\" ]; then clean=true; fi",
-  "detached=false",
-  "if [ -z \"$symbolic_head\" ]; then detached=true; fi",
-  "printf 'TRUEFORGE_REPOSITORY_PROOF repository=%s sha=%s clean=%s detached=%s root=%s\\n' \"$remote_identity\" \"$head_sha\" \"$clean\" \"$detached\" \"$repository_root\"",
+  "printf 'TRUEFORGE_REPOSITORY_PROOF\\n'",
+  "pwd -P",
+  "git config --get remote.origin.url",
+  "git rev-parse --show-toplevel",
+  "git rev-parse --verify HEAD",
+  "git rev-parse --abbrev-ref HEAD",
+  "git status --porcelain=v1 --untracked-files=all",
 ].join("; ");
 
 /** Compatibility names now point at the deterministic proof, never setup. */
@@ -648,6 +649,7 @@ export interface SandboxRepositoryPreparationResult {
   repository: string;
   baselineSha: string;
   repositoryRoot: string;
+  workspaceRoot: string;
   sandboxId?: string;
   evidenceId: string;
   mission: Mission;
@@ -775,6 +777,7 @@ interface VerifiedLockedRepositoryPreparation extends VerifiedSandboxExecution {
   repository: string;
   baselineSha: string;
   repositoryRoot: string;
+  workspaceRoot: string;
 }
 
 interface VerifiedSandboxSetup {
@@ -1165,6 +1168,7 @@ export class TrueForgeMissionRunner {
           repository: verified.repository,
           baseline_sha: verified.baselineSha,
           repository_root: verified.repositoryRoot,
+          workspace_root: verified.workspaceRoot,
           observed_exec_count: verified.observedExecCount,
           ...(verified.sandboxId === undefined ? {} : { sandbox_id: verified.sandboxId }),
         }),
@@ -1181,6 +1185,7 @@ export class TrueForgeMissionRunner {
         repository: verified.repository,
         baselineSha: verified.baselineSha,
         repositoryRoot: verified.repositoryRoot,
+        workspaceRoot: verified.workspaceRoot,
         ...(verified.sandboxId === undefined ? {} : { sandboxId: verified.sandboxId }),
         evidenceId: evidence.id,
         mission: await this.missions.getMission(mission.id),
@@ -3530,8 +3535,9 @@ function buildSandboxPreparationInstruction(
   return [
     `Run bounded sandbox-only setup for mission ${mission.id} before any coding delegation.`,
     `Use only the configured sandbox ${toolName} tool; this is the bounded setup/mutation phase.`,
-    `You may issue at most ${SANDBOX_SETUP_ITERATION_LIMIT} sequential ${toolName} calls, one at a time, to prepare the Node.js >=${MINIMUM_SANDBOX_NODE_MAJOR_VERSION} and npm toolchain.`,
+    `You have a separate budget of at most ${SANDBOX_SETUP_EXEC_LIMIT} sequential ${toolName} calls; the TrueForge model-iteration budget for this phase is ${SANDBOX_SETUP_ITERATION_LIMIT}.`,
     "A setup command may fail; inspect its structured exit result and correct the setup within this same bounded phase.",
+    `On Debian 12/bookworm, inspect node --version and npm --version before stopping. Debian's stock apt nodejs is Node.js 18 and does not satisfy readiness; when Node.js is missing, below ${MINIMUM_SANDBOX_NODE_MAJOR_VERSION}, or npm is missing, configure a signed NodeSource ${SANDBOX_NODE_SOURCE_MAJOR}.x source (for example ${SANDBOX_NODE_SOURCE_SETUP_URL}) and install nodejs from it. Inspect both versions again after installation and do not treat a successful setup command or narration as proof.`,
     mission.trueforgeSandboxId === undefined
       ? "Use the newly created sandbox and keep all setup calls on the coordinator root thread."
       : `Reuse the persisted sandbox ${mission.trueforgeSandboxId} and do not create a replacement sandbox.`,
@@ -3564,13 +3570,14 @@ function buildLockedRepositoryPreparationInstruction(
   return [
     `Run bounded sandbox-only repository setup for mission ${mission.id} in the persistent workspace before the first delegated workspace snapshot.`,
     `Use only the configured sandbox ${toolName} tool; this is the bounded setup/mutation phase.`,
-    `You may issue at most ${SANDBOX_SETUP_ITERATION_LIMIT} sequential ${toolName} calls, one at a time, to prepare ${LOCKED_FIXTURE_OWNER}/${LOCKED_FIXTURE_REPO} at locked baseline ${LOCKED_FIXTURE_SHA}.`,
+    `You have a separate budget of at most ${SANDBOX_SETUP_EXEC_LIMIT} sequential ${toolName} calls; the TrueForge model-iteration budget for this phase is ${SANDBOX_SETUP_ITERATION_LIMIT}.`,
     "A setup command may fail; inspect its structured exit result and correct the local preparation within this same bounded phase.",
     mission.trueforgeSandboxId === undefined
       ? "Use the newly created sandbox and keep all setup calls on the coordinator root thread."
       : `Reuse the persisted sandbox ${mission.trueforgeSandboxId} and do not create a replacement sandbox.`,
+    "The locked worktree must end at the persistent sandbox's default/current workspace root. Run setup from that root and clone or repair the repository directly in `.`; do not create a nested repository and do not rely on a transient `cd`, because the separate proof turn starts from the default root again.",
     "Local clone, fetch, checkout, and worktree preparation are allowed; do not push, create a branch, commit, open a pull request, or perform any other remote mutation.",
-    "Do not use MCP servers, subagents, parallel tool calls, the host, or agent narration as proof. A separate exact read-only measurement will verify origin, SHA, cleanliness, detached state, and sandbox identity.",
+    "Do not use MCP servers, subagents, parallel tool calls, the host, or agent narration as proof. A separate exact read-only measurement will verify origin, SHA, cleanliness, detached state, workspace root, and sandbox identity.",
   ].join(" ");
 }
 
@@ -3583,7 +3590,7 @@ function buildLockedRepositoryProofInstruction(
     LOCKED_REPOSITORY_PROOF_COMMAND,
     toolName,
     LOCKED_REPOSITORY_PREPARATION_INTENT,
-  ) + " This is the deterministic measurement/proof phase; do not repair the repository if the proof fails.";
+  ) + " This is the deterministic measurement/proof phase; do not repair the repository if the proof fails. Run the exact measurement from the sandbox default/current workspace root with no added cd, cwd, or wrapper; TypeScript will require that measured workspace root and repository root are identical, so a nested or transiently selected worktree fails closed.";
 }
 
 function buildSandboxVerificationIntent(): string {
@@ -5192,7 +5199,16 @@ function boundedSetupExecArguments(
 }
 
 function unsafeSandboxSetupCommand(command: string): boolean {
-  return /\bgit\s+(?:push|commit|tag|branch\b|reset\s+--hard|clean\b)|\b(?:create_pull_request|pull_request_create)\b|\bgh\s+pr\s+(?:create|merge|close)\b/i.test(command);
+  if (
+    /\bgit\s+(?:push|commit|tag|branch\b|reset\s+--hard|clean\b)|\b(?:create_pull_request|pull_request_create)\b|\bgh\s+pr\s+(?:create|merge|close)\b/i.test(command)
+  ) {
+    return true;
+  }
+  if (/\b(?:cd|pushd|popd)\b/i.test(command)) {
+    return true;
+  }
+  return /\bgit\s+clone\b/i.test(command) &&
+    !/\bgit\s+clone\b[\s\S]*\s\.\s*(?:[;&]|$)/i.test(command);
 }
 
 function verifyBoundedSandboxSetup(
@@ -5229,12 +5245,12 @@ function verifyBoundedSandboxSetup(
       "no exec observed in the bounded setup phase",
     );
   }
-  if (calls.length > SANDBOX_SETUP_ITERATION_LIMIT) {
+  if (calls.length > SANDBOX_SETUP_EXEC_LIMIT) {
     return sandboxPhaseFailure(
       operation,
       "bounded-setup",
       events,
-      `budget exhaustion: observed ${calls.length} exec calls, limit is ${SANDBOX_SETUP_ITERATION_LIMIT}`,
+      `exec budget exhaustion: observed ${calls.length} sandbox exec calls, limit is ${SANDBOX_SETUP_EXEC_LIMIT}; the TrueForge model-iteration budget is separate`,
     );
   }
   if (!setupExecsAreSequential(events, calls)) {
@@ -5255,7 +5271,7 @@ function verifyBoundedSandboxSetup(
         operation,
         "bounded-setup",
         events,
-        "a setup exec did not contain only bounded intent and command arguments or attempted a protected mutation",
+        "a setup exec did not contain only bounded intent and command arguments or attempted a protected/non-root workspace operation",
       );
     }
     const response = toolResponseForCall(events, call.id);
@@ -5309,7 +5325,7 @@ function verifyBoundedSandboxSetup(
       "bounded-setup",
       events,
       normalizedError.includes("iteration") || normalizedError.includes("limit")
-        ? "budget exhaustion ended the bounded setup turn"
+        ? `model iteration budget exhaustion ended the bounded setup turn; the sandbox exec budget is separate and limited to ${SANDBOX_SETUP_EXEC_LIMIT} calls`
         : completion.error === null
         ? "setup runtime failure ended the bounded setup turn"
         : `setup runtime failure ended the bounded setup turn: ${completion.error}`,
@@ -5467,6 +5483,90 @@ function verifySandboxIdentity(
   return sandboxId;
 }
 
+interface LockedRepositoryProofMeasurements {
+  workspaceRoot: string;
+  remoteUrl: string;
+  repositoryRoot: string;
+  headSha: string;
+  headRef: string;
+  status: string;
+}
+
+function parseLockedRepositoryProofOutput(
+  output: string,
+): LockedRepositoryProofMeasurements | null {
+  const lines = output.replace(/\r\n/g, "\n").split("\n");
+  while (lines.at(-1) === "") {
+    lines.pop();
+  }
+  if (lines.length < 6 || lines[0] !== "TRUEFORGE_REPOSITORY_PROOF") {
+    return null;
+  }
+  const workspaceRoot = lines[1]?.trim();
+  const remoteUrl = lines[2]?.trim();
+  const repositoryRoot = lines[3]?.trim();
+  const headSha = lines[4]?.trim();
+  const headRef = lines[5]?.trim();
+  if (
+    workspaceRoot === undefined ||
+    remoteUrl === undefined ||
+    repositoryRoot === undefined ||
+    headSha === undefined ||
+    headRef === undefined ||
+    workspaceRoot.length === 0 ||
+    remoteUrl.length === 0 ||
+    repositoryRoot.length === 0 ||
+    headSha.length === 0 ||
+    headRef.length === 0
+  ) {
+    return null;
+  }
+  return {
+    workspaceRoot,
+    remoteUrl,
+    repositoryRoot,
+    headSha,
+    headRef,
+    status: lines.slice(6).join("\n").trim(),
+  };
+}
+
+function repositoryIdentityFromRemoteUrl(remoteUrl: string): string | null {
+  const prefixes = [
+    "https://github.com/",
+    "ssh://git@github.com/",
+    "git@github.com:",
+  ];
+  const prefix = prefixes.find((candidate) => remoteUrl.startsWith(candidate));
+  if (prefix === undefined) {
+    return null;
+  }
+  const identity = remoteUrl
+    .slice(prefix.length)
+    .replace(/\.git$/i, "")
+    .replace(/\/+$/, "");
+  return /^[^/\s]+\/[^/\s]+$/.test(identity) ? identity : null;
+}
+
+function normalizeAbsoluteSandboxPath(value: string): string | null {
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || !trimmed.startsWith("/") || trimmed.includes("\0")) {
+    return null;
+  }
+  const segments: string[] = [];
+  for (const segment of trimmed.split("/")) {
+    if (segment.length === 0 || segment === ".") {
+      continue;
+    }
+    if (segment === "..") {
+      segments.pop();
+    } else {
+      segments.push(segment);
+    }
+  }
+  return "/" + segments.join("/");
+}
+
 function verifyLockedRepositoryPreparation(
   events: TrueForgeApi.TurnStreamingEvent[],
   command: string,
@@ -5549,43 +5649,54 @@ function verifyLockedRepositoryPreparation(
     "repository proof",
     { allowCoordinatorIterationStop: true },
   );
-  const proof = observed.output.trim().match(
-    /^TRUEFORGE_REPOSITORY_PROOF repository=([^\s]+) sha=([0-9a-fA-F]{40}) clean=(true|false) detached=(true|false) root=(\/.+)$/,
-  );
-  if (
-    proof === null ||
-    proof[1] === undefined ||
-    proof[2] === undefined ||
-    proof[3] === undefined ||
-    proof[4] === undefined ||
-    proof[5] === undefined
-  ) {
+  const proof = parseLockedRepositoryProofOutput(observed.output);
+  if (proof === null) {
     return sandboxPhaseFailure(
       operation,
       phase,
       events,
-      "failed postcondition: repository proof did not return repository identity, baseline SHA, clean state, detached state, and root",
+      "failed postcondition: repository proof did not return the raw workspace, remote, root, SHA, ref, and status measurements",
     );
   }
-  if (proof[1] !== LOCKED_FIXTURE_OWNER + "/" + LOCKED_FIXTURE_REPO) {
+  const repository = repositoryIdentityFromRemoteUrl(proof.remoteUrl);
+  if (repository !== LOCKED_FIXTURE_OWNER + "/" + LOCKED_FIXTURE_REPO) {
     return sandboxPhaseFailure(
       operation,
       phase,
       events,
-      "failed postcondition: repository proof returned " + sanitizeRuntimeText(proof[1]) +
+      "failed postcondition: repository proof returned " + sanitizeRuntimeText(repository ?? proof.remoteUrl) +
         "; expected " + LOCKED_FIXTURE_OWNER + "/" + LOCKED_FIXTURE_REPO,
     );
   }
-  if (proof[2] !== LOCKED_FIXTURE_SHA) {
+  if (proof.headSha !== LOCKED_FIXTURE_SHA) {
     return sandboxPhaseFailure(
       operation,
       phase,
       events,
-      "failed postcondition: repository proof returned baseline SHA " + proof[2] +
+      "failed postcondition: repository proof returned baseline SHA " + sanitizeRuntimeText(proof.headSha) +
         "; expected " + LOCKED_FIXTURE_SHA,
     );
   }
-  if (proof[3] !== "true") {
+  const workspaceRoot = normalizeAbsoluteSandboxPath(proof.workspaceRoot);
+  const repositoryRoot = normalizeAbsoluteSandboxPath(proof.repositoryRoot);
+  if (workspaceRoot === null || repositoryRoot === null) {
+    return sandboxPhaseFailure(
+      operation,
+      phase,
+      events,
+      "failed postcondition: repository proof returned a non-absolute workspace or repository root",
+    );
+  }
+  if (workspaceRoot !== repositoryRoot) {
+    return sandboxPhaseFailure(
+      operation,
+      phase,
+      events,
+      "failed postcondition: repository root " + repositoryRoot +
+        " is not the persistent/default sandbox workspace root " + workspaceRoot,
+    );
+  }
+  if (proof.status.trim().length > 0) {
     return sandboxPhaseFailure(
       operation,
       phase,
@@ -5593,7 +5704,7 @@ function verifyLockedRepositoryPreparation(
       "failed postcondition: repository workspace is not clean",
     );
   }
-  if (proof[4] !== "true") {
+  if (proof.headRef !== "HEAD") {
     return sandboxPhaseFailure(
       operation,
       phase,
@@ -5607,9 +5718,10 @@ function verifyLockedRepositoryPreparation(
     outputSummary: summarizeOutput(observed.output),
     toolCallId: call.id,
     observedExecCount: executionCalls.length,
-    repository: proof[1],
-    baselineSha: proof[2],
-    repositoryRoot: proof[5],
+    repository,
+    baselineSha: proof.headSha,
+    repositoryRoot,
+    workspaceRoot,
     ...(sandboxId === undefined ? {} : { sandboxId }),
   };
 }

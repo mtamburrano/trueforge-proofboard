@@ -24,6 +24,7 @@ import {
   LOCKED_REPOSITORY_PROOF_COMMAND,
   LOCKED_REPOSITORY_PREPARATION_COMMAND,
   LOCKED_REPOSITORY_PREPARATION_INTENT,
+  SANDBOX_SETUP_EXEC_LIMIT,
   SANDBOX_SETUP_ITERATION_LIMIT,
   buildDelegatedWorkspaceDeltaCommand,
   createMissionHttpApp,
@@ -269,7 +270,10 @@ function workspaceDeltaEvents({
 
 function repositorySetupEvents({
   turnId = "turn-repository-setup",
-  commands = ["mkdir -p /workspace/locked-repository"],
+  commands = [
+    `git clone --no-checkout ${LOCKED_REPOSITORY_REMOTE_URL} .`,
+    `git checkout --quiet --detach ${PRIMARY_REPOSITORY.ref}`,
+  ],
   exitCodes = commands.map(() => 0),
   intents = commands.map((command) => `Prepare the local repository with ${command}.`),
   threadId = "main",
@@ -318,10 +322,22 @@ function repositoryProofEvents({
   repository = `${PRIMARY_REPOSITORY.owner}/${PRIMARY_REPOSITORY.name}`,
   sha = PRIMARY_REPOSITORY.ref,
   root = "/workspace",
+  cwd = root,
+  remoteUrl = `https://github.com/${repository}.git`,
   exitCode = 0,
   clean = "true",
   detached = "true",
-  result = `TRUEFORGE_REPOSITORY_PROOF repository=${repository} sha=${sha} clean=${clean} detached=${detached} root=${root}\n`,
+  status = clean === "true" ? "" : " M README.md",
+  headRef = detached === "true" ? "HEAD" : "main",
+  result = [
+    "TRUEFORGE_REPOSITORY_PROOF",
+    cwd,
+    remoteUrl,
+    root,
+    sha,
+    headRef,
+    ...(status.length === 0 ? [] : [status]),
+  ].join("\n") + "\n",
   turnId = "turn-repository-proof",
   intent = LOCKED_REPOSITORY_PREPARATION_INTENT,
   threadId = "main",
@@ -366,7 +382,7 @@ function trueforgeStream(events) {
   };
 }
 
-async function lockedRepositoryRunnerFixture({ preparation = {}, failRestore = false } = {}) {
+async function lockedRepositoryRunnerFixture({ preparation = {}, setup = {}, failRestore = false } = {}) {
   const missions = new MissionService(new InMemoryMissionRepository(), fixedClock);
   const turnRequests = [];
   const agentSpecUpdates = [];
@@ -393,7 +409,7 @@ async function lockedRepositoryRunnerFixture({ preparation = {}, failRestore = f
         turnRequests.push({ sessionId, request, agentSpec: activeAgentSpec });
         const current = turnNumber++;
         if (current === 0) {
-          return trueforgeStream(repositorySetupEvents());
+          return trueforgeStream(repositorySetupEvents(setup));
         }
         if (current === 1) {
           return trueforgeStream(repositoryProofEvents(preparation));
@@ -999,10 +1015,13 @@ test("empty locked fixture sandboxes are prepared before the workspace snapshot 
   );
   assert.match(fixture.turnRequests[0].request.input[0].content, /bounded setup\/mutation/i);
   assert.doesNotMatch(fixture.turnRequests[0].request.input[0].content, /Call the sandbox tool exec exactly once/);
+  assert.match(fixture.turnRequests[0].request.input[0].content, /persistent sandbox's default\/current workspace root/i);
+  assert.match(fixture.turnRequests[0].request.input[0].content, /clone or repair the repository directly in `\.`/i);
   assert.deepEqual(sandboxInstructionArguments(fixture.turnRequests[1].request), {
     intent: LOCKED_REPOSITORY_PREPARATION_INTENT,
     command: LOCKED_REPOSITORY_PROOF_COMMAND,
   });
+  assert.match(fixture.turnRequests[1].request.input[0].content, /no added cd, cwd, or wrapper/i);
   assert.equal(fixture.turnRequests[2].request.previousTurnId, "turn-repository-proof");
   assert.match(
     fixture.turnRequests[2].request.input[0].content,
@@ -1062,10 +1081,12 @@ test("empty locked fixture sandboxes are prepared before the workspace snapshot 
   assert.ok(preparation);
   assert.equal(preparation.result, "passed");
   assert.match(preparation.details, /"baseline_sha":"590aa8a6d72c580f61fc1b19d33e9876bc0feb9b"/);
+  assert.match(preparation.details, /"workspace_root":"\/workspace"/);
   assert.equal(LOCKED_REPOSITORY_PREPARATION_COMMAND, LOCKED_REPOSITORY_PROOF_COMMAND);
   assert.match(LOCKED_REPOSITORY_PROOF_COMMAND, /git config --get remote\.origin\.url/);
   assert.match(LOCKED_REPOSITORY_PROOF_COMMAND, /git status --porcelain=v1/);
-  assert.match(LOCKED_REPOSITORY_PROOF_COMMAND, /git symbolic-ref --short -q HEAD/);
+  assert.match(LOCKED_REPOSITORY_PROOF_COMMAND, /git rev-parse --abbrev-ref HEAD/);
+  assert.doesNotMatch(LOCKED_REPOSITORY_PROOF_COMMAND, /sed|if \[|remote_identity|worktree_status/);
   assert.doesNotMatch(LOCKED_REPOSITORY_PROOF_COMMAND, /git clone|git checkout|git push|create_pull_request/);
 });
 
@@ -1105,6 +1126,60 @@ test("locked repository preparation accepts root main and rejects dynamic child 
     /uncorrelated structured response|coordinator-owned/i,
   );
   assert.equal(childResponse.turnRequests.length, 2);
+});
+
+test("locked repository preparation rejects transient or nested workspace setup before proof", async () => {
+  const fixture = await lockedRepositoryRunnerFixture({
+    setup: {
+      commands: [
+        `cd /workspace/locked-repository && git clone --no-checkout ${LOCKED_REPOSITORY_REMOTE_URL} .`,
+        `cd /workspace/locked-repository && git checkout --quiet --detach ${PRIMARY_REPOSITORY.ref}`,
+      ],
+    },
+  });
+
+  await assert.rejects(
+    fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
+      workItemId: fixture.workItem.id,
+      delegateToSubagent: true,
+    }),
+    /protected\/non-root workspace operation|bounded setup/i,
+  );
+  assert.equal(fixture.turnRequests.length, 1);
+  const state = await fixture.missions.getState();
+  assert.equal(state.workItems.find((item) => item.id === fixture.workItem.id).status, "blocked");
+  const failure = state.evidence.find((evidence) =>
+    evidence.result === "failed" && evidence.summary.includes("Locked repository preparation failed"),
+  );
+  assert.ok(failure);
+  assert.match(failure.details, /bounded-setup/);
+  assert.match(failure.details, /observed_exec_count.*2/);
+});
+
+test("locked repository proof rejects a nested repository root even when setup completed", async () => {
+  const fixture = await lockedRepositoryRunnerFixture({
+    preparation: {
+      cwd: "/workspace",
+      root: "/workspace/locked-repository",
+    },
+  });
+
+  await assert.rejects(
+    fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
+      workItemId: fixture.workItem.id,
+      delegateToSubagent: true,
+    }),
+    /persistent\/default sandbox workspace root|workspace root/i,
+  );
+  assert.equal(fixture.turnRequests.length, 2);
+  const state = await fixture.missions.getState();
+  assert.equal(state.workItems.find((item) => item.id === fixture.workItem.id).status, "blocked");
+  assert.equal(
+    state.evidence.some((evidence) =>
+      evidence.result === "passed" && evidence.summary.startsWith("Sandbox repository proof verified"),
+    ),
+    false,
+  );
 });
 
 test("coordinator runtime restoration failure blocks delegated coding", async () => {
@@ -1152,7 +1227,14 @@ test("real locked repository preparation handles a fresh clone and rejects a dir
 
     assert.equal(
       prepared.stdout.trim(),
-      `TRUEFORGE_REPOSITORY_PROOF repository=${PRIMARY_DELIVERY_FIXTURE.owner}/${PRIMARY_DELIVERY_FIXTURE.repository} sha=${boundary.baselineSha} clean=true detached=true root=${boundary.workspacePath}`,
+      [
+        "TRUEFORGE_REPOSITORY_PROOF",
+        boundary.workspacePath,
+        LOCKED_REPOSITORY_REMOTE_URL,
+        boundary.workspacePath,
+        boundary.baselineSha,
+        "HEAD",
+      ].join("\n"),
     );
     assert.equal(prepared.stderr, "");
     assert.equal(
@@ -1180,7 +1262,9 @@ test("real locked repository preparation handles a fresh clone and rejects a dir
     });
     assert.match(
       dirty.stdout,
-      new RegExp(`TRUEFORGE_REPOSITORY_PROOF repository=${PRIMARY_DELIVERY_FIXTURE.owner}/${PRIMARY_DELIVERY_FIXTURE.repository} sha=${boundary.baselineSha} clean=false detached=true`),
+      new RegExp(
+        `TRUEFORGE_REPOSITORY_PROOF\\n${boundary.workspacePath}\\n${LOCKED_REPOSITORY_REMOTE_URL}\\n${boundary.workspacePath}\\n${boundary.baselineSha}\\nHEAD\\n M README\\.md`,
+      ),
     );
   } finally {
     await rm(boundary.root, { recursive: true, force: true });
