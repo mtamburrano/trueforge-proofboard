@@ -17,6 +17,7 @@ import {
   TrueForgeMissionRunner,
   buildCoordinatorAgentSpec,
   buildMissionAgentSpec,
+  createDaytonaSandboxExecutor,
 } from "../dist/index.js";
 
 const LOCKED_FIXTURE_SHA = "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b";
@@ -691,6 +692,24 @@ function fakeClient(eventFactory = fakeEvents, { passAgentSpec = false } = {}) {
     },
   };
   return { client, calls };
+}
+
+function fakeSandboxExecutor(commands, outputs, sandboxId) {
+  const calls = [];
+  return {
+    calls,
+    async execute(request) {
+      const index = calls.length;
+      assert.equal(request.sandboxId, sandboxId);
+      assert.equal(request.command, commands[index]);
+      calls.push(request);
+      return {
+        sandboxId,
+        exitCode: 0,
+        stdout: outputs[index],
+      };
+    },
+  };
 }
 
 function sandboxSetupEvents(
@@ -2870,25 +2889,17 @@ test("independent implementation proof measures final facts after normal agentic
     "typecheck passed\n",
     "tests passed\n",
   ];
-  const { client, calls } = fakeClient((turnId) => {
-    const index = Number(turnId.slice("turn-".length)) - 1;
-    return sandboxEvents(turnId, 0, [], {
-      includeSandboxCreated: false,
-      sandboxArguments: {
-        intent: "Measure one independent final-state fact.",
-        command: commands[index],
-        ...(index % 2 === 1 ? { cwd: "/" } : {}),
-      },
-      sandboxResult: {
-        success: true,
-        response: { exitCode: 0, result: outputs[index] },
-      },
-    });
-  });
+  const { client, calls } = fakeClient();
+  const sandboxExecutor = fakeSandboxExecutor(
+    commands,
+    outputs,
+    "sandbox-agentic-execution",
+  );
   const missions = new MissionService(new InMemoryMissionRepository());
   const runner = new TrueForgeMissionRunner(missions, client, {
     model: "openai/gpt-5-4-mini",
     dynamicSubAgents: true,
+    sandboxExecutor,
   });
   const mission = await runner.createMission({
     id: "mission-agentic-final-proof",
@@ -2922,18 +2933,15 @@ test("independent implementation proof measures final facts after normal agentic
   assert.deepEqual(proof.checks.map((check) => check.name), ["typecheck", "test"]);
   assert.equal(proof.executionOrigin.kind, "sandbox");
   assert.equal(proof.executionOrigin.threadId, undefined);
-  assert.equal(calls.turns.length, commands.length);
+  assert.equal(proof.executionOrigin.turnId, undefined);
+  assert.equal(calls.turns.length, 0);
+  assert.equal(sandboxExecutor.calls.length, commands.length);
+  assert.deepEqual(sandboxExecutor.calls.map((call) => call.command), commands);
+  assert.equal(sandboxExecutor.calls.every((call) => call.sandboxId === "sandbox-agentic-execution"), true);
   assert.equal(commands.every((command) => command.includes(repositoryRoot)), true);
   assert.equal(commands.some((command) => /find \\./.test(command)), false);
-  assert.equal(calls.turns[0].request.previousTurnId, "turn-agentic-execution");
-  assert.equal(calls.turns.every((turn, index) =>
-    sandboxInstructionArguments(turn.request).command === commands[index]
-  ), true);
   assert.equal(commands.every((command) => !/[;&|]|\n/.test(command)), true);
-  assert.equal(calls.updates.length, commands.length * 2);
-  assert.equal(calls.updates.filter((call) =>
-    call.request.agent.spec.config.dynamicSubAgents.enabled === true
-  ).length, commands.length);
+  assert.equal(calls.updates.length, 0);
 
   const handoff = await missions.recordHandoff(mission.id, {
     workItemId: workItem.id,
@@ -2967,18 +2975,17 @@ test("independent implementation proof rejects out-of-scope final changes before
     " M src/index.ts\u0000?? package.json\u0000",
     "diff --git a/src/index.ts b/src/index.ts\n--- a/src/index.ts\n+++ b/src/index.ts\n@@ -1 +1,2 @@\n before\n+after",
   ];
-  const { client, calls } = fakeClient((turnId) => {
-    const index = Number(turnId.slice("turn-".length)) - 1;
-    return sandboxEvents(turnId, 0, [], {
-      includeSandboxCreated: false,
-      sandboxArguments: { intent: "Measure one final-state fact.", command: commands[index] },
-      sandboxResult: { success: true, response: { exitCode: 0, result: outputs[index] } },
-    });
-  });
+  const { client, calls } = fakeClient();
+  const sandboxExecutor = fakeSandboxExecutor(
+    commands,
+    outputs,
+    "sandbox-agentic-out-of-scope",
+  );
   const missions = new MissionService(new InMemoryMissionRepository());
   const runner = new TrueForgeMissionRunner(missions, client, {
     model: "openai/gpt-5-4-mini",
     dynamicSubAgents: true,
+    sandboxExecutor,
   });
   const mission = await runner.createMission({
     id: "mission-agentic-out-of-scope",
@@ -3007,12 +3014,63 @@ test("independent implementation proof rejects out-of-scope final changes before
     runner.proveImplementation({ missionId: mission.id, workItemId: workItem.id }),
     /outside the allowed scope: package\.json/,
   );
-  assert.equal(calls.turns.length, commands.length);
+  assert.equal(calls.turns.length, 0);
+  assert.equal(sandboxExecutor.calls.length, commands.length);
   const state = await missions.getState();
-  assert.equal(state.evidence.some((evidence) =>
+  const failureEvidence = state.evidence.find((evidence) =>
     evidence.workItemId === workItem.id && evidence.source === "sandbox" &&
     evidence.result === "failed" && /outside the allowed scope/.test(evidence.summary)
+  );
+  assert.ok(failureEvidence);
+  const failureDetails = JSON.parse(failureEvidence.details);
+  assert.deepEqual(failureDetails.measurements.map((measurement) => measurement.command), commands);
+  assert.equal(failureDetails.measurements.every((measurement) =>
+    measurement.result === "passed" && measurement.exitCode === 0 &&
+    measurement.sandboxId === "sandbox-agentic-out-of-scope"
   ), true);
+});
+
+test("direct Daytona proof execution targets the requested sandbox without a TrueForge turn", async () => {
+  const requests = [];
+  const executor = createDaytonaSandboxExecutor({
+    apiKey: "daytona-test-secret",
+    toolboxBaseUrl: "https://proxy.example/toolbox/",
+    commandTimeoutSeconds: 17,
+    fetch: async (url, init) => {
+      requests.push({ url: String(url), init });
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { exitCode: 0, result: "proof output\n" };
+        },
+      };
+    },
+  });
+
+  const result = await executor.execute({
+    sandboxId: "sandbox/persisted",
+    command: "git status --porcelain=v1",
+    cwd: "/proof",
+  });
+
+  assert.equal(requests.length, 1);
+  assert.equal(
+    requests[0].url,
+    "https://proxy.example/toolbox/sandbox%2Fpersisted/process/execute",
+  );
+  assert.equal(requests[0].init.method, "POST");
+  assert.equal(requests[0].init.headers.Authorization, "Bearer daytona-test-secret");
+  assert.deepEqual(JSON.parse(requests[0].init.body), {
+    command: "git status --porcelain=v1",
+    cwd: "/proof",
+    timeout: 17,
+  });
+  assert.deepEqual(result, {
+    sandboxId: "sandbox/persisted",
+    exitCode: 0,
+    stdout: "proof output\n",
+  });
 });
 
 test("sandbox verification persists the command, output summary, and exit status", async () => {

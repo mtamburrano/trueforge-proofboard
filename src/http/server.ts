@@ -39,6 +39,7 @@ import {
   TrueForgeTurnResult,
   VerifiedRepositoryInspection,
   WorkGraphPlanner,
+  IMPLEMENTATION_PROOF_MODE,
 } from "../trueforge.js";
 import { parseContentDiffEvidence } from "../diff.js";
 import {
@@ -1021,6 +1022,7 @@ class MissionController {
         evidence.result !== "passed"
       ) ||
       !proofEvidence.some((evidence) => evidence?.source === "sandbox") ||
+      !proofEvidence.every(isDirectImplementationProofEvidence) ||
       state.evidence.some((evidence) =>
         evidence.workItemId === implementation.id &&
         evidence.attempt === implementation.attempt &&
@@ -1029,7 +1031,7 @@ class MissionController {
       )
     ) {
       throw new MissionControlError(
-        "Delivery approval requires current passed deterministic proof for the approved attempt.",
+        "Delivery approval requires current passed direct deterministic proof for the approved attempt.",
       );
     }
     const reviewEvidence = state.evidence.find((evidence) =>
@@ -1880,6 +1882,10 @@ function requireCurrentDeliveryApprovalCorrelation(
     (attempt.claim.trueforgeSandboxId !== undefined &&
       approval.trueforgeSandboxId !== attempt.claim.trueforgeSandboxId) ||
     requiredEvidenceIds.some((evidenceId) => !approval.evidenceIds.includes(evidenceId)) ||
+    proofEvidenceIds.some((evidenceId) => {
+      const evidence = state.evidence.find((item) => item.id === evidenceId);
+      return !isDirectImplementationProofEvidence(evidence);
+    }) ||
     requiredEvidenceIds.some((evidenceId) => {
       const evidence = state.evidence.find((item) => item.id === evidenceId);
       return evidence === undefined ||
@@ -1893,6 +1899,12 @@ function requireCurrentDeliveryApprovalCorrelation(
       "The delivery approval is stale or does not match the current proven implementation attempt.",
     );
   }
+}
+
+function isDirectImplementationProofEvidence(evidence: Evidence | undefined): boolean {
+  return evidence?.source === "sandbox" &&
+    evidence.result === "passed" &&
+    evidenceDetails(evidence)?.proof_mode === IMPLEMENTATION_PROOF_MODE;
 }
 
 function persistedPullRequestReadback(

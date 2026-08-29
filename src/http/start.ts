@@ -6,11 +6,21 @@ import {
   TrueForgeMissionRunner,
   createTrueForgeClient,
 } from "../trueforge.js";
+import { createDaytonaSandboxExecutor } from "../daytona.js";
 import { resolveMissionRuntimeConfig } from "./config.js";
 import { createMissionHttpApp } from "./server.js";
 
 const { host, port, statePath, baseUrl, model, githubServer } =
   resolveMissionRuntimeConfig(process.env);
+const daytonaApiKey = process.env.DAYTONA_API_KEY?.trim();
+const sandboxExecutor = daytonaApiKey === undefined || daytonaApiKey.length === 0
+  ? undefined
+  : createDaytonaSandboxExecutor({
+      apiKey: daytonaApiKey,
+      ...(process.env.DAYTONA_TOOLBOX_BASE_URL === undefined
+        ? {}
+        : { toolboxBaseUrl: process.env.DAYTONA_TOOLBOX_BASE_URL }),
+    });
 
 const missions = new MissionService(new JsonMissionRepository(statePath));
 const runner = new TrueForgeMissionRunner(
@@ -28,6 +38,7 @@ const runner = new TrueForgeMissionRunner(
     repositoryToolName: "get_commit",
     sandboxToolName: "exec",
     deliveryToolName: "create_pull_request",
+    ...(sandboxExecutor === undefined ? {} : { sandboxExecutor }),
     mcpServers: [{
       name: githubServer,
       enableTools: ["get_file_contents", "get_commit", "create_pull_request", "pull_request_read"],

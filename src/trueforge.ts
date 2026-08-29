@@ -42,6 +42,25 @@ export interface TrueForgeClientOptions {
   timeoutInSeconds?: number;
 }
 
+export interface SandboxCommandExecutionRequest {
+  sandboxId: string;
+  command: string;
+  cwd?: string;
+  timeoutSeconds?: number;
+}
+
+export interface SandboxCommandExecutionResult {
+  sandboxId?: string;
+  exitCode: number;
+  stdout: string;
+}
+
+export interface SandboxCommandExecutor {
+  execute(
+    request: SandboxCommandExecutionRequest,
+  ): Promise<SandboxCommandExecutionResult>;
+}
+
 export interface TrueForgeMissionConfig {
   model: string;
   instructions?: string;
@@ -53,6 +72,7 @@ export interface TrueForgeMissionConfig {
   deliveryToolName?: string;
   iterationLimit?: number;
   sandboxEnabled?: boolean;
+  sandboxExecutor?: SandboxCommandExecutor;
 }
 
 export type TrueForgeCoordinatorToolSurface = "repository-read" | "sandbox-exec" | "review";
@@ -185,6 +205,8 @@ const DELEGATED_WORKSPACE_SNAPSHOT_INTENT =
 const DELEGATED_WORKSPACE_DELTA_INTENT =
   "Capture the coordinator-owned current work-item and cumulative mission workspace deltas after delegated implementation.";
 const MAX_COORDINATOR_EXEC_INTENT_LENGTH = 1_200;
+const MAX_IMPLEMENTATION_PROOF_OUTPUT_LENGTH = 2_000_000;
+export const IMPLEMENTATION_PROOF_MODE = "application_direct_sandbox" as const;
 export const MAX_COORDINATOR_ZERO_TOOL_RETRIES = 2;
 const PULL_REQUEST_READ_TOOL_NAME = "pull_request_read";
 
@@ -877,8 +899,26 @@ interface VerifiedSandboxSetup {
 
 interface IndependentSandboxMeasurement {
   sessionId: string;
-  turnId: string;
-  verified: VerifiedSandboxExecution;
+  turnId?: string;
+  verified: IndependentSandboxExecution;
+}
+
+interface IndependentSandboxExecution {
+  exitCode: number;
+  stdout: string;
+  outputSummary: string;
+  toolCallId?: string;
+  observedExecCount: number;
+  sandboxId: string;
+}
+
+interface ImplementationProofMeasurement {
+  command: string;
+  result: "passed" | "failed";
+  exitCode?: number;
+  output?: string;
+  sandboxId?: string;
+  error?: string;
 }
 
 export class TrueForgeIntegrationError extends Error {
@@ -1273,15 +1313,44 @@ export class TrueForgeMissionRunner {
       );
     }
 
+    const measurements: ImplementationProofMeasurement[] = [];
     try {
       const repositoryRoot = PRIMARY_SANDBOX_REPOSITORY_ROOT;
+      const measure = async (command: string): Promise<IndependentSandboxMeasurement> => {
+        let recorded = false;
+        try {
+          const measurement = await this.measureImplementationState(mission.id, command);
+          measurements.push({
+            command: sanitizeRuntimeText(command),
+            result: measurement.verified.exitCode === 0 ? "passed" : "failed",
+            exitCode: measurement.verified.exitCode,
+            output: measurement.verified.outputSummary,
+            sandboxId: measurement.verified.sandboxId,
+          });
+          recorded = true;
+          if (measurement.verified.exitCode !== 0) {
+            throw new TrueForgeIntegrationError(
+              "prove implementation",
+              `Independent proof command exited with code ${measurement.verified.exitCode}.`,
+            );
+          }
+          return measurement;
+        } catch (error) {
+          if (!recorded) {
+            const reason = error instanceof TrueForgeIntegrationError
+              ? error.message
+              : "Direct sandbox execution failed.";
+            measurements.push({
+              command: sanitizeRuntimeText(command),
+              result: "failed",
+              error: sanitizeRuntimeText(reason),
+            });
+          }
+          throw error;
+        }
+      };
       const remoteCommand = IMPLEMENTATION_REPOSITORY_IDENTITY_COMMAND;
-      const remote = await this.measureImplementationState(
-        mission.id,
-        workItem.id,
-        remoteCommand,
-        "Measure the completed repository origin.",
-      );
+      const remote = await measure(remoteCommand);
       const repository = repositoryIdentityFromRemoteUrl(remote.verified.stdout.trim());
       const expectedRepository = `${mission.repository.owner}/${mission.repository.name}`;
       if (repository !== expectedRepository) {
@@ -1295,22 +1364,12 @@ export class TrueForgeMissionRunner {
         repositoryRoot,
         `merge-base --is-ancestor ${baselineSha} HEAD`,
       );
-      const ancestry = await this.measureImplementationState(
-        mission.id,
-        workItem.id,
-        ancestryCommand,
-        "Verify that the pinned baseline is an ancestor of the completed workspace.",
-      );
+      const ancestry = await measure(ancestryCommand);
       const statusCommand = gitAtRepository(
         repositoryRoot,
         "status --porcelain=v1 -z --untracked-files=all",
       );
-      const status = await this.measureImplementationState(
-        mission.id,
-        workItem.id,
-        statusCommand,
-        "Measure every staged, unstaged, and untracked workspace change.",
-      );
+      const status = await measure(statusCommand);
       const statusFiles = completeChangedFilesFromCommand(
         status.verified.stdout,
         statusCommand,
@@ -1326,12 +1385,7 @@ export class TrueForgeMissionRunner {
         repositoryRoot,
         `diff --no-ext-diff --binary ${baselineSha} --`,
       );
-      const diff = await this.measureImplementationState(
-        mission.id,
-        workItem.id,
-        diffCommand,
-        "Capture the actual completed diff from the pinned baseline.",
-      );
+      const diff = await measure(diffCommand);
       const diffFiles = changedFilesFromDiff(diff.verified.stdout, diffCommand);
       if (!isContentDiffOutput(diff.verified.stdout) || diffFiles.length === 0) {
         throw new TrueForgeIntegrationError(
@@ -1365,12 +1419,7 @@ export class TrueForgeMissionRunner {
         checkMeasurements.push({
           name,
           command,
-          measurement: await this.measureImplementationState(
-            mission.id,
-            workItem.id,
-            command,
-            `Run the authoritative ${name} check against the completed workspace.`,
-          ),
+          measurement: await measure(command),
         });
       }
 
@@ -1381,10 +1430,13 @@ export class TrueForgeMissionRunner {
         source: "sandbox",
         summary: `Independent proof verified repository ${expectedRepository} at ${repositoryRoot}.`,
         details: JSON.stringify({
+          proof_mode: IMPLEMENTATION_PROOF_MODE,
           command: remoteCommand,
           repository: expectedRepository,
           repository_root: repositoryRoot,
           remote_url: remote.verified.stdout.trim(),
+          exit_code: remote.verified.exitCode,
+          sandbox_id: remote.verified.sandboxId,
         }),
         executionOrigin: sandboxMeasurementOrigin(remote),
       });
@@ -1395,9 +1447,11 @@ export class TrueForgeMissionRunner {
         source: "sandbox",
         summary: `Independent proof verified pinned baseline ancestry at ${baselineSha}.`,
         details: JSON.stringify({
+          proof_mode: IMPLEMENTATION_PROOF_MODE,
           command: ancestryCommand,
           baseline_sha: baselineSha,
           exit_code: ancestry.verified.exitCode,
+          sandbox_id: ancestry.verified.sandboxId,
         }),
         executionOrigin: sandboxMeasurementOrigin(ancestry),
       });
@@ -1408,10 +1462,13 @@ export class TrueForgeMissionRunner {
         source: "sandbox",
         summary: "Independent proof measured the complete final workspace status.",
         details: JSON.stringify({
+          proof_mode: IMPLEMENTATION_PROOF_MODE,
           complete_changed_files: true,
           command: statusCommand,
+          exit_code: status.verified.exitCode,
           output: status.verified.stdout,
           changed_files: statusFiles,
+          sandbox_id: status.verified.sandboxId,
         }),
         executionOrigin: sandboxMeasurementOrigin(status),
       });
@@ -1423,11 +1480,14 @@ export class TrueForgeMissionRunner {
         source: "sandbox",
         summary: "Independent proof captured the actual final diff from the pinned baseline.",
         details: JSON.stringify({
+          proof_mode: IMPLEMENTATION_PROOF_MODE,
           command: diffCommand,
+          exit_code: diff.verified.exitCode,
           output: diffSummary,
           changed_files: diffFiles,
           output_truncated: diff.verified.stdout.trim().length > 4_000,
           baseline_sha: baselineSha,
+          sandbox_id: diff.verified.sandboxId,
         }),
         executionOrigin: sandboxMeasurementOrigin(diff),
       });
@@ -1441,9 +1501,11 @@ export class TrueForgeMissionRunner {
           source: "sandbox",
           summary: `Independent authoritative ${name} check passed.`,
           details: JSON.stringify({
+            proof_mode: IMPLEMENTATION_PROOF_MODE,
             command,
             exit_code: measurement.verified.exitCode,
             output: measurement.verified.outputSummary,
+            sandbox_id: measurement.verified.sandboxId,
           }),
           executionOrigin: sandboxMeasurementOrigin(measurement),
         });
@@ -1480,7 +1542,7 @@ export class TrueForgeMissionRunner {
       const reason = error instanceof TrueForgeIntegrationError
         ? error.message
         : "Independent final-state proof failed.";
-      await this.recordImplementationProofFailure(mission.id, workItem.id, reason);
+      await this.recordImplementationProofFailure(mission.id, workItem.id, reason, measurements);
       if (error instanceof TrueForgeIntegrationError) {
         throw error;
       }
@@ -1490,38 +1552,68 @@ export class TrueForgeMissionRunner {
 
   private async measureImplementationState(
     missionId: string,
-    workItemId: string,
     command: string,
-    intent: string,
   ): Promise<IndependentSandboxMeasurement> {
     const mission = await this.missions.getMission(missionId);
-    if (mission.trueforgeSandboxId === undefined || mission.trueforgeTurnId === undefined) {
+    if (
+      mission.trueforgeSessionId === undefined ||
+      mission.trueforgeSandboxId === undefined ||
+      mission.trueforgeTurnId === undefined
+    ) {
       throw new TrueForgeIntegrationError(
         "prove implementation",
-        "Agentic execution did not leave a persisted sandbox and predecessor turn for independent proof.",
+        "Agentic execution did not leave a persisted TrueForge session, sandbox, and predecessor turn for independent proof.",
       );
     }
-    const toolName = canonicalSandboxToolName(undefined, this.config.sandboxToolName);
-    const execution = await this.executeCoordinatorTurn(
-      mission.id,
-      buildSandboxVerificationInstruction(mission, command, toolName, intent),
-      {
-        workItemId,
-        previousTurnId: mission.trueforgeTurnId,
-        coordinatorToolSurface: "sandbox-exec",
-        coordinatorPhase: "deterministic-proof",
-      },
-    );
-    return {
-      sessionId: execution.sessionId,
-      turnId: execution.turnId,
-      verified: verifySandboxExecution(
-        execution.rawEvents,
+    const sandboxExecutor = this.config.sandboxExecutor;
+    if (sandboxExecutor === undefined) {
+      throw new TrueForgeIntegrationError(
+        "prove implementation",
+        "Direct sandbox execution is required for implementation proof, but no sandbox executor is configured.",
+      );
+    }
+
+    let execution: SandboxCommandExecutionResult;
+    try {
+      execution = await sandboxExecutor.execute({
+        sandboxId: mission.trueforgeSandboxId,
         command,
-        toolName,
-        mission.trueforgeSandboxId,
-        true,
-      ),
+      });
+    } catch (error) {
+      const reason = error instanceof Error
+        ? error.message
+        : "The direct sandbox executor failed.";
+      throw new TrueForgeIntegrationError(
+        "prove implementation",
+        `Direct sandbox execution failed: ${sanitizeRuntimeText(reason)}`,
+      );
+    }
+    if (
+      (execution.sandboxId !== undefined && execution.sandboxId !== mission.trueforgeSandboxId) ||
+      !Number.isInteger(execution.exitCode) ||
+      typeof execution.stdout !== "string"
+    ) {
+      throw new TrueForgeIntegrationError(
+        "prove implementation",
+        "Direct sandbox execution returned an invalid or different sandbox result.",
+      );
+    }
+    if (execution.stdout.length > MAX_IMPLEMENTATION_PROOF_OUTPUT_LENGTH) {
+      throw new TrueForgeIntegrationError(
+        "prove implementation",
+        `Direct sandbox execution exceeded the ${MAX_IMPLEMENTATION_PROOF_OUTPUT_LENGTH}-character output bound.`,
+      );
+    }
+    const sandboxId = execution.sandboxId ?? mission.trueforgeSandboxId;
+    return {
+      sessionId: mission.trueforgeSessionId,
+      verified: {
+        exitCode: execution.exitCode,
+        stdout: execution.stdout,
+        outputSummary: summarizeOutput(execution.stdout),
+        observedExecCount: 1,
+        sandboxId,
+      },
     };
   }
 
@@ -3514,6 +3606,7 @@ export class TrueForgeMissionRunner {
     missionId: string,
     workItemId: string,
     reason: string,
+    measurements: readonly ImplementationProofMeasurement[] = [],
   ): Promise<void> {
     const safeReason = sanitizeRuntimeText(reason);
     try {
@@ -3526,7 +3619,9 @@ export class TrueForgeMissionRunner {
         details: JSON.stringify({
           failure_layer: "proof",
           failure_category: "sandbox",
+          proof_mode: IMPLEMENTATION_PROOF_MODE,
           reason: safeReason,
+          measurements,
         }),
       });
     } catch {
@@ -3667,12 +3762,17 @@ function implementationCheckCommand(repositoryRoot: string, name: string): strin
 }
 
 function sandboxMeasurementOrigin(measurement: IndependentSandboxMeasurement): ExecutionOrigin {
-  return {
+  const origin: ExecutionOrigin = {
     kind: "sandbox",
     sessionId: measurement.sessionId,
-    turnId: measurement.turnId,
-    toolCallId: measurement.verified.toolCallId,
   };
+  if (measurement.turnId !== undefined) {
+    origin.turnId = measurement.turnId;
+  }
+  if (measurement.verified.toolCallId !== undefined) {
+    origin.toolCallId = measurement.verified.toolCallId;
+  }
+  return origin;
 }
 
 function buildTurnInstruction(

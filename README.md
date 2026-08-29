@@ -32,7 +32,7 @@ Start the local Mission Control server with:
 npm start
 ```
 
-The `prestart` lifecycle step builds `dist/` first, so this works from a clean checkout without generated output. The unauthenticated UI binds only to loopback, and state-changing browser requests must be same-origin. Then open `http://127.0.0.1:8787`. The UI creates or recovers the primary mission from `.trueforge/mission-state.json`. Creating and running the mission uses the configured local TrueForge server; provider and connector credentials remain in that server and are never included in browser payloads.
+The `prestart` lifecycle step builds `dist/` first, so this works from a clean checkout without generated output. The unauthenticated UI binds only to loopback, and state-changing browser requests must be same-origin. Then open `http://127.0.0.1:8787`. The UI creates or recovers the primary mission from `.trueforge/mission-state.json`. Creating and running the mission uses the configured local TrueForge server; provider and connector credentials remain server-side and are never included in browser payloads. The optional direct proof adapter also keeps its Daytona key server-only.
 
 The demo model defaults to `alibaba/qwen3-8-max`. The supported selectors are
 `alibaba/qwen3-8-max`, `alibaba/qwen3-7-flash`, `openai/gpt-5-4-mini`, and
@@ -72,8 +72,13 @@ when the configured MCP server made the exact file request and returned a matchi
 structured resource. Failed or incomplete MCP evidence blocks the mission; it is
 never replaced with canned repository content. `runSandboxVerification` applies the
 same proof boundary to the canonical sandbox `exec` tool, recording the exact
-command, exit code, and bounded output summary. The deterministic primary fixture
-runs its checks from the provisioned project directory.
+command, exit code, and bounded output summary. Implementation proof runs its
+authoritative measurements through a direct Daytona toolbox request addressed
+to the persisted sandbox ID; it never asks a model to select or invoke a proof
+command. Set the server-only `DAYTONA_API_KEY` (and optionally
+`DAYTONA_TOOLBOX_BASE_URL`) when running the HTTP app. Without that executor,
+implementation proof fails closed and records the missing integration. The
+deterministic primary fixture runs its checks from the provisioned project directory.
 
 Before delegated coding starts, the primary mission runs a separate sandbox
 readiness turn. That turn prepares or verifies Node.js 20+ and npm; on the known
@@ -119,5 +124,6 @@ for other targets.
 
 Configure the TrueForge model, GitHub MCP connector, and sandbox provider in the
 local TrueForge UI as described in [`docs/trueforge-smoke.md`](docs/trueforge-smoke.md).
-Only the SDK client receives connection credentials; mission persistence stores
-session, turn, and sandbox identifiers, not tokens or provider secrets.
+Only the server-side SDK client and direct Daytona adapter receive connection
+credentials; mission persistence stores session, turn, and sandbox identifiers,
+not tokens or provider secrets.

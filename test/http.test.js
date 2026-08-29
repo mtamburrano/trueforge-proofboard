@@ -15,6 +15,7 @@ import {
   PRIMARY_MISSION_OBJECTIVE,
   PRIMARY_SANDBOX_REPOSITORY_ROOT,
   PRIMARY_VERIFICATION_COMMAND,
+  IMPLEMENTATION_PROOF_MODE,
   TrueForgeIntegrationError,
   createMissionHttpApp,
   resolveMissionRuntimeConfig,
@@ -30,6 +31,7 @@ class TestMissionRunner {
       inspectionRepository = PRIMARY_DELIVERY_FIXTURE,
       deliveryHeadSha = "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1",
       deliveryHeadPatches = PRIMARY_VERIFIED_DELIVERY_PATCHES,
+      proofMode = IMPLEMENTATION_PROOF_MODE,
     } = {},
   ) {
     this.missions = missions;
@@ -39,6 +41,7 @@ class TestMissionRunner {
     this.inspectionRepository = inspectionRepository;
     this.deliveryHeadSha = deliveryHeadSha;
     this.deliveryHeadPatches = deliveryHeadPatches;
+    this.proofMode = proofMode;
     this.sandboxInputs = [];
     this.operationLog = [];
     this.turnInputs = [];
@@ -216,7 +219,12 @@ class TestMissionRunner {
       result: "passed",
       source: "sandbox",
       summary: "Independent proof captured the actual final diff.",
-      details: JSON.stringify({ command: "git diff", output: diffOutput, changed_files: filesChanged }),
+      details: JSON.stringify({
+        proof_mode: this.proofMode,
+        command: "git diff",
+        output: diffOutput,
+        changed_files: filesChanged,
+      }),
       executionOrigin: origin,
     });
     const typecheck = await this.missions.addEvidence(input.missionId, {
@@ -225,6 +233,12 @@ class TestMissionRunner {
       result: "passed",
       source: "sandbox",
       summary: "Independent typecheck passed.",
+      details: JSON.stringify({
+        proof_mode: this.proofMode,
+        command: "npm run typecheck",
+        exit_code: 0,
+        output: "typecheck passed",
+      }),
       executionOrigin: origin,
     });
     const tests = await this.missions.addEvidence(input.missionId, {
@@ -233,6 +247,12 @@ class TestMissionRunner {
       result: "passed",
       source: "sandbox",
       summary: "Independent tests passed.",
+      details: JSON.stringify({
+        proof_mode: this.proofMode,
+        command: PRIMARY_VERIFICATION_COMMAND,
+        exit_code: 0,
+        output: "all tests passed",
+      }),
       executionOrigin: origin,
     });
     return {
@@ -759,6 +779,31 @@ test("run mission performs deterministic proof and independent review after codi
   assert.equal(state.evidence.some((item) =>
     item.workItemId === implementTicket.id && item.source === "sandbox" && item.attempt === 1
   ), true);
+});
+
+test("delivery approval refuses a green handoff without the direct proof marker", async () => {
+  const { app, runner, missions } = testApp(new InMemoryMissionRepository(), {
+    proofMode: "coordinator_turn",
+  });
+
+  await app.request("/api/mission", { method: "POST" });
+  let current = await json(await app.request("/api/mission"));
+  const inspectTicket = current.mission.tickets.find((item) => item.assignedRole === "planner");
+  await authorizeTicket(app, inspectTicket.id);
+  const inspected = await json(await app.request("/api/mission/run", { method: "POST" }));
+  const implementTicket = inspected.mission.tickets.find((item) => item.assignedRole === "implementer");
+  await authorizeTicket(app, implementTicket.id);
+  await app.request("/api/mission/run", { method: "POST" });
+
+  const proofResponse = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(proofResponse.status, 502);
+  const failed = await json(proofResponse);
+  const failedTicket = failed.mission.tickets.find((item) => item.id === implementTicket.id);
+  assert.equal(failedTicket.status, "blocked");
+  assert.equal(failed.mission.approvals.length, 0);
+  assert.equal(runner.calls.sandbox, 1);
+  assert.equal(runner.calls.headInspect, 0);
+  assert.equal((await missions.getState()).missions[0].status, "blocked");
 });
 
 test("proof findings require human reauthorization and reuse the same execution binding", async () => {

@@ -16,5 +16,6 @@ export * from "./diff.js";
 export * from "./fixture.js";
 export * from "./persistence.js";
 export * from "./trueforge.js";
+export * from "./daytona.js";
 export * from "./http/server.js";
 export * from "./http/config.js";
