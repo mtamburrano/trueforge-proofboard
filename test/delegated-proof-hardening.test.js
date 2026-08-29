@@ -21,8 +21,10 @@ import {
   RepositoryWorkGraphPlanner,
   TrueForgeMissionRunner,
   DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
+  LOCKED_REPOSITORY_PROOF_COMMAND,
   LOCKED_REPOSITORY_PREPARATION_COMMAND,
   LOCKED_REPOSITORY_PREPARATION_INTENT,
+  SANDBOX_SETUP_ITERATION_LIMIT,
   buildDelegatedWorkspaceDeltaCommand,
   createMissionHttpApp,
 } from "../dist/index.js";
@@ -265,13 +267,62 @@ function workspaceDeltaEvents({
   ];
 }
 
-function repositoryPreparationEvents({
+function repositorySetupEvents({
+  turnId = "turn-repository-setup",
+  commands = ["mkdir -p /workspace/locked-repository"],
+  exitCodes = commands.map(() => 0),
+  intents = commands.map((command) => `Prepare the local repository with ${command}.`),
+  threadId = "main",
+  responseThreadId = "main",
+  sandboxId = "sandbox-1",
+  turnState = { status: "done", requiredActions: [] },
+} = {}) {
+  assert.equal(commands.length, exitCodes.length);
+  assert.equal(commands.length, intents.length);
+  const events = [
+    { type: "turn.created", id: `${turnId}-created`, turnId, threadId: null, state: { status: "running" } },
+    { type: "sandbox.created", id: `${turnId}-sandbox`, threadId: null, sandboxId },
+  ];
+  commands.forEach((command, index) => {
+    const callId = `${turnId}-call-setup-${index + 1}`;
+    events.push(
+      {
+        type: "model.message",
+        id: `${turnId}-model-${index + 1}`,
+        threadId,
+        toolCalls: [{
+          id: callId,
+          function: {
+            name: "exec",
+            arguments: JSON.stringify({ intent: intents[index], command }),
+          },
+        }],
+      },
+      {
+        type: "tool.response",
+        id: `${turnId}-response-${index + 1}`,
+        threadId: responseThreadId,
+        toolCallId: callId,
+        content: JSON.stringify({
+          success: true,
+          response: { exitCode: exitCodes[index], result: "repository setup complete\n" },
+        }),
+      },
+    );
+  });
+  events.push({ type: "turn.done", id: `${turnId}-done`, threadId: null, state: turnState });
+  return events;
+}
+
+function repositoryProofEvents({
   repository = `${PRIMARY_REPOSITORY.owner}/${PRIMARY_REPOSITORY.name}`,
   sha = PRIMARY_REPOSITORY.ref,
   root = "/workspace",
   exitCode = 0,
-  result = `TRUEFORGE_REPOSITORY_READY repository=${repository} sha=${sha} root=${root}\n`,
-  turnId = "turn-repository-preparation",
+  clean = "true",
+  detached = "true",
+  result = `TRUEFORGE_REPOSITORY_PROOF repository=${repository} sha=${sha} clean=${clean} detached=${detached} root=${root}\n`,
+  turnId = "turn-repository-proof",
   intent = LOCKED_REPOSITORY_PREPARATION_INTENT,
   threadId = "main",
   responseThreadId = "main",
@@ -279,7 +330,6 @@ function repositoryPreparationEvents({
   const callId = `${turnId}-call-preparation`;
   return [
     { type: "turn.created", id: `${turnId}-created`, turnId, threadId: null, state: { status: "running" } },
-    { type: "sandbox.created", id: `${turnId}-sandbox`, threadId: null, sandboxId: "sandbox-1" },
     {
       type: "model.message",
       id: `${turnId}-model`,
@@ -290,7 +340,7 @@ function repositoryPreparationEvents({
           name: "exec",
           arguments: JSON.stringify({
             intent,
-            command: LOCKED_REPOSITORY_PREPARATION_COMMAND,
+            command: LOCKED_REPOSITORY_PROOF_COMMAND,
           }),
         },
       }],
@@ -343,12 +393,15 @@ async function lockedRepositoryRunnerFixture({ preparation = {}, failRestore = f
         turnRequests.push({ sessionId, request, agentSpec: activeAgentSpec });
         const current = turnNumber++;
         if (current === 0) {
-          return trueforgeStream(repositoryPreparationEvents(preparation));
+          return trueforgeStream(repositorySetupEvents());
         }
         if (current === 1) {
-          return trueforgeStream(workspaceSnapshotEvents(WORKSPACE_START_TREE));
+          return trueforgeStream(repositoryProofEvents(preparation));
         }
         if (current === 2) {
+          return trueforgeStream(workspaceSnapshotEvents(WORKSPACE_START_TREE));
+        }
+        if (current === 3) {
           return trueforgeStream(delegatedEvents(
             "npm run typecheck && npm test",
             diffOutput(),
@@ -939,28 +992,33 @@ test("empty locked fixture sandboxes are prepared before the workspace snapshot 
   });
 
   assert.ok(result.implementationHandoff);
-  assert.equal(fixture.turnRequests.length, 4);
+  assert.equal(fixture.turnRequests.length, 5);
   assert.deepEqual(
     fixture.turnRequests.map((turn) => turn.sessionId),
-    Array(4).fill(ORIGIN.sessionId),
+    Array(5).fill(ORIGIN.sessionId),
   );
-  assert.deepEqual(sandboxInstructionArguments(fixture.turnRequests[0].request), {
+  assert.match(fixture.turnRequests[0].request.input[0].content, /bounded setup\/mutation/i);
+  assert.doesNotMatch(fixture.turnRequests[0].request.input[0].content, /Call the sandbox tool exec exactly once/);
+  assert.deepEqual(sandboxInstructionArguments(fixture.turnRequests[1].request), {
     intent: LOCKED_REPOSITORY_PREPARATION_INTENT,
-    command: LOCKED_REPOSITORY_PREPARATION_COMMAND,
+    command: LOCKED_REPOSITORY_PROOF_COMMAND,
   });
-  assert.equal(fixture.turnRequests[1].request.previousTurnId, "turn-repository-preparation");
+  assert.equal(fixture.turnRequests[2].request.previousTurnId, "turn-repository-proof");
   assert.match(
     fixture.turnRequests[2].request.input[0].content,
-    /prepared and verified the pinned repository in this persistent sandbox workspace/i,
+    /workspace tree before delegated implementation/i,
   );
-  assert.equal(fixture.turnRequests[3].request.previousTurnId, ORIGIN.turnId);
+  assert.equal(fixture.turnRequests[3].request.previousTurnId, "turn-workspace-start");
+  assert.equal(fixture.turnRequests[4].request.previousTurnId, ORIGIN.turnId);
   assert.deepEqual(
     fixture.agentSpecUpdates.map((update) => update.sessionId),
-    Array(6).fill(ORIGIN.sessionId),
+    Array(8).fill(ORIGIN.sessionId),
   );
   assert.deepEqual(
     fixture.agentSpecUpdates.map((update) => update.request.agent.spec.config.iterationLimit),
     [
+      SANDBOX_SETUP_ITERATION_LIMIT,
+      DEFAULT_TRUEFORGE_ITERATION_LIMIT,
       COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
       DEFAULT_TRUEFORGE_ITERATION_LIMIT,
       COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
@@ -972,35 +1030,43 @@ test("empty locked fixture sandboxes are prepared before the workspace snapshot 
   assert.equal(fixture.agentSpecUpdates[0].request.agent.spec.model.params.parallelToolCalls, false);
   assert.equal(fixture.agentSpecUpdates[2].request.agent.spec.model.params.parallelToolCalls, false);
   assert.equal(fixture.agentSpecUpdates[4].request.agent.spec.model.params.parallelToolCalls, false);
+  assert.equal(fixture.agentSpecUpdates[6].request.agent.spec.model.params.parallelToolCalls, false);
   assert.deepEqual(fixture.agentSpecUpdates[0].request.agent.spec.mcpServers, []);
   assert.deepEqual(fixture.agentSpecUpdates[2].request.agent.spec.mcpServers, []);
   assert.deepEqual(fixture.agentSpecUpdates[4].request.agent.spec.mcpServers, []);
+  assert.deepEqual(fixture.agentSpecUpdates[6].request.agent.spec.mcpServers, []);
   assert.equal(fixture.agentSpecUpdates[1].request.agent.spec.model.params, undefined);
   assert.equal(fixture.agentSpecUpdates[3].request.agent.spec.model.params, undefined);
   assert.equal(fixture.agentSpecUpdates[5].request.agent.spec.model.params, undefined);
+  assert.equal(fixture.agentSpecUpdates[7].request.agent.spec.model.params, undefined);
   assert.equal(fixture.agentSpecUpdates[1].request.agent.spec.config.dynamicSubAgents.enabled, true);
   assert.equal(fixture.agentSpecUpdates[3].request.agent.spec.config.dynamicSubAgents.enabled, true);
   assert.equal(fixture.agentSpecUpdates[5].request.agent.spec.config.dynamicSubAgents.enabled, true);
+  assert.equal(fixture.agentSpecUpdates[7].request.agent.spec.config.dynamicSubAgents.enabled, true);
   assert.equal(fixture.agentSpecUpdates[1].request.agent.spec.mcpServers[0].name, "github");
   assert.equal(fixture.agentSpecUpdates[3].request.agent.spec.mcpServers[0].name, "github");
   assert.equal(fixture.agentSpecUpdates[5].request.agent.spec.mcpServers[0].name, "github");
-  assert.equal(fixture.turnRequests[0].agentSpec.config.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
+  assert.equal(fixture.agentSpecUpdates[7].request.agent.spec.mcpServers[0].name, "github");
+  assert.equal(fixture.turnRequests[0].agentSpec.config.iterationLimit, SANDBOX_SETUP_ITERATION_LIMIT);
   assert.equal(fixture.turnRequests[1].agentSpec.config.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
-  assert.equal(fixture.turnRequests[2].agentSpec.config.iterationLimit, DEFAULT_TRUEFORGE_ITERATION_LIMIT);
-  assert.equal(fixture.turnRequests[2].agentSpec.config.dynamicSubAgents.enabled, true);
-  assert.equal(fixture.turnRequests[3].agentSpec.config.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
+  assert.equal(fixture.turnRequests[2].agentSpec.config.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
+  assert.equal(fixture.turnRequests[3].agentSpec.config.iterationLimit, DEFAULT_TRUEFORGE_ITERATION_LIMIT);
+  assert.equal(fixture.turnRequests[3].agentSpec.config.dynamicSubAgents.enabled, true);
+  assert.equal(fixture.turnRequests[4].agentSpec.config.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
 
   const state = await fixture.missions.getState();
   assert.equal(state.missions[0].trueforgeSandboxId, "sandbox-1");
   const preparation = state.evidence.find((evidence) =>
-    evidence.summary.startsWith("Sandbox prepared mtamburrano/proofboard-demo-fixture"),
+    evidence.summary.startsWith("Sandbox repository proof verified mtamburrano/proofboard-demo-fixture"),
   );
   assert.ok(preparation);
   assert.equal(preparation.result, "passed");
   assert.match(preparation.details, /"baseline_sha":"590aa8a6d72c580f61fc1b19d33e9876bc0feb9b"/);
-  assert.match(LOCKED_REPOSITORY_PREPARATION_COMMAND, /git clone --quiet/);
-  assert.match(LOCKED_REPOSITORY_PREPARATION_COMMAND, /git checkout --quiet --detach/);
-  assert.doesNotMatch(LOCKED_REPOSITORY_PREPARATION_COMMAND, /git push|create_pull_request/);
+  assert.equal(LOCKED_REPOSITORY_PREPARATION_COMMAND, LOCKED_REPOSITORY_PROOF_COMMAND);
+  assert.match(LOCKED_REPOSITORY_PROOF_COMMAND, /git config --get remote\.origin\.url/);
+  assert.match(LOCKED_REPOSITORY_PROOF_COMMAND, /git status --porcelain=v1/);
+  assert.match(LOCKED_REPOSITORY_PROOF_COMMAND, /git symbolic-ref --short -q HEAD/);
+  assert.doesNotMatch(LOCKED_REPOSITORY_PROOF_COMMAND, /git clone|git checkout|git push|create_pull_request/);
 });
 
 test("locked repository preparation accepts root main and rejects dynamic child execs", async () => {
@@ -1012,7 +1078,7 @@ test("locked repository preparation accepts root main and rejects dynamic child 
     delegateToSubagent: true,
   });
   assert.ok(acceptedResult.implementationHandoff);
-  assert.equal(accepted.turnRequests.length, 4);
+  assert.equal(accepted.turnRequests.length, 5);
 
   const child = await lockedRepositoryRunnerFixture({
     preparation: { threadId: "thread-subagent" },
@@ -1022,9 +1088,9 @@ test("locked repository preparation accepts root main and rejects dynamic child 
       workItemId: child.workItem.id,
       delegateToSubagent: true,
     }),
-    /not coordinator-owned/i,
+    /not coordinator-owned|outside the TrueForge root thread/i,
   );
-  assert.equal(child.turnRequests.length, 1);
+  assert.equal(child.turnRequests.length, 2);
   const state = await child.missions.getState();
   assert.equal(state.workItems.find((item) => item.id === child.workItem.id).status, "blocked");
 
@@ -1038,7 +1104,7 @@ test("locked repository preparation accepts root main and rejects dynamic child 
     }),
     /uncorrelated structured response|coordinator-owned/i,
   );
-  assert.equal(childResponse.turnRequests.length, 1);
+  assert.equal(childResponse.turnRequests.length, 2);
 });
 
 test("coordinator runtime restoration failure blocks delegated coding", async () => {
@@ -1067,10 +1133,17 @@ test("coordinator runtime restoration failure blocks delegated coding", async ()
 test("real locked repository preparation handles a fresh clone and rejects a dirty worktree", async () => {
   const boundary = await createLocalRepositoryBoundary();
   try {
-    const command = LOCKED_REPOSITORY_PREPARATION_COMMAND.replaceAll(
-      PRIMARY_DELIVERY_FIXTURE.baselineSha,
-      boundary.baselineSha,
+    await runLocalGit(
+      ["clone", LOCKED_REPOSITORY_REMOTE_URL, boundary.workspacePath],
+      boundary.root,
+      boundary.gitEnv,
     );
+    await runLocalGit(
+      ["checkout", "--quiet", "--detach", boundary.baselineSha],
+      boundary.workspacePath,
+      boundary.gitEnv,
+    );
+    const command = LOCKED_REPOSITORY_PROOF_COMMAND;
     const prepared = await execFileAsync("sh", ["-c", command], {
       cwd: boundary.workspacePath,
       env: { ...process.env, ...boundary.gitEnv },
@@ -1079,7 +1152,7 @@ test("real locked repository preparation handles a fresh clone and rejects a dir
 
     assert.equal(
       prepared.stdout.trim(),
-      `TRUEFORGE_REPOSITORY_READY repository=${PRIMARY_DELIVERY_FIXTURE.owner}/${PRIMARY_DELIVERY_FIXTURE.repository} sha=${boundary.baselineSha} root=${boundary.workspacePath}`,
+      `TRUEFORGE_REPOSITORY_PROOF repository=${PRIMARY_DELIVERY_FIXTURE.owner}/${PRIMARY_DELIVERY_FIXTURE.repository} sha=${boundary.baselineSha} clean=true detached=true root=${boundary.workspacePath}`,
     );
     assert.equal(prepared.stderr, "");
     assert.equal(
@@ -1100,20 +1173,14 @@ test("real locked repository preparation handles a fresh clone and rejects a dir
     );
 
     await writeFile(path.join(boundary.workspacePath, "README.md"), "pre-existing dirty content\n", "utf8");
-    await assert.rejects(
-      execFileAsync("sh", ["-c", command], {
-        cwd: boundary.workspacePath,
-        env: { ...process.env, ...boundary.gitEnv },
-        maxBuffer: 1024 * 1024,
-      }),
-      (error) => {
-        assert.equal(error.code, 86);
-        assert.match(
-          `${error.stdout ?? ""}${error.stderr ?? ""}`,
-          /LOCKED_REPOSITORY_PREPARATION_FAILED existing Git worktree is not clean before checkout\./,
-        );
-        return true;
-      },
+    const dirty = await execFileAsync("sh", ["-c", command], {
+      cwd: boundary.workspacePath,
+      env: { ...process.env, ...boundary.gitEnv },
+      maxBuffer: 1024 * 1024,
+    });
+    assert.match(
+      dirty.stdout,
+      new RegExp(`TRUEFORGE_REPOSITORY_PROOF repository=${PRIMARY_DELIVERY_FIXTURE.owner}/${PRIMARY_DELIVERY_FIXTURE.repository} sha=${boundary.baselineSha} clean=false detached=true`),
     );
   } finally {
     await rm(boundary.root, { recursive: true, force: true });
@@ -1131,9 +1198,8 @@ test("wrong locked repository identity or baseline blocks before delegation", as
       error: /expected 590aa8a6d72c580f61fc1b19d33e9876bc0feb9b/i,
     },
     {
-      exitCode: 86,
-      result: "LOCKED_REPOSITORY_PREPARATION_FAILED could not check out the locked baseline.\n",
-      error: /could not check out the locked baseline/i,
+      clean: "false",
+      error: /repository workspace is not clean/i,
     },
   ]) {
     const fixture = await lockedRepositoryRunnerFixture({ preparation });
@@ -1144,7 +1210,7 @@ test("wrong locked repository identity or baseline blocks before delegation", as
       }),
       (error) => preparation.error.test(error.message),
     );
-    assert.equal(fixture.turnRequests.length, 1);
+    assert.equal(fixture.turnRequests.length, 2);
     const state = await fixture.missions.getState();
     assert.equal(state.workItems.find((item) => item.id === fixture.workItem.id).status, "blocked");
     const failure = state.evidence.find((evidence) =>

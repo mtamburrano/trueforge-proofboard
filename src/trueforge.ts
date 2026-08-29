@@ -54,6 +54,7 @@ export interface TrueForgeMissionConfig {
 }
 
 export type TrueForgeCoordinatorToolSurface = "repository-read" | "sandbox-exec";
+export type TrueForgeCoordinatorPhase = "repository-read" | "bounded-setup" | "deterministic-proof";
 
 export interface TrueForgeEventStream extends AsyncIterable<TrueForgeApi.TurnStreamingEvent> {
   withMetadata?: () => AsyncIterable<{ data: TrueForgeApi.TurnStreamingEvent }>;
@@ -119,6 +120,8 @@ export const DEFAULT_TRUEFORGE_ITERATION_LIMIT = 64;
 export const MAX_TRUEFORGE_ITERATION_LIMIT = 1_024;
 /** Deterministic coordinator operations get one model iteration and one tool call. */
 export const COORDINATOR_TRUEFORGE_ITERATION_LIMIT = 1;
+/** Setup may observe and correct a failed sandbox command, but remains finite. */
+export const SANDBOX_SETUP_ITERATION_LIMIT = 4;
 export const MINIMUM_SANDBOX_NODE_MAJOR_VERSION = 20;
 export const SANDBOX_TOOLCHAIN_READINESS_INTENT =
   "Prepare and verify the sandbox toolchain before coding delegation.";
@@ -126,121 +129,48 @@ export const LOCKED_REPOSITORY_PREPARATION_INTENT =
   "Prepare and verify the locked repository before delegated workspace proof.";
 const SANDBOX_TOOLCHAIN_REQUIREMENT =
   "Node.js >=20 and npm are required before coding delegation.";
-const SANDBOX_NODE_SOURCE_MAJOR = 22;
-const SANDBOX_NODE_SOURCE_KEY_URL =
-  "https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key";
-const SANDBOX_NODE_SOURCE_REPOSITORY =
-  `https://deb.nodesource.com/node_${SANDBOX_NODE_SOURCE_MAJOR}.x`;
 export const DELEGATED_COMPLETE_CHANGED_FILES_COMMAND =
   "git status --porcelain=v1 -z --untracked-files=all";
 export { DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND } from "./diff.js";
 
 /**
- * Prepare the primary fixture in the sandbox workspace used by every later
- * proof turn. The command only reads from the remote and mutates the local
- * checkout; it never creates a branch or performs a remote write.
+ * The setup command is intentionally supplied by the bounded setup agent. It
+ * may iterate over local sandbox preparation without making a long command a
+ * model-reconstruction contract. The proof command below is the only
+ * coordinator-owned repository command and is read-only.
  */
-export const LOCKED_REPOSITORY_PREPARATION_COMMAND = [
+export const LOCKED_REPOSITORY_PROOF_COMMAND = [
   "set -eu",
   "unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE",
-  `expected_repository='${LOCKED_FIXTURE_OWNER}/${LOCKED_FIXTURE_REPO}'`,
-  `expected_sha='${LOCKED_FIXTURE_SHA}'`,
-  "repository_created=false",
-  "git_root=\"$(git rev-parse --show-toplevel 2>/dev/null || true)\"",
-  "if [ -z \"$git_root\" ]; then",
-  "  workspace_entry=\"$(find . -mindepth 1 -maxdepth 1 -print -quit)\"",
-  "  if [ -n \"$workspace_entry\" ]; then",
-  `    printf '%s\\n' 'LOCKED_REPOSITORY_PREPARATION_FAILED workspace is not empty and is not a Git worktree for ${LOCKED_FIXTURE_OWNER}/${LOCKED_FIXTURE_REPO}.' >&2`,
-  "    exit 86",
-  "  fi",
-  `  if ! git clone --quiet --no-checkout --no-tags 'https://github.com/${LOCKED_FIXTURE_OWNER}/${LOCKED_FIXTURE_REPO}.git' . >/dev/null 2>&1; then`,
-  `    printf '%s\\n' 'LOCKED_REPOSITORY_PREPARATION_FAILED clone of ${LOCKED_FIXTURE_OWNER}/${LOCKED_FIXTURE_REPO} failed.' >&2`,
-  "    exit 86",
-  "  fi",
-  "  repository_created=true",
-  "  git_root=\"$(git rev-parse --show-toplevel 2>/dev/null || true)\"",
-  "fi",
-  "if [ -z \"$git_root\" ]; then",
-  "  printf '%s\\n' 'LOCKED_REPOSITORY_PREPARATION_FAILED no Git worktree was found after preparation.' >&2",
-  "  exit 86",
-  "fi",
-  "cd \"$git_root\"",
-  "if [ ! -e .git ] || [ \"$(git rev-parse --is-inside-work-tree 2>/dev/null || true)\" != \"true\" ]; then",
-  "  printf '%s\\n' 'LOCKED_REPOSITORY_PREPARATION_FAILED the prepared path has no usable Git worktree.' >&2",
-  "  exit 86",
-  "fi",
-  "remote_url=\"$(git config --get remote.origin.url 2>/dev/null || true)\"",
+  "remote_url=\"$(git config --get remote.origin.url)\"",
   "remote_identity=\"$(printf '%s' \"$remote_url\" | sed -E 's#^(https://github\\.com/|ssh://git@github\\.com/|git@github\\.com:)##; s#\\.git$##; s#/$##')\"",
-  "if [ \"$remote_identity\" != \"$expected_repository\" ]; then",
-  "  printf '%s\\n' \"LOCKED_REPOSITORY_PREPARATION_FAILED repository identity did not match expected $expected_repository.\" >&2",
-  "  exit 86",
-  "fi",
-  "if [ \"$repository_created\" != \"true\" ]; then",
-  "  worktree_status=\"$(git status --porcelain=v1 --untracked-files=all 2>/dev/null || true)\"",
-  "  if [ -n \"$worktree_status\" ]; then",
-  "    printf '%s\\n' 'LOCKED_REPOSITORY_PREPARATION_FAILED existing Git worktree is not clean before checkout.' >&2",
-  "    exit 86",
-  "  fi",
-  "fi",
-  "if ! git cat-file -e \"$expected_sha^{commit}\" 2>/dev/null; then",
-  "  if ! git fetch --quiet --no-tags origin \"$expected_sha\" >/dev/null 2>&1; then",
-  "    printf '%s\\n' \"LOCKED_REPOSITORY_PREPARATION_FAILED could not fetch the locked baseline $expected_sha from the verified repository.\" >&2",
-  "    exit 86",
-  "  fi",
-  "fi",
-  "if ! git checkout --quiet --detach \"$expected_sha\" >/dev/null 2>&1; then",
-  "  printf '%s\\n' \"LOCKED_REPOSITORY_PREPARATION_FAILED could not check out the locked baseline $expected_sha.\" >&2",
-  "  exit 86",
-  "fi",
-  "worktree_status=\"$(git status --porcelain=v1 --untracked-files=all 2>/dev/null || true)\"",
-  "if [ -n \"$worktree_status\" ]; then",
-  "  printf '%s\\n' 'LOCKED_REPOSITORY_PREPARATION_FAILED prepared Git worktree is not clean after checkout.' >&2",
-  "  exit 86",
-  "fi",
-  "head_sha=\"$(git rev-parse --verify HEAD 2>/dev/null || true)\"",
-  "if [ \"$head_sha\" != \"$expected_sha\" ]; then",
-  "  printf '%s\\n' \"LOCKED_REPOSITORY_PREPARATION_FAILED checked out SHA did not match expected $expected_sha.\" >&2",
-  "  exit 86",
-  "fi",
-  "if [ -n \"$(git symbolic-ref --short -q HEAD || true)\" ]; then",
-  "  printf '%s\\n' 'LOCKED_REPOSITORY_PREPARATION_FAILED the locked baseline is not checked out in detached mode.' >&2",
-  "  exit 86",
-  "fi",
-  "printf 'TRUEFORGE_REPOSITORY_READY repository=%s sha=%s root=%s\\n' \"$expected_repository\" \"$head_sha\" \"$git_root\"",
-].join("\n");
+  "repository_root=\"$(git rev-parse --show-toplevel)\"",
+  "head_sha=\"$(git rev-parse --verify HEAD)\"",
+  "worktree_status=\"$(git status --porcelain=v1 --untracked-files=all)\"",
+  "symbolic_head=\"$(git symbolic-ref --short -q HEAD || true)\"",
+  "clean=false",
+  "if [ -z \"$worktree_status\" ]; then clean=true; fi",
+  "detached=false",
+  "if [ -z \"$symbolic_head\" ]; then detached=true; fi",
+  "printf 'TRUEFORGE_REPOSITORY_PROOF repository=%s sha=%s clean=%s detached=%s root=%s\\n' \"$remote_identity\" \"$head_sha\" \"$clean\" \"$detached\" \"$repository_root\"",
+].join("; ");
+
+/** Compatibility names now point at the deterministic proof, never setup. */
+export const LOCKED_REPOSITORY_PREPARATION_COMMAND = LOCKED_REPOSITORY_PROOF_COMMAND;
 export const DELEGATED_REPOSITORY_PREPARATION_INTENT = LOCKED_REPOSITORY_PREPARATION_INTENT;
-export const DELEGATED_REPOSITORY_PREPARATION_COMMAND = LOCKED_REPOSITORY_PREPARATION_COMMAND;
+export const DELEGATED_REPOSITORY_PREPARATION_COMMAND = LOCKED_REPOSITORY_PROOF_COMMAND;
 
 /**
- * Debian 12/bookworm ships Node.js 18. Add the NodeSource 22.x repository
- * before installing nodejs so apt cannot satisfy readiness with that package.
- * The NodeSource nodejs package includes npm; the final marker verifies both.
+ * This short command is deliberately read-only. It is the deterministic
+ * measurement that independently proves both versions after setup finishes.
  */
-export const SANDBOX_TOOLCHAIN_READINESS_COMMAND = [
+export const SANDBOX_TOOLCHAIN_PROOF_COMMAND = [
   "set -eu",
-  "has_supported_node() { command -v node >/dev/null 2>&1 && node -e 'process.exit(Number(process.versions.node.split(\".\")[0]) >= 20 ? 0 : 1)' >/dev/null 2>&1; }",
-  "if ! has_supported_node || ! command -v npm >/dev/null 2>&1; then",
-  "  if command -v apt-get >/dev/null 2>&1; then",
-  "    export DEBIAN_FRONTEND=noninteractive",
-  "    apt-get update -qq",
-  "    apt-get install -y -qq --no-install-recommends ca-certificates curl gnupg",
-  "    install -d -m 0755 /etc/apt/keyrings",
-  `    curl -fsSL ${SANDBOX_NODE_SOURCE_KEY_URL} | gpg --dearmor --yes -o /etc/apt/keyrings/nodesource.gpg`,
-  `    printf '%s\\n' 'deb [signed-by=/etc/apt/keyrings/nodesource.gpg] ${SANDBOX_NODE_SOURCE_REPOSITORY} nodistro main' > /etc/apt/sources.list.d/nodesource.list`,
-  "    apt-get update -qq",
-  "    apt-get install -y -qq --no-install-recommends nodejs",
-  "  else",
-    `    printf '%s\\n' '${SANDBOX_TOOLCHAIN_REQUIREMENT} Install them in the sandbox image.' >&2`,
-  "    exit 86",
-  "  fi",
-  "fi",
-  "if ! has_supported_node || ! command -v npm >/dev/null 2>&1; then",
-  `  printf '%s\\n' '${SANDBOX_TOOLCHAIN_REQUIREMENT} The sandbox could not prepare them.' >&2`,
-  "  exit 86",
-  "fi",
-  "printf 'TRUEFORGE_TOOLCHAIN_READY node=%s npm=%s\\n' \"$(node --version)\" \"$(npm --version)\"",
-].join("\n");
-
+  "node_version=\"$(node --version)\"",
+  "npm_version=\"$(npm --version)\"",
+  "printf 'TRUEFORGE_TOOLCHAIN_PROOF node=%s npm=%s\\n' \"$node_version\" \"$npm_version\"",
+].join("; ");
+export const SANDBOX_TOOLCHAIN_READINESS_COMMAND = SANDBOX_TOOLCHAIN_PROOF_COMMAND;
 export const PRIMARY_WORK_GRAPH_IDS = {
   inspect: "primary-inspect",
   implement: "primary-implement",
@@ -584,6 +514,7 @@ interface InternalRunTurnOptions extends RunTurnOptions {
   input?: TrueForgeApi.TurnInputItem[];
   coordinatorRuntime?: boolean;
   coordinatorToolSurface?: TrueForgeCoordinatorToolSurface;
+  coordinatorPhase?: TrueForgeCoordinatorPhase;
   coordinatorMcpServerName?: string;
   coordinatorExpectedToolName?: string;
   delegatedWorkspaceStart?: {
@@ -830,6 +761,8 @@ interface VerifiedSandboxExecution {
   exitCode: number;
   stdout: string;
   outputSummary: string;
+  toolCallId: string;
+  observedExecCount: number;
   sandboxId?: string;
 }
 
@@ -842,6 +775,13 @@ interface VerifiedLockedRepositoryPreparation extends VerifiedSandboxExecution {
   repository: string;
   baselineSha: string;
   repositoryRoot: string;
+}
+
+interface VerifiedSandboxSetup {
+  sandboxId?: string;
+  observedExecCount: number;
+  commands: string[];
+  failedExecCount: number;
 }
 
 export class TrueForgeIntegrationError extends Error {
@@ -905,10 +845,19 @@ export function buildCoordinatorAgentSpec(
   return buildCoordinatorAgentSpecForSurface(config, surface);
 }
 
+export function buildSandboxSetupAgentSpec(
+  config: TrueForgeMissionConfig,
+): TrueForgeApi.AgentSpec {
+  return buildCoordinatorAgentSpecForSurface(config, "sandbox-exec", {
+    phase: "bounded-setup",
+  });
+}
+
 function buildCoordinatorAgentSpecForSurface(
   config: TrueForgeMissionConfig,
   surface: TrueForgeCoordinatorToolSurface,
   options: {
+    phase?: TrueForgeCoordinatorPhase;
     mcpServerName?: string;
     repositoryToolName?: string;
   } = {},
@@ -923,7 +872,10 @@ function buildCoordinatorAgentSpecForSurface(
     ...config,
     mcpServers,
     dynamicSubAgents: false,
-    iterationLimit: COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
+    ...(surface === "sandbox-exec" ? { sandboxEnabled: true } : {}),
+    iterationLimit: surface === "sandbox-exec" && options.phase === "bounded-setup"
+      ? SANDBOX_SETUP_ITERATION_LIMIT
+      : COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
   });
   return {
     ...spec,
@@ -1140,7 +1092,9 @@ export class TrueForgeMissionRunner {
       return undefined;
     }
 
-    let execution: InternalTurnResult | undefined;
+    let setupExecution: InternalTurnResult | undefined;
+    let proofExecution: InternalTurnResult | undefined;
+    let phase: TrueForgeCoordinatorPhase = "bounded-setup";
     try {
       const toolName = canonicalSandboxToolName(undefined, this.config.sandboxToolName);
       const preparationOptions: RunTurnOptions = {};
@@ -1155,44 +1109,75 @@ export class TrueForgeMissionRunner {
       } else if (previousTurnId !== undefined) {
         preparationOptions.previousTurnId = previousTurnId;
       }
-      execution = await this.executeCoordinatorTurn(
+      setupExecution = await this.executeCoordinatorTurn(
         mission.id,
         buildLockedRepositoryPreparationInstruction(mission, toolName),
         {
           ...preparationOptions,
           coordinatorToolSurface: "sandbox-exec",
+          coordinatorPhase: "bounded-setup",
+        },
+      );
+      const setup = verifyBoundedSandboxSetup(
+        setupExecution.rawEvents,
+        toolName,
+        mission.trueforgeSandboxId,
+        "prepare repository",
+      );
+      await this.recordSandboxSetupEvidence(
+        mission.id,
+        workItemId,
+        setupExecution,
+        "repository preparation",
+        setup,
+      );
+
+      const preparedMission = await this.missions.getMission(mission.id);
+      phase = "deterministic-proof";
+      proofExecution = await this.executeCoordinatorTurn(
+        mission.id,
+        buildLockedRepositoryProofInstruction(preparedMission, toolName),
+        {
+          previousTurnId: setupExecution.turnId,
+          coordinatorToolSurface: "sandbox-exec",
+          coordinatorPhase: "deterministic-proof",
         },
       );
       const verified = verifyLockedRepositoryPreparation(
-        execution.rawEvents,
-        LOCKED_REPOSITORY_PREPARATION_COMMAND,
+        proofExecution.rawEvents,
+        LOCKED_REPOSITORY_PROOF_COMMAND,
         toolName,
-        mission.trueforgeSandboxId,
+        preparedMission.trueforgeSandboxId,
       );
       const evidence = await this.missions.addEvidence(mission.id, {
         workItemId,
         kind: "tool_result",
         result: "passed",
         source: "sandbox",
-        summary: `Sandbox prepared ${verified.repository} at locked baseline ${verified.baselineSha}.`,
+        summary: "Sandbox repository proof verified " + verified.repository +
+          " at locked baseline " + verified.baselineSha + ".",
         details: JSON.stringify({
+          phase: "deterministic_proof",
+          classification: "deterministic measurement/proof",
           tool: toolName,
           intent: LOCKED_REPOSITORY_PREPARATION_INTENT,
-          command: LOCKED_REPOSITORY_PREPARATION_COMMAND,
+          command: LOCKED_REPOSITORY_PROOF_COMMAND,
           repository: verified.repository,
           baseline_sha: verified.baselineSha,
           repository_root: verified.repositoryRoot,
+          observed_exec_count: verified.observedExecCount,
           ...(verified.sandboxId === undefined ? {} : { sandbox_id: verified.sandboxId }),
         }),
         executionOrigin: {
           kind: "sandbox",
-          sessionId: execution.sessionId,
-          turnId: execution.turnId,
+          sessionId: proofExecution.sessionId,
+          turnId: proofExecution.turnId,
+          toolCallId: verified.toolCallId,
         },
       });
       return {
-        sessionId: execution.sessionId,
-        turnId: execution.turnId,
+        sessionId: proofExecution.sessionId,
+        turnId: proofExecution.turnId,
         repository: verified.repository,
         baselineSha: verified.baselineSha,
         repositoryRoot: verified.repositoryRoot,
@@ -1201,7 +1186,13 @@ export class TrueForgeMissionRunner {
         mission: await this.missions.getMission(mission.id),
       };
     } catch (error) {
-      await this.recordRepositoryPreparationFailure(mission.id, workItemId, error, execution);
+      await this.recordRepositoryPreparationFailure(
+        mission.id,
+        workItemId,
+        error,
+        proofExecution ?? setupExecution,
+        phase,
+      );
       if (error instanceof TrueForgeIntegrationError && error.operation === "prepare repository") {
         throw error;
       }
@@ -1210,10 +1201,11 @@ export class TrueForgeMissionRunner {
         : "The locked repository could not be prepared or verified.";
       throw new TrueForgeIntegrationError(
         "prepare repository",
-        `Locked repository preparation failed before delegated workspace proof: ${reason}`,
+        "Locked repository preparation failed before delegated workspace proof: " + reason,
       );
     }
   }
+
 
   private async captureDelegatedWorkspaceStart(
     missionId: string,
@@ -1229,9 +1221,10 @@ export class TrueForgeMissionRunner {
         "exec",
         DELEGATED_WORKSPACE_SNAPSHOT_INTENT,
       ),
-      {
-        coordinatorToolSurface: "sandbox-exec",
-        ...(previousTurnId === undefined ? {} : { previousTurnId }),
+        {
+          coordinatorToolSurface: "sandbox-exec",
+          coordinatorPhase: "deterministic-proof",
+          ...(previousTurnId === undefined ? {} : { previousTurnId }),
       },
     );
     requireCompletedTurn(
@@ -1318,6 +1311,7 @@ export class TrueForgeMissionRunner {
       {
         previousTurnId,
         coordinatorToolSurface: "sandbox-exec",
+        coordinatorPhase: "deterministic-proof",
       },
     );
     requireCompletedTurn(
@@ -1913,7 +1907,9 @@ export class TrueForgeMissionRunner {
     input: SandboxPreparationInput,
   ): Promise<SandboxPreparationResult> {
     const mission = await this.missions.getMission(input.missionId);
-    let execution: InternalTurnResult | undefined;
+    let setupExecution: InternalTurnResult | undefined;
+    let proofExecution: InternalTurnResult | undefined;
+    let phase: TrueForgeCoordinatorPhase = "bounded-setup";
     try {
       const toolName = canonicalSandboxToolName(undefined, this.config.sandboxToolName);
       const preparationOptions: RunTurnOptions = {};
@@ -1926,42 +1922,73 @@ export class TrueForgeMissionRunner {
         }
         preparationOptions.previousTurnId = mission.trueforgeTurnId;
       }
-      execution = await this.executeCoordinatorTurn(
+      setupExecution = await this.executeCoordinatorTurn(
         mission.id,
         buildSandboxPreparationInstruction(mission, toolName),
         {
           ...preparationOptions,
           coordinatorToolSurface: "sandbox-exec",
+          coordinatorPhase: "bounded-setup",
+        },
+      );
+      const setup = verifyBoundedSandboxSetup(
+        setupExecution.rawEvents,
+        toolName,
+        mission.trueforgeSandboxId,
+        "prepare sandbox",
+      );
+      await this.recordSandboxSetupEvidence(
+        mission.id,
+        undefined,
+        setupExecution,
+        "toolchain",
+        setup,
+      );
+
+      const preparedMission = await this.missions.getMission(mission.id);
+      phase = "deterministic-proof";
+      proofExecution = await this.executeCoordinatorTurn(
+        mission.id,
+        buildSandboxProofInstruction(preparedMission, toolName),
+        {
+          previousTurnId: setupExecution.turnId,
+          coordinatorToolSurface: "sandbox-exec",
+          coordinatorPhase: "deterministic-proof",
         },
       );
       const verified = verifySandboxReadiness(
-        execution.rawEvents,
-        SANDBOX_TOOLCHAIN_READINESS_COMMAND,
+        proofExecution.rawEvents,
+        SANDBOX_TOOLCHAIN_PROOF_COMMAND,
         toolName,
-        mission.trueforgeSandboxId,
+        preparedMission.trueforgeSandboxId,
       );
       const evidence = await this.missions.addEvidence(mission.id, {
         kind: "tool_result",
         result: "passed",
         source: "sandbox",
-        summary: `Sandbox toolchain is ready with Node.js ${verified.nodeVersion} and npm ${verified.npmVersion}.`,
+        summary: "Sandbox toolchain proof verified Node.js " + verified.nodeVersion +
+          " and npm " + verified.npmVersion + ".",
         details: JSON.stringify({
+          phase: "deterministic_proof",
+          classification: "deterministic measurement/proof",
           tool: toolName,
           intent: SANDBOX_TOOLCHAIN_READINESS_INTENT,
-          command: SANDBOX_TOOLCHAIN_READINESS_COMMAND,
+          command: SANDBOX_TOOLCHAIN_PROOF_COMMAND,
           node_version: verified.nodeVersion,
           npm_version: verified.npmVersion,
+          observed_exec_count: verified.observedExecCount,
           ...(verified.sandboxId === undefined ? {} : { sandbox_id: verified.sandboxId }),
         }),
         executionOrigin: {
           kind: "sandbox",
-          sessionId: execution.sessionId,
-          turnId: execution.turnId,
+          sessionId: proofExecution.sessionId,
+          turnId: proofExecution.turnId,
+          toolCallId: verified.toolCallId,
         },
       });
       return {
-        sessionId: execution.sessionId,
-        turnId: execution.turnId,
+        sessionId: proofExecution.sessionId,
+        turnId: proofExecution.turnId,
         nodeVersion: verified.nodeVersion,
         npmVersion: verified.npmVersion,
         ...(verified.sandboxId === undefined ? {} : { sandboxId: verified.sandboxId }),
@@ -1969,7 +1996,12 @@ export class TrueForgeMissionRunner {
         mission: await this.missions.getMission(mission.id),
       };
     } catch (error) {
-      await this.recordSandboxPreparationFailure(mission.id, error, execution);
+      await this.recordSandboxPreparationFailure(
+        mission.id,
+        error,
+        proofExecution ?? setupExecution,
+        phase,
+      );
       if (error instanceof TrueForgeIntegrationError && error.operation === "prepare sandbox") {
         throw error;
       }
@@ -1978,10 +2010,11 @@ export class TrueForgeMissionRunner {
         : "The sandbox toolchain could not be prepared or verified.";
       throw new TrueForgeIntegrationError(
         "prepare sandbox",
-        `Sandbox toolchain readiness failed: ${SANDBOX_TOOLCHAIN_REQUIREMENT} ${reason}`,
+        "Sandbox toolchain readiness failed: " + SANDBOX_TOOLCHAIN_REQUIREMENT + " " + reason,
       );
     }
   }
+
 
   async runSandboxVerification(
     input: SandboxVerificationInput,
@@ -2011,6 +2044,7 @@ export class TrueForgeMissionRunner {
         {
           ...verificationOptions,
           coordinatorToolSurface: "sandbox-exec",
+          coordinatorPhase: "deterministic-proof",
         },
       );
       const verified = verifySandboxExecution(
@@ -2025,17 +2059,21 @@ export class TrueForgeMissionRunner {
         source: "sandbox" as const,
         summary: `Sandbox ${toolName} completed the verification command with exit code 0.`,
         details: JSON.stringify({
+          phase: "deterministic_proof",
+          classification: "deterministic measurement/proof",
           tool: toolName,
           intent,
           command,
           exit_code: verified.exitCode,
           output: verified.outputSummary,
+          observed_exec_count: verified.observedExecCount,
           ...(verified.sandboxId === undefined ? {} : { sandbox_id: verified.sandboxId }),
         }),
         executionOrigin: {
           kind: "sandbox" as const,
           sessionId: execution.sessionId,
           turnId: execution.turnId,
+          toolCallId: verified.toolCallId,
         },
       };
       const evidence = input.workItemId === undefined
@@ -2063,6 +2101,7 @@ export class TrueForgeMissionRunner {
         input.command,
         error,
         execution,
+        "deterministic-proof",
       );
       if (error instanceof TrueForgeIntegrationError) {
         throw error;
@@ -2106,13 +2145,16 @@ export class TrueForgeMissionRunner {
             ...(options.coordinatorExpectedToolName === undefined
               ? {}
               : { repositoryToolName: options.coordinatorExpectedToolName }),
+            ...(options.coordinatorPhase === undefined
+              ? {}
+              : { phase: options.coordinatorPhase }),
           },
         ),
         "bound coordinator runtime",
       );
       execution = await this.executeTurn(missionId, instruction, {
-        ...options,
-        coordinatorRuntime: true,
+          ...options,
+          coordinatorRuntime: true,
       });
     } catch (error) {
       operationFailed = true;
@@ -2311,6 +2353,7 @@ export class TrueForgeMissionRunner {
           options.coordinatorRuntime === true,
           rawEvents,
           options.coordinatorExpectedToolName,
+          options.coordinatorPhase,
         );
         if (evidence !== null) {
           const evidenceInput = {
@@ -2861,14 +2904,51 @@ export class TrueForgeMissionRunner {
     }
   }
 
+  private async recordSandboxSetupEvidence(
+    missionId: string,
+    workItemId: string | undefined,
+    execution: InternalTurnResult,
+    operation: string,
+    setup: VerifiedSandboxSetup,
+  ): Promise<void> {
+    const evidenceInput = {
+      kind: "tool_result" as const,
+      result: "informational" as const,
+      source: "sandbox" as const,
+      summary: "Bounded sandbox " + operation + " setup completed; deterministic proof remains required.",
+      details: JSON.stringify({
+        phase: "bounded_setup",
+        classification: "bounded setup/mutation",
+        operation,
+        tool: "exec",
+        observed_exec_count: setup.observedExecCount,
+        failed_exec_count: setup.failedExecCount,
+        commands: setup.commands.map((command) => sanitizeRuntimeText(command)),
+        ...(setup.sandboxId === undefined ? {} : { sandbox_id: setup.sandboxId }),
+      }),
+      executionOrigin: {
+        kind: "sandbox" as const,
+        sessionId: execution.sessionId,
+        turnId: execution.turnId,
+      },
+    };
+    if (workItemId === undefined) {
+      await this.missions.addEvidence(missionId, evidenceInput);
+    } else {
+      await this.missions.addEvidence(missionId, { ...evidenceInput, workItemId });
+    }
+  }
+
   private async recordSandboxPreparationFailure(
     missionId: string,
     error: unknown,
     execution: InternalTurnResult | undefined,
+    phase: SandboxControlPhase,
   ): Promise<void> {
     const message = error instanceof TrueForgeIntegrationError
       ? error.message
       : "The sandbox toolchain could not be prepared or verified.";
+    const reason = sanitizeRuntimeText(message);
     try {
       await this.missions.addEvidence(missionId, {
         kind: "tool_result",
@@ -2879,9 +2959,19 @@ export class TrueForgeMissionRunner {
           failure_layer: "tool",
           failure_category: "sandbox",
           tool: "exec",
+          phase,
+          classification: phase === "bounded-setup"
+            ? "bounded setup/mutation"
+            : "deterministic measurement/proof",
           intent: SANDBOX_TOOLCHAIN_READINESS_INTENT,
-          command: SANDBOX_TOOLCHAIN_READINESS_COMMAND,
-          reason: message,
+          ...(phase === "deterministic-proof"
+            ? { proof_command: SANDBOX_TOOLCHAIN_PROOF_COMMAND }
+            : {}),
+          failed_postcondition: reason,
+          reason,
+          observed_exec_count: execution === undefined
+            ? 0
+            : observedToolCalls(execution.rawEvents).filter((call) => call.name === "exec").length,
           ...runtimeFailureDetails(execution),
         }),
         ...(execution === undefined
@@ -2928,6 +3018,7 @@ export class TrueForgeMissionRunner {
     workItemId: string,
     error: unknown,
     execution: InternalTurnResult | undefined,
+    phase: SandboxControlPhase,
   ): Promise<void> {
     const message = error instanceof TrueForgeIntegrationError
       ? error.message
@@ -2943,9 +3034,19 @@ export class TrueForgeMissionRunner {
         details: JSON.stringify({
           failure_layer: "tool",
           failure_category: "sandbox",
+          phase,
+          classification: phase === "bounded-setup"
+            ? "bounded setup/mutation"
+            : "deterministic measurement/proof",
           intent: LOCKED_REPOSITORY_PREPARATION_INTENT,
-          command: LOCKED_REPOSITORY_PREPARATION_COMMAND,
+          ...(phase === "deterministic-proof"
+            ? { proof_command: LOCKED_REPOSITORY_PROOF_COMMAND }
+            : {}),
+          failed_postcondition: reason,
           reason,
+          observed_exec_count: execution === undefined
+            ? 0
+            : observedToolCalls(execution.rawEvents).filter((call) => call.name === "exec").length,
           ...runtimeFailureDetails(execution),
         }),
         ...(execution === undefined
@@ -2971,10 +3072,12 @@ export class TrueForgeMissionRunner {
     command: string,
     error: unknown,
     execution: InternalTurnResult | undefined,
+    phase: SandboxControlPhase,
   ): Promise<void> {
     const message = error instanceof TrueForgeIntegrationError
       ? error.message
       : "The sandbox verification could not be verified.";
+    const reason = sanitizeRuntimeText(message);
     try {
       const evidenceInput = {
         kind: "test_result" as const,
@@ -2984,8 +3087,14 @@ export class TrueForgeMissionRunner {
         details: JSON.stringify({
           failure_layer: "tool",
           failure_category: "sandbox",
+          phase,
+          classification: "deterministic measurement/proof",
           command: typeof command === "string" ? command.trim().slice(0, 2_000) : "",
-          reason: message,
+          failed_postcondition: reason,
+          reason,
+          observed_exec_count: execution === undefined
+            ? 0
+            : observedToolCalls(execution.rawEvents).filter((call) => call.name === "exec").length,
           ...runtimeFailureDetails(execution),
         }),
         ...(execution === undefined
@@ -3419,17 +3528,27 @@ function buildSandboxPreparationInstruction(
   toolName: string,
 ): string {
   return [
-    `Prepare the configured sandbox for mission ${mission.id} before any coding delegation.`,
-    `Call the sandbox tool ${toolName} exactly once with this JSON object: ${JSON.stringify({
-      intent: SANDBOX_TOOLCHAIN_READINESS_INTENT,
-      command: SANDBOX_TOOLCHAIN_READINESS_COMMAND,
-    })}.`,
+    `Run bounded sandbox-only setup for mission ${mission.id} before any coding delegation.`,
+    `Use only the configured sandbox ${toolName} tool; this is the bounded setup/mutation phase.`,
+    `You may issue at most ${SANDBOX_SETUP_ITERATION_LIMIT} sequential ${toolName} calls, one at a time, to prepare the Node.js >=${MINIMUM_SANDBOX_NODE_MAJOR_VERSION} and npm toolchain.`,
+    "A setup command may fail; inspect its structured exit result and correct the setup within this same bounded phase.",
     mission.trueforgeSandboxId === undefined
-      ? "Record the sandbox identity before executing the command."
+      ? "Use the newly created sandbox and keep all setup calls on the coordinator root thread."
       : `Reuse the persisted sandbox ${mission.trueforgeSandboxId} and do not create a replacement sandbox.`,
-    "Do not run the command on the host, do not use a different execution tool, and do not fabricate the result.",
-    "Return the structured sandbox response after the toolchain is prepared and verified.",
+    "Do not use MCP servers, subagents, parallel tool calls, the host, or any remote mutation. Do not claim readiness from narration; a separate deterministic proof will verify the final state.",
   ].join(" ");
+}
+
+function buildSandboxProofInstruction(
+  mission: Mission,
+  toolName: string,
+): string {
+  return buildSandboxVerificationInstruction(
+    mission,
+    SANDBOX_TOOLCHAIN_PROOF_COMMAND,
+    toolName,
+    SANDBOX_TOOLCHAIN_READINESS_INTENT,
+  ) + " This is the deterministic measurement/proof phase; do not repair the sandbox if the proof fails.";
 }
 
 function buildLockedRepositoryPreparationInstruction(
@@ -3443,18 +3562,28 @@ function buildLockedRepositoryPreparationInstruction(
     );
   }
   return [
-    `Prepare the locked repository for mission ${mission.id} in the persistent sandbox workspace before the first delegated workspace snapshot.`,
-    `Call the sandbox tool ${toolName} exactly once with this JSON object: ${JSON.stringify({
-      intent: LOCKED_REPOSITORY_PREPARATION_INTENT,
-      command: LOCKED_REPOSITORY_PREPARATION_COMMAND,
-    })}.`,
+    `Run bounded sandbox-only repository setup for mission ${mission.id} in the persistent workspace before the first delegated workspace snapshot.`,
+    `Use only the configured sandbox ${toolName} tool; this is the bounded setup/mutation phase.`,
+    `You may issue at most ${SANDBOX_SETUP_ITERATION_LIMIT} sequential ${toolName} calls, one at a time, to prepare ${LOCKED_FIXTURE_OWNER}/${LOCKED_FIXTURE_REPO} at locked baseline ${LOCKED_FIXTURE_SHA}.`,
+    "A setup command may fail; inspect its structured exit result and correct the local preparation within this same bounded phase.",
     mission.trueforgeSandboxId === undefined
-      ? "Record the sandbox identity before executing the command."
+      ? "Use the newly created sandbox and keep all setup calls on the coordinator root thread."
       : `Reuse the persisted sandbox ${mission.trueforgeSandboxId} and do not create a replacement sandbox.`,
-    "The command may clone or fetch the pinned repository and use a local detached checkout, but it must not push, create a branch, commit, open a pull request, or perform any other remote mutation.",
-    "Do not run the command on the host, do not use a different execution tool, and do not fabricate the result.",
-    "Return the structured sandbox response only after repository identity, worktree, and exact baseline SHA have been verified.",
+    "Local clone, fetch, checkout, and worktree preparation are allowed; do not push, create a branch, commit, open a pull request, or perform any other remote mutation.",
+    "Do not use MCP servers, subagents, parallel tool calls, the host, or agent narration as proof. A separate exact read-only measurement will verify origin, SHA, cleanliness, detached state, and sandbox identity.",
   ].join(" ");
+}
+
+function buildLockedRepositoryProofInstruction(
+  mission: Mission,
+  toolName: string,
+): string {
+  return buildSandboxVerificationInstruction(
+    mission,
+    LOCKED_REPOSITORY_PROOF_COMMAND,
+    toolName,
+    LOCKED_REPOSITORY_PREPARATION_INTENT,
+  ) + " This is the deterministic measurement/proof phase; do not repair the repository if the proof fails.";
 }
 
 function buildSandboxVerificationIntent(): string {
@@ -4119,7 +4248,16 @@ function coordinatorWorkspaceExecution(
   events: TrueForgeApi.TurnStreamingEvent[],
   expectedCommand: string,
 ): CoordinatorWorkspaceExecution | null {
-  const executions = observedToolCalls(events).filter((call) => call.name === "exec");
+  const calls = observedToolCalls(events);
+  if (
+    calls.some((call) => call.name !== "exec") ||
+    hasParallelToolCalls(events) ||
+    events.some((event) => event.type === "thread.created") ||
+    events.some((event) => event.type.startsWith("mcp."))
+  ) {
+    return null;
+  }
+  const executions = calls.filter((call) => call.name === "exec");
   if (executions.length !== 1) {
     return null;
   }
@@ -4322,6 +4460,24 @@ function runtimeFailureDetails(
         return response;
       }),
   };
+  const observedCalls = observedToolCalls(execution.rawEvents);
+  details.observed_tool_count = observedCalls.length;
+  details.observed_exec_count = observedCalls.filter((call) => call.name === "exec").length;
+  const exitCodes = observedCalls.flatMap((call) => {
+    const response = parseExecutionResponse(toolResponseForCall(execution.rawEvents, call.id));
+    return response === null ? [] : [response.exitCode];
+  });
+  if (exitCodes.length > 0) {
+    details.observed_exit_codes = exitCodes;
+    details.last_exit_code = exitCodes.at(-1);
+  }
+  const completionEvent = [...execution.rawEvents].reverse().find((event) => event.type === "turn.done");
+  if (completionEvent !== undefined) {
+    const completion = turnCompletion(completionEvent);
+    if (completion.error !== null) {
+      details.runtime_error = completion.error;
+    }
+  }
   const sandboxIds = execution.rawEvents
     .map(sandboxIdFromEvent)
     .filter((sandboxId): sandboxId is string => sandboxId !== null);
@@ -4757,6 +4913,7 @@ function coordinatorExecProvenance(
   argumentsValue: unknown,
   expectedCommand: string,
   expectedExecutionArguments: Readonly<Record<string, unknown>> = {},
+  requireExactCommand = false,
 ): CoordinatorExecProvenance | null {
   if (!isRecord(argumentsValue)) {
     return null;
@@ -4769,8 +4926,10 @@ function coordinatorExecProvenance(
     intent === null ||
     actualCommand === null ||
     actualCommand.trim().length === 0 ||
-    normalizeSafeWorkingDirectoryPrefix(actualCommand) !==
-      normalizeSafeWorkingDirectoryPrefix(expectedCommand)
+    (requireExactCommand
+      ? actualCommand.trim() !== expectedCommand.trim()
+      : normalizeSafeWorkingDirectoryPrefix(actualCommand) !==
+        normalizeSafeWorkingDirectoryPrefix(expectedCommand))
   ) {
     return null;
   }
@@ -4891,6 +5050,308 @@ function normalizeCommitPatch(value: string): string {
   return hunkStart === -1 ? normalized : normalized.slice(hunkStart);
 }
 
+type SandboxControlPhase = "bounded-setup" | "deterministic-proof";
+
+function sandboxPhaseFailure(
+  operation: string,
+  phase: SandboxControlPhase,
+  events: TrueForgeApi.TurnStreamingEvent[],
+  message: string,
+): never {
+  const calls = observedToolCalls(events);
+  const execCalls = calls.filter((call) => call.name === "exec");
+  const exitCodes = execCalls.flatMap((call) => {
+    const response = parseExecutionResponse(toolResponseForCall(events, call.id));
+    return response === null ? [] : [response.exitCode];
+  });
+  const completionEvent = [...events].reverse().find((event) => event.type === "turn.done");
+  const completion = completionEvent === undefined ? null : turnCompletion(completionEvent);
+  const diagnostics = [
+    `phase=${phase}`,
+    `observed exec count=${execCalls.length}`,
+    ...(exitCodes.length === 0 ? [] : [`exit code=${exitCodes.at(-1)}`]),
+    ...(completion?.error === null || completion === null ? [] : [`runtime error=${completion.error}`]),
+  ].join(", ");
+  return verificationFailure(
+    operation,
+    `${phase === "bounded-setup" ? "Bounded sandbox setup" : "Deterministic sandbox proof"} failed: ${message} (${diagnostics}).`,
+  );
+}
+
+function hasParallelToolCalls(events: TrueForgeApi.TurnStreamingEvent[]): boolean {
+  return events.some((event) => {
+    if (event.type !== "model.message" && event.type !== "model.message.delta") {
+      return false;
+    }
+    const toolCalls = recordValue(event).toolCalls;
+    return Array.isArray(toolCalls) && toolCalls.length > 1;
+  });
+}
+
+function sandboxOnlyCoordinatorCalls(
+  events: TrueForgeApi.TurnStreamingEvent[],
+  operation: string,
+  phase: SandboxControlPhase,
+): ReturnType<typeof observedToolCalls> {
+  if (events.some((event) => event.type.startsWith("mcp."))) {
+    return sandboxPhaseFailure(
+      operation,
+      phase,
+      events,
+      "the sandbox-only coordinator surface emitted an MCP event",
+    );
+  }
+  if (events.some((event) => event.type === "thread.created")) {
+    return sandboxPhaseFailure(
+      operation,
+      phase,
+      events,
+      "the sandbox-only coordinator surface created a subagent thread",
+    );
+  }
+  if (hasParallelToolCalls(events)) {
+    return sandboxPhaseFailure(
+      operation,
+      phase,
+      events,
+      "parallel tool calls were observed despite the single-call boundary",
+    );
+  }
+  const calls = observedToolCalls(events);
+  const unsupportedCall = calls.find((call) => call.name !== "exec");
+  if (unsupportedCall !== undefined) {
+    return sandboxPhaseFailure(
+      operation,
+      phase,
+      events,
+      `unsupported coordinator tool ${unsupportedCall.name} was observed`,
+    );
+  }
+  const childCall = calls.find((call) => !isCoordinatorRootThread(call.threadId));
+  if (childCall !== undefined) {
+    return sandboxPhaseFailure(
+      operation,
+      phase,
+      events,
+      "a coordinator-owned exec was emitted outside the TrueForge root thread",
+    );
+  }
+  return calls;
+}
+
+function setupExecsAreSequential(
+  events: TrueForgeApi.TurnStreamingEvent[],
+  calls: ReturnType<typeof observedToolCalls>,
+): boolean {
+  let previousResponseIndex = -1;
+  for (const call of calls) {
+    const callIndex = events.findIndex((event) => {
+      if (event.type !== "model.message" && event.type !== "model.message.delta") {
+        return false;
+      }
+      const toolCalls = recordValue(event).toolCalls;
+      return Array.isArray(toolCalls) && toolCalls.some((rawCall) =>
+        isRecord(rawCall) && stringOrNull(rawCall.id) === call.id
+      );
+    });
+    const responseIndex = events.findIndex((event) =>
+      (event.type === "tool.response" || event.type === "tool.response_required") &&
+      stringOrNull(recordValue(event).toolCallId ?? recordValue(event).tool_call_id) === call.id,
+    );
+    if (callIndex < 0 || responseIndex < callIndex || callIndex < previousResponseIndex) {
+      return false;
+    }
+    previousResponseIndex = responseIndex;
+  }
+  return true;
+}
+
+function boundedSetupExecArguments(
+  value: unknown,
+): { intent: string; command: string } | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const intent = boundedCoordinatorExecIntent(value.intent);
+  const command = typeof value.command === "string" ? value.command.trim() : "";
+  const keys = Object.keys(value).sort();
+  if (
+    intent === null ||
+    command.length === 0 ||
+    command.length > 8_000 ||
+    keys.length !== 2 ||
+    keys[0] !== "command" ||
+    keys[1] !== "intent"
+  ) {
+    return null;
+  }
+  if (unsafeSandboxSetupCommand(command)) {
+    return null;
+  }
+  return { intent, command };
+}
+
+function unsafeSandboxSetupCommand(command: string): boolean {
+  return /\bgit\s+(?:push|commit|tag|branch\b|reset\s+--hard|clean\b)|\b(?:create_pull_request|pull_request_create)\b|\bgh\s+pr\s+(?:create|merge|close)\b/i.test(command);
+}
+
+function verifyBoundedSandboxSetup(
+  events: TrueForgeApi.TurnStreamingEvent[],
+  toolName: string,
+  expectedSandboxId: string | undefined,
+  operation: string,
+): VerifiedSandboxSetup {
+  if (toolName !== "exec") {
+    return sandboxPhaseFailure(
+      operation,
+      "bounded-setup",
+      events,
+      "sandbox setup requires the canonical TrueForge exec tool",
+    );
+  }
+  const calls = sandboxOnlyCoordinatorCalls(events, operation, "bounded-setup");
+  let sandboxId: string | undefined;
+  try {
+    sandboxId = verifySandboxIdentity(events, expectedSandboxId, operation);
+  } catch (error) {
+    return sandboxPhaseFailure(
+      operation,
+      "bounded-setup",
+      events,
+      error instanceof TrueForgeIntegrationError ? error.message : "sandbox identity was not verified",
+    );
+  }
+  if (calls.length === 0) {
+    return sandboxPhaseFailure(
+      operation,
+      "bounded-setup",
+      events,
+      "no exec observed in the bounded setup phase",
+    );
+  }
+  if (calls.length > SANDBOX_SETUP_ITERATION_LIMIT) {
+    return sandboxPhaseFailure(
+      operation,
+      "bounded-setup",
+      events,
+      `budget exhaustion: observed ${calls.length} exec calls, limit is ${SANDBOX_SETUP_ITERATION_LIMIT}`,
+    );
+  }
+  if (!setupExecsAreSequential(events, calls)) {
+    return sandboxPhaseFailure(
+      operation,
+      "bounded-setup",
+      events,
+      "setup execs were not sequentially observed; each command must receive its response before the next call",
+    );
+  }
+
+  const commands: string[] = [];
+  let failedExecCount = 0;
+  for (const call of calls) {
+    const argumentsValue = boundedSetupExecArguments(call.arguments);
+    if (argumentsValue === null) {
+      return sandboxPhaseFailure(
+        operation,
+        "bounded-setup",
+        events,
+        "a setup exec did not contain only bounded intent and command arguments or attempted a protected mutation",
+      );
+    }
+    const response = toolResponseForCall(events, call.id);
+    if (response === undefined || !isCoordinatorRootThread(
+      stringOrNull(recordValue(response).threadId ?? recordValue(response).thread_id),
+    )) {
+      return sandboxPhaseFailure(
+        operation,
+        "bounded-setup",
+        events,
+        "a setup exec had no root-thread structured response",
+      );
+    }
+    const observed = parseExecutionResponse(response);
+    if (observed === null) {
+      return sandboxPhaseFailure(
+        operation,
+        "bounded-setup",
+        events,
+        "a setup exec returned a runtime failure or malformed response",
+      );
+    }
+    if (observed.success !== true) {
+      return sandboxPhaseFailure(
+        operation,
+        "bounded-setup",
+        events,
+        "a setup exec returned success=false; setup runtime failure is fail-closed",
+      );
+    }
+    if (observed.exitCode !== 0) {
+      failedExecCount += 1;
+    }
+    commands.push(argumentsValue.command);
+  }
+
+  const done = [...events].reverse().find((event) => event.type === "turn.done");
+  if (done === undefined) {
+    return sandboxPhaseFailure(
+      operation,
+      "bounded-setup",
+      events,
+      "the bounded setup turn did not finish",
+    );
+  }
+  const completion = turnCompletion(done);
+  if (completion.status !== "done") {
+    const normalizedError = completion.error?.toLowerCase() ?? "";
+    return sandboxPhaseFailure(
+      operation,
+      "bounded-setup",
+      events,
+      normalizedError.includes("iteration") || normalizedError.includes("limit")
+        ? "budget exhaustion ended the bounded setup turn"
+        : completion.error === null
+        ? "setup runtime failure ended the bounded setup turn"
+        : `setup runtime failure ended the bounded setup turn: ${completion.error}`,
+    );
+  }
+  if (completion.requiredActions === null) {
+    return sandboxPhaseFailure(
+      operation,
+      "bounded-setup",
+      events,
+      "the bounded setup turn did not include required actions",
+    );
+  }
+  if (completion.requiredActions.length > 0) {
+    return sandboxPhaseFailure(
+      operation,
+      "bounded-setup",
+      events,
+      "the bounded setup turn paused with required actions",
+    );
+  }
+  const lastCall = calls.at(-1);
+  const lastResponse = lastCall === undefined
+    ? undefined
+    : toolResponseForCall(events, lastCall.id);
+  const lastObserved = parseExecutionResponse(lastResponse);
+  if (lastObserved === null || lastObserved.success !== true || lastObserved.exitCode !== 0) {
+    return sandboxPhaseFailure(
+      operation,
+      "bounded-setup",
+      events,
+      "the final setup exec failed; deterministic proof was not started",
+    );
+  }
+  return {
+    observedExecCount: calls.length,
+    commands,
+    failedExecCount,
+    ...(sandboxId === undefined ? {} : { sandboxId }),
+  };
+}
+
 function verifySandboxExecution(
   events: TrueForgeApi.TurnStreamingEvent[],
   command: string,
@@ -4901,7 +5362,7 @@ function verifySandboxExecution(
     return sandboxFailure("Sandbox verification requires the canonical TrueForge exec tool.");
   }
   const sandboxId = verifySandboxIdentity(events, expectedSandboxId, "run sandbox verification");
-  const executionCalls = observedToolCalls(events).filter((call) => call.name === toolName);
+  const executionCalls = sandboxOnlyCoordinatorCalls(events, "run sandbox verification", "deterministic-proof");
   if (executionCalls.length > 1) {
     return sandboxFailure(
       `Expected exactly one coordinator-owned ${toolName} sandbox call, found ${executionCalls.length}.`,
@@ -4915,7 +5376,7 @@ function verifySandboxExecution(
   }
   const canonicalCalls = executionCalls.filter(
     (call) => isCoordinatorRootThread(call.threadId) &&
-      coordinatorExecProvenance(call.arguments, command) !== null,
+      coordinatorExecProvenance(call.arguments, command, {}, true) !== null,
   );
   if (canonicalCalls.length !== 1) {
     return sandboxFailure(
@@ -4926,11 +5387,7 @@ function verifySandboxExecution(
   if (call === undefined || !isRecord(call.arguments)) {
     return sandboxFailure(`${toolName} sandbox arguments were not a JSON object.`);
   }
-  const response = events.find(
-    (event) =>
-      event.type === "tool.response" &&
-      recordValue(event).toolCallId === call.id,
-  );
+  const response = toolResponseForCall(events, call.id);
   if (response === undefined) {
     return sandboxFailure(`${toolName} sandbox call has no structured response.`);
   }
@@ -4971,6 +5428,8 @@ function verifySandboxExecution(
     exitCode,
     stdout,
     outputSummary: summarizeOutput(stdout),
+    toolCallId: call.id,
+    observedExecCount: executionCalls.length,
     ...(sandboxId === undefined ? {} : { sandboxId }),
   };
 }
@@ -5015,28 +5474,36 @@ function verifyLockedRepositoryPreparation(
   expectedSandboxId?: string,
 ): VerifiedLockedRepositoryPreparation {
   const operation = "prepare repository";
+  const phase = "deterministic-proof" as const;
   if (toolName !== "exec") {
     return verificationFailure(operation, "Repository preparation requires the canonical TrueForge exec tool.");
   }
   const sandboxId = verifySandboxIdentity(events, expectedSandboxId, operation);
-  const executionCalls = observedToolCalls(events).filter((call) => call.name === toolName);
+  const executionCalls = sandboxOnlyCoordinatorCalls(events, operation, phase);
   if (executionCalls.length !== 1) {
-    return verificationFailure(
+    return sandboxPhaseFailure(
       operation,
-      `Expected exactly one coordinator-owned ${toolName} repository-preparation call, found ${executionCalls.length}.`,
+      phase,
+      events,
+      "Expected exactly one coordinator-owned " + toolName +
+        " repository-preparation call, found " + executionCalls.length,
     );
   }
   const call = executionCalls[0];
-  if (call === undefined || !isCoordinatorRootThread(call.threadId)) {
-    return verificationFailure(
+  if (call === undefined) {
+    return sandboxPhaseFailure(
       operation,
-      "The locked repository preparation call was not coordinator-owned.",
+      phase,
+      events,
+      "the repository proof did not contain an exec call",
     );
   }
-  if (coordinatorExecProvenance(call.arguments, command) === null) {
-    return verificationFailure(
+  if (coordinatorExecProvenance(call.arguments, command, {}, true) === null) {
+    return sandboxPhaseFailure(
       operation,
-      "The coordinator-owned repository preparation call did not match the required command and intent.",
+      phase,
+      events,
+      "The coordinator-owned repository proof call did not match the required exact read-only command and intent",
     );
   }
   const response = toolResponseForCall(events, call.id);
@@ -5044,70 +5511,109 @@ function verifyLockedRepositoryPreparation(
     response === undefined ||
     !isCoordinatorRootThread(stringOrNull(recordValue(response).threadId ?? recordValue(response).thread_id))
   ) {
-    return verificationFailure(
+    return sandboxPhaseFailure(
       operation,
-      "The coordinator-owned locked repository preparation call has no uncorrelated structured response.",
+      phase,
+      events,
+      "The coordinator-owned locked repository proof call has no uncorrelated structured response",
     );
   }
   const observed = parseExecutionResponse(response);
   if (observed === null) {
-    return verificationFailure(
+    return sandboxPhaseFailure(
       operation,
-      "The coordinator-owned locked repository preparation returned no structured sandbox response.",
+      phase,
+      events,
+      "The coordinator-owned locked repository proof returned no structured sandbox response",
     );
   }
   if (observed.success !== true) {
-    return verificationFailure(
+    return sandboxPhaseFailure(
       operation,
-      "The locked repository preparation sandbox response did not return success: true.",
+      phase,
+      events,
+      "The locked repository proof sandbox response did not return success: true",
     );
   }
   if (observed.exitCode !== 0) {
-    const failureMarker = observed.output.match(
-      /(?:^|\n)LOCKED_REPOSITORY_PREPARATION_FAILED ([^\n]+)/,
+    return sandboxPhaseFailure(
+      operation,
+      phase,
+      events,
+      "The locked repository proof command exited with code " + observed.exitCode,
     );
-    const failure = failureMarker?.[1] === undefined
-      ? `The locked repository preparation command exited with code ${observed.exitCode}.`
-      : `Locked repository preparation failed: ${sanitizeRuntimeText(failureMarker[1])}`;
-    return verificationFailure(operation, failure);
   }
   requireCompletedTurn(
     events,
     operation,
-    "repository preparation",
+    "repository proof",
     { allowCoordinatorIterationStop: true },
   );
-  const ready = observed.output.trim().match(
-    /^TRUEFORGE_REPOSITORY_READY repository=([^\s]+) sha=([0-9a-fA-F]{40}) root=(\/.+)$/,
+  const proof = observed.output.trim().match(
+    /^TRUEFORGE_REPOSITORY_PROOF repository=([^\s]+) sha=([0-9a-fA-F]{40}) clean=(true|false) detached=(true|false) root=(\/.+)$/,
   );
-  if (ready === null || ready[1] === undefined || ready[2] === undefined || ready[3] === undefined) {
-    return verificationFailure(
+  if (
+    proof === null ||
+    proof[1] === undefined ||
+    proof[2] === undefined ||
+    proof[3] === undefined ||
+    proof[4] === undefined ||
+    proof[5] === undefined
+  ) {
+    return sandboxPhaseFailure(
       operation,
-      "The coordinator-owned repository preparation did not return the required repository identity, root, and exact baseline SHA proof.",
+      phase,
+      events,
+      "failed postcondition: repository proof did not return repository identity, baseline SHA, clean state, detached state, and root",
     );
   }
-  if (ready[1] !== `${LOCKED_FIXTURE_OWNER}/${LOCKED_FIXTURE_REPO}`) {
-    return verificationFailure(
+  if (proof[1] !== LOCKED_FIXTURE_OWNER + "/" + LOCKED_FIXTURE_REPO) {
+    return sandboxPhaseFailure(
       operation,
-      `Repository preparation returned ${sanitizeRuntimeText(ready[1])}; expected ${LOCKED_FIXTURE_OWNER}/${LOCKED_FIXTURE_REPO}.`,
+      phase,
+      events,
+      "failed postcondition: repository proof returned " + sanitizeRuntimeText(proof[1]) +
+        "; expected " + LOCKED_FIXTURE_OWNER + "/" + LOCKED_FIXTURE_REPO,
     );
   }
-  if (ready[2] !== LOCKED_FIXTURE_SHA) {
-    return verificationFailure(
+  if (proof[2] !== LOCKED_FIXTURE_SHA) {
+    return sandboxPhaseFailure(
       operation,
-      `Repository preparation returned baseline SHA ${ready[2]}; expected ${LOCKED_FIXTURE_SHA}.`,
+      phase,
+      events,
+      "failed postcondition: repository proof returned baseline SHA " + proof[2] +
+        "; expected " + LOCKED_FIXTURE_SHA,
+    );
+  }
+  if (proof[3] !== "true") {
+    return sandboxPhaseFailure(
+      operation,
+      phase,
+      events,
+      "failed postcondition: repository workspace is not clean",
+    );
+  }
+  if (proof[4] !== "true") {
+    return sandboxPhaseFailure(
+      operation,
+      phase,
+      events,
+      "failed postcondition: repository is not detached",
     );
   }
   return {
     exitCode: observed.exitCode,
     stdout: observed.output,
     outputSummary: summarizeOutput(observed.output),
-    repository: ready[1],
-    baselineSha: ready[2],
-    repositoryRoot: ready[3],
+    toolCallId: call.id,
+    observedExecCount: executionCalls.length,
+    repository: proof[1],
+    baselineSha: proof[2],
+    repositoryRoot: proof[5],
     ...(sandboxId === undefined ? {} : { sandboxId }),
   };
 }
+
 
 function verifySandboxReadiness(
   events: TrueForgeApi.TurnStreamingEvent[],
@@ -5121,22 +5627,26 @@ function verifySandboxReadiness(
     toolName,
     expectedSandboxId,
   );
-  const match = execution.stdout.match(
-    /TRUEFORGE_TOOLCHAIN_READY\s+node=(v\d+\.\d+\.\d+)\s+npm=(\d+\.\d+\.\d+)/,
+  const match = execution.stdout.trim().match(
+    /^TRUEFORGE_TOOLCHAIN_PROOF\s+node=(v\d+\.\d+\.\d+)\s+npm=(\d+\.\d+\.\d+)$/,
   );
   if (match === null || match[1] === undefined || match[2] === undefined) {
-    throw new TrueForgeIntegrationError(
+    return sandboxPhaseFailure(
       "prepare sandbox",
-      "Sandbox toolchain readiness did not report Node.js and npm versions.",
+      "deterministic-proof",
+      events,
+      "failed postcondition: toolchain proof did not report Node.js and npm versions",
     );
   }
   const nodeVersion = match[1];
   const npmVersion = match[2];
   const nodeMajor = Number(nodeVersion.slice(1).split(".")[0]);
   if (!Number.isInteger(nodeMajor) || nodeMajor < MINIMUM_SANDBOX_NODE_MAJOR_VERSION) {
-    throw new TrueForgeIntegrationError(
+    return sandboxPhaseFailure(
       "prepare sandbox",
-      `Sandbox toolchain requires Node.js >=${MINIMUM_SANDBOX_NODE_MAJOR_VERSION}; observed ${nodeVersion}.`,
+      "deterministic-proof",
+      events,
+      `failed postcondition: sandbox toolchain requires Node.js >=${MINIMUM_SANDBOX_NODE_MAJOR_VERSION}; observed ${nodeVersion}`,
     );
   }
   return { ...execution, nodeVersion, npmVersion };
@@ -5297,7 +5807,11 @@ function summarizeRuntimeEvent(event: TrueForgeApi.TurnStreamingEvent): TrueForg
   };
 }
 
-function runtimeDetails(event: TrueForgeApi.TurnStreamingEvent): string {
+function runtimeDetails(
+  event: TrueForgeApi.TurnStreamingEvent,
+  coordinatorRuntime = false,
+  coordinatorPhase?: TrueForgeCoordinatorPhase,
+): string {
   const summary = summarizeRuntimeEvent(event);
   const record = recordValue(event);
   const details: Record<string, unknown> = {
@@ -5307,6 +5821,14 @@ function runtimeDetails(event: TrueForgeApi.TurnStreamingEvent): string {
     thread_id: summary.threadId,
     turn_id: summary.turnId,
   };
+  if (coordinatorRuntime && coordinatorPhase !== undefined) {
+    details.phase = coordinatorPhase;
+    details.classification = coordinatorPhase === "bounded-setup"
+      ? "bounded setup/mutation"
+      : coordinatorPhase === "deterministic-proof"
+      ? "deterministic measurement/proof"
+      : "bounded coordinator read";
+  }
   if (event.type === "turn.done" || event.type === "thread.done") {
     const state = record.state;
     if (isRecord(state)) {
@@ -5342,8 +5864,9 @@ function runtimeEvidence(
   coordinatorRuntime: boolean,
   events: TrueForgeApi.TurnStreamingEvent[],
   coordinatorExpectedToolName?: string,
+  coordinatorPhase?: TrueForgeCoordinatorPhase,
 ): RuntimeEvidence | null {
-  const details = runtimeDetails(event);
+  const details = runtimeDetails(event, coordinatorRuntime, coordinatorPhase);
   switch (event.type) {
     case "turn.created":
       return {
@@ -5361,7 +5884,8 @@ function runtimeEvidence(
         ? state.requiredActions ?? state.required_actions
         : undefined;
       const requiredActions = Array.isArray(rawRequiredActions) ? rawRequiredActions : null;
-      const boundedStop = coordinatorRuntime && isExpectedCoordinatorIterationStop(
+      const boundedStop = coordinatorRuntime && coordinatorPhase !== "bounded-setup" &&
+        isExpectedCoordinatorIterationStop(
         events,
         completion,
         coordinatorExpectedToolName,
@@ -5372,7 +5896,7 @@ function runtimeEvidence(
           kind: "tool_result",
           result: "informational",
           summary: coordinatorExpectedToolName === undefined || coordinatorExpectedToolName === "exec"
-            ? "TrueForge stopped the coordinator after the configured one-iteration sandbox boundary."
+            ? "TrueForge stopped the coordinator after the configured one-iteration sandbox proof boundary."
             : "TrueForge stopped the coordinator after the configured one-iteration deterministic read boundary.",
           details,
         };
