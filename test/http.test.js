@@ -42,7 +42,7 @@ class TestMissionRunner {
     this.sandboxInputs = [];
     this.operationLog = [];
     this.turnInputs = [];
-    this.deliveryCalls = { requested: [], resolved: [], protectedOperations: 0 };
+    this.deliveryCalls = { requested: [], resolved: [], protectedOperations: 0, lifecycle: [] };
     this.calls = { create: 0, inspect: 0, headInspect: 0, turn: 0, sandbox: 0 };
   }
 
@@ -118,6 +118,7 @@ class TestMissionRunner {
     const target = input.target;
     const resourceUri = `repo://${target.owner}/${target.repo}/sha/${this.deliveryHeadSha}`;
     const evidence = await this.missions.addEvidence(input.missionId, {
+      workItemId: input.workItemId,
       kind: "tool_result",
       result: "passed",
       source: "mcp",
@@ -163,6 +164,12 @@ class TestMissionRunner {
     const turnId = `test-turn-${this.calls.turn}`;
     await this.missions.attachTrueforgeTurn(missionId, turnId);
     await this.missions.attachTrueforgeSandbox(missionId, "test-sandbox-durable");
+    if (options.workItemId !== undefined) {
+      await this.missions.attachWorkItemExecution(missionId, options.workItemId, {
+        trueforgeSessionId: "test-session-durable",
+        trueforgeSandboxId: "test-sandbox-durable",
+      });
+    }
     await this.missions.addEvidence(missionId, {
       workItemId: options.workItemId,
       kind: "tool_result",
@@ -305,13 +312,19 @@ class TestMissionRunner {
     };
   }
 
-  async resolvePullRequestApproval(missionId, pending, decision) {
-    this.deliveryCalls.resolved.push({ missionId, pending, decision });
+  async resolvePullRequestApproval(missionId, pending, decision, workItemId) {
+    this.deliveryCalls.resolved.push({ missionId, pending, decision, workItemId });
     if (decision !== "approved") {
       return null;
     }
     this.deliveryCalls.protectedOperations += 1;
-    return {
+    const lifecycleState = await this.missions.getState();
+    const implementation = lifecycleState.workItems.find((item) => item.assignedRole === "implementer");
+    this.deliveryCalls.lifecycle.push({
+      missionStatus: lifecycleState.missions.find((item) => item.id === missionId)?.status,
+      workItemStatus: implementation?.status,
+    });
+    const result = {
       number: 73,
       url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/73",
       headSha: pending.target.headSha,
@@ -320,6 +333,32 @@ class TestMissionRunner {
       threadId: pending.threadId,
       toolCallId: pending.toolCallId,
     };
+    await this.missions.addEvidence(missionId, {
+      ...(workItemId === undefined ? {} : { workItemId }),
+      kind: "tool_result",
+      result: "passed",
+      source: "mcp",
+      summary: "MCP verified pull request #73 after creation.",
+      details: JSON.stringify({
+        server: "github",
+        tool: "pull_request_read",
+        repository_owner: "mtamburrano",
+        repository_name: "proofboard-demo-fixture",
+        base: "main",
+        head: "proofboard-verified-delivery",
+        head_sha: result.headSha,
+        pull_request_number: result.number,
+        pull_request_url: result.url,
+      }),
+      executionOrigin: {
+        kind: "mcp",
+        sessionId: result.sessionId,
+        turnId: result.turnId,
+        threadId: result.threadId,
+        toolCallId: "test-pull-request-read-call",
+      },
+    });
+    return result;
   }
 }
 
@@ -348,6 +387,37 @@ async function authorizeTicket(app, ticketId, actor = "test-operator") {
     method: "PATCH",
     body: JSON.stringify({
       status: "ready",
+      actor,
+      expected_revision: current.mission.revision,
+    }),
+  });
+  assert.equal(response.status, 200);
+  return json(response);
+}
+
+async function reachDeliveryApproval(app) {
+  await app.request("/api/mission", { method: "POST" });
+  let current = await json(await app.request("/api/mission"));
+  const inspectTicket = current.mission.tickets.find((item) => item.assignedRole === "planner");
+  await authorizeTicket(app, inspectTicket.id);
+  const inspected = await json(await app.request("/api/mission/run", { method: "POST" }));
+  const implementTicket = inspected.mission.tickets.find((item) => item.assignedRole === "implementer");
+  await authorizeTicket(app, implementTicket.id);
+  await app.request("/api/mission/run", { method: "POST" });
+  const provedResponse = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(provedResponse.status, 200);
+  const proved = await json(provedResponse);
+  const approval = proved.mission.approvals.find((item) => item.decision === "pending");
+  assert.ok(approval, "A passed current attempt should create a pending delivery approval.");
+  return { implementTicket, approval, proved };
+}
+
+async function decideDelivery(app, approval, decision, actor = "delivery-operator") {
+  const current = await json(await app.request("/api/mission"));
+  const response = await app.request(`/api/mission/approvals/${approval.id}`, {
+    method: "POST",
+    body: JSON.stringify({
+      decision,
       actor,
       expected_revision: current.mission.revision,
     }),
@@ -650,6 +720,479 @@ test("run mission executes only the human-authorized queue ticket and preserves 
   assert.doesNotMatch(serialized, /must-not-reach-browser|provider_secret/);
 });
 
+test("run mission performs deterministic proof and independent review after coding", async () => {
+  const { app, runner, missions } = testApp();
+
+  await app.request("/api/mission", { method: "POST" });
+  let current = await json(await app.request("/api/mission"));
+  const inspectTicket = current.mission.tickets.find((item) => item.assignedRole === "planner");
+  await authorizeTicket(app, inspectTicket.id);
+  await app.request("/api/mission/run", { method: "POST" });
+
+  current = await json(await app.request("/api/mission"));
+  const implementTicket = current.mission.tickets.find((item) => item.assignedRole === "implementer");
+  await authorizeTicket(app, implementTicket.id);
+  await app.request("/api/mission/run", { method: "POST" });
+
+  const proofResponse = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(proofResponse.status, 200);
+  const proved = await json(proofResponse);
+  const provedTicket = proved.mission.tickets.find((item) => item.id === implementTicket.id);
+  assert.equal(provedTicket.status, "awaiting_approval");
+  assert.equal(provedTicket.attempts[0].status, "awaiting_approval");
+  assert.equal(provedTicket.claim.trueforgeSessionId, "test-session-durable");
+  assert.equal(provedTicket.claim.trueforgeSandboxId, "test-sandbox-durable");
+  assert.equal(proved.mission.mission.status, "awaiting_approval");
+  assert.equal(proved.mission.approvals.length, 1);
+  assert.equal(proved.mission.approvals[0].workItemId, implementTicket.id);
+  assert.equal(proved.mission.approvals[0].attempt, 1);
+  assert.deepEqual(runner.operationLog, ["inspect", "execute", "prove", "head-inspect"]);
+  assert.equal(runner.calls.sandbox, 1);
+  assert.equal(runner.calls.headInspect, 1);
+
+  const state = await missions.getState();
+  assert.equal(state.handoffs.length, 1);
+  assert.equal(state.handoffs[0].attempt, 1);
+  assert.equal(state.reviews.length, 1);
+  assert.equal(state.reviews[0].outcome, "accepted");
+  assert.equal(state.reviews[0].attempt, 1);
+  assert.equal(state.evidence.some((item) =>
+    item.workItemId === implementTicket.id && item.source === "sandbox" && item.attempt === 1
+  ), true);
+});
+
+test("proof findings require human reauthorization and reuse the same execution binding", async () => {
+  const { app, runner, missions } = testApp(new InMemoryMissionRepository(), { failSandbox: true });
+
+  await app.request("/api/mission", { method: "POST" });
+  let current = await json(await app.request("/api/mission"));
+  const inspectTicket = current.mission.tickets.find((item) => item.assignedRole === "planner");
+  await authorizeTicket(app, inspectTicket.id);
+  await app.request("/api/mission/run", { method: "POST" });
+
+  current = await json(await app.request("/api/mission"));
+  const implementTicket = current.mission.tickets.find((item) => item.assignedRole === "implementer");
+  await authorizeTicket(app, implementTicket.id);
+  await app.request("/api/mission/run", { method: "POST" });
+
+  const failedProof = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(failedProof.status, 200);
+  const changesRequested = await json(failedProof);
+  const failedTicket = changesRequested.mission.tickets.find((item) => item.id === implementTicket.id);
+  assert.equal(failedTicket.status, "changes_requested");
+  assert.equal(failedTicket.attempts[0].status, "changes_requested");
+  assert.equal(failedTicket.claim.trueforgeSandboxId, "test-sandbox-durable");
+  assert.match(failedTicket.requestedChanges[0], /exited with code 1/i);
+  assert.equal(changesRequested.mission.handoffs.length, 0);
+  assert.equal(changesRequested.mission.reviews.length, 0);
+
+  const automaticRetry = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(automaticRetry.status, 400);
+  assert.equal(runner.calls.turn, 1);
+  assert.equal(runner.calls.sandbox, 1);
+
+  await authorizeTicket(app, implementTicket.id, "repair-operator");
+  runner.failSandbox = false;
+  const reworkExecution = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(reworkExecution.status, 200);
+  const reworkProving = await json(reworkExecution);
+  const reworkTicket = reworkProving.mission.tickets.find((item) => item.id === implementTicket.id);
+  assert.equal(reworkTicket.status, "proving");
+  assert.equal(reworkTicket.attempt, 2);
+  assert.equal(reworkTicket.attempts[0].retiredBy, "repair-operator");
+  assert.equal(reworkTicket.attempts[1].claim.trueforgeSessionId, "test-session-durable");
+  assert.equal(reworkTicket.attempts[1].claim.trueforgeSandboxId, "test-sandbox-durable");
+  assert.match(runner.turnInputs[1].instruction, /Requested rework findings:.*exited with code 1/i);
+
+  const reworkProof = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(reworkProof.status, 200);
+  const reworkComplete = await json(reworkProof);
+  const reworked = reworkComplete.mission.tickets.find((item) => item.id === implementTicket.id);
+  assert.equal(reworked.status, "awaiting_approval");
+  assert.equal(reworked.attempts[1].status, "awaiting_approval");
+  assert.equal(reworkComplete.mission.mission.status, "awaiting_approval");
+  assert.equal(reworkComplete.mission.approvals.length, 1);
+  assert.equal(reworkComplete.mission.approvals[0].attempt, 2);
+  assert.equal(runner.calls.sandbox, 2);
+  assert.equal(runner.calls.headInspect, 1);
+
+  const state = await missions.getState();
+  assert.equal(state.handoffs.length, 1);
+  assert.equal(state.handoffs[0].attempt, 2);
+  assert.equal(state.reviews.length, 1);
+  assert.equal(state.reviews[0].attempt, 2);
+  assert.equal(state.evidence.some((item) =>
+    item.workItemId === implementTicket.id && item.source === "sandbox" && item.attempt === 2
+  ), true);
+});
+
+test("Changes Requested stays inert across JSON reconnect before a new authorized attempt", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "trueforge-proofboard-rework-reconnect-"));
+  const filePath = path.join(directory, "state.json");
+  let reviewCalls = 0;
+  const verifier = {
+    review() {
+      reviewCalls += 1;
+      return reviewCalls === 1
+        ? {
+            outcome: "changes_requested",
+            reviewer: "test-reviewer",
+            summary: "The first attempt needs one bounded correction.",
+            finding: "The first attempt does not satisfy the measured contract.",
+          }
+        : {
+            outcome: "accepted",
+            reviewer: "test-reviewer",
+            summary: "The corrected attempt satisfies the measured contract.",
+            finding: "The corrected attempt is independently verified.",
+          };
+    },
+  };
+
+  try {
+    const first = testApp(new JsonMissionRepository(filePath), { verifier });
+    await first.app.request("/api/mission", { method: "POST" });
+    let current = await json(await first.app.request("/api/mission"));
+    const inspectTicket = current.mission.tickets.find((item) => item.assignedRole === "planner");
+    await authorizeTicket(first.app, inspectTicket.id);
+    const inspected = await json(await first.app.request("/api/mission/run", { method: "POST" }));
+    const implementTicket = inspected.mission.tickets.find((item) => item.assignedRole === "implementer");
+    await authorizeTicket(first.app, implementTicket.id);
+    await first.app.request("/api/mission/run", { method: "POST" });
+
+    const requested = await json(await first.app.request("/api/mission/run", { method: "POST" }));
+    const requestedTicket = requested.mission.tickets.find((item) => item.id === implementTicket.id);
+    assert.equal(requestedTicket.status, "changes_requested");
+    assert.equal(requestedTicket.attempts[0].status, "changes_requested");
+    assert.equal(requested.mission.reviews.length, 1);
+    assert.equal(requested.mission.handoffs.length, 1);
+
+    const restoredMissions = new MissionService(new JsonMissionRepository(filePath));
+    const restoredRunner = new TestMissionRunner(restoredMissions);
+    const restoredApp = createMissionHttpApp({ missions: restoredMissions, runner: restoredRunner, verifier });
+    current = await json(await restoredApp.request("/api/mission"));
+    const restoredTicket = current.mission.tickets.find((item) => item.id === implementTicket.id);
+    assert.equal(restoredTicket.status, "changes_requested");
+    assert.equal(restoredTicket.attempts[0].retiredAt, undefined);
+    assert.equal(restoredTicket.claim.trueforgeSessionId, "test-session-durable");
+    assert.equal(restoredTicket.claim.trueforgeSandboxId, "test-sandbox-durable");
+    assert.equal(current.mission.mission.execution.resumed, true);
+
+    const inert = await restoredApp.request("/api/mission/run", { method: "POST" });
+    assert.equal(inert.status, 400);
+    assert.equal(restoredRunner.calls.turn, 0);
+    assert.equal(restoredRunner.calls.sandbox, 0);
+
+    const reauthorized = await restoredApp.request(`/api/mission/tickets/${implementTicket.id}/status`, {
+      method: "PATCH",
+      body: JSON.stringify({
+        status: "ready",
+        actor: "reconnect-operator",
+        expected_revision: current.mission.revision,
+      }),
+    });
+    assert.equal(reauthorized.status, 200);
+
+    const reworkExecution = await json(await restoredApp.request("/api/mission/run", { method: "POST" }));
+    const reworkTicket = reworkExecution.mission.tickets.find((item) => item.id === implementTicket.id);
+    assert.equal(reworkTicket.status, "proving");
+    assert.equal(reworkTicket.attempt, 2);
+    assert.equal(reworkTicket.attempts[0].retiredBy, "reconnect-operator");
+    assert.equal(reworkTicket.attempts[1].claim.trueforgeSessionId, "test-session-durable");
+    assert.equal(reworkTicket.attempts[1].claim.trueforgeSandboxId, "test-sandbox-durable");
+    assert.equal(restoredRunner.turnInputs[0].options.previousTurnId, "test-turn-1");
+
+    const reworkProof = await json(await restoredApp.request("/api/mission/run", { method: "POST" }));
+    const completedTicket = reworkProof.mission.tickets.find((item) => item.id === implementTicket.id);
+    assert.equal(completedTicket.status, "awaiting_approval");
+    assert.equal(completedTicket.attempts[1].status, "awaiting_approval");
+    assert.equal(reworkProof.mission.approvals.at(-1).attempt, 2);
+    assert.equal(reworkProof.mission.reviews.length, 2);
+    assert.equal(reworkProof.mission.reviews.at(-1).outcome, "accepted");
+    assert.equal(restoredRunner.calls.turn, 1);
+    assert.equal(restoredRunner.calls.sandbox, 1);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a stale approval revision cannot overwrite a newer durable decision", async () => {
+  const { app, runner, missions } = testApp();
+  const { implementTicket, approval, proved } = await reachDeliveryApproval(app);
+  await missions.addEvidence(PRIMARY_MISSION_ID, {
+    kind: "tool_result",
+    result: "informational",
+    source: "system",
+    summary: "A newer reconnect state was observed before the operator clicked approve.",
+  });
+
+  const response = await app.request(`/api/mission/approvals/${approval.id}`, {
+    method: "POST",
+    body: JSON.stringify({
+      decision: "approved",
+      actor: "stale-operator",
+      expected_revision: proved.mission.revision,
+    }),
+  });
+  assert.equal(response.status, 409);
+  const payload = await json(response);
+  assert.equal(payload.mission.approvals.find((item) => item.id === approval.id).decision, "pending");
+  assert.equal(payload.mission.tickets.find((item) => item.id === implementTicket.id).status, "awaiting_approval");
+  assert.equal(runner.deliveryCalls.protectedOperations, 0);
+  assert.equal(runner.deliveryCalls.resolved.length, 0);
+});
+
+test("a reconnect resumes a durably completed implementation turn without replaying it", async () => {
+  const repository = new InMemoryMissionRepository();
+  const first = testApp(repository);
+  await first.app.request("/api/mission", { method: "POST" });
+  let current = await json(await first.app.request("/api/mission"));
+  const inspectTicket = current.mission.tickets.find((item) => item.assignedRole === "planner");
+  await authorizeTicket(first.app, inspectTicket.id);
+  const inspected = await json(await first.app.request("/api/mission/run", { method: "POST" }));
+  const implementTicket = inspected.mission.tickets.find((item) => item.assignedRole === "implementer");
+  await authorizeTicket(first.app, implementTicket.id);
+  const executed = await first.app.request("/api/mission/run", { method: "POST" });
+  assert.equal(executed.status, 200);
+
+  const snapshot = await repository.load();
+  const persistedTicket = snapshot.workItems.find((item) => item.id === implementTicket.id);
+  persistedTicket.status = "in_progress";
+  persistedTicket.attempts.at(-1).status = "in_progress";
+  await repository.save(snapshot);
+
+  const restoredMissions = new MissionService(repository);
+  const restoredRunner = new TestMissionRunner(restoredMissions);
+  const restoredApp = createMissionHttpApp({ missions: restoredMissions, runner: restoredRunner });
+  const resumed = await restoredApp.request("/api/mission/run", { method: "POST" });
+  assert.equal(resumed.status, 200);
+  const payload = await json(resumed);
+  const resumedTicket = payload.mission.tickets.find((item) => item.id === implementTicket.id);
+  assert.equal(resumedTicket.status, "proving");
+  assert.equal(resumedTicket.attempts.length, 1);
+  assert.equal(restoredRunner.calls.turn, 0);
+});
+
+test("approved delivery advances the same attempt through read-back before Done", async () => {
+  const { app, runner, missions } = testApp();
+  const { implementTicket, approval } = await reachDeliveryApproval(app);
+
+  const delivered = await decideDelivery(app, approval, "approved", "release-operator");
+  const ticket = delivered.mission.tickets.find((item) => item.id === implementTicket.id);
+  const persistedApproval = delivered.mission.approvals.find((item) => item.id === approval.id);
+  const delivery = delivered.mission.delivery[0];
+
+  assert.equal(delivered.mission.mission.status, "delivered");
+  assert.equal(ticket.status, "done");
+  assert.equal(ticket.attempts[0].status, "done");
+  assert.equal(persistedApproval.decision, "approved");
+  assert.equal(persistedApproval.decidedBy, "release-operator");
+  assert.equal(typeof persistedApproval.decidedAt, "string");
+  assert.equal(delivery.approvalId, approval.id);
+  assert.equal(delivery.workItemId, implementTicket.id);
+  assert.equal(delivery.attempt, 1);
+  assert.deepEqual(delivery.pullRequest, {
+    number: 73,
+    url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/73",
+    repositoryOwner: "mtamburrano",
+    repositoryName: "proofboard-demo-fixture",
+    base: "main",
+    head: "proofboard-verified-delivery",
+    headSha: "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1",
+  });
+  assert.deepEqual(runner.deliveryCalls.lifecycle, [{
+    missionStatus: "verifying",
+    workItemStatus: "delivering",
+  }]);
+  assert.equal(runner.deliveryCalls.protectedOperations, 1);
+  assert.equal(runner.deliveryCalls.resolved[0].workItemId, implementTicket.id);
+
+  const state = await missions.getState();
+  const readback = state.evidence.find((item) =>
+    item.source === "mcp" && item.details?.includes('"tool":"pull_request_read"'),
+  );
+  assert.equal(readback.workItemId, implementTicket.id);
+  assert.equal(readback.attempt, 1);
+  assert.equal(delivered.mission.progress.execution, "passed");
+  assert.equal(delivered.mission.progress.verification, "passed");
+});
+
+test("rejecting or cancelling delivery blocks the ticket without a protected operation", async () => {
+  for (const decision of ["rejected", "cancelled"]) {
+    const { app, runner } = testApp();
+    const { implementTicket, approval } = await reachDeliveryApproval(app);
+    const result = await decideDelivery(app, approval, decision, `${decision}-operator`);
+    const ticket = result.mission.tickets.find((item) => item.id === implementTicket.id);
+    const persistedApproval = result.mission.approvals.find((item) => item.id === approval.id);
+
+    assert.equal(result.mission.mission.status, "blocked");
+    assert.equal(ticket.status, "blocked");
+    assert.equal(persistedApproval.decision, decision);
+    assert.equal(persistedApproval.decidedBy, `${decision}-operator`);
+    assert.equal(result.mission.delivery.length, 0);
+    assert.equal(runner.deliveryCalls.protectedOperations, 0);
+    assert.equal(runner.deliveryCalls.resolved.length, 1);
+    assert.equal(runner.deliveryCalls.resolved[0].decision, decision);
+    assert.equal((await app.request("/api/mission/run", { method: "POST" })).status, 400);
+    assert.equal(runner.deliveryCalls.protectedOperations, 0);
+  }
+});
+
+test("an approval cannot deliver after the current ticket enters Changes Requested", async () => {
+  const repository = new InMemoryMissionRepository();
+  const first = testApp(repository);
+  const { implementTicket, approval } = await reachDeliveryApproval(first.app);
+  const snapshot = await repository.load();
+  const currentTicket = snapshot.workItems.find((item) => item.id === implementTicket.id);
+  const currentAttempt = currentTicket.attempts.at(-1);
+  currentTicket.status = "changes_requested";
+  currentTicket.requestedChanges = ["A newer proof finding requires rework."];
+  currentAttempt.status = "changes_requested";
+  await repository.save(snapshot);
+
+  const restoredMissions = new MissionService(repository);
+  const restoredRunner = new TestMissionRunner(restoredMissions);
+  const restoredApp = createMissionHttpApp({ missions: restoredMissions, runner: restoredRunner });
+  const response = await restoredApp.request(`/api/mission/approvals/${approval.id}`, {
+    method: "POST",
+    body: JSON.stringify({ decision: "approved", actor: "stale-operator" }),
+  });
+  assert.equal(response.status, 502);
+  const persisted = await restoredMissions.getState();
+  assert.equal(persisted.approvals.find((item) => item.id === approval.id).decision, "pending");
+  assert.equal(persisted.workItems.find((item) => item.id === implementTicket.id).status, "changes_requested");
+  assert.equal(restoredRunner.deliveryCalls.protectedOperations, 0);
+});
+
+test("approval and delivery correlation survive a JSON reconnect", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "trueforge-proofboard-delivery-reconnect-"));
+  const filePath = path.join(directory, "state.json");
+  try {
+    const first = testApp(new JsonMissionRepository(filePath));
+    const { implementTicket, approval } = await reachDeliveryApproval(first.app);
+
+    const restoredMissions = new MissionService(new JsonMissionRepository(filePath));
+    const restoredRunner = new TestMissionRunner(restoredMissions);
+    const restoredApp = createMissionHttpApp({ missions: restoredMissions, runner: restoredRunner });
+    const restored = await json(await restoredApp.request("/api/mission"));
+    const restoredTicket = restored.mission.tickets.find((item) => item.id === implementTicket.id);
+    const restoredApproval = restored.mission.approvals.find((item) => item.id === approval.id);
+    assert.equal(restoredTicket.status, "awaiting_approval");
+    assert.equal(restoredTicket.attempt, 1);
+    assert.equal(restoredTicket.claim.trueforgeSessionId, "test-session-durable");
+    assert.equal(restoredTicket.claim.trueforgeSandboxId, "test-sandbox-durable");
+    assert.equal(restoredApproval.workItemId, implementTicket.id);
+    assert.equal(restoredApproval.attempt, 1);
+    assert.equal(restoredApproval.decision, "pending");
+
+    const pendingRun = await restoredApp.request("/api/mission/run", { method: "POST" });
+    assert.equal(pendingRun.status, 200);
+    const pendingState = await json(pendingRun);
+    assert.equal(pendingState.mission.mission.status, "awaiting_approval");
+    assert.equal(restoredRunner.calls.headInspect, 0);
+    assert.equal(restoredRunner.deliveryCalls.protectedOperations, 0);
+
+    const delivered = await decideDelivery(restoredApp, restoredApproval, "approved", "reconnect-operator");
+    assert.equal(delivered.mission.mission.status, "delivered");
+    assert.equal(delivered.mission.delivery[0].workItemId, implementTicket.id);
+    assert.equal(delivered.mission.delivery[0].attempt, 1);
+    assert.equal(delivered.mission.approvals[0].decidedBy, "reconnect-operator");
+    assert.equal(restoredRunner.deliveryCalls.protectedOperations, 1);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a restart resumes from persisted pull-request read-back without repeating protected delivery", async () => {
+  const repository = new InMemoryMissionRepository();
+  const first = testApp(repository);
+  const { implementTicket, approval } = await reachDeliveryApproval(first.app);
+  const context = approval.executionContext;
+  await first.missions.decideApproval(PRIMARY_MISSION_ID, approval.id, {
+    decision: "approved",
+    decidedBy: "release-operator",
+  });
+  await first.missions.transitionSystemWorkItem(PRIMARY_MISSION_ID, implementTicket.id, "delivering", {
+    trigger: "approval",
+  });
+  await first.missions.transitionMission(PRIMARY_MISSION_ID, "verifying");
+  await first.missions.addEvidence(PRIMARY_MISSION_ID, {
+    workItemId: implementTicket.id,
+    kind: "tool_result",
+    result: "passed",
+    source: "mcp",
+    summary: "MCP verified the pull request before the controller restarted.",
+    details: JSON.stringify({
+      server: "github",
+      tool: "pull_request_read",
+      repository_owner: context.repositoryOwner,
+      repository_name: context.repositoryName,
+      base: context.base,
+      head: context.head,
+      head_sha: context.headSha,
+      pull_request_number: 73,
+      pull_request_url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/73",
+    }),
+    executionOrigin: {
+      kind: "mcp",
+      sessionId: context.sessionId,
+      turnId: "restart-readback-turn",
+      threadId: context.threadId,
+      toolCallId: "restart-readback-call",
+    },
+  });
+
+  const restoredMissions = new MissionService(repository);
+  const restoredRunner = new TestMissionRunner(restoredMissions);
+  const restoredApp = createMissionHttpApp({ missions: restoredMissions, runner: restoredRunner });
+  const response = await restoredApp.request("/api/mission/run", { method: "POST" });
+  assert.equal(response.status, 200);
+  const delivered = await json(response);
+  assert.equal(delivered.mission.mission.status, "delivered");
+  assert.equal(delivered.mission.delivery[0].approvalId, approval.id);
+  assert.equal(delivered.mission.delivery[0].attempt, 1);
+  assert.equal(restoredRunner.deliveryCalls.protectedOperations, 0);
+  assert.equal(restoredRunner.deliveryCalls.resolved.length, 0);
+});
+
+test("a semantic changes-requested review stops the queue without automatic repair", async () => {
+  const reviewed = [];
+  const verifier = {
+    review(context) {
+      reviewed.push(context);
+      return {
+        outcome: "changes_requested",
+        reviewer: "test-reviewer",
+        summary: "The measured implementation needs a contract correction.",
+        finding: "The measured diff does not satisfy the acceptance criteria.",
+      };
+    },
+  };
+  const { app, runner, missions } = testApp(new InMemoryMissionRepository(), { verifier });
+
+  await app.request("/api/mission", { method: "POST" });
+  let current = await json(await app.request("/api/mission"));
+  const inspectTicket = current.mission.tickets.find((item) => item.assignedRole === "planner");
+  await authorizeTicket(app, inspectTicket.id);
+  await app.request("/api/mission/run", { method: "POST" });
+  current = await json(await app.request("/api/mission"));
+  const implementTicket = current.mission.tickets.find((item) => item.assignedRole === "implementer");
+  await authorizeTicket(app, implementTicket.id);
+  await app.request("/api/mission/run", { method: "POST" });
+
+  const reviewResponse = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(reviewResponse.status, 200);
+  const changesRequested = await json(reviewResponse);
+  const ticket = changesRequested.mission.tickets.find((item) => item.id === implementTicket.id);
+  assert.equal(ticket.status, "changes_requested");
+  assert.deepEqual(ticket.requestedChanges, ["The measured diff does not satisfy the acceptance criteria."]);
+  assert.equal(reviewed.length, 1);
+  assert.equal(reviewed[0].actualFilesChanged.length > 0, true);
+  assert.equal((await missions.getState()).reviews[0].outcome, "changes_requested");
+  assert.equal(runner.calls.sandbox, 1);
+  assert.equal((await app.request("/api/mission/run", { method: "POST" })).status, 400);
+});
+
 test("run mission requires an explicit Ready authorization and performs no provider call otherwise", async () => {
   const { app, runner } = testApp();
   await app.request("/api/mission", { method: "POST" });
@@ -784,4 +1327,58 @@ test("a fresh service recovers the same mission and evidence from isolated JSON 
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("HTTP renders durable rework history and rejects stale authorization revisions", async () => {
+  const { app, missions } = testApp();
+  await app.request("/api/mission", { method: "POST" });
+  const initial = await json(await app.request("/api/mission"));
+  const ticket = initial.mission.tickets.find((item) => item.assignedRole === "planner");
+  await authorizeTicket(app, ticket.id);
+  await missions.claimWorkItem(PRIMARY_MISSION_ID, ticket.id, {
+    owner: "proof-worker",
+    trueforgeSessionId: "test-session-durable",
+    trueforgeSandboxId: "sandbox-rework",
+  });
+  await missions.transitionSystemWorkItem(PRIMARY_MISSION_ID, ticket.id, "proving", {
+    trigger: "execution",
+  });
+  await missions.transitionSystemWorkItem(PRIMARY_MISSION_ID, ticket.id, "changes_requested", {
+    trigger: "proof",
+    reason: "The deterministic proof needs one more bounded assertion.",
+  });
+
+  const changesRequested = await json(await app.request("/api/mission"));
+  const repairTicket = changesRequested.mission.tickets.find((item) => item.id === ticket.id);
+  assert.equal(repairTicket.status, "changes_requested");
+  assert.equal(repairTicket.attempt, 1);
+  assert.deepEqual(repairTicket.requestedChanges, ["The deterministic proof needs one more bounded assertion."]);
+  assert.equal(repairTicket.attempts[0].claim.trueforgeSandboxId, "sandbox-rework");
+  assert.equal(repairTicket.attempts[0].status, "changes_requested");
+
+  const stale = await app.request(`/api/mission/tickets/${ticket.id}/status`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      status: "ready",
+      actor: "repair-operator",
+      expected_revision: changesRequested.mission.revision - 1,
+    }),
+  });
+  assert.equal(stale.status, 409);
+  const stillBlocked = await json(await app.request("/api/mission"));
+  assert.equal(stillBlocked.mission.tickets.find((item) => item.id === ticket.id).status, "changes_requested");
+
+  const authorized = await app.request(`/api/mission/tickets/${ticket.id}/status`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      status: "ready",
+      actor: "repair-operator",
+      expected_revision: stillBlocked.mission.revision,
+    }),
+  });
+  assert.equal(authorized.status, 200);
+  const authorizedPayload = await json(authorized);
+  assert.equal(authorizedPayload.ticket.status, "ready");
+  assert.equal(authorizedPayload.ticket.attempts[0].retiredBy, "repair-operator");
+  assert.equal(authorizedPayload.ticket.attempts[0].claim.trueforgeSessionId, "test-session-durable");
 });

@@ -74,6 +74,28 @@ export interface WorkItemClaim {
   trueforgeSandboxId?: string;
 }
 
+export const workItemAttemptStatuses = [
+  "in_progress",
+  "proving",
+  "changes_requested",
+  "awaiting_approval",
+  "delivering",
+  "done",
+  "blocked",
+] as const;
+export type WorkItemAttemptStatus = (typeof workItemAttemptStatuses)[number];
+
+/** Durable metadata for one bounded Ready-to-pipeline execution cycle. */
+export interface WorkItemAttempt {
+  number: number;
+  authorization: WorkItemExecutionAuthorization;
+  requestedChanges: string[];
+  claim: WorkItemClaim;
+  status: WorkItemAttemptStatus;
+  retiredAt?: string;
+  retiredBy?: string;
+}
+
 export interface HumanWorkItemTransitionInput {
   actor: string;
   expectedRevision?: number;
@@ -93,6 +115,7 @@ export const MAX_WORK_GRAPH_ITEMS = 8;
 export const MAX_WORK_ITEM_ACCEPTANCE_CRITERIA = 12;
 export const MAX_WORK_ITEM_REQUIRED_CHECKS = 12;
 export const MAX_WORK_ITEM_ALLOWED_FILES = 8;
+export const MAX_WORK_ITEM_REQUESTED_CHANGES = 12;
 export const implementationCheckResults = ["passed", "failed", "not_run"] as const;
 export type ImplementationCheckResult = (typeof implementationCheckResults)[number];
 export const executionOriginKinds = ["trueforge", "mcp", "sandbox", "tool"] as const;
@@ -213,7 +236,7 @@ export const humanWorkItemTransitions: Readonly<{
   ready: ["backlog"],
   in_progress: [],
   proving: [],
-  changes_requested: [],
+  changes_requested: ["ready"],
   awaiting_approval: [],
   delivering: [],
   done: [],
@@ -228,7 +251,7 @@ export const workItemTransitions: Readonly<{
   ready: ["backlog", "in_progress", "blocked"],
   in_progress: ["proving", "ready_for_review", "blocked"],
   proving: ["changes_requested", "awaiting_approval", "blocked"],
-  changes_requested: ["in_progress", "blocked"],
+  changes_requested: ["blocked"],
   awaiting_approval: ["delivering", "blocked"],
   delivering: ["done", "blocked"],
   done: [],
@@ -272,6 +295,12 @@ export interface WorkItem {
   executionAuthorization?: WorkItemExecutionAuthorization;
   /** A claim is intentionally retained after failure so work cannot be double-claimed. */
   claim?: WorkItemClaim;
+  /** Number of bounded execution attempts that have been claimed. */
+  attempt: number;
+  /** Prior attempts remain immutable history even after their claim is retired. */
+  attempts: WorkItemAttempt[];
+  /** Concrete findings requested for the current rework authorization. */
+  requestedChanges?: string[];
   blockedReason?: string;
   delegation?: WorkItemDelegation;
 }
@@ -336,6 +365,7 @@ export interface Evidence {
   summary: string;
   createdAt: string;
   workItemId?: string;
+  attempt?: number;
   details?: string;
   executionOrigin?: ExecutionOrigin;
 }
@@ -353,6 +383,7 @@ export interface Handoff {
   componentsTouched: string[];
   memoryImpact: MemoryImpact;
   createdAt: string;
+  attempt?: number;
   diffSummary?: string;
   checks?: ImplementationCheck[];
   evidenceIds?: string[];
@@ -385,6 +416,7 @@ export interface Review {
   evidenceIds: string[];
   findingEvidenceId: string;
   createdAt: string;
+  attempt?: number;
 }
 
 export interface Approval {
@@ -402,6 +434,11 @@ export interface Approval {
   expiresAt: string;
   decidedBy?: string;
   decidedAt?: string;
+  workItemId?: string;
+  attempt?: number;
+  handoffId?: string;
+  reviewId?: string;
+  trueforgeSandboxId?: string;
   executionContext?: ApprovalExecutionContext;
 }
 
@@ -439,6 +476,8 @@ export interface Delivery {
   createdAt: string;
   reference?: string;
   approvalId?: string;
+  workItemId?: string;
+  attempt?: number;
   pullRequest?: PullRequestReference;
   executionOrigin?: ExecutionOrigin;
 }
@@ -554,6 +593,11 @@ export interface RequestApprovalInput {
   evidenceIds?: string[];
   expiresAt?: string;
   id?: string;
+  workItemId?: string;
+  attempt?: number;
+  handoffId?: string;
+  reviewId?: string;
+  trueforgeSandboxId?: string;
   executionContext?: ApprovalExecutionContext;
 }
 
@@ -570,6 +614,8 @@ export interface RecordDeliveryInput {
   reference?: string;
   approvalId?: string;
   id?: string;
+  workItemId?: string;
+  attempt?: number;
   pullRequest?: PullRequestReference;
   executionOrigin?: ExecutionOrigin;
 }
@@ -577,6 +623,7 @@ export interface RecordDeliveryInput {
 export interface DecideApprovalInput {
   decision: "approved" | "rejected" | "cancelled";
   decidedBy: string;
+  expectedRevision?: number;
 }
 
 export type MissionDomainErrorCode =
@@ -1064,6 +1111,51 @@ function validateWorkItemClaim(value: unknown, label: string): WorkItemClaim {
   return result;
 }
 
+function nonNegativeInteger(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    return fail("invalid_input", `${label} must be a non-negative integer.`);
+  }
+  return value;
+}
+
+function validateWorkItemAttempt(value: unknown, label: string): WorkItemAttempt {
+  const attempt = objectValue(value, label);
+  const requestedChanges = stringArray(
+    attempt.requestedChanges ?? [],
+    `${label}.requestedChanges`,
+    MAX_WORK_ITEM_REQUESTED_CHANGES,
+  );
+  const retiredAt = attempt.retiredAt === undefined
+    ? undefined
+    : timestamp(attempt.retiredAt, `${label}.retiredAt`);
+  const retiredBy = attempt.retiredBy === undefined
+    ? undefined
+    : requiredString(attempt.retiredBy, `${label}.retiredBy`, 200);
+  const result: WorkItemAttempt = {
+    number: nonNegativeInteger(attempt.number, `${label}.number`),
+    authorization: validateWorkItemExecutionAuthorization(
+      attempt.authorization,
+      `${label}.authorization`,
+    ),
+    requestedChanges,
+    claim: validateWorkItemClaim(attempt.claim, `${label}.claim`),
+    status: enumValue(attempt.status, workItemAttemptStatuses, `${label}.status`),
+  };
+  if (retiredAt !== undefined) {
+    result.retiredAt = retiredAt;
+  }
+  if (retiredBy !== undefined) {
+    result.retiredBy = retiredBy;
+  }
+  if (result.number === 0) {
+    return fail("invalid_input", `${label}.number must be greater than zero.`);
+  }
+  if ((retiredAt === undefined) !== (retiredBy === undefined)) {
+    return fail("invalid_input", `${label}.retiredAt and ${label}.retiredBy must be provided together.`);
+  }
+  return result;
+}
+
 function validateWorkItem(value: unknown, label: string): WorkItem {
   const workItem = objectValue(value, label);
   const assignedRole = optionalString(workItem.assignedRole, `${label}.assignedRole`, 30);
@@ -1074,6 +1166,31 @@ function validateWorkItem(value: unknown, label: string): WorkItem {
   );
   const allowedFiles = optionalFilePathArray(workItem.allowedFiles, `${label}.allowedFiles`);
   const blockedReason = optionalString(workItem.blockedReason, `${label}.blockedReason`, 2_000);
+  const requestedChanges = optionalStringArray(
+    workItem.requestedChanges,
+    `${label}.requestedChanges`,
+    MAX_WORK_ITEM_REQUESTED_CHANGES,
+  );
+  const rawAttempts = workItem.attempts === undefined
+    ? []
+    : arrayValue(workItem.attempts, `${label}.attempts`);
+  const attempts = rawAttempts.map((item, index) =>
+    validateWorkItemAttempt(item, `${label}.attempts[${index}]`),
+  );
+  const attempt = workItem.attempt === undefined
+    ? attempts.at(-1)?.number ?? 0
+    : nonNegativeInteger(workItem.attempt, `${label}.attempt`);
+  if (attempts.length > 0 && attempts.at(-1)?.number !== attempt) {
+    return fail("invalid_input", `${label}.attempt must match the latest attempt history entry.`);
+  }
+  if (attempts.length === 0 && attempt !== 0) {
+    return fail("invalid_input", `${label}.attempt requires attempt history.`);
+  }
+  for (const [index, item] of attempts.entries()) {
+    if (item.number !== index + 1) {
+      return fail("invalid_input", `${label}.attempts must be numbered consecutively from one.`);
+    }
+  }
   const rawAcceptanceCriteria = workItem.acceptanceCriteria ?? workItem.acceptanceConditions;
   const acceptanceCriteria = rawAcceptanceCriteria === undefined
     ? []
@@ -1092,6 +1209,8 @@ function validateWorkItem(value: unknown, label: string): WorkItem {
     dependsOn: stringArray(workItem.dependsOn, `${label}.dependsOn`),
     createdAt: timestamp(workItem.createdAt, `${label}.createdAt`),
     updatedAt: timestamp(workItem.updatedAt, `${label}.updatedAt`),
+    attempt,
+    attempts,
   };
   if (assignedRole !== undefined) {
     result.assignedRole = enumValue(assignedRole, executionRoles, `${label}.assignedRole`);
@@ -1113,6 +1232,9 @@ function validateWorkItem(value: unknown, label: string): WorkItem {
   }
   if (workItem.claim !== undefined) {
     result.claim = validateWorkItemClaim(workItem.claim, `${label}.claim`);
+  }
+  if (requestedChanges !== undefined) {
+    result.requestedChanges = requestedChanges;
   }
   if (blockedReason !== undefined) {
     result.blockedReason = blockedReason;
@@ -1257,6 +1379,9 @@ function validateStructuredHandoffFields(
 function validateEvidence(value: unknown, label: string): Evidence {
   const evidence = objectValue(value, label);
   const workItemId = optionalString(evidence.workItemId, `${label}.workItemId`, 200);
+  const attempt = evidence.attempt === undefined
+    ? undefined
+    : nonNegativeInteger(evidence.attempt, `${label}.attempt`);
   const details = optionalString(evidence.details, `${label}.details`);
   const executionOrigin = evidence.executionOrigin === undefined
     ? undefined
@@ -1273,6 +1398,9 @@ function validateEvidence(value: unknown, label: string): Evidence {
   if (workItemId !== undefined) {
     result.workItemId = workItemId;
   }
+  if (attempt !== undefined) {
+    result.attempt = attempt;
+  }
   if (details !== undefined) {
     result.details = details;
   }
@@ -1286,6 +1414,9 @@ function validateHandoff(value: unknown, label: string): Handoff {
   const handoff = objectValue(value, label);
   const result = enumValue(handoff.result, handoffResults, `${label}.result`);
   const filesChanged = stringArray(handoff.filesChanged, `${label}.filesChanged`);
+  const attempt = handoff.attempt === undefined
+    ? undefined
+    : nonNegativeInteger(handoff.attempt, `${label}.attempt`);
   const output: Handoff = {
     id: identifier(handoff.id, `${label}.id`),
     missionId: identifier(handoff.missionId, `${label}.missionId`),
@@ -1300,6 +1431,9 @@ function validateHandoff(value: unknown, label: string): Handoff {
     memoryImpact: enumValue(handoff.memoryImpact, memoryImpacts, `${label}.memoryImpact`),
     createdAt: timestamp(handoff.createdAt, `${label}.createdAt`),
   };
+  if (attempt !== undefined) {
+    output.attempt = attempt;
+  }
   const structured = validateStructuredHandoffFields(handoff, label, result, filesChanged);
   if (structured !== null) {
     output.diffSummary = structured.diffSummary;
@@ -1337,7 +1471,10 @@ function validateReview(value: unknown, label: string): Review {
   if (evidenceIds.length === 0) {
     return fail("invalid_input", `${label}.evidenceIds must contain the reviewed evidence.`);
   }
-  return {
+  const attempt = review.attempt === undefined
+    ? undefined
+    : nonNegativeInteger(review.attempt, `${label}.attempt`);
+  const output: Review = {
     id: identifier(review.id, `${label}.id`),
     missionId: identifier(review.missionId, `${label}.missionId`),
     workItemId: identifier(review.workItemId, `${label}.workItemId`),
@@ -1353,6 +1490,10 @@ function validateReview(value: unknown, label: string): Review {
     findingEvidenceId: identifier(review.findingEvidenceId, `${label}.findingEvidenceId`),
     createdAt: timestamp(review.createdAt, `${label}.createdAt`),
   };
+  if (attempt !== undefined) {
+    output.attempt = attempt;
+  }
+  return output;
 }
 
 function validateApproval(value: unknown, label: string): Approval {
@@ -1379,6 +1520,20 @@ function validateApproval(value: unknown, label: string): Approval {
       ? undefined
       : timestamp(approval.decidedAt, `${label}.decidedAt`);
   const decision = enumValue(approval.decision, approvalDecisions, `${label}.decision`);
+  const workItemId = optionalString(approval.workItemId, `${label}.workItemId`, 200);
+  const attempt = approval.attempt === undefined
+    ? undefined
+    : nonNegativeInteger(approval.attempt, `${label}.attempt`);
+  if (attempt !== undefined && attempt === 0) {
+    return fail("invalid_input", `${label}.attempt must be greater than zero.`);
+  }
+  const handoffId = optionalString(approval.handoffId, `${label}.handoffId`, 200);
+  const reviewId = optionalString(approval.reviewId, `${label}.reviewId`, 200);
+  const trueforgeSandboxId = optionalString(
+    approval.trueforgeSandboxId,
+    `${label}.trueforgeSandboxId`,
+    200,
+  );
   if (decision === "pending" && (decidedBy !== undefined || decidedAt !== undefined)) {
     return fail("invalid_input", `${label} cannot have a decision actor or timestamp while pending.`);
   }
@@ -1404,6 +1559,21 @@ function validateApproval(value: unknown, label: string): Approval {
   }
   if (decidedAt !== undefined) {
     result.decidedAt = decidedAt;
+  }
+  if (workItemId !== undefined) {
+    result.workItemId = identifier(workItemId, `${label}.workItemId`);
+  }
+  if (attempt !== undefined) {
+    result.attempt = attempt;
+  }
+  if (handoffId !== undefined) {
+    result.handoffId = identifier(handoffId, `${label}.handoffId`);
+  }
+  if (reviewId !== undefined) {
+    result.reviewId = identifier(reviewId, `${label}.reviewId`);
+  }
+  if (trueforgeSandboxId !== undefined) {
+    result.trueforgeSandboxId = trueforgeSandboxId;
   }
   if (approval.executionContext !== undefined) {
     result.executionContext = validateApprovalExecutionContext(
@@ -1487,6 +1657,13 @@ function validateDelivery(value: unknown, label: string): Delivery {
   const delivery = objectValue(value, label);
   const reference = optionalString(delivery.reference, `${label}.reference`, 2_000);
   const status = enumValue(delivery.status, deliveryStatuses, `${label}.status`);
+  const workItemId = optionalString(delivery.workItemId, `${label}.workItemId`, 200);
+  const attempt = delivery.attempt === undefined
+    ? undefined
+    : nonNegativeInteger(delivery.attempt, `${label}.attempt`);
+  if (attempt !== undefined && attempt === 0) {
+    return fail("invalid_input", `${label}.attempt must be greater than zero.`);
+  }
   if (status === "delivered" && reference === undefined) {
     return fail("invalid_input", `${label}.reference is required for a delivered record.`);
   }
@@ -1505,6 +1682,12 @@ function validateDelivery(value: unknown, label: string): Delivery {
   }
   if (delivery.approvalId !== undefined) {
     result.approvalId = identifier(delivery.approvalId, `${label}.approvalId`);
+  }
+  if (workItemId !== undefined) {
+    result.workItemId = identifier(workItemId, `${label}.workItemId`);
+  }
+  if (attempt !== undefined) {
+    result.attempt = attempt;
   }
   if (delivery.pullRequest !== undefined) {
     result.pullRequest = validatePullRequestReference(
@@ -1562,6 +1745,30 @@ function ensureUniqueIds(state: MissionState): void {
   }
 }
 
+function isPlannerBaselineEvidence(
+  item: Evidence,
+  workItems: Map<string, WorkItem>,
+): boolean {
+  if (
+    item.workItemId === undefined ||
+    item.source !== "mcp" ||
+    item.kind !== "tool_result" ||
+    workItems.get(item.workItemId)?.assignedRole !== "planner" ||
+    item.details === undefined
+  ) {
+    return false;
+  }
+  try {
+    const details = JSON.parse(item.details) as unknown;
+    return typeof details === "object" &&
+      details !== null &&
+      !Array.isArray(details) &&
+      (details as Record<string, unknown>).provenance_kind === "baseline";
+  } catch {
+    return false;
+  }
+}
+
 export function validateMissionState(value: unknown): MissionState {
   const state = objectValue(value, "state");
   if (state.schemaVersion !== 1) {
@@ -1611,6 +1818,35 @@ export function validateMissionState(value: unknown): MissionState {
         `Claimed work item ${workItem.id} cannot remain in ${workItem.status} state.`,
       );
     }
+    if (workItem.claim !== undefined && workItem.attempts.length > 0) {
+      const currentAttempt = workItem.attempts.at(-1);
+      if (currentAttempt === undefined ||
+          JSON.stringify(currentAttempt.claim) !== JSON.stringify(workItem.claim)) {
+        fail(
+          "invalid_input",
+          `Work item ${workItem.id} claim does not match its current attempt history.`,
+        );
+      }
+    }
+    const currentAttempt = workItem.attempts.at(-1);
+    if (workItem.status === "ready" &&
+        currentAttempt?.status === "changes_requested" &&
+        currentAttempt.retiredAt === undefined) {
+      fail(
+        "invalid_input",
+        `Work item ${workItem.id} cannot return to Ready before its prior attempt is retired.`,
+      );
+    }
+    if (currentAttempt !== undefined &&
+        isProductWorkItemStatus(workItem.status) &&
+        workItem.status !== "backlog" &&
+        workItem.status !== "ready" &&
+        currentAttempt.status !== workItem.status) {
+      fail(
+        "invalid_input",
+        `Work item ${workItem.id} status does not match its current attempt history.`,
+      );
+    }
     for (const dependencyId of workItem.dependsOn) {
       const dependency = workItems.get(dependencyId);
       if (dependency === undefined) {
@@ -1648,6 +1884,13 @@ export function validateMissionState(value: unknown): MissionState {
       if (workItem === undefined || workItem.missionId !== item.missionId) {
         fail("invalid_input", `Evidence ${item.id} references an invalid work item.`);
       }
+      if (item.attempt !== undefined &&
+          (item.attempt === 0 || item.attempt > workItem.attempt ||
+            !workItem.attempts.some((attempt) => attempt.number === item.attempt))) {
+        fail("invalid_input", `Evidence ${item.id} references an invalid work-item attempt.`);
+      }
+    } else if (item.attempt !== undefined) {
+      fail("invalid_input", `Evidence ${item.id} cannot identify an attempt without a work item.`);
     }
   }
 
@@ -1655,6 +1898,11 @@ export function validateMissionState(value: unknown): MissionState {
     const workItem = workItems.get(handoff.workItemId);
     if (!missions.has(handoff.missionId) || workItem === undefined || workItem.missionId !== handoff.missionId) {
       fail("invalid_input", `Handoff ${handoff.id} references an invalid work item or mission.`);
+    }
+    if (handoff.attempt !== undefined &&
+        (handoff.attempt === 0 || handoff.attempt > workItem.attempt ||
+          !workItem.attempts.some((attempt) => attempt.number === handoff.attempt))) {
+      fail("invalid_input", `Handoff ${handoff.id} references an invalid work-item attempt.`);
     }
     validateStructuredHandoffCorrelation(
       result,
@@ -1678,6 +1926,11 @@ export function validateMissionState(value: unknown): MissionState {
       handoff.workItemId !== review.workItemId
     ) {
       fail("invalid_input", `Review ${review.id} references an invalid mission, work item, or handoff.`);
+    }
+    if (review.attempt !== undefined &&
+        (review.attempt === 0 || review.attempt > workItem.attempt ||
+          !workItem.attempts.some((attempt) => attempt.number === review.attempt))) {
+      fail("invalid_input", `Review ${review.id} references an invalid work-item attempt.`);
     }
     const structured = asStructuredHandoff(handoff);
     if (structured === null || handoff.result !== "done") {
@@ -1730,10 +1983,58 @@ export function validateMissionState(value: unknown): MissionState {
     if (!missions.has(approval.missionId)) {
       fail("invalid_input", `Approval ${approval.id} references an unknown mission.`);
     }
+    const workItem = approval.workItemId === undefined
+      ? undefined
+      : workItems.get(approval.workItemId);
+    if (approval.workItemId !== undefined &&
+        (workItem === undefined || workItem.missionId !== approval.missionId)) {
+      fail("invalid_input", `Approval ${approval.id} references an invalid work item.`);
+    }
+    if (approval.attempt !== undefined &&
+        (workItem === undefined || approval.attempt > workItem.attempt ||
+          !workItem.attempts.some((attempt) => attempt.number === approval.attempt))) {
+      fail("invalid_input", `Approval ${approval.id} references an invalid work-item attempt.`);
+    }
+    if (approval.handoffId !== undefined) {
+      const handoff = handoffsById.get(approval.handoffId);
+      if (
+        handoff === undefined ||
+        handoff.missionId !== approval.missionId ||
+        (workItem !== undefined && handoff.workItemId !== workItem.id) ||
+        (approval.attempt !== undefined && handoff.attempt !== approval.attempt)
+      ) {
+        fail("invalid_input", `Approval ${approval.id} references an invalid handoff.`);
+      }
+    }
+    if (approval.reviewId !== undefined) {
+      const review = result.reviews.find((candidate) => candidate.id === approval.reviewId);
+      if (
+        review === undefined ||
+        review.missionId !== approval.missionId ||
+        (workItem !== undefined && review.workItemId !== workItem.id) ||
+        (approval.attempt !== undefined && review.attempt !== approval.attempt)
+      ) {
+        fail("invalid_input", `Approval ${approval.id} references an invalid review.`);
+      }
+    }
+    if (approval.trueforgeSandboxId !== undefined && workItem !== undefined) {
+      const attempt = workItem.attempts.find((candidate) => candidate.number === approval.attempt);
+      if (attempt?.claim.trueforgeSandboxId !== approval.trueforgeSandboxId) {
+        fail("invalid_input", `Approval ${approval.id} is not bound to the recorded TrueForge sandbox.`);
+      }
+    }
     for (const evidenceId of approval.evidenceIds) {
       const item = evidence.get(evidenceId);
       if (item === undefined || item.missionId !== approval.missionId) {
         fail("invalid_input", `Approval ${approval.id} references invalid evidence.`);
+      }
+      if (
+        approval.workItemId !== undefined &&
+        item.workItemId !== undefined &&
+        item.workItemId !== approval.workItemId &&
+        !isPlannerBaselineEvidence(item, workItems)
+      ) {
+        fail("invalid_input", `Approval ${approval.id} mixes evidence from another work item.`);
       }
     }
   }
@@ -1752,6 +2053,13 @@ export function validateMissionState(value: unknown): MissionState {
         approval.actionType !== PRIMARY_CONSEQUENTIAL_ACTION
       ) {
         fail("invalid_input", `Delivery ${delivery.id} does not reference an approved delivery action.`);
+      }
+      if (
+        delivery.workItemId !== undefined &&
+        (approval.workItemId !== delivery.workItemId ||
+          delivery.attempt !== undefined && approval.attempt !== delivery.attempt)
+      ) {
+        fail("invalid_input", `Delivery ${delivery.id} is not correlated to its approved work-item attempt.`);
       }
       if (delivery.pullRequest !== undefined && delivery.executionOrigin !== undefined) {
         const context = approval.executionContext;
@@ -1772,6 +2080,19 @@ export function validateMissionState(value: unknown): MissionState {
           );
         }
       }
+    }
+    if (delivery.workItemId !== undefined) {
+      const workItem = workItems.get(delivery.workItemId);
+      if (workItem === undefined || workItem.missionId !== delivery.missionId) {
+        fail("invalid_input", `Delivery ${delivery.id} references an invalid work item.`);
+      }
+      if (delivery.attempt !== undefined &&
+          (delivery.attempt > workItem.attempt ||
+            !workItem.attempts.some((attempt) => attempt.number === delivery.attempt))) {
+        fail("invalid_input", `Delivery ${delivery.id} references an invalid work-item attempt.`);
+      }
+    } else if (delivery.attempt !== undefined) {
+      fail("invalid_input", `Delivery ${delivery.id} cannot identify an attempt without a work item.`);
     }
   }
 
@@ -1897,6 +2218,75 @@ function ensureDependenciesComplete(state: MissionState, workItem: WorkItem): vo
   }
 }
 
+function stableExecutionBinding(
+  label: string,
+  ...values: Array<string | undefined>
+): string | undefined {
+  const unique = [...new Set(values.filter((value): value is string => value !== undefined))];
+  if (unique.length > 1) {
+    fail(
+      "invalid_transition",
+      `${label} identity changed across attempts; refusing to create a replacement binding.`,
+    );
+  }
+  return unique[0];
+}
+
+function ensureAttemptHistoryForClaim(workItem: WorkItem): WorkItemAttempt {
+  const existing = workItem.attempts.at(-1);
+  if (existing !== undefined) {
+    return existing;
+  }
+  if (workItem.claim === undefined) {
+    fail(
+      "invalid_transition",
+      `Work item ${workItem.id} has no prior claim to retire before reauthorization.`,
+    );
+  }
+  const authorization = workItem.executionAuthorization ?? {
+    authorizedBy: "legacy-recovered",
+    authorizedAt: workItem.claim.claimedAt,
+  };
+  const attempt: WorkItemAttempt = {
+    number: workItem.attempt === 0 ? 1 : workItem.attempt,
+    authorization: clone(authorization),
+    requestedChanges: [...(workItem.requestedChanges ?? [])],
+    claim: clone(workItem.claim),
+    status: "changes_requested",
+  };
+  workItem.attempt = attempt.number;
+  workItem.attempts.push(attempt);
+  return attempt;
+}
+
+function updateCurrentAttempt(
+  workItem: WorkItem,
+  status: WorkItemAttemptStatus,
+): void {
+  const attempt = workItem.attempts.at(-1);
+  if (attempt !== undefined) {
+    attempt.status = status;
+    if (workItem.requestedChanges !== undefined) {
+      attempt.requestedChanges = [...workItem.requestedChanges];
+    }
+  }
+}
+
+function workItemFinding(
+  state: MissionState,
+  workItem: WorkItem,
+  reason?: string,
+): string {
+  const explicit = reason === undefined ? undefined : optionalString(reason, "reason", 4_000);
+  if (explicit !== undefined) {
+    return explicit;
+  }
+  const latestFailure = [...state.evidence].reverse().find((evidence) =>
+    evidence.workItemId === workItem.id && evidence.result === "failed",
+  );
+  return latestFailure?.summary ?? "The current proof did not establish the ticket contract.";
+}
+
 function ensureAllWorkComplete(state: MissionState, missionId: string): void {
   const incomplete = state.workItems
     .filter((item) => item.missionId === missionId && !isCompletedWorkItemStatus(item.status))
@@ -1907,6 +2297,95 @@ function ensureAllWorkComplete(state: MissionState, missionId: string): void {
       `Mission ${missionId} still has incomplete work items: ${incomplete.join(", ")}.`,
     );
   }
+}
+
+function productDeliveryWorkItems(state: MissionState, missionId: string): WorkItem[] {
+  return state.workItems.filter((item) =>
+    item.missionId === missionId && item.assignedRole !== "reviewer"
+  );
+}
+
+function ensureQueueApprovalReady(state: MissionState, missionId: string): void {
+  const productItems = productDeliveryWorkItems(state, missionId);
+  if (productItems.length === 0) {
+    ensureAllWorkComplete(state, missionId);
+    return;
+  }
+  const incomplete = productItems.filter((item) => {
+    if (item.assignedRole === "implementer") {
+      return item.status !== "awaiting_approval" && !isCompletedWorkItemStatus(item.status);
+    }
+    return !isCompletedWorkItemStatus(item.status);
+  });
+  if (incomplete.length > 0) {
+    fail(
+      "dependency_blocked",
+      `Mission ${missionId} is not ready for approval; queue items are not at the approval gate: ${incomplete.map((item) => item.id).join(", ")}.`,
+    );
+  }
+}
+
+function ensureQueueVerificationReady(state: MissionState, missionId: string): void {
+  const productItems = productDeliveryWorkItems(state, missionId);
+  if (productItems.length === 0) {
+    ensureAllWorkComplete(state, missionId);
+    return;
+  }
+  const incomplete = productItems.filter((item) => {
+    if (item.assignedRole === "implementer") {
+      return !["delivering", "done"].includes(item.status) && !isCompletedWorkItemStatus(item.status);
+    }
+    return !isCompletedWorkItemStatus(item.status);
+  });
+  if (incomplete.length > 0) {
+    fail(
+      "dependency_blocked",
+      `Mission ${missionId} is not ready for delivery verification: queue items are not delivering or done: ${incomplete.map((item) => item.id).join(", ")}.`,
+    );
+  }
+}
+
+function ensureQueueDeliveryComplete(
+  state: MissionState,
+  missionId: string,
+  deliveryWorkItemId: string,
+  deliveryAttempt: number | undefined,
+): WorkItem | undefined {
+  const productItems = productDeliveryWorkItems(state, missionId);
+  if (productItems.length === 0) {
+    ensureAllWorkComplete(state, missionId);
+    return undefined;
+  }
+  const deliveryWorkItem = findWorkItem(state, missionId, deliveryWorkItemId);
+  if (deliveryWorkItem.assignedRole !== "implementer" ||
+      (!["delivering", "done"].includes(deliveryWorkItem.status) &&
+        !isCompletedWorkItemStatus(deliveryWorkItem.status))) {
+    fail(
+      "invalid_transition",
+      `Delivery work item ${deliveryWorkItem.id} must be delivering before the verified result is recorded.`,
+    );
+  }
+  if (deliveryAttempt !== undefined && deliveryWorkItem.attempt !== deliveryAttempt) {
+    fail(
+      "approval_blocked",
+      `Delivery work item ${deliveryWorkItem.id} is on attempt ${deliveryWorkItem.attempt}, not approved attempt ${deliveryAttempt}.`,
+    );
+  }
+  const incomplete = productItems.filter((item) =>
+    item.id === deliveryWorkItem.id
+      ? (!["delivering", "done"].includes(item.status) && !isCompletedWorkItemStatus(item.status))
+      : !isCompletedWorkItemStatus(item.status),
+  );
+  if (incomplete.length > 0) {
+    fail(
+      "dependency_blocked",
+      `Mission ${missionId} still has incomplete delivery work items: ${incomplete.map((item) => item.id).join(", ")}.`,
+    );
+  }
+  if (isStructuredImplementationWorkItem(deliveryWorkItem)) {
+    ensureAcceptedIndependentReview(state, deliveryWorkItem);
+  }
+  return deliveryWorkItem;
 }
 
 function ensureMissionEvidence(state: MissionState, missionId: string, evidenceIds: string[]): void {
@@ -1926,6 +2405,49 @@ function ensureApprovalEvidence(state: MissionState, approval: Approval): void {
     const evidence = state.evidence.find((item) => item.id === evidenceId);
     if (evidence === undefined || evidence.missionId !== approval.missionId) {
       fail("approval_blocked", `Approval ${approval.id} references invalid supporting evidence.`);
+    }
+  }
+}
+
+function ensureCurrentApprovalCorrelation(state: MissionState, approval: Approval): void {
+  if (approval.workItemId === undefined) {
+    return;
+  }
+  const workItem = state.workItems.find((item) =>
+    item.id === approval.workItemId && item.missionId === approval.missionId,
+  );
+  const currentAttempt = workItem?.attempts.at(-1);
+  if (
+    workItem === undefined ||
+    approval.attempt === undefined ||
+    approval.attempt !== workItem.attempt ||
+    !["awaiting_approval", "delivering"].includes(workItem.status) ||
+    currentAttempt === undefined ||
+    currentAttempt.status !== workItem.status
+  ) {
+    fail(
+      "approval_blocked",
+      `Approval ${approval.id} is stale for the current work-item attempt.`,
+    );
+  }
+  if (approval.handoffId !== undefined) {
+    const latestHandoff = state.handoffs
+      .filter((handoff) => handoff.missionId === approval.missionId && handoff.workItemId === workItem.id)
+      .at(-1);
+    if (latestHandoff?.id !== approval.handoffId || latestHandoff.attempt !== approval.attempt) {
+      fail("approval_blocked", `Approval ${approval.id} is stale for the current implementation handoff.`);
+    }
+  }
+  if (approval.reviewId !== undefined) {
+    const latestReview = state.reviews
+      .filter((review) => review.missionId === approval.missionId && review.workItemId === workItem.id)
+      .at(-1);
+    if (
+      latestReview?.id !== approval.reviewId ||
+      latestReview.attempt !== approval.attempt ||
+      latestReview.outcome !== "accepted"
+    ) {
+      fail("approval_blocked", `Approval ${approval.id} is stale for the current implementation review.`);
     }
   }
 }
@@ -1975,6 +2497,7 @@ function ensureApprovedAction(
     fail("approval_blocked", `Approval ${approval.id} has expired.`);
   }
   ensureApprovalEvidence(state, approval);
+  ensureCurrentApprovalCorrelation(state, approval);
   return approval;
 }
 
@@ -2013,6 +2536,7 @@ function ensureApprovedDelivery(
     fail("approval_blocked", `Approval ${approval.id} has expired.`);
   }
   ensureApprovalEvidence(state, approval);
+  ensureCurrentApprovalCorrelation(state, approval);
   return approval;
 }
 
@@ -2344,6 +2868,12 @@ function ensureSuccessfulImplementationHandoff(state: MissionState, workItem: Wo
     .filter((handoff) => handoff.missionId === workItem.missionId && handoff.workItemId === workItem.id)
     .at(-1);
   const structured = latest === undefined ? null : asStructuredHandoff(latest);
+  if (workItem.attempt > 0 && latest?.attempt !== workItem.attempt) {
+    return fail(
+      "invalid_transition",
+      `Work item ${workItem.id} requires a structured implementation handoff for attempt ${workItem.attempt}.`,
+    );
+  }
   if (latest === undefined || structured === null || latest.result !== "done") {
     const proofFailure = state.evidence
       .filter((evidence) =>
@@ -2379,7 +2909,9 @@ function ensureAcceptedIndependentReview(state: MissionState, workItem: WorkItem
     latestHandoff === undefined ||
     latestReview === undefined ||
     latestReview.outcome !== "accepted" ||
-    latestReview.handoffId !== latestHandoff.id
+    latestReview.handoffId !== latestHandoff.id ||
+    (workItem.attempt > 0 &&
+      (latestHandoff.attempt !== workItem.attempt || latestReview.attempt !== workItem.attempt))
   ) {
     return fail(
       "invalid_transition",
@@ -2617,17 +3149,37 @@ export class MissionService {
         normalizedMissionId,
         normalizedId(workItemId, "workItemId"),
       );
-      if (workItem.status !== "backlog") {
+      if (workItem.status !== "backlog" && workItem.status !== "changes_requested") {
         fail(
           "invalid_transition",
-          `Work item ${workItem.id} can only be authorized from backlog, not ${workItem.status}.`,
+          `Work item ${workItem.id} can only be authorized from backlog or changes_requested, not ${workItem.status}.`,
         );
       }
-      if (workItem.claim !== undefined) {
+      if (workItem.status === "backlog" && workItem.claim !== undefined) {
         fail("invalid_transition", `Work item ${workItem.id} has already been claimed.`);
       }
       ensureDependenciesComplete(state, workItem);
       const actor = requiredString(input.actor, "actor", 200);
+      if (workItem.status === "changes_requested") {
+        if (workItem.delegation?.status === "running") {
+          fail(
+            "invalid_transition",
+            `Work item ${workItem.id} still has a running delegation; it cannot be reauthorized yet.`,
+          );
+        }
+        const priorAttempt = workItem.claim === undefined
+          ? workItem.attempts.at(-1)
+          : ensureAttemptHistoryForClaim(workItem);
+        if (priorAttempt !== undefined) {
+          if (workItem.claim !== undefined) {
+            priorAttempt.claim = clone(workItem.claim);
+          }
+          priorAttempt.status = "changes_requested";
+          priorAttempt.retiredAt = now;
+          priorAttempt.retiredBy = actor;
+        }
+        delete workItem.claim;
+      }
       workItem.executionAuthorization = {
         authorizedBy: actor,
         authorizedAt: now,
@@ -2707,22 +3259,46 @@ export class MissionService {
       }
       ensureDependenciesComplete(state, workItem);
       const owner = requiredString(input.owner, "owner", 200);
-      const trueforgeSessionId = optionalString(
+      const requestedSessionId = optionalString(
         input.trueforgeSessionId,
         "trueforgeSessionId",
         200,
       );
-      const trueforgeSandboxId = optionalString(
+      const requestedSandboxId = optionalString(
         input.trueforgeSandboxId,
         "trueforgeSandboxId",
         200,
       );
-      workItem.claim = {
+      const priorAttempt = workItem.attempts.at(-1);
+      const priorClaim = priorAttempt?.claim;
+      const trueforgeSessionId = stableExecutionBinding(
+        "TrueForge session",
+        requestedSessionId,
+        mission.trueforgeSessionId,
+        priorClaim?.trueforgeSessionId,
+      );
+      const trueforgeSandboxId = stableExecutionBinding(
+        "TrueForge sandbox",
+        requestedSandboxId,
+        mission.trueforgeSandboxId,
+        priorClaim?.trueforgeSandboxId,
+      );
+      const claim: WorkItemClaim = {
         owner,
         claimedAt: now,
         ...(trueforgeSessionId === undefined ? {} : { trueforgeSessionId }),
         ...(trueforgeSandboxId === undefined ? {} : { trueforgeSandboxId }),
       };
+      const attempt: WorkItemAttempt = {
+        number: workItem.attempt + 1,
+        authorization: clone(workItem.executionAuthorization),
+        requestedChanges: [...(workItem.requestedChanges ?? [])],
+        claim: clone(claim),
+        status: "in_progress",
+      };
+      workItem.attempt = attempt.number;
+      workItem.attempts.push(attempt);
+      workItem.claim = claim;
       workItem.status = "in_progress";
       workItem.updatedAt = now;
       return workItem;
@@ -2742,10 +3318,10 @@ export class MissionService {
     workItemId: string,
     expectedRevision?: number,
   ): Promise<WorkItem> {
-    return this.transitionSystemWorkItem(missionId, workItemId, "in_progress", {
-      trigger: "claim",
-      ...(expectedRevision === undefined ? {} : { expectedRevision }),
-    });
+    throw new MissionDomainError(
+      "invalid_transition",
+      "Changes Requested is a hard stop; a human must move the ticket to Ready before it can be claimed again.",
+    );
   }
 
   async transitionSystemWorkItem(
@@ -2776,8 +3352,7 @@ export class MissionService {
       }
       const legal =
         (options.trigger === "claim" &&
-          ((fromStatus === "ready" && nextStatus === "in_progress") ||
-            (fromStatus === "changes_requested" && nextStatus === "in_progress"))) ||
+          fromStatus === "ready" && nextStatus === "in_progress") ||
         (options.trigger === "execution" && fromStatus === "in_progress" && nextStatus === "proving") ||
         (options.trigger === "proof" && fromStatus === "proving" &&
           (["changes_requested", "awaiting_approval", "blocked"].includes(nextStatus) ||
@@ -2803,6 +3378,12 @@ export class MissionService {
       } else {
         delete workItem.blockedReason;
       }
+      if (nextStatus === "changes_requested") {
+        workItem.requestedChanges = [workItemFinding(state, workItem, options.reason)];
+      } else if (nextStatus === "awaiting_approval" || nextStatus === "done") {
+        delete workItem.requestedChanges;
+      }
+      updateCurrentAttempt(workItem, nextStatus as WorkItemAttemptStatus);
       workItem.status = nextStatus;
       workItem.updatedAt = now;
       return workItem;
@@ -2929,6 +3510,10 @@ export class MissionService {
       if (trueforgeSandboxId !== undefined) {
         workItem.claim.trueforgeSandboxId = trueforgeSandboxId;
       }
+      const attempt = workItem.attempts.at(-1);
+      if (attempt !== undefined) {
+        attempt.claim = clone(workItem.claim);
+      }
       workItem.updatedAt = now;
       return workItem;
     });
@@ -3032,6 +3617,8 @@ export class MissionService {
           createdAt: prior?.createdAt ?? now,
           updatedAt: now,
           assignedRole: planned.assignedRole,
+          attempt: prior?.attempt ?? 0,
+          attempts: prior?.attempts === undefined ? [] : clone(prior.attempts),
         };
         const allowedFiles = planned.allowedFiles ?? prior?.allowedFiles;
         if (allowedFiles !== undefined) {
@@ -3049,6 +3636,9 @@ export class MissionService {
         }
         if (prior?.claim !== undefined) {
           workItem.claim = clone(prior.claim);
+        }
+        if (prior?.requestedChanges !== undefined) {
+          workItem.requestedChanges = [...prior.requestedChanges];
         }
         if (prior?.blockedReason !== undefined) {
           workItem.blockedReason = prior.blockedReason;
@@ -3295,6 +3885,8 @@ export class MissionService {
         dependsOn,
         createdAt: now,
         updatedAt: now,
+        attempt: 0,
+        attempts: [],
       };
       if (assignedRole !== undefined) {
         workItem.assignedRole = assignedRole;
@@ -3318,7 +3910,10 @@ export class MissionService {
   ): Promise<WorkItem> {
     if (options.trigger === "human") {
       if (status !== "backlog" && status !== "ready") {
-        fail("invalid_transition", "Humans may only move tickets between backlog and ready.");
+        fail(
+          "invalid_transition",
+          "Humans may move tickets between backlog and ready, or authorize changes_requested rework by moving it to ready.",
+        );
       }
       if (options.actor === undefined) {
         fail("invalid_input", "A human ticket transition requires an actor.");
@@ -3417,6 +4012,7 @@ export class MissionService {
           reviewer,
           outcome,
           handoffId: context.handoff.id,
+          ...(workItem.attempt === 0 ? {} : { attempt: workItem.attempt }),
           filesChanged: context.filesChanged,
           diffSummary: context.diffSummary,
           checks: context.checks,
@@ -3439,18 +4035,31 @@ export class MissionService {
         findingEvidenceId,
         createdAt: now,
       };
+      if (workItem.attempt > 0) {
+        review.attempt = workItem.attempt;
+        findingEvidence.attempt = workItem.attempt;
+      }
       state.evidence.push(findingEvidence);
       state.reviews.push(review);
       const legacyReview = workItem.status === "ready_for_review";
-      workItem.status = outcome === "accepted"
+      const nextStatus: WorkItemStatus = outcome === "accepted"
         ? legacyReview ? "complete" : "awaiting_approval"
         : outcome === "changes_requested"
         ? legacyReview ? "ready" : "changes_requested"
         : "blocked";
+      workItem.status = nextStatus;
+      if (!legacyReview) {
+        if (outcome === "changes_requested" || outcome === "blocked") {
+          workItem.requestedChanges = [finding];
+        } else {
+          delete workItem.requestedChanges;
+        }
+        updateCurrentAttempt(workItem, nextStatus as WorkItemAttemptStatus);
+      }
       if (legacyReview && outcome === "changes_requested") {
         // Older mission snapshots treated a requested change as a fresh ready
-        // attempt. Queue tickets retain their claim and use the explicit
-        // changes_requested -> in_progress repair path instead.
+        // attempt. Product-lifecycle tickets use the explicit human-gated
+        // changes_requested -> ready path above instead.
         delete workItem.claim;
       }
       workItem.updatedAt = now;
@@ -3472,8 +4081,11 @@ export class MissionService {
           `Mission ${mission.id} cannot transition from ${mission.status} to ${nextStatus}.`,
         );
       }
-      if (nextStatus === "awaiting_approval" || nextStatus === "verifying") {
-        ensureAllWorkComplete(state, mission.id);
+      if (nextStatus === "awaiting_approval") {
+        ensureQueueApprovalReady(state, mission.id);
+      }
+      if (nextStatus === "verifying") {
+        ensureQueueVerificationReady(state, mission.id);
       }
       if (nextStatus === "delivered") {
         fail("invalid_transition", "Record a verified delivery before marking a mission delivered.");
@@ -3494,9 +4106,9 @@ export class MissionService {
       const workItemId = input.workItemId === undefined
         ? undefined
         : normalizedId(input.workItemId, "workItemId");
-      if (workItemId !== undefined) {
-        findWorkItem(state, normalizedMissionId, workItemId);
-      }
+      const workItem = workItemId === undefined
+        ? undefined
+        : findWorkItem(state, normalizedMissionId, workItemId);
       const details = optionalString(input.details, "details");
       const executionOrigin = input.executionOrigin === undefined
         ? undefined
@@ -3512,6 +4124,9 @@ export class MissionService {
       };
       if (workItemId !== undefined) {
         evidence.workItemId = workItemId;
+      }
+      if (workItem !== undefined && workItem.attempt > 0) {
+        evidence.attempt = workItem.attempt;
       }
       if (details !== undefined) {
         evidence.details = details;
@@ -3572,6 +4187,9 @@ export class MissionService {
           : enumValue(input.memoryImpact, memoryImpacts, "memoryImpact"),
         createdAt: now,
       };
+      if (workItem.attempt > 0) {
+        handoff.attempt = workItem.attempt;
+      }
       if (structured !== null) {
         handoff.diffSummary = structured.diffSummary;
         handoff.checks = structured.checks;
@@ -3613,6 +4231,35 @@ export class MissionService {
       const expiresAt = input.expiresAt === undefined
         ? defaultApprovalExpiry(now)
         : timestamp(input.expiresAt, "expiresAt");
+      const workItemId = input.workItemId === undefined
+        ? undefined
+        : normalizedId(input.workItemId, "workItemId");
+      const attempt = input.attempt === undefined
+        ? undefined
+        : nonNegativeInteger(input.attempt, "attempt");
+      if (attempt !== undefined && attempt === 0) {
+        fail("invalid_input", "attempt must be greater than zero.");
+      }
+      const handoffId = input.handoffId === undefined
+        ? undefined
+        : normalizedId(input.handoffId, "handoffId");
+      const reviewId = input.reviewId === undefined
+        ? undefined
+        : normalizedId(input.reviewId, "reviewId");
+      const trueforgeSandboxId = input.trueforgeSandboxId === undefined
+        ? undefined
+        : requiredString(input.trueforgeSandboxId, "trueforgeSandboxId", 200);
+      if (workItemId !== undefined) {
+        const workItem = findWorkItem(state, normalizedMissionId, workItemId);
+        if (attempt !== undefined && attempt !== workItem.attempt) {
+          fail(
+            "invalid_input",
+            `Approval attempt ${attempt} does not match work item ${workItem.id} attempt ${workItem.attempt}.`,
+          );
+        }
+      } else if (attempt !== undefined || handoffId !== undefined || reviewId !== undefined || trueforgeSandboxId !== undefined) {
+        fail("invalid_input", "Approval attempt correlation requires a work item.");
+      }
       const approval: Approval = {
         id,
         missionId: normalizedMissionId,
@@ -3627,6 +4274,21 @@ export class MissionService {
         createdAt: now,
         expiresAt,
       };
+      if (workItemId !== undefined) {
+        approval.workItemId = workItemId;
+      }
+      if (attempt !== undefined) {
+        approval.attempt = attempt;
+      }
+      if (handoffId !== undefined) {
+        approval.handoffId = handoffId;
+      }
+      if (reviewId !== undefined) {
+        approval.reviewId = reviewId;
+      }
+      if (trueforgeSandboxId !== undefined) {
+        approval.trueforgeSandboxId = trueforgeSandboxId;
+      }
       if (input.executionContext !== undefined) {
         approval.executionContext = validateApprovalExecutionContext(
           input.executionContext,
@@ -3697,6 +4359,7 @@ export class MissionService {
     input: DecideApprovalInput,
   ): Promise<Approval> {
     return this.mutate((state, now) => {
+      ensureExpectedRevision(state, input.expectedRevision);
       const normalizedMissionId = normalizedId(missionId, "missionId");
       const mission = findMission(state, normalizedMissionId);
       ensureOpen(mission);
@@ -3738,6 +4401,15 @@ export class MissionService {
         "verificationSummary",
       );
       const reference = optionalString(input.reference, "reference", 2_000);
+      const workItemId = input.workItemId === undefined
+        ? undefined
+        : normalizedId(input.workItemId, "workItemId");
+      const attempt = input.attempt === undefined
+        ? undefined
+        : nonNegativeInteger(input.attempt, "attempt");
+      if (attempt !== undefined && attempt === 0) {
+        fail("invalid_input", "attempt must be greater than zero.");
+      }
       const pullRequest = input.pullRequest === undefined
         ? undefined
         : validatePullRequestReference(input.pullRequest, "pullRequest");
@@ -3745,17 +4417,43 @@ export class MissionService {
         ? undefined
         : validateExecutionOrigin(input.executionOrigin, "executionOrigin");
       let approvedDelivery: Approval | undefined;
+      let deliveryWorkItem: WorkItem | undefined;
       if (status === "delivered") {
         if (mission.status !== "verifying") {
           fail("invalid_transition", "A delivered record requires a mission in verifying state.");
         }
-        ensureAllWorkComplete(state, normalizedMissionId);
+        if (workItemId === undefined) {
+          if (attempt !== undefined) {
+            fail("invalid_input", "attempt requires a work item for a delivered record.");
+          }
+          ensureAllWorkComplete(state, normalizedMissionId);
+        }
+        if (workItemId !== undefined) {
+          deliveryWorkItem = ensureQueueDeliveryComplete(
+            state,
+            normalizedMissionId,
+            workItemId,
+            attempt,
+          );
+        }
         approvedDelivery = ensureApprovedDelivery(
           state,
           normalizedMissionId,
           input.approvalId,
           now,
         );
+        if (
+          workItemId !== undefined &&
+          approvedDelivery.workItemId !== workItemId
+        ) {
+          fail("approval_blocked", "The delivered result is not correlated to the approved work item.");
+        }
+        if (
+          attempt !== undefined &&
+          approvedDelivery.attempt !== attempt
+        ) {
+          fail("approval_blocked", "The delivered result is not correlated to the approved work-item attempt.");
+        }
         if (reference === undefined) {
           fail("invalid_input", "reference is required for a delivered record.");
         }
@@ -3805,6 +4503,12 @@ export class MissionService {
       if (approvedDelivery !== undefined) {
         delivery.approvalId = approvedDelivery.id;
       }
+      if (workItemId !== undefined) {
+        delivery.workItemId = workItemId;
+      }
+      if (attempt !== undefined) {
+        delivery.attempt = attempt;
+      }
       if (pullRequest !== undefined) {
         delivery.pullRequest = pullRequest;
       }
@@ -3812,6 +4516,12 @@ export class MissionService {
         delivery.executionOrigin = executionOrigin;
       }
       state.deliveries.push(delivery);
+      if (status === "delivered" && deliveryWorkItem !== undefined && deliveryWorkItem.status === "delivering") {
+        updateCurrentAttempt(deliveryWorkItem, "done");
+        delete deliveryWorkItem.requestedChanges;
+        deliveryWorkItem.status = "done";
+        deliveryWorkItem.updatedAt = now;
+      }
       mission.status = status === "delivered" ? "delivered" : "failed";
       mission.updatedAt = now;
       return delivery;

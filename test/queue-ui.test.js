@@ -25,7 +25,10 @@ test("Proof Board UI declares the queue columns and system-owned boundary", () =
     assert.match(appScript, new RegExp(`id: "${status}"`));
   }
   assert.match(appScript, /data-drop-enabled/);
-  assert.match(appScript, /Only the first two columns accept a human move/);
+  assert.match(appScript, /Backlog ↔ Ready authorizes work/);
+  assert.match(appScript, /Changes Requested → Ready authorizes bounded rework/);
+  assert.match(appScript, /humanSource: true/);
+  assert.match(appScript, /Authorize bounded rework/);
   assert.match(appScript, /draggable="\$\{canDrag\}"/);
   assert.match(appScript, /\["backlog", "ready"\]/);
   assert.match(appScript, /system-owned/);
@@ -34,15 +37,28 @@ test("Proof Board UI declares the queue columns and system-owned boundary", () =
 test("Proof Board UI keeps durable polling, drawer, activity, proof, and approval affordances", () => {
   assert.match(appScript, /setInterval\(pollMission, POLL_INTERVAL_MS\)/);
   assert.match(appScript, /expected_revision: currentView\.revision/);
+  assert.match(appScript, /expected_revision: currentView\?\.revision/);
+  assert.match(appScript, /Placement is a server-owned projection/);
+  assert.match(appScript, /pollInFlight/);
   assert.match(appScript, /id="ticket-drawer"/);
+  assert.match(appScript, /Attempt history/);
+  assert.match(appScript, /Review history/);
+  assert.match(appScript, /requestedChanges/);
+  assert.match(appScript, /Retired by/);
   assert.match(appScript, /item\.workItemId === ticket\.id/);
   assert.match(appScript, /Deterministic proof/);
   assert.match(appScript, /Approve exact action/);
+  assert.match(appScript, /Second human gate/);
+  assert.match(appScript, /Human approval recorded/);
+  assert.match(appScript, /Delivery verified/);
+  assert.match(appScript, /refresh and reconnect cannot authorize delivery/);
   assert.match(appScript, /Read-back/);
   assert.match(styleSheet, /\.ticket-board\s*\{/);
   assert.match(styleSheet, /\.ticket-drawer\s*\{/);
   assert.match(styleSheet, /grid-template-columns: repeat\(8/);
   assert.match(styleSheet, /\.ticket-column\.is-drag-over/);
+  assert.match(styleSheet, /\.attempt-card/);
+  assert.match(styleSheet, /\.drawer-rework/);
 });
 
 test("mission view correlates card activity and evidence to the durable ticket", async () => {

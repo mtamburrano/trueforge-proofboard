@@ -204,3 +204,19 @@ test("run coordinator never lets an older revision replace newer state", async (
     { revision: 5, marker: "authoritative-rerender", authoritative: true },
   ]);
 });
+
+test("run coordinator rejects malformed revisions during reconnect", async () => {
+  const { createRunCoordinator } = await loadRunState();
+  const rendered = [];
+  const coordinator = createRunCoordinator({
+    onState(view) {
+      rendered.push(view);
+    },
+  });
+
+  assert.equal(coordinator.accept({ revision: -1, marker: "negative" }), false);
+  assert.equal(coordinator.accept({ revision: Number.NaN, marker: "nan" }), false);
+  assert.equal(coordinator.accept({ revision: 1.5, marker: "fractional" }), false);
+  assert.equal(coordinator.latestRevision(), null);
+  assert.deepEqual(rendered, []);
+});

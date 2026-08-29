@@ -1489,9 +1489,10 @@ test("normal implementer and reviewer turns remain agentic for a validated model
 
   assert.equal(calls.create[0].agent.spec.model.params, undefined);
   assert.equal(calls.turns.length, 2);
-  for (const turn of calls.turns) {
-    assert.equal(turn.agentSpec.model.params, undefined);
-  }
+  assert.equal(calls.turns[0].agentSpec.model.params, undefined);
+  assert.equal(calls.turns[1].agentSpec.model.params.parallel_tool_calls, false);
+  assert.deepEqual(calls.turns[1].agentSpec.mcpServers, []);
+  assert.equal(calls.turns[1].agentSpec.config.sandbox.enabled, false);
 });
 
 test("runner performs an independent bounded contract review", async () => {
@@ -1545,6 +1546,15 @@ test("runner performs an independent bounded contract review", async () => {
   assert.match(instruction, /actualDiff/);
   assert.match(instruction, /src\/index\.ts/);
   assert.match(instruction, /Do not rely on implementer narration/);
+  assert.equal(calls.updates.length, 2);
+  assert.deepEqual(
+    calls.updates.map((update) => update.request.agent.spec.config.iterationLimit),
+    [COORDINATOR_TRUEFORGE_ITERATION_LIMIT, DEFAULT_TRUEFORGE_ITERATION_LIMIT],
+  );
+  assert.equal(calls.updates[0].request.agent.spec.model.params.parallel_tool_calls, false);
+  assert.equal(calls.updates[1].request.agent.spec.model.params, undefined);
+  assert.deepEqual(calls.updates[0].request.agent.spec.mcpServers, []);
+  assert.equal(calls.updates[0].request.agent.spec.config.sandbox.enabled, false);
 });
 
 test("runner does not mark a done turn as passed while required actions remain", async () => {

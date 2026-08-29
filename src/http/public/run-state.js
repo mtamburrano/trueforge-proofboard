@@ -12,7 +12,7 @@
     let latestView = null;
 
     function accept(view, { force = false, authoritative = false } = {}) {
-      if (!view || typeof view.revision !== "number") return false;
+      if (!view || !Number.isInteger(view.revision) || view.revision < 0) return false;
       if (latestRevision !== null && view.revision < latestRevision) return false;
       if (!force && view.revision === latestRevision) return false;
       latestRevision = view.revision;

@@ -131,6 +131,100 @@ test("a ready ticket is claimed once and later lifecycle edges are system-owned"
   assert.equal(done.status, "done");
 });
 
+test("changes requested is a hard stop and human rework preserves the prior attempt", async () => {
+  const { missions, mission, ticket } = await queueFixture();
+  await missions.moveWorkItemByHuman(mission.id, ticket.id, "ready", { actor: "first-operator" });
+  await missions.claimWorkItem(mission.id, ticket.id, {
+    owner: "trueforge-worker",
+    trueforgeSessionId: "session-reused",
+    trueforgeSandboxId: "sandbox-reused",
+  });
+  await missions.transitionSystemWorkItem(mission.id, ticket.id, "proving", {
+    trigger: "execution",
+  });
+  const failed = await missions.transitionSystemWorkItem(mission.id, ticket.id, "changes_requested", {
+    trigger: "proof",
+    reason: "The deterministic proof found an incomplete contract.",
+  });
+  assert.equal(failed.status, "changes_requested");
+  assert.deepEqual(failed.requestedChanges, ["The deterministic proof found an incomplete contract."]);
+
+  await assert.rejects(
+    missions.resumeChangesRequestedWorkItem(mission.id, ticket.id),
+    domainError("invalid_transition"),
+  );
+  await assert.rejects(
+    missions.transitionSystemWorkItem(mission.id, ticket.id, "in_progress", { trigger: "claim" }),
+    domainError("invalid_transition"),
+  );
+
+  const beforeRework = await missions.getState();
+  const reauthorized = await missions.moveWorkItemByHuman(
+    mission.id,
+    ticket.id,
+    "ready",
+    { actor: "rework-operator", expectedRevision: beforeRework.revision },
+  );
+  assert.equal(reauthorized.status, "ready");
+  assert.equal(reauthorized.claim, undefined);
+  assert.equal(reauthorized.executionAuthorization.authorizedBy, "rework-operator");
+  assert.deepEqual(reauthorized.requestedChanges, ["The deterministic proof found an incomplete contract."]);
+  assert.equal(reauthorized.attempts.length, 1);
+  assert.equal(reauthorized.attempts[0].status, "changes_requested");
+  assert.equal(reauthorized.attempts[0].claim.trueforgeSessionId, "session-reused");
+  assert.equal(reauthorized.attempts[0].claim.trueforgeSandboxId, "sandbox-reused");
+  assert.equal(reauthorized.attempts[0].retiredBy, "rework-operator");
+
+  const second = await missions.claimWorkItem(mission.id, ticket.id, { owner: "trueforge-worker" });
+  assert.equal(second.status, "in_progress");
+  assert.equal(second.attempt, 2);
+  assert.equal(second.attempts.length, 2);
+  assert.equal(second.claim.trueforgeSessionId, "session-reused");
+  assert.equal(second.claim.trueforgeSandboxId, "sandbox-reused");
+  assert.deepEqual(second.attempts[1].requestedChanges, reauthorized.requestedChanges);
+});
+
+test("rework authorization, retired claims, and attempt identity survive JSON reconnect", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "trueforge-proofboard-rework-"));
+  const filePath = path.join(directory, "state.json");
+  try {
+    const first = await queueFixture(new JsonMissionRepository(filePath), "mission-rework-reconnect");
+    await first.missions.moveWorkItemByHuman(first.mission.id, first.ticket.id, "ready", {
+      actor: "operator",
+    });
+    await first.missions.claimWorkItem(first.mission.id, first.ticket.id, {
+      owner: "worker",
+      trueforgeSessionId: "session-reconnect-rework",
+      trueforgeSandboxId: "sandbox-reconnect-rework",
+    });
+    await first.missions.transitionSystemWorkItem(first.mission.id, first.ticket.id, "proving", {
+      trigger: "execution",
+    });
+    await first.missions.transitionSystemWorkItem(first.mission.id, first.ticket.id, "changes_requested", {
+      trigger: "proof",
+      reason: "The proof needs one bounded correction.",
+    });
+    await first.missions.moveWorkItemByHuman(first.mission.id, first.ticket.id, "ready", {
+      actor: "rework-operator",
+    });
+
+    const second = new MissionService(new JsonMissionRepository(filePath), NOW);
+    const restored = await second.getWorkItem(first.mission.id, first.ticket.id);
+    assert.equal(restored.status, "ready");
+    assert.equal(restored.claim, undefined);
+    assert.equal(restored.executionAuthorization.authorizedBy, "rework-operator");
+    assert.equal(restored.attempts[0].retiredBy, "rework-operator");
+    assert.equal(restored.attempts[0].claim.trueforgeSandboxId, "sandbox-reconnect-rework");
+
+    const claimed = await second.claimWorkItem(first.mission.id, first.ticket.id, { owner: "worker" });
+    assert.equal(claimed.attempt, 2);
+    assert.equal(claimed.claim.trueforgeSessionId, "session-reconnect-rework");
+    assert.equal(claimed.claim.trueforgeSandboxId, "sandbox-reconnect-rework");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("concurrent claim attempts share one durable winner", async () => {
   const repository = new InMemoryMissionRepository();
   const first = await queueFixture(repository);
@@ -218,4 +312,42 @@ test("HTTP exposes ticket reads and rejects non-human lifecycle shortcuts", asyn
   assert.equal(claim.status, 200);
   assert.equal((await claim.json()).ticket.status, "in_progress");
   assert.equal((await missions.getMission(mission.id)).status, "draft");
+});
+
+test("HTTP requires human reauthorization before a changes-requested ticket can be claimed", async () => {
+  const { missions, mission, ticket } = await queueFixture(
+    new InMemoryMissionRepository(),
+    "primary-mission",
+  );
+  const app = createMissionHttpApp({ missions, runner: {} });
+  await missions.moveWorkItemByHuman(mission.id, ticket.id, "ready", { actor: "operator" });
+  await missions.claimWorkItem(mission.id, ticket.id, { owner: "worker" });
+  await missions.transitionSystemWorkItem(mission.id, ticket.id, "proving", {
+    trigger: "execution",
+  });
+  await missions.transitionSystemWorkItem(mission.id, ticket.id, "changes_requested", {
+    trigger: "proof",
+    reason: "Fix the failed proof contract.",
+  });
+
+  const blockedClaim = await app.request("/api/mission/tickets/" + ticket.id + "/claim", {
+    method: "POST",
+    body: JSON.stringify({ owner: "worker" }),
+  });
+  assert.equal(blockedClaim.status, 400);
+
+  const current = await missions.getState();
+  const authorized = await app.request("/api/mission/tickets/" + ticket.id + "/status", {
+    method: "PATCH",
+    body: JSON.stringify({
+      status: "ready",
+      actor: "operator",
+      expected_revision: current.revision,
+    }),
+  });
+  assert.equal(authorized.status, 200);
+  const payload = await authorized.json();
+  assert.equal(payload.ticket.status, "ready");
+  assert.equal(payload.ticket.claim, undefined);
+  assert.equal(payload.ticket.attempts[0].retiredBy, "operator");
 });

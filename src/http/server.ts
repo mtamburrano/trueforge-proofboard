@@ -21,6 +21,7 @@ import {
   WorkItem,
   MAX_WORK_ITEM_ACCEPTANCE_CRITERIA,
   PRIMARY_CONSEQUENTIAL_ACTION,
+  missionTransitions,
   validateWorkGraph,
 } from "../domain.js";
 import {
@@ -96,6 +97,7 @@ export interface MissionRunner {
     missionId: string,
     pending: TrueForgeDeliveryApproval,
     decision: "approved" | "rejected" | "cancelled",
+    workItemId?: string,
   ): Promise<TrueForgePullRequestResult | null>;
   reviewContract?(context: ReviewContext): Promise<ImplementationReviewDecision>;
 }
@@ -212,6 +214,7 @@ export interface EvidenceView {
   createdAt: string;
   workItemId?: string;
   workItemTitle?: string;
+  attempt?: number;
   metadata: Record<string, string | number>;
   executionOrigin?: Evidence["executionOrigin"];
 }
@@ -227,6 +230,7 @@ export interface HandoffView {
   openQuestions: string[];
   memoryImpact: Handoff["memoryImpact"];
   createdAt: string;
+  attempt?: number;
   diffSummary?: string;
   checks?: Handoff["checks"];
   evidenceIds?: string[];
@@ -247,6 +251,7 @@ export interface ReviewView {
   evidenceIds: string[];
   findingEvidenceId: string;
   createdAt: string;
+  attempt?: number;
 }
 
 export interface ActivityView {
@@ -308,6 +313,9 @@ export interface MissionView {
     allowedFiles?: string[];
     executionAuthorization?: WorkItem["executionAuthorization"];
     claim?: WorkItem["claim"];
+    attempt: number;
+    attempts: WorkItem["attempts"];
+    requestedChanges?: string[];
     blockedReason?: string;
     delegation?: WorkItem["delegation"];
   }>;
@@ -328,6 +336,11 @@ export interface MissionView {
     decision: string;
     createdAt: string;
     expiresAt: string;
+    workItemId?: string;
+    attempt?: number;
+    handoffId?: string;
+    reviewId?: string;
+    trueforgeSandboxId?: string;
     decidedBy?: string;
     decidedAt?: string;
     executionContext?: Approval["executionContext"];
@@ -339,6 +352,8 @@ export interface MissionView {
     createdAt: string;
     reference?: string;
     approvalId?: string;
+    workItemId?: string;
+    attempt?: number;
     pullRequest?: {
       number: number;
       url: string;
@@ -346,6 +361,7 @@ export interface MissionView {
       repositoryName: string;
       base: string;
       head: string;
+      headSha?: string;
     };
     executionOrigin?: {
       kind: string;
@@ -606,15 +622,35 @@ class MissionController {
     }
     try {
       await this.prepareMissionForExecution();
-      const workItem = await this.claimForExecution(queued, "trueforge-worker");
-      if (workItem.assignedRole === "planner") {
-        await this.executeRepositoryInspection(workItem);
-      } else if (workItem.assignedRole === "implementer") {
-        await this.executeImplementation(workItem);
+      if (queued.status === "proving") {
+        await this.executeProofAndReview(queued);
+      } else if (queued.status === "awaiting_approval") {
+        const approval = (await this.missions.getState()).approvals
+          .filter((item) =>
+            item.missionId === PRIMARY_MISSION_ID &&
+            item.workItemId === queued.id &&
+            item.attempt === queued.attempt &&
+            isPrimaryDeliveryApproval(item),
+          )
+          .at(-1);
+        if (approval?.decision === "approved") {
+          await this.resumePrimaryDelivery(queued);
+        } else {
+          await this.ensurePrimaryDeliveryApproval();
+        }
+      } else if (queued.status === "delivering") {
+        await this.resumePrimaryDelivery(queued);
       } else {
-        throw new MissionControlError(
-          `Ready ticket ${workItem.id} has no executable implementation role.`,
-        );
+        const workItem = await this.claimForExecution(queued, "trueforge-worker");
+        if (workItem.assignedRole === "planner") {
+          await this.executeRepositoryInspection(workItem);
+        } else if (workItem.assignedRole === "implementer") {
+          await this.executeImplementation(workItem);
+        } else {
+          throw new MissionControlError(
+            `Ready ticket ${workItem.id} has no executable implementation role.`,
+          );
+        }
       }
       return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID);
     } catch (error) {
@@ -627,7 +663,10 @@ class MissionController {
   private async nextQueueWorkItem(): Promise<WorkItem | undefined> {
     const state = await this.missions.getState();
     const items = state.workItems.filter((item) => item.missionId === PRIMARY_MISSION_ID);
-    const active = items.filter((item) => item.status === "in_progress" && item.claim !== undefined);
+    const active = items.filter((item) =>
+      ["in_progress", "proving", "awaiting_approval", "delivering"].includes(item.status) &&
+      item.claim !== undefined,
+    );
     if (active.length > 1) {
       throw new MissionControlError("Only one TrueForge ticket may execute at a time.");
     }
@@ -639,6 +678,95 @@ class MissionController {
       item.claim === undefined &&
       item.executionAuthorization !== undefined,
     );
+  }
+
+  private async executeProofAndReview(workItem: WorkItem): Promise<void> {
+    if (workItem.assignedRole !== "implementer" || workItem.claim === undefined) {
+      throw new MissionControlError(
+        `Ticket ${workItem.id} cannot enter independent proof without an implementer claim.`,
+      );
+    }
+
+    // A process can restart after proof or review has already been persisted
+    // but before the enclosing request returned. Continue from the durable
+    // checkpoint instead of measuring the same sandbox a second time.
+    const recoveredState = await this.missions.getState();
+    const recoveredHandoff = recoveredState.handoffs
+      .filter((item) =>
+        item.missionId === PRIMARY_MISSION_ID &&
+        item.workItemId === workItem.id &&
+        item.attempt === workItem.attempt,
+      )
+      .at(-1);
+    const recoveredReview = recoveredState.reviews
+      .filter((item) =>
+        item.missionId === PRIMARY_MISSION_ID &&
+        item.workItemId === workItem.id &&
+        item.attempt === workItem.attempt,
+      )
+      .at(-1);
+    if (recoveredHandoff?.result === "done") {
+      if (recoveredReview?.outcome === "accepted") {
+        await this.ensurePrimaryDeliveryApproval();
+        return;
+      }
+      if (recoveredReview === undefined) {
+        const outcome = await this.reviewImplementation(workItem.id);
+        if (outcome === "accepted") {
+          await this.ensurePrimaryDeliveryApproval();
+        }
+        return;
+      }
+    }
+
+    let handoff: ImplementationHandoffDraft;
+    try {
+      handoff = await this.runner.proveImplementation({
+        missionId: PRIMARY_MISSION_ID,
+        workItemId: workItem.id,
+      });
+      await this.recordImplementationHandoff(handoff, workItem.id);
+    } catch (error) {
+      if (!isRecoverableImplementationProofFailure(error)) {
+        throw error;
+      }
+      await this.recordProofFindingAndRequestChanges(workItem.id, error);
+      return;
+    }
+
+    const outcome = await this.reviewImplementation(workItem.id);
+    if (outcome === "blocked") {
+      throw new MissionControlError(
+        "Independent verification blocked the implementation; inspect the durable finding before retrying.",
+      );
+    }
+    if (outcome === "accepted") {
+      await this.ensurePrimaryDeliveryApproval();
+    }
+  }
+
+  private async recordProofFindingAndRequestChanges(
+    workItemId: string,
+    error: unknown,
+  ): Promise<void> {
+    const reason = missionFailureReason(error);
+    await this.missions.addEvidence(PRIMARY_MISSION_ID, {
+      workItemId,
+      kind: "reviewer_finding",
+      result: "failed",
+      source: "reviewer",
+      summary: "Independent deterministic proof requested changes before review.",
+      details: JSON.stringify({
+        failure_layer: "proof_board",
+        failure_category: "verification",
+        phase: "deterministic-proof",
+        reason,
+      }),
+    });
+    await this.missions.transitionSystemWorkItem(PRIMARY_MISSION_ID, workItemId, "changes_requested", {
+      trigger: "proof",
+      reason,
+    });
   }
 
   private async claimForExecution(
@@ -690,6 +818,27 @@ class MissionController {
   }
 
   private async executeRepositoryInspection(workItem: WorkItem): Promise<void> {
+    const state = await this.missions.getState();
+    const inspectionEvidence = latestEvidenceForAttempt(
+      state.evidence,
+      workItem.id,
+      workItem.attempt,
+      "mcp",
+    );
+    if (inspectionEvidence?.result === "passed") {
+      await this.missions.transitionSystemWorkItem(PRIMARY_MISSION_ID, workItem.id, "proving", {
+        trigger: "execution",
+      });
+      await this.missions.transitionSystemWorkItem(PRIMARY_MISSION_ID, workItem.id, "done", {
+        trigger: "proof",
+      });
+      await this.persistInspectedWorkGraph(
+        { evidenceId: inspectionEvidence.id },
+        workItem.id,
+      );
+      await this.ensureWorkItems();
+      return;
+    }
     let inspectionResult: unknown;
     await this.executeClaimedWork(workItem.id, async () => {
       const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
@@ -714,6 +863,21 @@ class MissionController {
 
   private async executeImplementation(workItem: WorkItem): Promise<void> {
     const state = await this.missions.getState();
+    const completedTurn = latestEvidenceForAttempt(
+      state.evidence,
+      workItem.id,
+      workItem.attempt,
+      "trueforge",
+    );
+    if (
+      completedTurn?.result === "passed" &&
+      completedTurn.summary.startsWith("TrueForge turn finished with status done")
+    ) {
+      await this.missions.transitionSystemWorkItem(PRIMARY_MISSION_ID, workItem.id, "proving", {
+        trigger: "execution",
+      });
+      return;
+    }
     const repositoryProof = state.evidence.find((evidence) =>
       evidence.missionId === PRIMARY_MISSION_ID &&
       evidence.source === "mcp" &&
@@ -742,6 +906,9 @@ class MissionController {
           `Mission objective: ${currentMission.objective}`,
           `Acceptance criteria: ${workItem.acceptanceCriteria.join(" ")}`,
           `Allowed files: ${(workItem.allowedFiles ?? []).join(", ")}`,
+          ...(workItem.requestedChanges === undefined
+            ? []
+            : [`Requested rework findings: ${workItem.requestedChanges.join(" ")}`]),
           `Verified repository facts: ${repository.owner}/${repository.name} at full commit ${verifiedSha}.`,
           `Use ${PRIMARY_SANDBOX_REPOSITORY_ROOT} as the one canonical absolute sandbox checkout root. Ensure the pinned repository is present there before edits; never use /workspace, a guessed cwd, or a nested checkout.`,
           "Use the real persistent sandbox and configured tools. You may inspect, edit, install, test, recover from structured command failures, and optionally delegate through TrueForge; keep the turn agentic instead of following a shell micro-script.",
@@ -807,9 +974,75 @@ class MissionController {
   private async ensurePrimaryDeliveryApproval(): Promise<void> {
     const state = await this.missions.getState();
     const workItems = state.workItems.filter((item) => item.missionId === PRIMARY_MISSION_ID);
-    if (workItems.length === 0 || workItems.some((item) => item.status !== "complete")) {
+    const implementation = workItems.find((item) => item.assignedRole === "implementer");
+    if (implementation === undefined) {
       throw new MissionControlError(
-        "Delivery approval requires every bounded work item to be independently complete.",
+        "Delivery approval requires a bounded implementer ticket.",
+      );
+    }
+    if (implementation.status !== "awaiting_approval" || implementation.claim === undefined) {
+      throw new MissionControlError(
+        "Delivery approval requires the current implementer ticket to be awaiting human approval.",
+      );
+    }
+    const attempt = implementation.attempts.at(-1);
+    const handoff = state.handoffs
+      .filter((item) => item.missionId === PRIMARY_MISSION_ID && item.workItemId === implementation.id)
+      .at(-1);
+    const review = state.reviews
+      .filter((item) => item.missionId === PRIMARY_MISSION_ID && item.workItemId === implementation.id)
+      .at(-1);
+    if (
+      attempt === undefined ||
+      attempt.status !== "awaiting_approval" ||
+      handoff === undefined ||
+      handoff.result !== "done" ||
+      handoff.attempt !== implementation.attempt ||
+      review === undefined ||
+      review.outcome !== "accepted" ||
+      review.attempt !== implementation.attempt ||
+      review.handoffId !== handoff.id
+    ) {
+      throw new MissionControlError(
+        "Delivery approval requires the current attempt's completed proof and accepted independent review.",
+      );
+    }
+    const proofEvidenceIds = handoff.evidenceIds ?? [];
+    const proofEvidence = proofEvidenceIds.map((evidenceId) =>
+      state.evidence.find((item) => item.id === evidenceId),
+    );
+    if (
+      proofEvidence.length === 0 ||
+      proofEvidence.some((evidence) =>
+        evidence === undefined ||
+        evidence.missionId !== PRIMARY_MISSION_ID ||
+        evidence.workItemId !== implementation.id ||
+        evidence.attempt !== implementation.attempt ||
+        evidence.result !== "passed"
+      ) ||
+      !proofEvidence.some((evidence) => evidence?.source === "sandbox") ||
+      state.evidence.some((evidence) =>
+        evidence.workItemId === implementation.id &&
+        evidence.attempt === implementation.attempt &&
+        ["sandbox", "reviewer"].includes(evidence.source) &&
+        evidence.result === "failed"
+      )
+    ) {
+      throw new MissionControlError(
+        "Delivery approval requires current passed deterministic proof for the approved attempt.",
+      );
+    }
+    const reviewEvidence = state.evidence.find((evidence) =>
+      evidence.id === review.findingEvidenceId &&
+      evidence.missionId === PRIMARY_MISSION_ID &&
+      evidence.workItemId === implementation.id &&
+      evidence.attempt === implementation.attempt &&
+      evidence.source === "reviewer" &&
+      evidence.result === "passed"
+    );
+    if (reviewEvidence === undefined) {
+      throw new MissionControlError(
+        "Delivery approval requires the accepted review finding for the current attempt.",
       );
     }
     const activeRequest = state.approvals.find((approval) =>
@@ -820,36 +1053,32 @@ class MissionController {
     );
     if (activeRequest !== undefined) {
       requireApprovalRepositoryProof(state, activeRequest);
+      requireCurrentDeliveryApprovalCorrelation(
+        state,
+        activeRequest,
+        implementation,
+        handoff,
+        review,
+      );
+      const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
+      if (mission.status === "executing") {
+        await this.missions.transitionMission(PRIMARY_MISSION_ID, "awaiting_approval");
+      }
       return;
     }
     const plannerIds = new Set(
       workItems.filter((item) => item.assignedRole === "planner").map((item) => item.id),
     );
-    const implementationIds = new Set(
-      workItems.filter((item) => item.assignedRole === "implementer").map((item) => item.id),
-    );
     const repositoryProof = state.evidence.filter((evidence) =>
       evidence.missionId === PRIMARY_MISSION_ID &&
       evidence.workItemId !== undefined &&
       plannerIds.has(evidence.workItemId) &&
-      evidence.source === "mcp"
+      evidence.source === "mcp" &&
+      evidence.result === "passed"
     ).at(-1);
-    const implementationProofEvidenceIds = new Set(state.handoffs
-      .filter((handoff) =>
-        handoff.missionId === PRIMARY_MISSION_ID &&
-        implementationIds.has(handoff.workItemId) &&
-        handoff.result === "done"
-      )
-      .flatMap((handoff) => handoff.evidenceIds ?? []));
-    const sandboxProof = state.evidence.filter((evidence) =>
-      evidence.missionId === PRIMARY_MISSION_ID &&
-      evidence.source === "sandbox" &&
-      evidence.result === "passed" &&
-      implementationProofEvidenceIds.has(evidence.id)
-    ).at(-1);
-    if (repositoryProof?.result !== "passed" || sandboxProof?.result !== "passed") {
+    if (repositoryProof === undefined) {
       throw new MissionControlError(
-        "Delivery approval requires current passed repository and sandbox proof.",
+        "Delivery approval requires current passed repository proof.",
       );
     }
     const mission = state.missions.find((item) => item.id === PRIMARY_MISSION_ID);
@@ -860,6 +1089,7 @@ class MissionController {
     const deliveryHeadResult = await this.runner.inspectDeliveryHead({
       missionId: PRIMARY_MISSION_ID,
       target: PRIMARY_DELIVERY_TARGET,
+      workItemId: implementation.id,
     });
     const deliveryState = await this.missions.getState();
     const { evidence: deliveryHeadProof, headSha } = deliveryHeadProofFromResult(
@@ -871,24 +1101,31 @@ class MissionController {
       headSha,
     };
     requireDeliveryHeadProof(deliveryHeadProof, deliveryTarget);
-    const acceptedReviewEvidenceIds = state.reviews
-      .filter((review) =>
-        review.missionId === PRIMARY_MISSION_ID && review.outcome === "accepted"
-      )
-      .map((review) => review.findingEvidenceId);
     const evidenceIds = [...new Set([
       repositoryProof.id,
       deliveryHeadProof.id,
-      sandboxProof.id,
-      ...implementationProofEvidenceIds,
-      ...acceptedReviewEvidenceIds,
+      ...proofEvidenceIds,
+      reviewEvidence.id,
     ])];
     const pending = await this.runner.requestPullRequestApproval(
       PRIMARY_MISSION_ID,
       deliveryTarget,
     );
+    if (
+      pending.target.owner !== deliveryTarget.owner ||
+      pending.target.repo !== deliveryTarget.repo ||
+      pending.target.base !== deliveryTarget.base ||
+      pending.target.head !== deliveryTarget.head ||
+      pending.target.title !== deliveryTarget.title ||
+      pending.target.body !== deliveryTarget.body ||
+      pending.target.headSha !== deliveryTarget.headSha
+    ) {
+      throw new MissionControlError(
+        "TrueForge returned a delivery approval for an artifact different from the verified head.",
+      );
+    }
     const target = pullRequestApprovalTarget(deliveryTarget);
-    await this.missions.requestActionApproval(PRIMARY_MISSION_ID, {
+    const approval = await this.missions.requestActionApproval(PRIMARY_MISSION_ID, {
       action: "Open the verified delivery",
       actionType: PRIMARY_CONSEQUENTIAL_ACTION,
       target,
@@ -896,21 +1133,74 @@ class MissionController {
       rationale: "A human must authorize the verified change before it is published for review.",
       expectedEffect: pullRequestExpectedEffect(deliveryTarget),
       evidenceIds,
+      workItemId: implementation.id,
+      attempt: implementation.attempt,
+      handoffId: handoff.id,
+      reviewId: review.id,
+      ...(attempt.claim.trueforgeSandboxId === undefined
+        ? {}
+        : { trueforgeSandboxId: attempt.claim.trueforgeSandboxId }),
       executionContext: approvalExecutionContext(pending),
     });
+    requireCurrentDeliveryApprovalCorrelation(
+      { ...(await this.missions.getState()) },
+      approval,
+      implementation,
+      handoff,
+      review,
+    );
+    const currentMission = await this.missions.getMission(PRIMARY_MISSION_ID);
+    if (currentMission.status === "executing") {
+      await this.missions.transitionMission(PRIMARY_MISSION_ID, "awaiting_approval");
+    }
   }
 
   async decidePrimaryDelivery(
     approvalId: string,
     decision: "approved" | "rejected" | "cancelled",
+    decidedBy = "mission-operator",
+    expectedRevision?: number,
   ): Promise<MissionView> {
     const state = await this.missions.getState();
+    if (expectedRevision !== undefined && state.revision !== expectedRevision) {
+      throw new MissionDomainError(
+        "conflict",
+        `Mission state changed from revision ${expectedRevision}; reload before deciding delivery.`,
+      );
+    }
     const approval = state.approvals.find((item) =>
       item.id === approvalId && item.missionId === PRIMARY_MISSION_ID
     );
     if (approval === undefined) {
       throw new MissionDomainError("not_found", "The requested approval was not found.");
     }
+    const implementation = state.workItems.find((item) =>
+      item.missionId === PRIMARY_MISSION_ID &&
+      item.assignedRole === "implementer" &&
+      item.id === approval.workItemId,
+    );
+    const handoff = implementation === undefined
+      ? undefined
+      : state.handoffs
+          .filter((item) => item.missionId === PRIMARY_MISSION_ID && item.workItemId === implementation.id)
+          .at(-1);
+    const review = implementation === undefined
+      ? undefined
+      : state.reviews
+          .filter((item) => item.missionId === PRIMARY_MISSION_ID && item.workItemId === implementation.id)
+          .at(-1);
+    if (implementation === undefined || handoff === undefined || review === undefined) {
+      throw new MissionControlError(
+        "The delivery approval is not correlated to a current implementation review.",
+      );
+    }
+    requireCurrentDeliveryApprovalCorrelation(
+      state,
+      approval,
+      implementation,
+      handoff,
+      review,
+    );
     requireApprovalRepositoryProof(state, approval);
     const pending = deliveryApprovalFromState(approval);
     const approvedHeadSha = pending.target.headSha;
@@ -918,46 +1208,176 @@ class MissionController {
       throw new MissionControlError("The approved delivery has no verified head identity.");
     }
     if (decision === "approved") {
-      await this.revalidatePrimaryDeliveryHead(pending.target);
+      await this.revalidatePrimaryDeliveryHead(pending.target, implementation.id);
     }
-    await this.missions.decideApproval(PRIMARY_MISSION_ID, approval.id, {
+    const decisionState = await this.missions.getState();
+    const decisionApproval = decisionState.approvals.find((item) =>
+      item.id === approval.id && item.missionId === PRIMARY_MISSION_ID
+    );
+    const decisionImplementation = decisionState.workItems.find((item) =>
+      item.id === implementation.id && item.missionId === PRIMARY_MISSION_ID
+    );
+    const decisionHandoff = decisionState.handoffs
+      .filter((item) => item.missionId === PRIMARY_MISSION_ID && item.workItemId === implementation.id)
+      .at(-1);
+    const decisionReview = decisionState.reviews
+      .filter((item) => item.missionId === PRIMARY_MISSION_ID && item.workItemId === implementation.id)
+      .at(-1);
+    if (
+      decisionApproval === undefined ||
+      decisionImplementation === undefined ||
+      decisionHandoff === undefined ||
+      decisionReview === undefined
+    ) {
+      throw new MissionControlError(
+        "The delivery approval changed before the operator decision could be persisted.",
+      );
+    }
+    requireCurrentDeliveryApprovalCorrelation(
+      decisionState,
+      decisionApproval,
+      decisionImplementation,
+      decisionHandoff,
+      decisionReview,
+    );
+    requireApprovalRepositoryProof(decisionState, decisionApproval);
+    const decidedApproval = await this.missions.decideApproval(PRIMARY_MISSION_ID, approval.id, {
       decision,
-      decidedBy: "mission-operator",
+      decidedBy,
+      expectedRevision: decisionState.revision,
     });
     if (decision !== "approved") {
       const result = await this.runner.resolvePullRequestApproval(
         PRIMARY_MISSION_ID,
         pending,
         decision,
+        implementation.id,
       );
       if (result !== null) {
         throw new MissionControlError("A denied delivery unexpectedly returned a pull request result.");
       }
-      const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
-      if (mission.status === "awaiting_approval") {
-        await this.missions.transitionMission(PRIMARY_MISSION_ID, "blocked");
-      }
+      await this.blockPrimaryDelivery(
+        `The operator ${decision} the protected delivery action; no pull request was created.`,
+      );
       return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID);
     }
 
-    const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
-    if (mission.status === "awaiting_approval") {
-      await this.missions.transitionMission(PRIMARY_MISSION_ID, "verifying");
-    }
-    const result = await this.missions.executeProtectedAction(
-      PRIMARY_MISSION_ID,
-      {
-        action: PRIMARY_CONSEQUENTIAL_ACTION,
-        target: approval.target,
-        expectedEffect: approval.expectedEffect,
-        approvalId: approval.id,
-      },
-      () => this.runner.resolvePullRequestApproval(
+    try {
+      await this.missions.transitionSystemWorkItem(
         PRIMARY_MISSION_ID,
+        implementation.id,
+        "delivering",
+        { trigger: "approval" },
+      );
+      const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
+      if (mission.status === "awaiting_approval") {
+        await this.missions.transitionMission(PRIMARY_MISSION_ID, "verifying");
+      }
+      return await this.completePrimaryDelivery(
+        decidedApproval,
         pending,
-        "approved",
-      ),
+        decisionImplementation,
+        approvedHeadSha,
+      );
+    } catch (error) {
+      await this.recordMissionFailure(error);
+      await this.blockPrimaryDelivery(error);
+      throw error;
+    }
+  }
+
+  private async resumePrimaryDelivery(workItem: WorkItem): Promise<void> {
+    const state = await this.missions.getState();
+    const approval = state.approvals
+      .filter((item) =>
+        item.missionId === PRIMARY_MISSION_ID &&
+        item.workItemId === workItem.id &&
+        item.attempt === workItem.attempt &&
+        isPrimaryDeliveryApproval(item),
+      )
+      .at(-1);
+    if (approval === undefined || approval.decision !== "approved") {
+      throw new MissionControlError(
+        "A delivering ticket requires a persisted approved delivery action before it can resume.",
+      );
+    }
+    const implementation = state.workItems.find((item) => item.id === workItem.id);
+    const handoff = state.handoffs
+      .filter((item) => item.missionId === PRIMARY_MISSION_ID && item.workItemId === workItem.id)
+      .at(-1);
+    const review = state.reviews
+      .filter((item) => item.missionId === PRIMARY_MISSION_ID && item.workItemId === workItem.id)
+      .at(-1);
+    if (implementation === undefined || handoff === undefined || review === undefined) {
+      throw new MissionControlError(
+        "The delivering ticket has no current proof and review correlation to resume.",
+      );
+    }
+    requireCurrentDeliveryApprovalCorrelation(
+      state,
+      approval,
+      implementation,
+      handoff,
+      review,
     );
+    requireApprovalRepositoryProof(state, approval);
+    const pending = deliveryApprovalFromState(approval);
+    const approvedHeadSha = pending.target.headSha;
+    if (approvedHeadSha === undefined) {
+      throw new MissionControlError("The approved delivery has no verified head identity.");
+    }
+    try {
+      if (implementation.status === "awaiting_approval") {
+        await this.missions.transitionSystemWorkItem(
+          PRIMARY_MISSION_ID,
+          implementation.id,
+          "delivering",
+          { trigger: "approval" },
+        );
+      }
+      const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
+      if (mission.status === "awaiting_approval") {
+        await this.missions.transitionMission(PRIMARY_MISSION_ID, "verifying");
+      }
+      await this.completePrimaryDelivery(
+        approval,
+        pending,
+        implementation,
+        approvedHeadSha,
+      );
+    } catch (error) {
+      await this.recordMissionFailure(error);
+      await this.blockPrimaryDelivery(error);
+      throw error;
+    }
+  }
+
+  private async completePrimaryDelivery(
+    approval: Approval,
+    pending: TrueForgeDeliveryApproval,
+    workItem: WorkItem,
+    approvedHeadSha: string,
+  ): Promise<MissionView> {
+    const persistedReadback = persistedPullRequestReadback(
+      await this.missions.getState(),
+      approval,
+      workItem,
+    );
+    const result = persistedReadback ?? await this.missions.executeProtectedAction(
+        PRIMARY_MISSION_ID,
+        {
+          action: PRIMARY_CONSEQUENTIAL_ACTION,
+          target: approval.target,
+          expectedEffect: approval.expectedEffect,
+          approvalId: approval.id,
+        },
+        () => this.runner.resolvePullRequestApproval(
+          PRIMARY_MISSION_ID,
+          pending,
+          "approved",
+          workItem.id,
+        ),
+      );
     if (result === null) {
       throw new MissionControlError("Approved delivery returned no pull request result.");
     }
@@ -967,6 +1387,7 @@ class MissionController {
       );
     }
     const evidence = await this.missions.addEvidence(PRIMARY_MISSION_ID, {
+      workItemId: workItem.id,
       kind: "tool_result",
       result: "passed",
       source: "trueforge",
@@ -981,6 +1402,7 @@ class MissionController {
         pull_request_number: result.number,
         pull_request_url: result.url,
         approval_id: approval.id,
+        attempt: workItem.attempt,
       }),
       executionOrigin: {
         kind: "mcp",
@@ -994,6 +1416,8 @@ class MissionController {
       status: "delivered",
       reference: result.url,
       approvalId: approval.id,
+      workItemId: workItem.id,
+      attempt: workItem.attempt,
       verificationSummary: `Verified evidence ${approval.evidenceIds.join(", ")} authorized the correlated pull request result ${evidence.id}.`,
       pullRequest: {
         number: result.number,
@@ -1015,12 +1439,43 @@ class MissionController {
     return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID);
   }
 
+  private async blockPrimaryDelivery(reason: unknown): Promise<void> {
+    const message = missionFailureReason(reason);
+    try {
+      const state = await this.missions.getState();
+      const workItem = state.workItems.find((item) =>
+        item.missionId === PRIMARY_MISSION_ID &&
+        item.assignedRole === "implementer" &&
+        ["awaiting_approval", "delivering"].includes(item.status) &&
+        item.claim !== undefined,
+      );
+      if (workItem !== undefined) {
+        await this.missions.transitionSystemWorkItem(PRIMARY_MISSION_ID, workItem.id, "blocked", {
+          trigger: "failure",
+          reason: message,
+        });
+      }
+      const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
+      if (![
+        "blocked",
+        "failed",
+        "delivered",
+      ].includes(mission.status) && missionTransitions[mission.status].includes("blocked")) {
+        await this.missions.transitionMission(PRIMARY_MISSION_ID, "blocked");
+      }
+    } catch {
+      // Preserve the original approval or delivery error when failure state is already durable.
+    }
+  }
+
   private async revalidatePrimaryDeliveryHead(
     target: PullRequestDeliveryTarget,
+    workItemId?: string,
   ): Promise<void> {
     const result = await this.runner.inspectDeliveryHead({
       missionId: PRIMARY_MISSION_ID,
       target,
+      ...(workItemId === undefined ? {} : { workItemId }),
     });
     const state = await this.missions.getState();
     const { evidence, headSha } = deliveryHeadProofFromResult(result, state);
@@ -1032,12 +1487,12 @@ class MissionController {
     }
   }
 
-  private async reviewImplementation(workItemId: string): Promise<void> {
+  private async reviewImplementation(workItemId: string): Promise<ReviewOutcome> {
     const workItem = await this.missions.getWorkItem(PRIMARY_MISSION_ID, workItemId);
     if (workItem.status === "complete") {
-      return;
+      return "accepted";
     }
-    if (workItem.status !== "ready_for_review") {
+    if (workItem.status !== "ready_for_review" && workItem.status !== "proving") {
       throw new MissionControlError(
         "Independent verification requires the implementation to be ready for review.",
       );
@@ -1051,11 +1506,7 @@ class MissionController {
       summary: decision.summary,
       finding: decision.finding,
     });
-    if (decision.outcome !== "accepted") {
-      throw new MissionControlError(
-        `Independent verification returned ${decision.outcome}: ${decision.finding}`,
-      );
-    }
+    return decision.outcome;
   }
 
   private async persistInspectedWorkGraph(
@@ -1105,7 +1556,7 @@ class MissionController {
         "Mission is blocked; inspect the durable failure record before retrying the same ticket.",
       );
     }
-    if (current.status !== "executing" && current.status !== "verifying") {
+    if (!["executing", "awaiting_approval", "verifying"].includes(current.status)) {
       throw new MissionControlError(`Mission cannot run from ${current.status}.`);
     }
   }
@@ -1149,7 +1600,7 @@ class MissionController {
       }
       const activeWorkItem = state.workItems.find((item) =>
         item.missionId === PRIMARY_MISSION_ID &&
-        (item.status === "in_progress" || item.status === "ready_for_review")
+        ["in_progress", "proving", "ready_for_review", "awaiting_approval", "delivering"].includes(item.status)
       );
       await this.missions.addEvidence(PRIMARY_MISSION_ID, {
         ...(activeWorkItem === undefined ? {} : { workItemId: activeWorkItem.id }),
@@ -1177,12 +1628,12 @@ class MissionController {
       const active = state.workItems.find(
         (item) =>
           item.missionId === PRIMARY_MISSION_ID &&
-          (item.status === "in_progress" || item.status === "ready_for_review") &&
+          ["in_progress", "proving", "ready_for_review", "awaiting_approval", "delivering"].includes(item.status) &&
           item.claim !== undefined,
       );
       if (active !== undefined) {
         const reason = missionFailureReason(error ?? "TrueForge execution failed before the ticket could advance.");
-        if (active.status === "in_progress") {
+        if (["in_progress", "proving", "awaiting_approval", "delivering"].includes(active.status)) {
           await this.missions.transitionSystemWorkItem(PRIMARY_MISSION_ID, active.id, "blocked", {
             trigger: "failure",
             reason,
@@ -1244,6 +1695,21 @@ function evidenceDetails(evidence: Evidence): Record<string, unknown> | null {
   } catch {
     return null;
   }
+}
+
+function latestEvidenceForAttempt(
+  evidence: Evidence[],
+  workItemId: string,
+  attempt: number,
+  source: Evidence["source"],
+): Evidence | undefined {
+  return evidence
+    .filter((item) =>
+      item.workItemId === workItemId &&
+      item.source === source &&
+      (item.attempt ?? 0) === attempt,
+    )
+    .at(-1);
 }
 
 function requireBaselineRepositoryProof(
@@ -1382,6 +1848,102 @@ function requireApprovalRepositoryProof(
     title: context.title,
     body: context.body,
   });
+}
+
+function requireCurrentDeliveryApprovalCorrelation(
+  state: MissionState,
+  approval: Approval,
+  workItem: WorkItem,
+  handoff: Handoff,
+  review: Review,
+): void {
+  const attempt = workItem.attempts.at(-1);
+  const proofEvidenceIds = handoff.evidenceIds ?? [];
+  const requiredEvidenceIds = [...new Set([
+    ...proofEvidenceIds,
+    review.findingEvidenceId,
+  ])];
+  if (
+    !isPrimaryDeliveryApproval(approval) ||
+    approval.workItemId !== workItem.id ||
+    approval.attempt !== workItem.attempt ||
+    (workItem.status !== "awaiting_approval" && workItem.status !== "delivering") ||
+    attempt === undefined ||
+    attempt.status !== workItem.status ||
+    approval.handoffId !== handoff.id ||
+    approval.reviewId !== review.id ||
+    handoff.result !== "done" ||
+    handoff.attempt !== workItem.attempt ||
+    review.outcome !== "accepted" ||
+    review.attempt !== workItem.attempt ||
+    review.handoffId !== handoff.id ||
+    (attempt.claim.trueforgeSandboxId !== undefined &&
+      approval.trueforgeSandboxId !== attempt.claim.trueforgeSandboxId) ||
+    requiredEvidenceIds.some((evidenceId) => !approval.evidenceIds.includes(evidenceId)) ||
+    requiredEvidenceIds.some((evidenceId) => {
+      const evidence = state.evidence.find((item) => item.id === evidenceId);
+      return evidence === undefined ||
+        evidence.missionId !== PRIMARY_MISSION_ID ||
+        evidence.workItemId !== workItem.id ||
+        evidence.attempt !== workItem.attempt ||
+        evidence.result !== "passed";
+    })
+  ) {
+    throw new MissionControlError(
+      "The delivery approval is stale or does not match the current proven implementation attempt.",
+    );
+  }
+}
+
+function persistedPullRequestReadback(
+  state: MissionState,
+  approval: Approval,
+  workItem: WorkItem,
+): TrueForgePullRequestResult | null {
+  const context = approval.executionContext;
+  if (context?.headSha === undefined) {
+    return null;
+  }
+  const expectedUrlPrefix = `https://github.com/${context.repositoryOwner}/${context.repositoryName}/pull/`;
+  const evidence = [...state.evidence].reverse().find((item) => {
+    const details = evidenceDetails(item);
+    return item.missionId === approval.missionId &&
+      item.workItemId === workItem.id &&
+      item.attempt === workItem.attempt &&
+      item.source === "mcp" &&
+      item.result === "passed" &&
+      details?.tool === "pull_request_read" &&
+      details.repository_owner === context.repositoryOwner &&
+      details.repository_name === context.repositoryName &&
+      details.base === context.base &&
+      details.head === context.head &&
+      details.head_sha === context.headSha &&
+      typeof details.pull_request_number === "number" &&
+      Number.isInteger(details.pull_request_number) &&
+      details.pull_request_number > 0 &&
+      typeof details.pull_request_url === "string" &&
+      details.pull_request_url === `${expectedUrlPrefix}${details.pull_request_number}` &&
+      item.executionOrigin?.kind === "mcp" &&
+      item.executionOrigin.sessionId === context.sessionId;
+  });
+  if (evidence === undefined) {
+    return null;
+  }
+  const details = evidenceDetails(evidence);
+  const number = details?.pull_request_number;
+  const url = details?.pull_request_url;
+  if (typeof number !== "number" || typeof url !== "string") {
+    return null;
+  }
+  return {
+    number,
+    url,
+    headSha: context.headSha,
+    sessionId: context.sessionId,
+    turnId: evidence.executionOrigin?.turnId ?? context.turnId,
+    threadId: context.threadId,
+    toolCallId: context.toolCallId,
+  };
 }
 
 function deliveryApprovalFromState(approval: Approval): TrueForgeDeliveryApproval {
@@ -1559,7 +2121,7 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
   }
   const passedEvidence = evidence.filter((item) => item.result === "passed").length;
   const failedEvidence = evidence.filter((item) => item.result === "failed").length;
-  const completed = workItems.filter((item) => item.status === "complete").length;
+  const completed = workItems.filter((item) => ["done", "complete"].includes(item.status)).length;
   const implementationItems = workItems.filter((item) => item.assignedRole === "implementer");
   const reviewerItems = workItems.filter((item) => item.assignedRole === "reviewer");
   const latestSandboxPreparation = [...missionEvidence].reverse().find((item) =>
@@ -1573,12 +2135,12 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
     item.delegation?.status === "interrupted"
   );
   const executionComplete = implementationItems.length > 0 &&
-    implementationItems.every((item) => item.status === "complete");
+    implementationItems.every((item) => ["done", "complete"].includes(item.status));
   const executionFailed = implementationExecutionFailed || (
     !executionComplete && latestSandboxPreparation?.result === "failed"
   );
   const executionRunning = implementationItems.some((item) =>
-    item.status === "in_progress" || item.status === "ready_for_review"
+    ["in_progress", "proving", "ready_for_review", "awaiting_approval", "delivering"].includes(item.status)
   ) || (
     !executionComplete &&
     !executionFailed &&
@@ -1674,6 +2236,7 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
         openQuestions: [...item.openQuestions],
         memoryImpact: item.memoryImpact,
         createdAt: item.createdAt,
+        ...(item.attempt === undefined ? {} : { attempt: item.attempt }),
         ...(item.diffSummary === undefined ? {} : { diffSummary: item.diffSummary }),
         ...(item.checks === undefined ? {} : {
           checks: item.checks.map((check) => ({
@@ -1703,6 +2266,7 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
         evidenceIds: [...item.evidenceIds],
         findingEvidenceId: item.findingEvidenceId,
         createdAt: item.createdAt,
+        ...(item.attempt === undefined ? {} : { attempt: item.attempt }),
       })),
     approvals: state.approvals
       .filter((item) => item.missionId === missionId)
@@ -1718,6 +2282,11 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
         decision: item.decision,
         createdAt: item.createdAt,
         expiresAt: item.expiresAt,
+        ...(item.workItemId === undefined ? {} : { workItemId: item.workItemId }),
+        ...(item.attempt === undefined ? {} : { attempt: item.attempt }),
+        ...(item.handoffId === undefined ? {} : { handoffId: item.handoffId }),
+        ...(item.reviewId === undefined ? {} : { reviewId: item.reviewId }),
+        ...(item.trueforgeSandboxId === undefined ? {} : { trueforgeSandboxId: item.trueforgeSandboxId }),
         ...(item.decidedBy === undefined ? {} : { decidedBy: item.decidedBy }),
         ...(item.decidedAt === undefined ? {} : { decidedAt: item.decidedAt }),
         ...(item.executionContext === undefined
@@ -1734,6 +2303,8 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
           createdAt: item.createdAt,
           ...(item.reference === undefined ? {} : { reference: item.reference }),
           ...(item.approvalId === undefined ? {} : { approvalId: item.approvalId }),
+          ...(item.workItemId === undefined ? {} : { workItemId: item.workItemId }),
+          ...(item.attempt === undefined ? {} : { attempt: item.attempt }),
           ...(item.pullRequest === undefined
             ? {}
             : { pullRequest: { ...item.pullRequest } }),
@@ -1761,6 +2332,16 @@ function mapTicket(item: WorkItem): MissionView["tickets"][number] {
       ? {}
       : { executionAuthorization: { ...item.executionAuthorization } }),
     ...(item.claim === undefined ? {} : { claim: { ...item.claim } }),
+    attempt: item.attempt,
+    attempts: item.attempts.map((attempt) => ({
+      ...attempt,
+      authorization: { ...attempt.authorization },
+      requestedChanges: [...attempt.requestedChanges],
+      claim: { ...attempt.claim },
+    })),
+    ...(item.requestedChanges === undefined
+      ? {}
+      : { requestedChanges: [...item.requestedChanges] }),
     ...(item.blockedReason === undefined ? {} : { blockedReason: item.blockedReason }),
     ...(item.delegation === undefined ? {} : { delegation: { ...item.delegation } }),
   };
@@ -1822,6 +2403,9 @@ function mapEvidence(
   };
   if (evidence.workItemId !== undefined) {
     view.workItemId = evidence.workItemId;
+  }
+  if (evidence.attempt !== undefined) {
+    view.attempt = evidence.attempt;
   }
   const title = evidence.workItemId === undefined ? undefined : titleByWorkId.get(evidence.workItemId);
   if (title !== undefined) {
@@ -2022,7 +2606,7 @@ export function createMissionHttpApp(options: MissionHttpOptions) {
         if (status !== "backlog" && status !== "ready") {
           throw new MissionDomainError(
             "invalid_transition",
-            "Humans may only move tickets between Backlog and Ready; later states are system-owned.",
+            "Humans may move tickets between Backlog and Ready, or authorize Changes Requested rework by moving it to Ready; later states are system-owned.",
           );
         }
         const actor = requiredRequestString(body.actor, "actor");
@@ -2060,11 +2644,13 @@ export function createMissionHttpApp(options: MissionHttpOptions) {
       }
       const approvalRoute = url.pathname.match(/^\/api\/mission\/approvals\/([^/]+)$/);
       if (request.method === "POST" && approvalRoute?.[1] !== undefined) {
-        const decision = await approvalDecisionFromRequest(request);
+        const { decision, decidedBy, expectedRevision } = await approvalDecisionFromRequest(request);
         return jsonResponse({
           mission: await controller.decidePrimaryDelivery(
             decodeURIComponent(approvalRoute[1]),
             decision,
+            decidedBy,
+            expectedRevision,
           ),
         });
       }
@@ -2139,7 +2725,11 @@ function requestRevision(body: Record<string, unknown>): number | undefined {
 
 async function approvalDecisionFromRequest(
   request: Request,
-): Promise<"approved" | "rejected" | "cancelled"> {
+): Promise<{
+  decision: "approved" | "rejected" | "cancelled";
+  decidedBy: string;
+  expectedRevision?: number;
+}> {
   let value: unknown;
   try {
     value = await request.json();
@@ -2153,7 +2743,17 @@ async function approvalDecisionFromRequest(
   if (decision !== "approved" && decision !== "rejected" && decision !== "cancelled") {
     throw new MissionDomainError("invalid_input", "Approval decision is not supported.");
   }
-  return decision;
+  const rawActor = value.actor ?? value.decided_by ?? value.decidedBy;
+  const expectedRevision = requestRevision(value);
+  return {
+    decision,
+    decidedBy: rawActor === undefined
+      ? "mission-operator"
+      : requiredRequestString(rawActor, "actor"),
+    ...(expectedRevision === undefined
+      ? {}
+      : { expectedRevision }),
+  };
 }
 
 function semanticVerifierFromRunner(
@@ -2266,6 +2866,15 @@ function missionFailureReason(error: unknown): string {
     .replace(/\b(?:api[_-]?key|token|password|secret|credential|cookie)\s*[:=]\s*[^\s,;]+/gi, "[redacted]")
     .replace(/\bBearer\s+[^\s,;]+/gi, "[redacted]")
     .slice(0, 2_000);
+}
+
+function isRecoverableImplementationProofFailure(error: unknown): boolean {
+  if (error instanceof TrueForgeIntegrationError) {
+    return error.operation === "prove implementation" ||
+      error.operation === "run sandbox verification";
+  }
+  return error instanceof MissionDomainError &&
+    (error.code === "invalid_input" || error.code === "invalid_transition");
 }
 
 function missionFailureClassification(error: unknown): {

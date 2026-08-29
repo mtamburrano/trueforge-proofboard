@@ -55,7 +55,7 @@ export interface TrueForgeMissionConfig {
   sandboxEnabled?: boolean;
 }
 
-export type TrueForgeCoordinatorToolSurface = "repository-read" | "sandbox-exec";
+export type TrueForgeCoordinatorToolSurface = "repository-read" | "sandbox-exec" | "review";
 export type TrueForgeCoordinatorPhase = "repository-read" | "bounded-setup" | "deterministic-proof";
 
 export interface DeterministicCoordinatorModelCapabilityPolicy {
@@ -332,6 +332,9 @@ export function buildWorkPacket(
   }
   if (workItem.allowedFiles !== undefined) {
     packet.workItem.allowedFiles = [...workItem.allowedFiles];
+  }
+  if (workItem.requestedChanges !== undefined) {
+    packet.workItem.requestedChanges = [...workItem.requestedChanges];
   }
   const serialized = JSON.stringify(packet);
   if (serialized.length > MAX_WORK_PACKET_BYTES) {
@@ -643,6 +646,7 @@ export interface RepositoryInspectionInput {
 export interface DeliveryHeadInspectionInput {
   missionId: string;
   target: PullRequestDeliveryTarget;
+  workItemId?: string;
   mcpServerName?: string;
 }
 
@@ -689,6 +693,7 @@ export interface WorkPacket {
     role: NonNullable<WorkItem["assignedRole"]>;
     requiredChecks?: string[];
     allowedFiles?: string[];
+    requestedChanges?: string[];
   };
   repository?: { owner: string; name: string; ref: string };
   evidence: Array<{
@@ -968,7 +973,11 @@ function buildCoordinatorAgentSpecForSurface(
     ...config,
     mcpServers,
     dynamicSubAgents: false,
-    ...(surface === "sandbox-exec" ? { sandboxEnabled: true } : {}),
+    ...(surface === "sandbox-exec"
+      ? { sandboxEnabled: true }
+      : surface === "review"
+      ? { sandboxEnabled: false }
+      : {}),
     iterationLimit: surface === "sandbox-exec" && options.phase === "bounded-setup"
       ? SANDBOX_SETUP_ITERATION_LIMIT
       : COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
@@ -1251,6 +1260,16 @@ export class TrueForgeMissionRunner {
       throw new TrueForgeIntegrationError(
         "prove implementation",
         "Independent implementation proof requires an implementer scope and a pinned repository baseline.",
+      );
+    }
+    if (
+      workItem.claim !== undefined &&
+      (workItem.claim.trueforgeSessionId !== mission.trueforgeSessionId ||
+        workItem.claim.trueforgeSandboxId !== mission.trueforgeSandboxId)
+    ) {
+      throw new TrueForgeIntegrationError(
+        "prove implementation",
+        "Independent proof rejected a work item claim that is not bound to the persisted TrueForge session and sandbox.",
       );
     }
 
@@ -1849,6 +1868,7 @@ export class TrueForgeMissionRunner {
     missionId: string,
     pending: TrueForgeDeliveryApproval,
     decision: "approved" | "rejected" | "cancelled",
+    workItemId?: string,
   ): Promise<TrueForgePullRequestResult | null> {
     const target = validatePullRequestDeliveryTarget(pending.target);
     validatePendingDeliveryApproval(pending, target);
@@ -1919,6 +1939,7 @@ export class TrueForgeMissionRunner {
       pullRequest,
       pending.serverName,
       execution.turnId,
+      workItemId,
     );
     return {
       ...pullRequest,
@@ -1936,6 +1957,7 @@ export class TrueForgeMissionRunner {
     pullRequest: { number: number; url: string },
     serverName: string,
     previousTurnId: string,
+    workItemId?: string,
   ): Promise<{ headSha: string }> {
     try {
       ensureRepositoryMcpConfigured(this.config, serverName, PULL_REQUEST_READ_TOOL_NAME);
@@ -2020,6 +2042,7 @@ export class TrueForgeMissionRunner {
         pull_request_url: verified.url,
       };
       const evidence = await this.missions.addEvidence(missionId, {
+        ...(workItemId === undefined ? {} : { workItemId }),
         kind: "tool_result",
         result: "passed",
         source: "mcp",
@@ -2101,11 +2124,19 @@ export class TrueForgeMissionRunner {
     context: ReviewContext,
   ): Promise<TrueForgeContractReviewResult> {
     const mission = await this.missions.getMission(context.workItem.missionId);
-    const execution = await this.executeTurn(
+    const execution = await this.executeCoordinatorTurn(
       mission.id,
       buildContractReviewInstruction(context),
-      {},
+      {
+        coordinatorToolSurface: "review",
+      },
     );
+    if (observedToolCalls(execution.rawEvents).length > 0) {
+      throw new TrueForgeIntegrationError(
+        "review contract",
+        "TrueForge emitted a tool call during the read-only contract review.",
+      );
+    }
     requireCompletedTurn(execution.rawEvents, "review contract", "reviewer");
     const decision = contractReviewDecisionFromEvents(execution.rawEvents);
     if (decision === null) {
@@ -2289,6 +2320,7 @@ export class TrueForgeMissionRunner {
         mcpServerName,
       );
       const evidence = await this.missions.addEvidence(mission.id, {
+        ...(input.workItemId === undefined ? {} : { workItemId: input.workItemId }),
         kind: "tool_result",
         result: "passed",
         source: "mcp",
