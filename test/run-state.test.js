@@ -142,6 +142,38 @@ test("run coordinator renders the authoritative failure state and stops polling"
   assert.equal(scheduler.activeCount(), 0);
 });
 
+test("run coordinator invokes the run-start hook for each retry", async () => {
+  const { createRunCoordinator } = await loadRunState();
+  const scheduler = manualScheduler();
+  const starts = [];
+  let startCalls = 0;
+  const coordinator = createRunCoordinator({
+    async start() {
+      startCalls += 1;
+      return { mission: { revision: startCalls, marker: `run-${startCalls}` } };
+    },
+    async refresh() {
+      return { mission: { revision: startCalls, marker: `run-${startCalls}` } };
+    },
+    onState() {},
+    onRunStart(view) {
+      starts.push(view?.marker ?? null);
+    },
+    schedule: scheduler.schedule,
+    cancel: scheduler.cancel,
+    intervalMs: 1,
+  });
+
+  coordinator.accept({ revision: 0, marker: "blocked" }, { force: true });
+  await coordinator.run();
+  await coordinator.run();
+
+  assert.deepEqual(starts, ["blocked", "run-1"]);
+  assert.equal(startCalls, 2);
+  assert.equal(coordinator.isRunning(), false);
+  assert.equal(scheduler.activeCount(), 0);
+});
+
 test("run coordinator never lets an older revision replace newer state", async () => {
   const { createRunCoordinator } = await loadRunState();
   const rendered = [];
@@ -171,4 +203,20 @@ test("run coordinator never lets an older revision replace newer state", async (
     { revision: 5, marker: "newer", authoritative: false },
     { revision: 5, marker: "authoritative-rerender", authoritative: true },
   ]);
+});
+
+test("run coordinator rejects malformed revisions during reconnect", async () => {
+  const { createRunCoordinator } = await loadRunState();
+  const rendered = [];
+  const coordinator = createRunCoordinator({
+    onState(view) {
+      rendered.push(view);
+    },
+  });
+
+  assert.equal(coordinator.accept({ revision: -1, marker: "negative" }), false);
+  assert.equal(coordinator.accept({ revision: Number.NaN, marker: "nan" }), false);
+  assert.equal(coordinator.accept({ revision: 1.5, marker: "fractional" }), false);
+  assert.equal(coordinator.latestRevision(), null);
+  assert.deepEqual(rendered, []);
 });

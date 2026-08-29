@@ -1,17 +1,36 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
+import { promisify } from "node:util";
+import { pathToFileURL } from "node:url";
 
 import {
   DeterministicImplementationVerifier,
+  COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
+  DEFAULT_TRUEFORGE_ITERATION_LIMIT,
   InMemoryMissionRepository,
   MissionService,
+  PRIMARY_DELIVERY_FIXTURE,
+  PRIMARY_VERIFIED_DELIVERY_PATCHES,
   PRIMARY_MISSION_ID,
   PRIMARY_MISSION_OBJECTIVE,
   PRIMARY_REPOSITORY,
+  PRIMARY_SANDBOX_REPOSITORY_ROOT,
   RepositoryWorkGraphPlanner,
   TrueForgeMissionRunner,
+  DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
+  LOCKED_REPOSITORY_PROOF_COMMAND,
+  LOCKED_REPOSITORY_PREPARATION_COMMAND,
+  LOCKED_REPOSITORY_PREPARATION_INTENT,
+  SANDBOX_SETUP_EXEC_LIMIT,
+  SANDBOX_SETUP_ITERATION_LIMIT,
+  buildDelegatedWorkspaceDeltaCommand,
   createMissionHttpApp,
 } from "../dist/index.js";
+import { workspaceDeltaEvidenceDetails } from "./delegated-proof-fixture.js";
 
 const ORIGIN = {
   kind: "trueforge",
@@ -19,9 +38,64 @@ const ORIGIN = {
   turnId: "turn-hardening",
   threadId: "thread-hardening",
 };
+const execFileAsync = promisify(execFile);
+const LOCKED_REPOSITORY_REMOTE_URL =
+  `https://github.com/${PRIMARY_DELIVERY_FIXTURE.owner}/${PRIMARY_DELIVERY_FIXTURE.repository}.git`;
+const WORKSPACE_SNAPSHOT_INTENT =
+  "Capture the coordinator-owned workspace tree before delegated implementation starts.";
+const WORKSPACE_DELTA_INTENT =
+  "Capture the coordinator-owned current work-item and cumulative mission workspace deltas after delegated implementation.";
 
 function fixedClock() {
   return new Date("2026-08-27T15:00:00.000Z");
+}
+
+async function runLocalGit(args, cwd, env = {}) {
+  return execFileAsync("git", args, {
+    cwd,
+    env: { ...process.env, ...env },
+    maxBuffer: 1024 * 1024,
+  });
+}
+
+async function createLocalRepositoryBoundary() {
+  const root = await mkdtemp(path.join(os.tmpdir(), "trueforge-locked-repository-"));
+  const remotePath = path.join(root, "remote.git");
+  const seedPath = path.join(root, "seed");
+  const workspacePath = path.join(root, "workspace");
+  const gitConfigPath = path.join(root, "gitconfig");
+  const gitEnv = {
+    GIT_CONFIG_GLOBAL: gitConfigPath,
+    GIT_CONFIG_NOSYSTEM: "1",
+  };
+
+  try {
+    await runLocalGit(["init", "--initial-branch=main", seedPath], root);
+    await runLocalGit(["config", "user.email", "test@example.invalid"], seedPath);
+    await runLocalGit(["config", "user.name", "TrueForge Test"], seedPath);
+    await writeFile(path.join(seedPath, "README.md"), "locked repository fixture\n", "utf8");
+    await runLocalGit(["add", "README.md"], seedPath);
+    await runLocalGit(["commit", "-m", "baseline"], seedPath);
+    await runLocalGit(["clone", "--bare", seedPath, remotePath], root);
+    await runLocalGit([
+      "config",
+      "--file",
+      gitConfigPath,
+      `url.${pathToFileURL(remotePath).href}.insteadOf`,
+      LOCKED_REPOSITORY_REMOTE_URL,
+    ], root);
+    await mkdir(workspacePath);
+    const { stdout } = await runLocalGit(["rev-parse", "--verify", "HEAD"], seedPath);
+    return {
+      gitEnv,
+      root,
+      workspacePath: await realpath(workspacePath),
+      baselineSha: stdout.trim(),
+    };
+  } catch (error) {
+    await rm(root, { recursive: true, force: true });
+    throw error;
+  }
 }
 
 function legacyPrimaryState() {
@@ -97,6 +171,286 @@ function diffOutput(files = ["src/index.ts", "test/index.test.js"]) {
   ].join("\n")).join("\n");
 }
 
+function changedFilesManifestOutput(files = ["src/index.ts", "test/index.test.js"]) {
+  return `${files.map((file) => ` M ${file}`).join("\u0000")}\u0000`;
+}
+
+const WORKSPACE_START_TREE = "a".repeat(40);
+const WORKSPACE_END_TREE = "b".repeat(40);
+
+function workspaceSnapshotEvents(
+  treeRef,
+  turnId = "turn-workspace-start",
+  { intent = WORKSPACE_SNAPSHOT_INTENT, threadId = "main", responseThreadId = "main" } = {},
+) {
+  return [
+    { type: "turn.created", id: `${turnId}-created`, turnId, threadId: null, state: { status: "running" } },
+    {
+      type: "model.message",
+      id: `${turnId}-model`,
+      threadId,
+      toolCalls: [{
+        id: `${turnId}-call-snapshot`,
+        function: {
+          name: "exec",
+          arguments: JSON.stringify({ intent, command: DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND }),
+        },
+      }],
+    },
+    {
+      type: "tool.response",
+      id: `${turnId}-response`,
+      threadId: responseThreadId,
+      toolCallId: `${turnId}-call-snapshot`,
+      content: JSON.stringify({ success: true, response: { exitCode: 0, result: `TRUEFORGE_WORKSPACE_TREE ${treeRef}\n` } }),
+    },
+    { type: "turn.done", id: `${turnId}-done`, threadId: null, state: { status: "done", requiredActions: [] } },
+  ];
+}
+
+function workspaceDeltaOutput(startTreeRef, missionStartTreeRef, endTreeRef, currentFiles, cumulativeFiles) {
+  const statusOutput = (files) => files.map((file) => `M\t${file}`).join("\n");
+  return [
+    `TRUEFORGE_WORKSPACE_DELTA start=${startTreeRef} mission_start=${missionStartTreeRef} end=${endTreeRef}`,
+    "TRUEFORGE_WORKSPACE_DELTA current_begin",
+    statusOutput(currentFiles),
+    "TRUEFORGE_WORKSPACE_DELTA current_end",
+    "TRUEFORGE_WORKSPACE_DELTA cumulative_begin",
+    statusOutput(cumulativeFiles),
+    "TRUEFORGE_WORKSPACE_DELTA cumulative_end",
+    "",
+  ].join("\n");
+}
+
+function workspaceDeltaEvents({
+  startTreeRef = WORKSPACE_START_TREE,
+  missionStartTreeRef = WORKSPACE_START_TREE,
+  endTreeRef = WORKSPACE_END_TREE,
+  currentFiles = ["src/index.ts", "test/index.test.js"],
+  cumulativeFiles = currentFiles,
+  turnId = "turn-workspace-delta",
+  intent = WORKSPACE_DELTA_INTENT,
+  threadId = "main",
+  responseThreadId = "main",
+} = {}) {
+  const command = buildDelegatedWorkspaceDeltaCommand(startTreeRef, missionStartTreeRef);
+  const callId = `${turnId}-call-delta`;
+  return [
+    { type: "turn.created", id: `${turnId}-created`, turnId, threadId: null, state: { status: "running" } },
+    {
+      type: "model.message",
+      id: `${turnId}-model`,
+      threadId,
+      toolCalls: [{
+        id: callId,
+        function: { name: "exec", arguments: JSON.stringify({ intent, command }) },
+      }],
+    },
+    {
+      type: "tool.response",
+      id: `${turnId}-response`,
+      threadId: responseThreadId,
+      toolCallId: callId,
+      content: JSON.stringify({
+        success: true,
+        response: {
+          exitCode: 0,
+          result: workspaceDeltaOutput(
+            startTreeRef,
+            missionStartTreeRef,
+            endTreeRef,
+            currentFiles,
+            cumulativeFiles,
+          ),
+        },
+      }),
+    },
+    { type: "turn.done", id: `${turnId}-done`, threadId: null, state: { status: "done", requiredActions: [] } },
+  ];
+}
+
+function repositorySetupEvents({
+  turnId = "turn-repository-setup",
+  commands = [
+    `git clone --no-checkout ${LOCKED_REPOSITORY_REMOTE_URL} ${PRIMARY_SANDBOX_REPOSITORY_ROOT}`,
+    `git -C ${PRIMARY_SANDBOX_REPOSITORY_ROOT} checkout --quiet --detach ${PRIMARY_REPOSITORY.ref}`,
+  ],
+  exitCodes = commands.map(() => 0),
+  intents = commands.map((command) => `Prepare the local repository with ${command}.`),
+  threadId = "main",
+  responseThreadId = "main",
+  sandboxId = "sandbox-1",
+  turnState = { status: "done", requiredActions: [] },
+} = {}) {
+  assert.equal(commands.length, exitCodes.length);
+  assert.equal(commands.length, intents.length);
+  const events = [
+    { type: "turn.created", id: `${turnId}-created`, turnId, threadId: null, state: { status: "running" } },
+    { type: "sandbox.created", id: `${turnId}-sandbox`, threadId: null, sandboxId },
+  ];
+  commands.forEach((command, index) => {
+    const callId = `${turnId}-call-setup-${index + 1}`;
+    events.push(
+      {
+        type: "model.message",
+        id: `${turnId}-model-${index + 1}`,
+        threadId,
+        toolCalls: [{
+          id: callId,
+          function: {
+            name: "exec",
+            arguments: JSON.stringify({ intent: intents[index], command }),
+          },
+        }],
+      },
+      {
+        type: "tool.response",
+        id: `${turnId}-response-${index + 1}`,
+        threadId: responseThreadId,
+        toolCallId: callId,
+        content: JSON.stringify({
+          success: true,
+          response: { exitCode: exitCodes[index], result: "repository setup complete\n" },
+        }),
+      },
+    );
+  });
+  events.push({ type: "turn.done", id: `${turnId}-done`, threadId: null, state: turnState });
+  return events;
+}
+
+function repositoryProofEvents({
+  repository = `${PRIMARY_REPOSITORY.owner}/${PRIMARY_REPOSITORY.name}`,
+  sha = PRIMARY_REPOSITORY.ref,
+  root = PRIMARY_SANDBOX_REPOSITORY_ROOT,
+  cwd = root,
+  remoteUrl = `https://github.com/${repository}.git`,
+  exitCode = 0,
+  clean = "true",
+  detached = "true",
+  status = clean === "true" ? "" : " M README.md",
+  headRef = detached === "true" ? "HEAD" : "main",
+  result = [
+    "TRUEFORGE_REPOSITORY_PROOF",
+    cwd,
+    remoteUrl,
+    root,
+    sha,
+    headRef,
+    ...(status.length === 0 ? [] : [status]),
+  ].join("\n") + "\n",
+  turnId = "turn-repository-proof",
+  intent = LOCKED_REPOSITORY_PREPARATION_INTENT,
+  threadId = "main",
+  responseThreadId = "main",
+} = {}) {
+  const callId = `${turnId}-call-preparation`;
+  return [
+    { type: "turn.created", id: `${turnId}-created`, turnId, threadId: null, state: { status: "running" } },
+    {
+      type: "model.message",
+      id: `${turnId}-model`,
+      threadId,
+      toolCalls: [{
+        id: callId,
+        function: {
+          name: "exec",
+          arguments: JSON.stringify({
+            intent,
+            command: LOCKED_REPOSITORY_PROOF_COMMAND,
+          }),
+        },
+      }],
+    },
+    {
+      type: "tool.response",
+      id: `${turnId}-response`,
+      threadId: responseThreadId,
+      toolCallId: callId,
+      content: JSON.stringify({ success: true, response: { exitCode, result } }),
+    },
+    { type: "turn.done", id: `${turnId}-done`, threadId: null, state: { status: "done", requiredActions: [] } },
+  ];
+}
+
+function trueforgeStream(events) {
+  return {
+    async *withMetadata() {
+      for (const event of events) {
+        yield { data: event };
+      }
+    },
+  };
+}
+
+async function lockedRepositoryRunnerFixture({ preparation = {}, setup = {}, failRestore = false } = {}) {
+  const missions = new MissionService(new InMemoryMissionRepository(), fixedClock);
+  const turnRequests = [];
+  const agentSpecUpdates = [];
+  let turnNumber = 0;
+  let activeAgentSpec;
+  const client = {
+    sessions: {
+      async create(request) {
+        activeAgentSpec = request.agent.spec;
+        return { data: { id: ORIGIN.sessionId } };
+      },
+      async get(sessionId) {
+        return { data: { id: sessionId } };
+      },
+      async update(sessionId, request) {
+        agentSpecUpdates.push({ sessionId, request });
+        if (failRestore && agentSpecUpdates.length === 2) {
+          throw new Error("session restore rejected");
+        }
+        activeAgentSpec = request.agent.spec;
+        return { data: { id: sessionId } };
+      },
+      async createTurnStream(sessionId, request) {
+        turnRequests.push({ sessionId, request, agentSpec: activeAgentSpec });
+        const current = turnNumber++;
+        if (current === 0) {
+          return trueforgeStream(repositorySetupEvents(setup));
+        }
+        if (current === 1) {
+          return trueforgeStream(repositoryProofEvents(preparation));
+        }
+        if (current === 2) {
+          return trueforgeStream(workspaceSnapshotEvents(WORKSPACE_START_TREE));
+        }
+        if (current === 3) {
+          return trueforgeStream(delegatedEvents(
+            "npm run typecheck && npm test",
+            diffOutput(),
+          ));
+        }
+        return trueforgeStream(workspaceDeltaEvents());
+      },
+    },
+  };
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-4-mini",
+    dynamicSubAgents: true,
+  });
+  const mission = await runner.createMission({
+    id: "mission-locked-repository-preparation",
+    objective: "Prepare the locked repository before delegated proof.",
+    repository: PRIMARY_REPOSITORY,
+  });
+  const workItem = await missions.addWorkItem(mission.id, {
+    id: "work-locked-repository-preparation",
+    title: "Implement the bounded change",
+    purpose: "Apply the bounded change in the prepared repository.",
+    acceptanceCriteria: ["The bounded change is checked."],
+    requiredChecks: ["typecheck", "test"],
+    assignedRole: "implementer",
+    allowedFiles: ["src/index.ts", "test/index.test.js"],
+    status: "ready",
+  });
+  await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
+  return { missions, runner, mission, workItem, turnRequests, agentSpecUpdates };
+}
+
 function transitionContractVerifier() {
   return {
     reviewContract(context) {
@@ -158,9 +512,22 @@ function transitionContractVerifier() {
   };
 }
 
-function delegatedEvents(command, output) {
+function delegatedEvents(
+  command,
+  output,
+  {
+    includeDiff = true,
+    diffCommand = "git diff",
+    includeManifest = true,
+    manifestCommand = "git status --porcelain=v1 -z --untracked-files=all",
+    manifestOutput = changedFilesManifestOutput(),
+    extraToolCalls = [],
+    narrationOnly = false,
+    responseType = "tool.response",
+  } = {},
+) {
   const response = (id, callId, result) => ({
-    type: "tool.response",
+    type: responseType,
     id,
     threadId: ORIGIN.threadId,
     toolCallId: callId,
@@ -192,18 +559,44 @@ function delegatedEvents(command, output) {
       threadId: ORIGIN.threadId,
       toolCalls: [
         { id: "call-check", function: { name: "exec", arguments: JSON.stringify({ command }) } },
-        { id: "call-diff", function: { name: "exec", arguments: JSON.stringify({ command: "git diff" }) } },
+        ...extraToolCalls.map((extra, index) => ({
+          id: extra.id ?? `call-extra-${index}`,
+          function: { name: "exec", arguments: JSON.stringify({ command: extra.command }) },
+        })),
+        ...(includeManifest
+          ? [{ id: "call-manifest", function: { name: "exec", arguments: JSON.stringify({ command: manifestCommand }) } }]
+          : []),
+        ...(includeDiff
+          ? [{ id: "call-diff", function: { name: "exec", arguments: JSON.stringify({ command: diffCommand }) } }]
+          : []),
       ],
     },
     response("event-check-response", "call-check", "checks complete\n"),
-    response("event-diff-response", "call-diff", output),
+    ...extraToolCalls.map((extra, index) => response(
+      `event-extra-response-${index}`,
+      extra.id ?? `call-extra-${index}`,
+      extra.output ?? "command completed\n",
+    )),
+    ...(includeManifest ? [response("event-manifest-response", "call-manifest", manifestOutput)] : []),
+    ...(includeDiff ? [response("event-diff-response", "call-diff", output)] : []),
     {
       type: "thread.done",
       id: "event-thread-done",
       threadId: ORIGIN.threadId,
       state: {
         status: "done",
-        output: { content: JSON.stringify({ decisions: [], openQuestions: [] }) },
+        output: {
+          content: JSON.stringify({
+            decisions: [],
+            openQuestions: [],
+            ...(narrationOnly
+              ? {
+                  filesChanged: ["src/index.ts", "test/index.test.js"],
+                  diffSummary: "The agent says both verified files changed.",
+                }
+              : {}),
+          }),
+        },
       },
     },
     {
@@ -214,8 +607,44 @@ function delegatedEvents(command, output) {
   ];
 }
 
-async function runnerFixture({ command = "npm run typecheck && npm test", output = diffOutput() } = {}) {
+function sandboxInstructionArguments(request) {
+  const content = request?.input?.[0]?.content;
+  assert.equal(typeof content, "string");
+  const match = content.match(
+    /Call the sandbox tool exec exactly once with this JSON object: (\{[\s\S]*?\})\./,
+  );
+  assert.ok(match, content);
+  return JSON.parse(match[1]);
+}
+
+async function runnerFixture({
+  command = "npm run typecheck && npm test",
+  output = diffOutput(),
+  allowedFiles = ["src/index.ts", "test/index.test.js"],
+  includeDiff = true,
+  diffCommand = "git diff",
+  includeManifest = true,
+  manifestCommand = "git status --porcelain=v1 -z --untracked-files=all",
+  manifestOutput,
+  extraToolCalls = [],
+  workspaceCurrentFiles = ["src/index.ts", "test/index.test.js"],
+  workspaceCumulativeFiles = workspaceCurrentFiles,
+  workspaceStartTreeRef = WORKSPACE_START_TREE,
+  workspaceMissionStartTreeRef = workspaceStartTreeRef,
+  workspaceEndTreeRef = WORKSPACE_END_TREE,
+  workspaceSnapshotIntent = WORKSPACE_SNAPSHOT_INTENT,
+  workspaceDeltaIntent = WORKSPACE_DELTA_INTENT,
+  workspaceSnapshotThreadId = "main",
+  workspaceDeltaThreadId = "main",
+  workspaceSnapshotResponseThreadId = "main",
+  workspaceDeltaResponseThreadId = "main",
+  narrationOnly = false,
+  responseType = "tool.response",
+  run = true,
+} = {}) {
   const missions = new MissionService(new InMemoryMissionRepository(), fixedClock);
+  let turnNumber = 0;
+  const turnRequests = [];
   const client = {
     sessions: {
       async create() {
@@ -224,10 +653,56 @@ async function runnerFixture({ command = "npm run typecheck && npm test", output
       async get(sessionId) {
         return { data: { id: sessionId } };
       },
-      async createTurnStream() {
+      async update(sessionId, request) {
+        return { data: { id: sessionId }, request };
+      },
+      async createTurnStream(sessionId, request) {
+        turnRequests.push({ sessionId, request });
+        const currentTurnNumber = turnNumber;
+        turnNumber += 1;
+        if (currentTurnNumber === 0) {
+          return {
+            async *withMetadata() {
+              for (const event of workspaceSnapshotEvents(workspaceStartTreeRef, "turn-workspace-start", {
+                intent: workspaceSnapshotIntent,
+                threadId: workspaceSnapshotThreadId,
+                responseThreadId: workspaceSnapshotResponseThreadId,
+              })) {
+                yield { data: event };
+              }
+            },
+          };
+        }
+        if (currentTurnNumber === 2) {
+          return {
+            async *withMetadata() {
+              for (const event of workspaceDeltaEvents({
+                startTreeRef: workspaceStartTreeRef,
+                missionStartTreeRef: workspaceMissionStartTreeRef,
+                endTreeRef: workspaceEndTreeRef,
+                currentFiles: workspaceCurrentFiles,
+                cumulativeFiles: workspaceCumulativeFiles,
+                intent: workspaceDeltaIntent,
+                threadId: workspaceDeltaThreadId,
+                responseThreadId: workspaceDeltaResponseThreadId,
+              })) {
+                yield { data: event };
+              }
+            },
+          };
+        }
         return {
           async *withMetadata() {
-            for (const event of delegatedEvents(command, output)) {
+            for (const event of delegatedEvents(command, output, {
+              includeDiff,
+              diffCommand,
+              includeManifest,
+              manifestCommand,
+              manifestOutput: manifestOutput ?? changedFilesManifestOutput(),
+              extraToolCalls,
+              narrationOnly,
+              responseType,
+            })) {
               yield { data: event };
             }
           },
@@ -236,7 +711,7 @@ async function runnerFixture({ command = "npm run typecheck && npm test", output
     },
   };
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "local/test-model",
+    model: "openai/gpt-5-4-mini",
     dynamicSubAgents: true,
   });
   const mission = await runner.createMission({
@@ -250,14 +725,17 @@ async function runnerFixture({ command = "npm run typecheck && npm test", output
     acceptanceCriteria: ["The bounded change is checked."],
     requiredChecks: ["typecheck", "test"],
     assignedRole: "implementer",
+    allowedFiles,
     status: "ready",
   });
   await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
-  const result = await runner.runTurn(mission.id, "Implement the bounded change.", {
-    workItemId: workItem.id,
-    delegateToSubagent: true,
-  });
-  return { missions, mission, workItem, result };
+  const result = run
+    ? await runner.runTurn(mission.id, "Implement the bounded change.", {
+        workItemId: workItem.id,
+        delegateToSubagent: true,
+      })
+    : undefined;
+  return { missions, mission, runner, workItem, result, turnRequests };
 }
 
 test("the default reviewer fails closed instead of trusting lexical contract anchors", () => {
@@ -342,14 +820,800 @@ test("an injected contract verifier accepts behavior it executes against the cha
 });
 
 test("shell wrappers cannot satisfy required delegated checks", async () => {
-  for (const command of ["echo npm test", "npm test || true"]) {
-    const { result } = await runnerFixture({ command });
-    assert.deepEqual(
-      result.implementationHandoff.checks.map((check) => [check.name, check.result]),
-      [["typecheck", "not_run"], ["test", "not_run"]],
+  for (const command of [
+    "echo npm test",
+    "npm test || true",
+    "npm run check 2>&1; echo \"EXIT_CODE=$?\"",
+  ]) {
+    const fixture = await runnerFixture({ command, run: false });
+    await assert.rejects(
+      fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
+        workItemId: fixture.workItem.id,
+        delegateToSubagent: true,
+      }),
+      (error) => /unsafe shell command|mask the real exit status/i.test(error.message),
+    );
+    const state = await fixture.missions.getState();
+    assert.equal(state.workItems.find((item) => item.id === fixture.workItem.id).status, "blocked");
+    assert.equal(
+      state.evidence.some((evidence) =>
+        evidence.result === "failed" && evidence.summary.startsWith("Delegated implementation evidence failed:"),
+      ),
+      true,
       command,
     );
   }
+});
+
+test("pending tool responses cannot satisfy delegated proof", async () => {
+  const fixture = await runnerFixture({ responseType: "tool.response_required", run: false });
+
+  await assert.rejects(
+    fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
+      workItemId: fixture.workItem.id,
+      delegateToSubagent: true,
+    }),
+    (error) => /no observed exit-preserving tool execution|was blocked/i.test(error.message),
+  );
+
+  const state = await fixture.missions.getState();
+  assert.equal(state.workItems.find((item) => item.id === fixture.workItem.id).status, "blocked");
+  assert.equal(state.evidence.some((evidence) =>
+    evidence.result === "failed" && evidence.summary.startsWith("Delegated implementation evidence failed:"),
+  ), true);
+});
+
+test("narrated file claims cannot substitute for a delegated content diff", async () => {
+  const fixture = await runnerFixture({ includeDiff: false, narrationOnly: true, run: false });
+
+  await assert.rejects(
+    fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
+      workItemId: fixture.workItem.id,
+      delegateToSubagent: true,
+    }),
+    (error) => /narration-only|content-bearing diff/i.test(error.message),
+  );
+
+  const state = await fixture.missions.getState();
+  const failure = state.evidence.find((evidence) =>
+    evidence.result === "failed" && evidence.summary.startsWith("Delegated implementation evidence failed:"),
+  );
+  assert.ok(failure);
+  assert.equal(state.workItems.find((item) => item.id === fixture.workItem.id).status, "blocked");
+  assert.match(failure.details, /narration-only|content-bearing diff/i);
+});
+
+test("safe working-directory prefixes preserve exit-aware check evidence", async () => {
+  const { result } = await runnerFixture({
+    command: "cd /workspace && npm run typecheck && npm test",
+  });
+
+  assert.deepEqual(result.implementationHandoff.checks.map((check) => [check.name, check.result]), [
+    ["typecheck", "passed"],
+    ["test", "passed"],
+  ]);
+});
+
+test("safe working-directory prefixes preserve independently reviewable diff evidence", async () => {
+  const fixture = await runnerFixture({
+    allowedFiles: ["src/index.ts"],
+    output: diffOutput(["src/index.ts"]),
+    diffCommand: "cd /workspace && git diff -- src/index.ts",
+    workspaceCurrentFiles: ["src/index.ts"],
+    workspaceCumulativeFiles: ["src/index.ts"],
+  });
+  const diffEvidence = (await fixture.missions.getState()).evidence.find((evidence) =>
+    evidence.kind === "diff_summary",
+  );
+  assert.ok(diffEvidence);
+  const details = JSON.parse(diffEvidence.details);
+  assert.equal(details.command, "git diff -- src/index.ts");
+
+  await fixture.missions.recordHandoff(fixture.mission.id, {
+    workItemId: fixture.workItem.id,
+    result: "done",
+    summary: "The delegated implementation is ready for independent review.",
+    filesChanged: fixture.result.implementationHandoff.filesChanged,
+    testsRun: ["npm run typecheck && npm test"],
+    diffSummary: fixture.result.implementationHandoff.diffSummary,
+    checks: fixture.result.implementationHandoff.checks,
+    evidenceIds: fixture.result.implementationHandoff.evidenceIds,
+    executionOrigin: fixture.result.implementationHandoff.executionOrigin,
+  });
+  await fixture.missions.transitionWorkItem(
+    fixture.mission.id,
+    fixture.workItem.id,
+    "ready_for_review",
+  );
+  const context = await fixture.missions.getReviewContext(
+    fixture.mission.id,
+    fixture.workItem.id,
+  );
+  assert.deepEqual(context.actualFilesChanged, ["src/index.ts"]);
+});
+
+test("coordinator workspace proof turns request their exact sandbox exec commands", async () => {
+  const missionStartTreeRef = "c".repeat(40);
+  const expectedDeltaCommand = buildDelegatedWorkspaceDeltaCommand(
+    WORKSPACE_START_TREE,
+    missionStartTreeRef,
+  );
+  const fixture = await runnerFixture({
+    workspaceMissionStartTreeRef: missionStartTreeRef,
+    workspaceSnapshotIntent: "Take the pre-delegation tree snapshot in the coordinator sandbox.",
+    workspaceDeltaIntent: "Collect the anchored workspace changes after delegated implementation.",
+    run: false,
+  });
+  await fixture.missions.attachTrueforgeWorkspaceBaseline(fixture.mission.id, missionStartTreeRef);
+
+  await fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
+    workItemId: fixture.workItem.id,
+    delegateToSubagent: true,
+  });
+
+  assert.equal(fixture.turnRequests.length, 3);
+  const snapshotRequest = fixture.turnRequests[0];
+  const deltaRequest = fixture.turnRequests[2];
+  assert.ok(snapshotRequest);
+  assert.ok(deltaRequest);
+  assert.match(snapshotRequest.request.input[0].content, /Call the sandbox tool exec exactly once/);
+  assert.match(deltaRequest.request.input[0].content, /Call the sandbox tool exec exactly once/);
+  assert.deepEqual(sandboxInstructionArguments(snapshotRequest.request), {
+    intent: WORKSPACE_SNAPSHOT_INTENT,
+    command: DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
+  });
+  assert.deepEqual(sandboxInstructionArguments(deltaRequest.request), {
+    intent: WORKSPACE_DELTA_INTENT,
+    command: expectedDeltaCommand,
+  });
+});
+
+test("delegated workspace snapshots and deltas reject ambient repository roots", () => {
+  const commands = [
+    DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
+    buildDelegatedWorkspaceDeltaCommand(WORKSPACE_START_TREE, WORKSPACE_END_TREE),
+  ];
+  for (const command of commands) {
+    assert.match(command, new RegExp(`canonical_root="${PRIMARY_SANDBOX_REPOSITORY_ROOT}"`));
+    assert.match(command, /git -C \"\$canonical_root\"/);
+    assert.match(command, /canonical_physical_root/);
+    assert.match(command, /repository_physical_root/);
+    assert.match(command, /if \[ \"\$repository_physical_root\" != \"\$canonical_physical_root\" \]/);
+    assert.doesNotMatch(command, /repository_root=\"\$\(git rev-parse --show-toplevel\)\"/);
+  }
+});
+
+test("coordinator workspace proof accepts root main and rejects dynamic child execs", async () => {
+  const accepted = await runnerFixture({
+    workspaceSnapshotThreadId: "main",
+    workspaceDeltaThreadId: "main",
+    run: false,
+  });
+  const acceptedResult = await accepted.runner.runTurn(accepted.mission.id, "Implement the bounded change.", {
+    workItemId: accepted.workItem.id,
+    delegateToSubagent: true,
+  });
+  assert.ok(acceptedResult.implementationHandoff);
+  assert.equal(accepted.turnRequests.length, 3);
+
+  const childSnapshot = await runnerFixture({
+    workspaceSnapshotThreadId: "thread-subagent",
+    run: false,
+  });
+  await assert.rejects(
+    childSnapshot.runner.runTurn(childSnapshot.mission.id, "Implement the bounded change.", {
+      workItemId: childSnapshot.workItem.id,
+      delegateToSubagent: true,
+    }),
+    /workspace start snapshot/i,
+  );
+  assert.equal(childSnapshot.turnRequests.length, 1);
+
+  const childSnapshotResponse = await runnerFixture({
+    workspaceSnapshotResponseThreadId: "thread-subagent",
+    run: false,
+  });
+  await assert.rejects(
+    childSnapshotResponse.runner.runTurn(childSnapshotResponse.mission.id, "Implement the bounded change.", {
+      workItemId: childSnapshotResponse.workItem.id,
+      delegateToSubagent: true,
+    }),
+    /workspace start snapshot/i,
+  );
+  assert.equal(childSnapshotResponse.turnRequests.length, 1);
+
+  const childDelta = await runnerFixture({
+    workspaceDeltaThreadId: "thread-subagent",
+    run: false,
+  });
+  await assert.rejects(
+    childDelta.runner.runTurn(childDelta.mission.id, "Implement the bounded change.", {
+      workItemId: childDelta.workItem.id,
+      delegateToSubagent: true,
+    }),
+    /workspace delta/i,
+  );
+  assert.equal(childDelta.turnRequests.length, 3);
+
+  const childDeltaResponse = await runnerFixture({
+    workspaceDeltaResponseThreadId: "thread-subagent",
+    run: false,
+  });
+  await assert.rejects(
+    childDeltaResponse.runner.runTurn(childDeltaResponse.mission.id, "Implement the bounded change.", {
+      workItemId: childDeltaResponse.workItem.id,
+      delegateToSubagent: true,
+    }),
+    /workspace delta/i,
+  );
+  assert.equal(childDeltaResponse.turnRequests.length, 3);
+});
+
+test("empty locked fixture sandboxes are prepared before the workspace snapshot and delegation", async () => {
+  const fixture = await lockedRepositoryRunnerFixture({
+    preparation: {
+      intent: "Initialize and verify the pinned repository in the persistent sandbox workspace.",
+    },
+  });
+
+  const result = await fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
+    workItemId: fixture.workItem.id,
+    delegateToSubagent: true,
+  });
+
+  assert.ok(result.implementationHandoff);
+  assert.equal(fixture.turnRequests.length, 5);
+  assert.deepEqual(
+    fixture.turnRequests.map((turn) => turn.sessionId),
+    Array(5).fill(ORIGIN.sessionId),
+  );
+  assert.match(fixture.turnRequests[0].request.input[0].content, /bounded setup\/mutation/i);
+  assert.doesNotMatch(fixture.turnRequests[0].request.input[0].content, /Call the sandbox tool exec exactly once/);
+  assert.match(fixture.turnRequests[0].request.input[0].content, /canonical absolute sandbox checkout root/i);
+  assert.match(fixture.turnRequests[0].request.input[0].content, /clone.*canonical.*absolute path|clone.*\/tmp\/proofboard-workspace/i);
+  assert.deepEqual(sandboxInstructionArguments(fixture.turnRequests[1].request), {
+    intent: LOCKED_REPOSITORY_PREPARATION_INTENT,
+    command: LOCKED_REPOSITORY_PROOF_COMMAND,
+  });
+  assert.match(fixture.turnRequests[1].request.input[0].content, /cwd may be omitted or exactly "\/"|no added cd/i);
+  assert.equal(fixture.turnRequests[2].request.previousTurnId, "turn-repository-proof");
+  assert.match(
+    fixture.turnRequests[2].request.input[0].content,
+    /workspace tree before delegated implementation/i,
+  );
+  assert.equal(fixture.turnRequests[3].request.previousTurnId, "turn-workspace-start");
+  assert.equal(fixture.turnRequests[4].request.previousTurnId, ORIGIN.turnId);
+  assert.deepEqual(
+    fixture.agentSpecUpdates.map((update) => update.sessionId),
+    Array(8).fill(ORIGIN.sessionId),
+  );
+  assert.deepEqual(
+    fixture.agentSpecUpdates.map((update) => update.request.agent.spec.config.iterationLimit),
+    [
+      SANDBOX_SETUP_ITERATION_LIMIT,
+      DEFAULT_TRUEFORGE_ITERATION_LIMIT,
+      COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
+      DEFAULT_TRUEFORGE_ITERATION_LIMIT,
+      COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
+      DEFAULT_TRUEFORGE_ITERATION_LIMIT,
+      COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
+      DEFAULT_TRUEFORGE_ITERATION_LIMIT,
+    ],
+  );
+  assert.equal(fixture.agentSpecUpdates[0].request.agent.spec.model.params.parallel_tool_calls, false);
+  assert.equal(fixture.agentSpecUpdates[2].request.agent.spec.model.params.parallel_tool_calls, false);
+  assert.equal(fixture.agentSpecUpdates[4].request.agent.spec.model.params.parallel_tool_calls, false);
+  assert.equal(fixture.agentSpecUpdates[6].request.agent.spec.model.params.parallel_tool_calls, false);
+  assert.deepEqual(fixture.agentSpecUpdates[0].request.agent.spec.mcpServers, []);
+  assert.deepEqual(fixture.agentSpecUpdates[2].request.agent.spec.mcpServers, []);
+  assert.deepEqual(fixture.agentSpecUpdates[4].request.agent.spec.mcpServers, []);
+  assert.deepEqual(fixture.agentSpecUpdates[6].request.agent.spec.mcpServers, []);
+  assert.equal(fixture.agentSpecUpdates[1].request.agent.spec.model.params, undefined);
+  assert.equal(fixture.agentSpecUpdates[3].request.agent.spec.model.params, undefined);
+  assert.equal(fixture.agentSpecUpdates[5].request.agent.spec.model.params, undefined);
+  assert.equal(fixture.agentSpecUpdates[7].request.agent.spec.model.params, undefined);
+  assert.equal(fixture.agentSpecUpdates[1].request.agent.spec.config.dynamicSubAgents.enabled, true);
+  assert.equal(fixture.agentSpecUpdates[3].request.agent.spec.config.dynamicSubAgents.enabled, true);
+  assert.equal(fixture.agentSpecUpdates[5].request.agent.spec.config.dynamicSubAgents.enabled, true);
+  assert.equal(fixture.agentSpecUpdates[7].request.agent.spec.config.dynamicSubAgents.enabled, true);
+  assert.equal(fixture.agentSpecUpdates[1].request.agent.spec.mcpServers[0].name, "github");
+  assert.equal(fixture.agentSpecUpdates[3].request.agent.spec.mcpServers[0].name, "github");
+  assert.equal(fixture.agentSpecUpdates[5].request.agent.spec.mcpServers[0].name, "github");
+  assert.equal(fixture.agentSpecUpdates[7].request.agent.spec.mcpServers[0].name, "github");
+  assert.equal(fixture.turnRequests[0].agentSpec.config.iterationLimit, SANDBOX_SETUP_ITERATION_LIMIT);
+  assert.equal(fixture.turnRequests[1].agentSpec.config.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
+  assert.equal(fixture.turnRequests[2].agentSpec.config.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
+  assert.equal(fixture.turnRequests[3].agentSpec.config.iterationLimit, DEFAULT_TRUEFORGE_ITERATION_LIMIT);
+  assert.equal(fixture.turnRequests[3].agentSpec.config.dynamicSubAgents.enabled, true);
+  assert.equal(fixture.turnRequests[4].agentSpec.config.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
+
+  const state = await fixture.missions.getState();
+  assert.equal(state.missions[0].trueforgeSandboxId, "sandbox-1");
+  const preparation = state.evidence.find((evidence) =>
+    evidence.summary.startsWith("Sandbox repository proof verified mtamburrano/proofboard-demo-fixture"),
+  );
+  assert.ok(preparation);
+  assert.equal(preparation.result, "passed");
+  assert.match(preparation.details, /"baseline_sha":"590aa8a6d72c580f61fc1b19d33e9876bc0feb9b"/);
+  assert.match(preparation.details, new RegExp(`"workspace_root":"${PRIMARY_SANDBOX_REPOSITORY_ROOT.replaceAll("/", "\\/")}"`));
+  assert.equal(LOCKED_REPOSITORY_PREPARATION_COMMAND, LOCKED_REPOSITORY_PROOF_COMMAND);
+  assert.match(LOCKED_REPOSITORY_PROOF_COMMAND, /git -C .* config --get remote\.origin\.url/);
+  assert.match(LOCKED_REPOSITORY_PROOF_COMMAND, /git -C .* status --porcelain=v1/);
+  assert.match(LOCKED_REPOSITORY_PROOF_COMMAND, /git -C .* rev-parse --abbrev-ref HEAD/);
+  assert.doesNotMatch(LOCKED_REPOSITORY_PROOF_COMMAND, /sed|if \[|remote_identity|worktree_status/);
+  assert.doesNotMatch(LOCKED_REPOSITORY_PROOF_COMMAND, /git clone|git checkout|git push|create_pull_request/);
+});
+
+test("locked repository preparation accepts root main and rejects dynamic child execs", async () => {
+  const accepted = await lockedRepositoryRunnerFixture({
+    preparation: { threadId: "main" },
+  });
+  const acceptedResult = await accepted.runner.runTurn(accepted.mission.id, "Implement the bounded change.", {
+    workItemId: accepted.workItem.id,
+    delegateToSubagent: true,
+  });
+  assert.ok(acceptedResult.implementationHandoff);
+  assert.equal(accepted.turnRequests.length, 5);
+
+  const child = await lockedRepositoryRunnerFixture({
+    preparation: { threadId: "thread-subagent" },
+  });
+  await assert.rejects(
+    child.runner.runTurn(child.mission.id, "Implement the bounded change.", {
+      workItemId: child.workItem.id,
+      delegateToSubagent: true,
+    }),
+    /not coordinator-owned|outside the TrueForge root thread/i,
+  );
+  assert.equal(child.turnRequests.length, 2);
+  const state = await child.missions.getState();
+  assert.equal(state.workItems.find((item) => item.id === child.workItem.id).status, "blocked");
+
+  const childResponse = await lockedRepositoryRunnerFixture({
+    preparation: { responseThreadId: "thread-subagent" },
+  });
+  await assert.rejects(
+    childResponse.runner.runTurn(childResponse.mission.id, "Implement the bounded change.", {
+      workItemId: childResponse.workItem.id,
+      delegateToSubagent: true,
+    }),
+    /uncorrelated structured response|coordinator-owned/i,
+  );
+  assert.equal(childResponse.turnRequests.length, 2);
+});
+
+test("locked repository preparation rejects transient or nested workspace setup before proof", async () => {
+  const fixture = await lockedRepositoryRunnerFixture({
+    setup: {
+      commands: [
+        `cd /workspace/locked-repository && git clone --no-checkout ${LOCKED_REPOSITORY_REMOTE_URL} .`,
+        `cd /workspace/locked-repository && git checkout --quiet --detach ${PRIMARY_REPOSITORY.ref}`,
+      ],
+    },
+  });
+
+  await assert.rejects(
+    fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
+      workItemId: fixture.workItem.id,
+      delegateToSubagent: true,
+    }),
+    /protected\/non-root workspace operation|bounded setup/i,
+  );
+  assert.equal(fixture.turnRequests.length, 1);
+  const state = await fixture.missions.getState();
+  assert.equal(state.workItems.find((item) => item.id === fixture.workItem.id).status, "blocked");
+  const failure = state.evidence.find((evidence) =>
+    evidence.result === "failed" && evidence.summary.includes("Locked repository preparation failed"),
+  );
+  assert.ok(failure);
+  assert.match(failure.details, /bounded-setup/);
+  assert.match(failure.details, /observed_exec_count.*2/);
+});
+
+test("locked repository proof rejects a nested repository root even when setup completed", async () => {
+  const fixture = await lockedRepositoryRunnerFixture({
+    preparation: {
+      cwd: PRIMARY_SANDBOX_REPOSITORY_ROOT,
+      root: `${PRIMARY_SANDBOX_REPOSITORY_ROOT}/locked-repository`,
+    },
+  });
+
+  await assert.rejects(
+    fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
+      workItemId: fixture.workItem.id,
+      delegateToSubagent: true,
+    }),
+    /persistent\/default sandbox workspace root|workspace root/i,
+  );
+  assert.equal(fixture.turnRequests.length, 2);
+  const state = await fixture.missions.getState();
+  assert.equal(state.workItems.find((item) => item.id === fixture.workItem.id).status, "blocked");
+  assert.equal(
+    state.evidence.some((evidence) =>
+      evidence.result === "passed" && evidence.summary.startsWith("Sandbox repository proof verified"),
+    ),
+    false,
+  );
+});
+
+test("coordinator runtime restoration failure blocks delegated coding", async () => {
+  const fixture = await lockedRepositoryRunnerFixture({ failRestore: true });
+
+  await assert.rejects(
+    fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
+      workItemId: fixture.workItem.id,
+      delegateToSubagent: true,
+    }),
+    /could not restore the normal multi-iteration agent before delegated coding/i,
+  );
+
+  assert.equal(fixture.turnRequests.length, 1);
+  const state = await fixture.missions.getState();
+  assert.equal(state.workItems.find((item) => item.id === fixture.workItem.id).status, "blocked");
+  assert.equal(
+    state.evidence.some((evidence) =>
+      evidence.result === "failed" &&
+      evidence.summary === "Locked repository preparation failed; delegated workspace proof did not start.",
+    ),
+    true,
+  );
+});
+
+test("real locked repository preparation handles a fresh clone and rejects a dirty worktree", async () => {
+  const boundary = await createLocalRepositoryBoundary();
+  try {
+    await runLocalGit(
+      ["clone", LOCKED_REPOSITORY_REMOTE_URL, boundary.workspacePath],
+      boundary.root,
+      boundary.gitEnv,
+    );
+    await runLocalGit(
+      ["checkout", "--quiet", "--detach", boundary.baselineSha],
+      boundary.workspacePath,
+      boundary.gitEnv,
+    );
+    const command = LOCKED_REPOSITORY_PROOF_COMMAND.replaceAll(
+      PRIMARY_SANDBOX_REPOSITORY_ROOT,
+      boundary.workspacePath,
+    );
+    const prepared = await execFileAsync("sh", ["-c", command], {
+      cwd: boundary.workspacePath,
+      env: { ...process.env, ...boundary.gitEnv },
+      maxBuffer: 1024 * 1024,
+    });
+
+    assert.equal(
+      prepared.stdout.trim(),
+      [
+        "TRUEFORGE_REPOSITORY_PROOF",
+        boundary.workspacePath,
+        LOCKED_REPOSITORY_REMOTE_URL,
+        boundary.workspacePath,
+        boundary.baselineSha,
+        "HEAD",
+      ].join("\n"),
+    );
+    assert.equal(prepared.stderr, "");
+    assert.equal(
+      (await runLocalGit(["rev-parse", "--verify", "HEAD"], boundary.workspacePath, boundary.gitEnv)).stdout.trim(),
+      boundary.baselineSha,
+    );
+    assert.equal(
+      (await runLocalGit(["status", "--porcelain=v1", "--untracked-files=all"], boundary.workspacePath, boundary.gitEnv)).stdout,
+      "",
+    );
+    assert.equal(
+      (await runLocalGit(["rev-parse", "--abbrev-ref", "HEAD"], boundary.workspacePath, boundary.gitEnv)).stdout.trim(),
+      "HEAD",
+    );
+    assert.equal(
+      (await runLocalGit(["config", "--get", "remote.origin.url"], boundary.workspacePath, boundary.gitEnv)).stdout.trim(),
+      LOCKED_REPOSITORY_REMOTE_URL,
+    );
+
+    await writeFile(path.join(boundary.workspacePath, "README.md"), "pre-existing dirty content\n", "utf8");
+    const dirty = await execFileAsync("sh", ["-c", command], {
+      cwd: boundary.workspacePath,
+      env: { ...process.env, ...boundary.gitEnv },
+      maxBuffer: 1024 * 1024,
+    });
+    assert.match(
+      dirty.stdout,
+      new RegExp(
+        `TRUEFORGE_REPOSITORY_PROOF\\n${boundary.workspacePath}\\n${LOCKED_REPOSITORY_REMOTE_URL}\\n${boundary.workspacePath}\\n${boundary.baselineSha}\\nHEAD\\n M README\\.md`,
+      ),
+    );
+  } finally {
+    await rm(boundary.root, { recursive: true, force: true });
+  }
+});
+
+test("wrong locked repository identity or baseline blocks before delegation", async () => {
+  for (const preparation of [
+    {
+      repository: "unexpected/repository",
+      error: /expected mtamburrano\/proofboard-demo-fixture/i,
+    },
+    {
+      sha: "b".repeat(40),
+      error: /expected 590aa8a6d72c580f61fc1b19d33e9876bc0feb9b/i,
+    },
+    {
+      clean: "false",
+      error: /repository workspace is not clean/i,
+    },
+  ]) {
+    const fixture = await lockedRepositoryRunnerFixture({ preparation });
+    await assert.rejects(
+      fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
+        workItemId: fixture.workItem.id,
+        delegateToSubagent: true,
+      }),
+      (error) => preparation.error.test(error.message),
+    );
+    assert.equal(fixture.turnRequests.length, 2);
+    const state = await fixture.missions.getState();
+    assert.equal(state.workItems.find((item) => item.id === fixture.workItem.id).status, "blocked");
+    const failure = state.evidence.find((evidence) =>
+      evidence.result === "failed" && evidence.summary.includes("Locked repository preparation failed"),
+    );
+    assert.ok(failure);
+  }
+});
+
+test("delegated diffs outside the work-item scope block implementation", async () => {
+  const fixture = await runnerFixture({
+    allowedFiles: ["src/index.ts"],
+    run: false,
+  });
+
+  await assert.rejects(
+    fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
+      workItemId: fixture.workItem.id,
+      delegateToSubagent: true,
+    }),
+    (error) => /outside the allowed scope|test\/index\.test\.js/i.test(error.message),
+  );
+
+  const state = await fixture.missions.getState();
+  const failure = state.evidence.find((evidence) =>
+    evidence.result === "failed" && evidence.summary.startsWith("Delegated implementation evidence failed:"),
+  );
+  assert.ok(failure);
+  assert.match(failure.details, /test\/index\.test\.js/);
+  assert.equal(state.workItems.find((item) => item.id === fixture.workItem.id).status, "blocked");
+});
+
+test("a path-filtered delegated diff cannot hide a forbidden changed file", async () => {
+  const fixture = await runnerFixture({
+    allowedFiles: ["src/index.ts"],
+    diffCommand: "git diff -- src/index.ts",
+    output: diffOutput(["src/index.ts"]),
+    workspaceCurrentFiles: ["src/index.ts", "test/index.test.js"],
+    workspaceCumulativeFiles: ["src/index.ts", "test/index.test.js"],
+    run: false,
+  });
+
+  await assert.rejects(
+    fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
+      workItemId: fixture.workItem.id,
+      delegateToSubagent: true,
+    }),
+    (error) => /coordinator workspace delta|scoped content diff/i.test(error.message) && /test\/index\.test\.js/i.test(error.message),
+  );
+
+  const state = await fixture.missions.getState();
+  const failure = state.evidence.find((evidence) =>
+    evidence.result === "failed" && evidence.summary.startsWith("Delegated implementation evidence failed:"),
+  );
+  assert.ok(failure);
+  assert.match(failure.details, /test\/index\.test\.js/);
+  assert.equal(state.evidence.some((evidence) => evidence.kind === "diff_summary"), false);
+  assert.equal(state.workItems.find((item) => item.id === fixture.workItem.id).status, "blocked");
+});
+
+test("a forbidden file committed before the child manifest is still captured by the coordinator", async () => {
+  const fixture = await runnerFixture({
+    allowedFiles: ["src/index.ts"],
+    diffCommand: "git diff -- src/index.ts",
+    output: diffOutput(["src/index.ts"]),
+    manifestOutput: changedFilesManifestOutput(["src/index.ts"]),
+    workspaceCurrentFiles: ["src/index.ts", "README.md"],
+    workspaceCumulativeFiles: ["src/index.ts", "README.md"],
+    extraToolCalls: [{
+      id: "call-commit-forbidden",
+      command: "git add -- README.md && git commit -m hidden-forbidden-change",
+      output: "[fixture hidden-forbidden-change] committed README.md\n",
+    }],
+    run: false,
+  });
+
+  await assert.rejects(
+    fixture.runner.runTurn(fixture.mission.id, "Implement the bounded change.", {
+      workItemId: fixture.workItem.id,
+      delegateToSubagent: true,
+    }),
+    (error) => /coordinator workspace delta|scoped content diff/i.test(error.message) &&
+      /README\.md/.test(error.message),
+  );
+
+  const state = await fixture.missions.getState();
+  const failure = state.evidence.find((evidence) =>
+    evidence.result === "failed" && evidence.summary.startsWith("Delegated implementation evidence failed:"),
+  );
+  assert.ok(failure);
+  assert.match(failure.details, /README\.md/);
+  assert.equal(state.workItems.find((item) => item.id === fixture.workItem.id).status, "blocked");
+});
+
+async function runSequentialWorkspaceScenario({ forbiddenOnSecond = false } = {}) {
+  const missions = new MissionService(new InMemoryMissionRepository(), fixedClock);
+  let turnNumber = 0;
+  const sourceFile = "src/index.ts";
+  const testFile = "test/index.test.js";
+  const client = {
+    sessions: {
+      async create() {
+        return { data: { id: ORIGIN.sessionId } };
+      },
+      async get(sessionId) {
+        return { data: { id: sessionId } };
+      },
+      async update(sessionId, request) {
+        return { data: { id: sessionId }, request };
+      },
+      async createTurnStream() {
+        const current = turnNumber++;
+        const itemNumber = Math.floor(current / 3) + 1;
+        const startTreeRef = String.fromCharCode("a".charCodeAt(0) + itemNumber - 1).repeat(40);
+        const missionStartTreeRef = WORKSPACE_START_TREE;
+        if (current % 3 === 0) {
+          return {
+            async *withMetadata() {
+              for (const event of workspaceSnapshotEvents(startTreeRef, `turn-sequential-start-${itemNumber}`)) {
+                yield { data: event };
+              }
+            },
+          };
+        }
+        if (current % 3 === 2) {
+          const currentFiles = itemNumber === 1
+            ? [sourceFile]
+            : forbiddenOnSecond
+            ? [testFile, "README.md"]
+            : [testFile];
+          const cumulativeFiles = itemNumber === 1
+            ? [sourceFile]
+            : [sourceFile, ...currentFiles];
+          return {
+            async *withMetadata() {
+              for (const event of workspaceDeltaEvents({
+                startTreeRef,
+                missionStartTreeRef,
+                endTreeRef: String.fromCharCode("a".charCodeAt(0) + itemNumber).repeat(40),
+                currentFiles,
+                cumulativeFiles,
+                turnId: `turn-sequential-delta-${itemNumber}`,
+              })) {
+                yield { data: event };
+              }
+            },
+          };
+        }
+        const file = itemNumber === 1 ? sourceFile : testFile;
+        return {
+          async *withMetadata() {
+            for (const event of delegatedEvents(
+              "npm run typecheck && npm test",
+              diffOutput([file]),
+              { includeManifest: false },
+            )) {
+              yield { data: event };
+            }
+          },
+        };
+      },
+    },
+  };
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-4-mini",
+    dynamicSubAgents: true,
+  });
+  const mission = await runner.createMission({
+    id: forbiddenOnSecond ? "mission-sequential-forbidden" : "mission-sequential-safe",
+    objective: "Prove sequential delegated workspace deltas.",
+  });
+  const sourceItem = await missions.addWorkItem(mission.id, {
+    id: "work-sequential-source",
+    title: "Implement the source change",
+    purpose: "Change only the source file.",
+    acceptanceCriteria: ["The source change is checked."],
+    requiredChecks: ["typecheck", "test"],
+    assignedRole: "implementer",
+    allowedFiles: [sourceFile],
+    status: "ready",
+  });
+  const testItem = await missions.addWorkItem(mission.id, {
+    id: "work-sequential-test",
+    title: "Implement the focused test change",
+    purpose: "Change only the focused test file.",
+    acceptanceCriteria: ["The focused test change is checked."],
+    requiredChecks: ["typecheck", "test"],
+    assignedRole: "implementer",
+    allowedFiles: [testFile],
+    status: "ready",
+  });
+  const completeItem = async (workItem) => {
+    await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
+    const execution = await runner.runTurn(mission.id, "Implement this sequential bounded item.", {
+      workItemId: workItem.id,
+      delegateToSubagent: true,
+    });
+    const draft = execution.implementationHandoff;
+    assert.ok(draft);
+    await missions.recordHandoff(mission.id, {
+      workItemId: workItem.id,
+      result: "done",
+      summary: "The sequential fixture item returned anchored proof.",
+      filesChanged: draft.filesChanged,
+      testsRun: [...new Set(draft.checks.map((check) => check.command))],
+      decisions: draft.decisions,
+      openQuestions: draft.openQuestions,
+      memoryImpact: "medium",
+      diffSummary: draft.diffSummary,
+      checks: draft.checks,
+      evidenceIds: draft.evidenceIds,
+      executionOrigin: draft.executionOrigin,
+    });
+    await missions.transitionWorkItem(mission.id, workItem.id, "ready_for_review");
+    await missions.reviewWorkItem(mission.id, {
+      workItemId: workItem.id,
+      outcome: "accepted",
+      reviewer: "independent-sequential-verifier",
+      summary: "The sequential fixture item was independently verified.",
+      finding: "No blocking findings.",
+    });
+    return execution;
+  };
+  const first = await completeItem(sourceItem);
+  let secondError;
+  try {
+    await completeItem(testItem);
+  } catch (error) {
+    secondError = error;
+  }
+  return { missions, mission, sourceItem, testItem, first, secondError };
+}
+
+test("sequential source then test items ignore the first accepted delta in the reused sandbox", async () => {
+  const result = await runSequentialWorkspaceScenario();
+  assert.equal(result.secondError, undefined);
+  const state = await result.missions.getState();
+  assert.deepEqual(state.workItems.map((item) => item.status), ["complete", "complete"]);
+  const secondProof = state.evidence.find((evidence) =>
+    evidence.workItemId === result.testItem.id && evidence.kind === "file_change",
+  );
+  assert.ok(secondProof);
+  const details = JSON.parse(secondProof.details);
+  assert.deepEqual(details.current_changed_files, ["test/index.test.js"]);
+  assert.deepEqual(details.cumulative_changed_files, ["src/index.ts", "test/index.test.js"]);
+});
+
+test("a forbidden change introduced by the second item fails its anchored delta", async () => {
+  const result = await runSequentialWorkspaceScenario({ forbiddenOnSecond: true });
+  assert.ok(result.secondError);
+  assert.match(result.secondError.message, /README\.md|coordinator workspace delta|scoped content diff/i);
+  const state = await result.missions.getState();
+  assert.equal(state.workItems.find((item) => item.id === result.sourceItem.id).status, "complete");
+  assert.equal(state.workItems.find((item) => item.id === result.testItem.id).status, "blocked");
+  assert.equal(state.handoffs.filter((handoff) => handoff.workItemId === result.testItem.id).length, 0);
+  const failure = state.evidence.find((evidence) =>
+    evidence.workItemId === result.testItem.id &&
+    evidence.result === "failed" &&
+    evidence.summary.startsWith("Delegated implementation evidence failed:"),
+  );
+  assert.ok(failure);
+  assert.match(failure.details, /README\.md/);
 });
 
 test("rename evidence uses the new path consistently", async () => {
@@ -359,7 +1623,12 @@ test("rename evidence uses the new path consistently", async () => {
     "rename from src/old-name.ts",
     "rename to src/new-name.ts",
   ].join("\n");
-  const { missions, mission, workItem, result } = await runnerFixture({ output });
+  const { missions, mission, workItem, result } = await runnerFixture({
+    output,
+    allowedFiles: ["src/new-name.ts"],
+    workspaceCurrentFiles: ["src/new-name.ts"],
+    workspaceCumulativeFiles: ["src/new-name.ts"],
+  });
 
   assert.deepEqual(result.implementationHandoff.filesChanged, ["src/new-name.ts"]);
   const handoff = await missions.recordHandoff(mission.id, {
@@ -453,93 +1722,59 @@ test("legacy primary missions are upgraded without losing their history", async 
   assert.equal(response.status, 201);
   const state = await missions.getState();
   const implementer = state.workItems.find((item) => item.id === "primary-implement");
+  const inspector = state.workItems.find((item) => item.id === "primary-inspect");
   assert.equal(state.evidence.some((evidence) => evidence.id === history.id), true);
   assert.equal(implementer.acceptanceCriteria.length > 0, true);
   assert.deepEqual(implementer.requiredChecks, ["typecheck", "test"]);
+  assert.equal(inspector.status, "backlog");
+
+  await missions.moveWorkItemByHuman(PRIMARY_MISSION_ID, inspector.id, "ready", {
+    actor: "legacy-migration-operator",
+  });
 
   const run = await app.request("/api/mission/run", { method: "POST" });
   assert.equal(run.status, 200);
   const afterRun = await missions.getState();
-  assert.equal(afterRun.missions[0].status, "verifying");
-  assert.equal(afterRun.workItems.filter((item) => item.status === "complete").length, 3);
+  assert.equal(afterRun.missions[0].status, "executing");
+  assert.equal(afterRun.workItems.filter((item) => item.status === "done").length, 1);
   assert.equal(afterRun.evidence.some((evidence) => evidence.id === history.id), true);
+  assert.equal(afterRun.evidence.some((evidence) => evidence.kind === "file_change"), false);
 });
 
-test("production app wires bounded contract review and fails closed on invalid results", async () => {
+test("production app leaves contract review and delivery behind later queue authorizations", async () => {
   const observedContexts = [];
-  const cases = [
-    {
-      label: "valid semantic review",
-      options: {
-        semanticReview(context) {
-          observedContexts.push(context);
-          return {
-            outcome: "accepted",
-            reviewer: "local-contract-reviewer",
-            summary: "The bounded implementation satisfies the contract.",
-            finding: "No blocking findings.",
-          };
-        },
-      },
-      status: 200,
-      outcome: "accepted",
+  const missions = new MissionService(
+    new InMemoryMissionRepository(legacyPrimaryState()),
+    fixedClock,
+  );
+  const runner = new LegacyPrimaryRunner(missions, {
+    semanticReview(context) {
+      observedContexts.push(context);
+      return {
+        outcome: "accepted",
+        reviewer: "local-contract-reviewer",
+        summary: "The bounded implementation satisfies the contract.",
+        finding: "No blocking findings.",
+      };
     },
-    {
-      label: "unavailable semantic review",
-      options: { exposeSemanticReview: false },
-      status: 502,
-      outcome: "changes_requested",
-    },
-    {
-      label: "malformed semantic review",
-      options: { semanticReview: null },
-      status: 502,
-      outcome: "changes_requested",
-    },
-    {
-      label: "invalid semantic review",
-      options: {
-        semanticReview: {
-          outcome: "accepted",
-          reviewer: "",
-          summary: "The result is malformed.",
-          finding: "The reviewer identity is missing.",
-        },
-      },
-      status: 502,
-      outcome: "changes_requested",
-    },
-  ];
+  });
+  const app = createMissionHttpApp({ missions, runner });
 
-  for (const reviewCase of cases) {
-    const missions = new MissionService(
-      new InMemoryMissionRepository(legacyPrimaryState()),
-      fixedClock,
-    );
-    const runner = new LegacyPrimaryRunner(missions, reviewCase.options);
-    const app = createMissionHttpApp({ missions, runner });
+  assert.equal((await app.request("/api/mission", { method: "POST" })).status, 201);
+  const stateBeforeRun = await missions.getState();
+  const inspector = stateBeforeRun.workItems.find((item) => item.id === "primary-inspect");
+  await missions.moveWorkItemByHuman(PRIMARY_MISSION_ID, inspector.id, "ready", {
+    actor: "queue-operator",
+  });
+  const response = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(response.status, 200);
 
-    assert.equal(
-      (await app.request("/api/mission", { method: "POST" })).status,
-      201,
-      reviewCase.label,
-    );
-    const response = await app.request("/api/mission/run", { method: "POST" });
-    assert.equal(response.status, reviewCase.status, reviewCase.label);
-
-    const state = await missions.getState();
-    const review = state.reviews.at(-1);
-    assert.equal(review?.outcome, reviewCase.outcome, reviewCase.label);
-    if (reviewCase.status === 200) {
-      const context = observedContexts.at(-1);
-      assert.ok(context, reviewCase.label);
-      assert.deepEqual(context.actualFilesChanged, ["src/index.ts", "test/index.test.js"]);
-      assert.match(context.actualDiff, /getNextDeliveryStage/);
-      assert.equal(context.workItem.purpose.length > 0, true);
-      assert.equal(context.workItem.acceptanceCriteria.length > 0, true);
-      assert.deepEqual(context.checks.map((check) => check.result), ["passed", "passed"]);
-    }
-  }
+  const state = await missions.getState();
+  assert.equal(observedContexts.length, 0);
+  assert.equal(state.reviews.length, 0);
+  assert.equal(state.handoffs.length, 0);
+  assert.equal(state.approvals.length, 0);
+  assert.equal(state.workItems.find((item) => item.id === "primary-implement").status, "backlog");
 });
 
 class LegacyPrimaryRunner {
@@ -571,6 +1806,7 @@ class LegacyPrimaryRunner {
   }
 
   async inspectRepository(input) {
+    const resourceUri = `repo://${PRIMARY_DELIVERY_FIXTURE.owner}/${PRIMARY_DELIVERY_FIXTURE.repository}/sha/${PRIMARY_DELIVERY_FIXTURE.baselineSha}`;
     const evidence = await this.missions.addEvidence(input.missionId, {
       id: "legacy-inspection-proof",
       workItemId: input.workItemId,
@@ -578,12 +1814,28 @@ class LegacyPrimaryRunner {
       result: "passed",
       source: "mcp",
       summary: "The pinned repository was inspected.",
+      details: JSON.stringify({
+        server: "github",
+        tool: "get_commit",
+        provenance_kind: "baseline",
+        arguments: {
+          owner: PRIMARY_DELIVERY_FIXTURE.owner,
+          repo: PRIMARY_DELIVERY_FIXTURE.repository,
+          sha: PRIMARY_DELIVERY_FIXTURE.baselineRef,
+          detail: "full_patch",
+        },
+        repository_owner: PRIMARY_DELIVERY_FIXTURE.owner,
+        repository_name: PRIMARY_DELIVERY_FIXTURE.repository,
+        requested_ref: PRIMARY_DELIVERY_FIXTURE.baselineRef,
+        uri: resourceUri,
+        commit_sha: PRIMARY_DELIVERY_FIXTURE.baselineSha,
+      }),
     });
     return {
       evidenceId: evidence.id,
-      resourceUri: "repo://mtamburrano/trueforge-proofboard/590aa8a6d72c580f61fc1b19d33e9876bc0feb9b/commit",
+      resourceUri,
       contentHash: "legacy-content-hash",
-      commitSha: "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b",
+      commitSha: PRIMARY_DELIVERY_FIXTURE.baselineSha,
       patches: {
         "src/index.ts": "@@ verified source",
         "test/index.test.js": "@@ verified tests",
@@ -591,16 +1843,47 @@ class LegacyPrimaryRunner {
     };
   }
 
+  async inspectDeliveryHead(input) {
+    const commitSha = "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1";
+    const resourceUri = `repo://${input.target.owner}/${input.target.repo}/sha/${commitSha}`;
+    const evidence = await this.missions.addEvidence(input.missionId, {
+      kind: "tool_result",
+      result: "passed",
+      source: "mcp",
+      summary: "The changed fixture delivery head was inspected.",
+      details: JSON.stringify({
+        server: "github",
+        tool: "get_commit",
+        provenance_kind: "delivery_head",
+        arguments: {
+          owner: input.target.owner,
+          repo: input.target.repo,
+          sha: input.target.head,
+          detail: "full_patch",
+        },
+        repository_owner: input.target.owner,
+        repository_name: input.target.repo,
+        requested_ref: input.target.head,
+        baseline_sha: PRIMARY_DELIVERY_FIXTURE.baselineSha,
+        uri: resourceUri,
+        commit_sha: commitSha,
+        patches: PRIMARY_VERIFIED_DELIVERY_PATCHES,
+      }),
+    });
+    return {
+      evidenceId: evidence.id,
+      resourceUri,
+      contentHash: "legacy-delivery-head-content-hash",
+      commitSha,
+      patches: PRIMARY_VERIFIED_DELIVERY_PATCHES,
+    };
+  }
+
   async runTurn(missionId, _instruction, options) {
     this.turn += 1;
     const turnId = `legacy-turn-${this.turn}`;
-    const threadId = `legacy-thread-${this.turn}`;
     await this.missions.attachTrueforgeTurn(missionId, turnId);
-    await this.missions.startWorkItemDelegation(missionId, options.workItemId, {
-      owner: "legacy-implementer",
-      threadId,
-      turnId,
-    });
+    await this.missions.attachTrueforgeSandbox(missionId, "legacy-sandbox");
     await this.missions.addEvidence(missionId, {
       workItemId: options.workItemId,
       kind: "tool_result",
@@ -608,74 +1891,74 @@ class LegacyPrimaryRunner {
       source: "trueforge",
       summary: "TrueForge turn finished with status done.",
     });
-    const origin = { kind: "trueforge", sessionId: "legacy-session", turnId, threadId };
-    const typecheck = await this.missions.addEvidence(missionId, {
-      workItemId: options.workItemId,
-      kind: "typecheck_result",
-      result: "passed",
-      source: "trueforge",
-      summary: "The delegated typecheck passed.",
-      executionOrigin: { ...origin, toolCallId: `legacy-typecheck-${this.turn}` },
-    });
-    const tests = await this.missions.addEvidence(missionId, {
-      workItemId: options.workItemId,
-      kind: "test_result",
-      result: "passed",
-      source: "trueforge",
-      summary: "The delegated tests passed.",
-      executionOrigin: { ...origin, toolCallId: `legacy-test-${this.turn}` },
-    });
-    const diff = await this.missions.addEvidence(missionId, {
-      workItemId: options.workItemId,
-      kind: "diff_summary",
-      result: "passed",
-      source: "trueforge",
-      summary: "The delegated content diff was captured.",
-      details: JSON.stringify({ command: "git diff", output: [
-        "diff --git a/src/index.ts b/src/index.ts",
-        "@@ -1 +1,2 @@",
-        "+export function getNextDeliveryStage(stage) { return stage === \"Plan\" ? \"Execute\" : null; }",
-        "diff --git a/test/index.test.js b/test/index.test.js",
-        "@@ -1 +1,2 @@",
-        "+assert.equal(getNextDeliveryStage(\"Plan\"), \"Execute\");",
-      ].join("\n") }),
-      executionOrigin: { ...origin, toolCallId: `legacy-diff-${this.turn}` },
-    });
-    await this.missions.completeWorkItemDelegation(missionId, options.workItemId, {
-      threadId,
-      turnId,
-    });
     return {
       sessionId: "legacy-session",
       turnId,
       events: [],
       mission: await this.missions.getMission(missionId),
-      implementationHandoff: {
-        filesChanged: ["src/index.ts", "test/index.test.js"],
-        diffSummary: "The source and focused test files changed.",
-        checks: [
-          {
-            name: "typecheck",
-            command: "npm run typecheck",
-            result: "passed",
-            required: true,
-            evidenceIds: [typecheck.id],
-            exitCode: 0,
-          },
-          {
-            name: "test",
-            command: "npm test",
-            result: "passed",
-            required: true,
-            evidenceIds: [tests.id],
-            exitCode: 0,
-          },
-        ],
-        decisions: [],
-        openQuestions: [],
-        evidenceIds: [typecheck.id, tests.id, diff.id],
-        executionOrigin: origin,
-      },
+    };
+  }
+
+  async proveImplementation(input) {
+    const origin = { kind: "sandbox", sessionId: "legacy-session" };
+    const diffOutput = [
+      "diff --git a/src/index.ts b/src/index.ts",
+      "@@ -1 +1,2 @@",
+      "+export function getNextDeliveryStage(stage) { return stage === \"Plan\" ? \"Execute\" : null; }",
+      "diff --git a/test/index.test.js b/test/index.test.js",
+      "@@ -1 +1,2 @@",
+      "+assert.equal(getNextDeliveryStage(\"Plan\"), \"Execute\");",
+    ].join("\n");
+    const typecheck = await this.missions.addEvidence(input.missionId, {
+      workItemId: input.workItemId,
+      kind: "typecheck_result",
+      result: "passed",
+      source: "sandbox",
+      summary: "The independent typecheck passed.",
+      executionOrigin: origin,
+    });
+    const tests = await this.missions.addEvidence(input.missionId, {
+      workItemId: input.workItemId,
+      kind: "test_result",
+      result: "passed",
+      source: "sandbox",
+      summary: "The independent tests passed.",
+      executionOrigin: origin,
+    });
+    const diff = await this.missions.addEvidence(input.missionId, {
+      workItemId: input.workItemId,
+      kind: "diff_summary",
+      result: "passed",
+      source: "sandbox",
+      summary: "The independent content diff was captured.",
+      details: JSON.stringify({ command: "git diff", output: diffOutput }),
+      executionOrigin: origin,
+    });
+    const manifest = await this.missions.addEvidence(input.missionId, {
+      workItemId: input.workItemId,
+      kind: "file_change",
+      result: "passed",
+      source: "sandbox",
+      summary: "The independent complete changed-file manifest was captured.",
+      details: JSON.stringify({
+        complete_changed_files: true,
+        command: "git status --porcelain=v1 -z --untracked-files=all",
+        output: " M src/index.ts\u0000 M test/index.test.js\u0000",
+        changed_files: ["src/index.ts", "test/index.test.js"],
+      }),
+      executionOrigin: origin,
+    });
+    return {
+      filesChanged: ["src/index.ts", "test/index.test.js"],
+      diffSummary: diffOutput,
+      checks: [
+        { name: "typecheck", command: "npm run typecheck", result: "passed", required: true, evidenceIds: [typecheck.id], exitCode: 0 },
+        { name: "test", command: "npm test", result: "passed", required: true, evidenceIds: [tests.id], exitCode: 0 },
+      ],
+      decisions: [],
+      openQuestions: [],
+      evidenceIds: [typecheck.id, tests.id, manifest.id, diff.id],
+      executionOrigin: origin,
     };
   }
 
@@ -688,5 +1971,31 @@ class LegacyPrimaryRunner {
       summary: "The sandbox verification passed.",
     });
     return { evidenceId: evidence.id };
+  }
+
+  async requestPullRequestApproval(missionId, target) {
+    return {
+      sessionId: "legacy-session",
+      turnId: "legacy-delivery-approval-turn",
+      threadId: "legacy-delivery-thread",
+      toolCallId: "legacy-create-pr-call",
+      serverName: "github",
+      toolName: "create_pull_request",
+      target: { ...target },
+    };
+  }
+
+  async resolvePullRequestApproval(_missionId, _pending, decision) {
+    return decision === "approved"
+      ? {
+          number: 1,
+          url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/1",
+          headSha: _pending.target.headSha,
+          sessionId: "legacy-session",
+          turnId: "legacy-delivery-result-turn",
+          threadId: "legacy-delivery-thread",
+          toolCallId: "legacy-create-pr-call",
+        }
+      : null;
   }
 }

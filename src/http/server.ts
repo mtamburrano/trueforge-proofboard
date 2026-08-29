@@ -1,119 +1,75 @@
 import { readFile } from "node:fs/promises";
 
 import {
+  buildDiagnosticSnapshot,
+  DiagnosticFailureCategory,
+  DiagnosticFailureLayer,
+  DiagnosticSnapshot,
+} from "../diagnostics.js";
+import {
+  Approval,
+  DeliveryAttemptTarget,
   Evidence,
   Handoff,
   Mission,
   MissionDomainError,
   MissionService,
   MissionState,
+  PullRequestReference,
   Review,
   ReviewContext,
   ReviewOutcome,
   WorkGraphDefinition,
   WorkItem,
   MAX_WORK_ITEM_ACCEPTANCE_CRITERIA,
+  PRIMARY_CONSEQUENTIAL_ACTION,
+  missionTransitions,
   validateWorkGraph,
 } from "../domain.js";
 import {
   buildPreflightWorkGraph,
+  DeliveryHeadInspectionInput,
+  ImplementationProofInput,
+  ImplementationHandoffDraft,
   RepositoryInspectionInput,
   RepositoryWorkGraphPlanner,
+  PullRequestDeliveryTarget,
   SandboxVerificationInput,
+  TrueForgeDeliveryApproval,
   TrueForgeIntegrationError,
+  TrueForgePullRequestResult,
   TrueForgeTurnResult,
   VerifiedRepositoryInspection,
   WorkGraphPlanner,
+  IMPLEMENTATION_PROOF_MODE,
 } from "../trueforge.js";
 import { parseContentDiffEvidence } from "../diff.js";
+import {
+  PRIMARY_DELIVERY_FIXTURE,
+  PRIMARY_VERIFIED_DELIVERY_FILES,
+  PRIMARY_VERIFIED_DELIVERY_PATCHES,
+  PRIMARY_SANDBOX_REPOSITORY_ROOT,
+} from "../fixture.js";
 
 export const PRIMARY_MISSION_ID = "primary-mission";
 export const PRIMARY_MISSION_OBJECTIVE =
   "Add a backwards-compatible getNextDeliveryStage(stage) helper to src/index.ts. It returns the next stage for Plan, Execute, and Prove, returns null for terminal Approve, preserves the existing identity exports, and includes focused tests for every transition.";
 export const PRIMARY_REPOSITORY = {
-  owner: "mtamburrano",
-  name: "trueforge-proofboard",
-  ref: "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b",
+  owner: PRIMARY_DELIVERY_FIXTURE.owner,
+  name: PRIMARY_DELIVERY_FIXTURE.repository,
+  ref: PRIMARY_DELIVERY_FIXTURE.baselineRef,
 } as const;
 
-export const PRIMARY_MISSION_VERIFICATION_SCRIPT = [
-  'import assert from "node:assert/strict";',
-  'import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";',
-  'import { spawnSync } from "node:child_process";',
-  'import os from "node:os";',
-  'import path from "node:path";',
-  'const source = await readFile("src/index.ts", "utf8");',
-  'assert.match(source, /(?:export\\s+function|export\\s+const)\\s+getNextDeliveryStage/, "mission stage helper is missing");',
-  'const transitions = [["Plan", "Execute"], ["Execute", "Prove"], ["Prove", "Approve"], ["Approve", null]];',
-  'const { getNextDeliveryStage } = await import("./dist/index.js");',
-  'assert.equal(typeof getNextDeliveryStage, "function", "mission stage helper is not callable");',
-  'for (const [stage, next] of transitions) assert.equal(getNextDeliveryStage(stage), next);',
-  'const directory = await mkdtemp(path.join(os.tmpdir(), "trueforge-mission-verification-"));',
-  'const loaderPath = path.join(directory, "loader.mjs");',
-  'const logPath = path.join(directory, "calls.jsonl");',
-  'const loaderSource = String.raw`',
-  'import { pathToFileURL } from "node:url";',
-  'const targetUrl = pathToFileURL(process.cwd() + "/dist/index.js").href;',
-  'export async function load(url, context, defaultLoad) {',
-  '  const loaded = await defaultLoad(url, context);',
-  '  if (url !== targetUrl) return loaded;',
-  '  let source = String(loaded.source);',
-  '  if (source.includes("__trueforgeVerificationWrapper")) return { ...loaded, source, shortCircuit: true };',
-  '  if (source.includes("export function getNextDeliveryStage")) {',
-  '    source = source.replace("export function getNextDeliveryStage", "function __verifiedGetNextDeliveryStage");',
-  '  } else if (source.includes("export const getNextDeliveryStage")) {',
-  '    source = source.replace("export const getNextDeliveryStage", "const __verifiedGetNextDeliveryStage");',
-  '  } else {',
-  '    throw new Error("mission stage helper is missing");',
-  '  }',
-  '  const newline = String.fromCharCode(10);',
-  '  source = "import { appendFileSync as __trueforgeAppendCall } from " + String.fromCharCode(34) + "node:fs" + String.fromCharCode(34) + ";" + newline + source;',
-  '  source += newline + "const __trueforgeVerificationWrapper = true;" + newline +',
-  '    "const __trueforgeMutationStage = process.env.MISSION_VERIFICATION_MUTATION_STAGE;" + newline +',
-  '    "const __trueforgeMutationResults = { Plan: null, Execute: null, Prove: null, Approve: " + String.fromCharCode(34) + "Plan" + String.fromCharCode(34) + " };" + newline +',
-  '    "export function getNextDeliveryStage(stage) {" + newline +',
-  '    "  const result = __verifiedGetNextDeliveryStage(stage);" + newline +',
-  '    "  const returnedResult = __trueforgeMutationStage === stage ? __trueforgeMutationResults[stage] : result;" + newline +',
-  '    "  __trueforgeAppendCall(process.env.MISSION_VERIFICATION_LOG, JSON.stringify({ stage, result: returnedResult, mutated: __trueforgeMutationStage === stage }) + String.fromCharCode(10));" + newline +',
-  '    "  return returnedResult;" + newline +',
-  '    "}" + newline;',
-  '  return { ...loaded, source, shortCircuit: true };',
-  '}',
-  '`;',
-  'try {',
-  'const testArguments = ["--loader", loaderPath, "--test", "test/index.test.js"];',
-  'const baseEnvironment = { ...process.env, MISSION_VERIFICATION_LOG: logPath };',
-  'delete baseEnvironment.MISSION_VERIFICATION_MUTATION_STAGE;',
-  'const runFocusedTests = (mutationStage, mutationLogPath) => spawnSync(process.execPath, testArguments, {',
-  '  cwd: process.cwd(),',
-  '  encoding: "utf8",',
-  '  env: { ...baseEnvironment, MISSION_VERIFICATION_LOG: mutationLogPath, ...(mutationStage ? { MISSION_VERIFICATION_MUTATION_STAGE: mutationStage } : {}) },',
-  '});',
-  'const readCalls = async (logFile) => (await readFile(logFile, "utf8").catch(() => "")).trim().split(String.fromCharCode(10)).filter(Boolean).map((line) => JSON.parse(line));',
-  'await writeFile(loaderPath, loaderSource, "utf8");',
-  'const testRun = runFocusedTests(null, logPath);',
-  'if (testRun.stdout) process.stdout.write(testRun.stdout);',
-  'if (testRun.status !== 0) {',
-  '  if (testRun.stderr) process.stderr.write(testRun.stderr);',
-  '  throw new Error("focused transition tests failed");',
-  '}',
-  'const observed = new Set((await readCalls(logPath)).map(({ stage, result }) => JSON.stringify([stage, result])));',
-  'for (const transition of transitions) {',
-  '  assert.ok(observed.has(JSON.stringify(transition)), "transition " + transition[0] + " -> " + transition[1] + " was not executed by the focused test");',
-  '  const mutationLogPath = path.join(directory, "mutation-" + transition[0] + ".jsonl");',
-  '  const mutationRun = runFocusedTests(transition[0], mutationLogPath);',
-  '  const mutatedStages = new Set((await readCalls(mutationLogPath)).filter(({ mutated }) => mutated).map(({ stage }) => stage));',
-  '  assert.ok(mutatedStages.has(transition[0]), "transition " + transition[0] + " was not exercised during mutation verification");',
-  '  assert.notEqual(mutationRun.status, 0, "focused test did not enforce transition " + transition[0] + " -> " + transition[1]);',
-  '}',
-  '  console.log("Mission transition verification passed.");',
-  '} finally {',
-  '  await rm(directory, { recursive: true, force: true });',
-  '}',
-].join("\n");
+export const PRIMARY_DELIVERY_TARGET: PullRequestDeliveryTarget = {
+  owner: PRIMARY_DELIVERY_FIXTURE.owner,
+  repo: PRIMARY_DELIVERY_FIXTURE.repository,
+  base: PRIMARY_DELIVERY_FIXTURE.base,
+  head: PRIMARY_DELIVERY_FIXTURE.head,
+  title: "Add the verified delivery-stage helper",
+  body: "Adds the backwards-compatible delivery-stage helper and focused transition coverage verified by the Proof Board mission.",
+};
 
-export const PRIMARY_VERIFICATION_COMMAND =
-  `npm test && node --input-type=module -e '${PRIMARY_MISSION_VERIFICATION_SCRIPT}'`;
+export const PRIMARY_VERIFICATION_COMMAND = "npm test";
 
 export interface MissionRunner {
   createMission(input: {
@@ -122,12 +78,36 @@ export interface MissionRunner {
     repository: { owner: string; name: string; ref: string };
   }): Promise<Mission>;
   inspectRepository(input: RepositoryInspectionInput): Promise<unknown>;
+  inspectDeliveryHead(input: DeliveryHeadInspectionInput): Promise<unknown>;
   runTurn(
     missionId: string,
     instruction: string,
-    options: { workItemId: string; delegateToSubagent?: boolean },
+    options: { workItemId: string; previousTurnId?: string; delegateToSubagent?: boolean },
   ): Promise<TrueForgeTurnResult>;
+  claimReadyWorkItem?(
+    missionId: string,
+    workItemId: string,
+    owner: string,
+    expectedRevision?: number,
+  ): Promise<WorkItem>;
+  proveImplementation(input: ImplementationProofInput): Promise<ImplementationHandoffDraft>;
   runSandboxVerification(input: SandboxVerificationInput): Promise<unknown>;
+  requestPullRequestApproval(
+    missionId: string,
+    target: PullRequestDeliveryTarget,
+  ): Promise<TrueForgeDeliveryApproval>;
+  resolvePullRequestApproval(
+    missionId: string,
+    pending: TrueForgeDeliveryApproval,
+    decision: "approved" | "rejected" | "cancelled",
+    workItemId?: string,
+  ): Promise<TrueForgePullRequestResult | null>;
+  reconcilePullRequestApproval?(
+    missionId: string,
+    pending: TrueForgeDeliveryApproval,
+    workItemId?: string,
+    knownPullRequest?: PullRequestReference,
+  ): Promise<TrueForgePullRequestResult | null>;
   reviewContract?(context: ReviewContext): Promise<ImplementationReviewDecision>;
 }
 
@@ -241,7 +221,9 @@ export interface EvidenceView {
   kind: Evidence["kind"];
   summary: string;
   createdAt: string;
+  workItemId?: string;
   workItemTitle?: string;
+  attempt?: number;
   metadata: Record<string, string | number>;
   executionOrigin?: Evidence["executionOrigin"];
 }
@@ -257,6 +239,7 @@ export interface HandoffView {
   openQuestions: string[];
   memoryImpact: Handoff["memoryImpact"];
   createdAt: string;
+  attempt?: number;
   diffSummary?: string;
   checks?: Handoff["checks"];
   evidenceIds?: string[];
@@ -277,6 +260,7 @@ export interface ReviewView {
   evidenceIds: string[];
   findingEvidenceId: string;
   createdAt: string;
+  attempt?: number;
 }
 
 export interface ActivityView {
@@ -285,6 +269,7 @@ export interface ActivityView {
   result: Evidence["result"] | "active";
   summary: string;
   createdAt: string;
+  workItemId?: string;
   category: "session" | "runtime" | "repository" | "sandbox" | "narration";
 }
 
@@ -297,6 +282,7 @@ export interface MissionView {
     createdAt: string;
     updatedAt: string;
     repository?: { owner: string; name: string; ref: string };
+    deliveryTarget?: { owner: string; repo: string; base: string; head: string };
     execution: { connected: boolean; resumed: boolean; sandboxId?: string };
   };
   progress: {
@@ -304,6 +290,7 @@ export interface MissionView {
     total: number;
     passedEvidence: number;
     failedEvidence: number;
+    execution: "not_started" | "running" | "passed" | "failed";
     verification: "not_started" | "running" | "passed" | "failed";
   };
   lanes: Array<{
@@ -318,21 +305,54 @@ export interface MissionView {
       dependsOn: string[];
       assignedRole?: WorkItem["assignedRole"];
       requiredChecks?: string[];
+      allowedFiles?: string[];
       delegation?: WorkItem["delegation"];
     }>;
   }>;
+  /** Queue-first board payload; lanes remain for clients using the original view. */
+  tickets: Array<{
+    id: string;
+    title: string;
+    purpose: string;
+    acceptanceCriteria: string[];
+    status: WorkItem["status"];
+    dependsOn: string[];
+    assignedRole?: WorkItem["assignedRole"];
+    requiredChecks?: string[];
+    allowedFiles?: string[];
+    executionAuthorization?: WorkItem["executionAuthorization"];
+    claim?: WorkItem["claim"];
+    attempt: number;
+    attempts: WorkItem["attempts"];
+    requestedChanges?: string[];
+    blockedReason?: string;
+    delegation?: WorkItem["delegation"];
+  }>;
   activity: ActivityView[];
   evidence: EvidenceView[];
+  diagnostics: DiagnosticSnapshot;
   handoffs: HandoffView[];
   reviews: ReviewView[];
   approvals: Array<{
     id: string;
     action: string;
+    actionType: string;
     target: string;
     risk: string;
+    rationale: string;
     expectedEffect: string;
+    evidenceIds: string[];
     decision: string;
     createdAt: string;
+    expiresAt: string;
+    workItemId?: string;
+    attempt?: number;
+    handoffId?: string;
+    reviewId?: string;
+    trueforgeSandboxId?: string;
+    decidedBy?: string;
+    decidedAt?: string;
+    executionContext?: Approval["executionContext"];
   }>;
   delivery: Array<{
     id: string;
@@ -340,6 +360,25 @@ export interface MissionView {
     verificationSummary: string;
     createdAt: string;
     reference?: string;
+    approvalId?: string;
+    workItemId?: string;
+    attempt?: number;
+    pullRequest?: {
+      number: number;
+      url: string;
+      repositoryOwner: string;
+      repositoryName: string;
+      base: string;
+      head: string;
+      headSha?: string;
+    };
+    executionOrigin?: {
+      kind: string;
+      sessionId: string;
+      turnId?: string;
+      threadId?: string;
+      toolCallId?: string;
+    };
   }>;
 }
 
@@ -374,7 +413,9 @@ function needsPrimaryWorkGraphUpgrade(workItems: WorkItem[]): boolean {
   const requiredChecks = implementer.requiredChecks ?? [];
   return workItems.some((item) => item.acceptanceCriteria.length === 0 || item.assignedRole === undefined) ||
     !requiredChecks.includes("typecheck") ||
-    !requiredChecks.includes("test");
+    !requiredChecks.includes("test") ||
+    implementer.allowedFiles === undefined ||
+    implementer.allowedFiles.length === 0;
 }
 
 function buildLegacyPrimaryWorkGraph(mission: Mission): WorkGraphDefinition {
@@ -402,6 +443,7 @@ function buildLegacyPrimaryWorkGraph(mission: Mission): WorkGraphDefinition {
         dependsOn: [LEGACY_PRIMARY_WORK_ITEM_IDS.inspect],
         assignedRole: "implementer",
         requiredChecks: ["typecheck", "test"],
+        allowedFiles: Object.keys(PRIMARY_VERIFIED_DELIVERY_FILES),
       },
       {
         id: LEGACY_PRIMARY_WORK_ITEM_IDS.verify,
@@ -445,6 +487,7 @@ function compactPrimaryWorkGraph(graph: WorkGraphDefinition): WorkGraphDefinitio
     );
   }
   const requiredChecks = [...new Set(implementers.flatMap((item) => item.requiredChecks ?? []))];
+  const allowedFiles = [...new Set(implementers.flatMap((item) => item.allowedFiles ?? []))];
   const inspection = inspections[0];
   const reviewer = reviewers[0];
   if (inspection === undefined || reviewer === undefined) {
@@ -464,6 +507,7 @@ function compactPrimaryWorkGraph(graph: WorkGraphDefinition): WorkGraphDefinitio
         dependsOn: [LEGACY_PRIMARY_WORK_ITEM_IDS.inspect],
         assignedRole: "implementer",
         ...(requiredChecks.length === 0 ? {} : { requiredChecks }),
+        allowedFiles,
       },
       {
         ...reviewer,
@@ -490,6 +534,13 @@ class MissionController {
     const state = await this.missions.getState();
     return state.missions.some((mission) => mission.id === PRIMARY_MISSION_ID)
       ? mapMissionState(state, PRIMARY_MISSION_ID)
+      : null;
+  }
+
+  async getPrimaryDiagnostics(): Promise<DiagnosticSnapshot | null> {
+    const state = await this.missions.getState();
+    return state.missions.some((mission) => mission.id === PRIMARY_MISSION_ID)
+      ? buildDiagnosticSnapshot(state, PRIMARY_MISSION_ID)
       : null;
   }
 
@@ -535,124 +586,378 @@ class MissionController {
     const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
     if (needsPrimaryWorkGraphUpgrade(workItems)) {
       if (mission.status !== "delivered" && mission.status !== "failed") {
-        await this.missions.persistWorkGraph(
+        const upgraded = await this.missions.persistWorkGraph(
           PRIMARY_MISSION_ID,
           buildLegacyPrimaryWorkGraph(mission),
         );
+        for (const item of upgraded) {
+          if (item.status === "ready" && item.claim === undefined && item.executionAuthorization === undefined) {
+            await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, item.id, "backlog");
+          }
+        }
       }
       return;
     }
     if (workItems.length > 0) {
       validateWorkGraph({ items: workItems });
+      // A pre-claim primary root may have been created by the legacy graph
+      // bootstrap. Keep it in the visible queue until a human authorizes it.
+      for (const item of workItems) {
+        if (item.status === "ready" && item.claim === undefined && item.executionAuthorization === undefined) {
+          await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, item.id, "backlog");
+        }
+      }
       return;
     }
-    await this.missions.persistWorkGraph(
+    const created = await this.missions.persistWorkGraph(
       PRIMARY_MISSION_ID,
       buildPreflightWorkGraph(mission),
     );
+    for (const item of created) {
+      if (item.status === "ready") {
+        await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, item.id, "backlog");
+      }
+    }
   }
 
   private async executePrimaryMission(): Promise<MissionView> {
     await this.createOrOpenPrimaryMission();
-    await this.prepareMissionForExecution();
-    try {
-      let state = await this.missions.getState();
-      const inspectionItems = state.workItems.filter((item) =>
-        item.missionId === PRIMARY_MISSION_ID &&
-        item.assignedRole === "planner" &&
-        item.dependsOn.length === 0
+    const queued = await this.nextQueueWorkItem();
+    if (queued === undefined) {
+      throw new MissionDomainError(
+        "invalid_transition",
+        "No ticket is Ready for execution. Move a Backlog ticket to Ready to authorize the next run.",
       );
-      if (inspectionItems.length !== 1 || inspectionItems[0] === undefined) {
-        throw new MissionControlError(
-          "Planning requires exactly one executable repository-inspection root.",
-        );
-      }
-      const inspectionItem = inspectionItems[0];
-      let inspectionResult: unknown;
-      await this.executeWork(inspectionItem.id, async () => {
-        inspectionResult = await this.runner.inspectRepository({
-          missionId: PRIMARY_MISSION_ID,
-          workItemId: inspectionItem.id,
-        });
-        await this.requirePassedEvidence(inspectionItem.id, "mcp");
-      });
-      if (inspectionResult !== undefined) {
-        await this.persistInspectedWorkGraph(inspectionResult, inspectionItem.id);
+    }
+    try {
+      await this.prepareMissionForExecution();
+      if (queued.status === "proving") {
+        await this.executeProofAndReview(queued);
+      } else if (queued.status === "awaiting_approval") {
+        const approval = (await this.missions.getState()).approvals
+          .filter((item) =>
+            item.missionId === PRIMARY_MISSION_ID &&
+            item.workItemId === queued.id &&
+            item.attempt === queued.attempt &&
+            isPrimaryDeliveryApproval(item),
+          )
+          .at(-1);
+        if (approval?.decision === "approved") {
+          await this.resumePrimaryDelivery(queued);
+        } else {
+          await this.ensurePrimaryDeliveryApproval();
+        }
+      } else if (queued.status === "delivering") {
+        await this.resumePrimaryDelivery(queued);
       } else {
-        const plannedState = await this.missions.getState();
-        const hasExecutableGraph = plannedState.workItems.some((item) =>
-          item.missionId === PRIMARY_MISSION_ID && item.assignedRole === "implementer"
-        ) && plannedState.workItems.some((item) =>
-          item.missionId === PRIMARY_MISSION_ID && item.assignedRole === "reviewer"
-        );
-        if (!hasExecutableGraph) {
+        const workItem = await this.claimForExecution(queued, "trueforge-worker");
+        if (workItem.assignedRole === "planner") {
+          await this.executeRepositoryInspection(workItem);
+        } else if (workItem.assignedRole === "implementer") {
+          await this.executeImplementation(workItem);
+        } else {
           throw new MissionControlError(
-            "Completed repository inspection did not produce executable work.",
+            `Ready ticket ${workItem.id} has no executable implementation role.`,
           );
         }
       }
-
-      state = await this.missions.getState();
-      const implementers = state.workItems.filter((item) =>
-        item.missionId === PRIMARY_MISSION_ID && item.assignedRole === "implementer"
-      );
-      const reviewers = state.workItems.filter((item) =>
-        item.missionId === PRIMARY_MISSION_ID && item.assignedRole === "reviewer"
-      );
-      if (implementers.length === 0 || reviewers.length === 0) {
-        throw new MissionControlError(
-          "Planning must produce bounded implementation and verification work.",
-        );
-      }
-      for (const implementer of implementers) {
-        await this.executeWork(implementer.id, async () => {
-          const execution = await this.runner.runTurn(
-            PRIMARY_MISSION_ID,
-            [
-              `Execute only this bounded work item: ${implementer.purpose}`,
-              `Acceptance criteria: ${implementer.acceptanceCriteria.join(" ")}`,
-              "Use the configured sandbox and verified pinned source.",
-              "Do not push, open a pull request, or perform any other remote mutation.",
-            ].join(" "),
-            { workItemId: implementer.id, delegateToSubagent: true },
-          );
-          await this.requirePassedTurn(implementer.id);
-          if (execution.implementationHandoff !== undefined) {
-            await this.recordImplementationHandoff(execution, implementer.id);
-          }
-        }, false);
-        await this.reviewImplementation(implementer.id);
-      }
-      for (const reviewer of reviewers) {
-        await this.executeWork(reviewer.id, async () => {
-          await this.runner.runSandboxVerification({
-            missionId: PRIMARY_MISSION_ID,
-            workItemId: reviewer.id,
-            command: PRIMARY_VERIFICATION_COMMAND,
-          });
-          await this.requirePassedEvidence(reviewer.id, "sandbox");
-        });
-      }
-
-      const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
-      if (mission.status === "executing") {
-        await this.missions.transitionMission(PRIMARY_MISSION_ID, "verifying");
-      }
       return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID);
     } catch (error) {
-      await this.blockActiveWork();
+      await this.recordMissionFailure(error);
+      await this.blockActiveWork(error);
       throw error;
     }
   }
 
-  private async recordImplementationHandoff(
-    execution: TrueForgeTurnResult,
-    workItemId: string,
-  ): Promise<void> {
-    const draft = execution.implementationHandoff;
-    if (draft === undefined) {
+  private async nextQueueWorkItem(): Promise<WorkItem | undefined> {
+    const state = await this.missions.getState();
+    const items = state.workItems.filter((item) => item.missionId === PRIMARY_MISSION_ID);
+    const active = items.filter((item) =>
+      ["in_progress", "proving", "awaiting_approval", "delivering"].includes(item.status) &&
+      item.claim !== undefined,
+    );
+    if (active.length > 1) {
+      throw new MissionControlError("Only one TrueForge ticket may execute at a time.");
+    }
+    if (active[0] !== undefined) {
+      return active[0];
+    }
+    return items.find((item) =>
+      item.status === "ready" &&
+      item.claim === undefined &&
+      item.executionAuthorization !== undefined,
+    );
+  }
+
+  private async executeProofAndReview(workItem: WorkItem): Promise<void> {
+    if (workItem.assignedRole !== "implementer" || workItem.claim === undefined) {
+      throw new MissionControlError(
+        `Ticket ${workItem.id} cannot enter independent proof without an implementer claim.`,
+      );
+    }
+
+    // A process can restart after proof or review has already been persisted
+    // but before the enclosing request returned. Continue from the durable
+    // checkpoint instead of measuring the same sandbox a second time.
+    const recoveredState = await this.missions.getState();
+    const recoveredHandoff = recoveredState.handoffs
+      .filter((item) =>
+        item.missionId === PRIMARY_MISSION_ID &&
+        item.workItemId === workItem.id &&
+        item.attempt === workItem.attempt,
+      )
+      .at(-1);
+    const recoveredReview = recoveredState.reviews
+      .filter((item) =>
+        item.missionId === PRIMARY_MISSION_ID &&
+        item.workItemId === workItem.id &&
+        item.attempt === workItem.attempt,
+      )
+      .at(-1);
+    if (recoveredHandoff?.result === "done") {
+      if (recoveredReview?.outcome === "accepted") {
+        await this.ensurePrimaryDeliveryApproval();
+        return;
+      }
+      if (recoveredReview === undefined) {
+        const outcome = await this.reviewImplementation(workItem.id);
+        if (outcome === "accepted") {
+          await this.ensurePrimaryDeliveryApproval();
+        }
+        return;
+      }
+    }
+
+    let handoff: ImplementationHandoffDraft;
+    try {
+      handoff = await this.runner.proveImplementation({
+        missionId: PRIMARY_MISSION_ID,
+        workItemId: workItem.id,
+      });
+      await this.recordImplementationHandoff(handoff, workItem.id);
+    } catch (error) {
+      if (!isRecoverableImplementationProofFailure(error)) {
+        throw error;
+      }
+      await this.recordProofFindingAndRequestChanges(workItem.id, error);
       return;
     }
+
+    const outcome = await this.reviewImplementation(workItem.id);
+    if (outcome === "blocked") {
+      throw new MissionControlError(
+        "Independent verification blocked the implementation; inspect the durable finding before retrying.",
+      );
+    }
+    if (outcome === "accepted") {
+      await this.ensurePrimaryDeliveryApproval();
+    }
+  }
+
+  private async recordProofFindingAndRequestChanges(
+    workItemId: string,
+    error: unknown,
+  ): Promise<void> {
+    const reason = missionFailureReason(error);
+    await this.missions.addEvidence(PRIMARY_MISSION_ID, {
+      workItemId,
+      kind: "reviewer_finding",
+      result: "failed",
+      source: "reviewer",
+      summary: "Independent deterministic proof requested changes before review.",
+      details: JSON.stringify({
+        failure_layer: "proof_board",
+        failure_category: "verification",
+        phase: "deterministic-proof",
+        reason,
+      }),
+    });
+    await this.missions.transitionSystemWorkItem(PRIMARY_MISSION_ID, workItemId, "changes_requested", {
+      trigger: "proof",
+      reason,
+    });
+  }
+
+  private async claimForExecution(
+    workItem: WorkItem,
+    owner: string,
+    expectedRevision?: number,
+  ): Promise<WorkItem> {
+    const revision = expectedRevision ?? (await this.missions.getState()).revision;
+    if (this.runner.claimReadyWorkItem !== undefined) {
+      return this.runner.claimReadyWorkItem(
+        PRIMARY_MISSION_ID,
+        workItem.id,
+        workItem.claim?.owner ?? owner,
+        workItem.status === "ready" ? revision : undefined,
+      );
+    }
+    if (workItem.status === "in_progress") {
+      if (workItem.claim === undefined) {
+        throw new MissionControlError(`In-progress ticket ${workItem.id} has no durable claim.`);
+      }
+      return workItem;
+    }
+    const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
+    return this.missions.claimReadyWorkItem(PRIMARY_MISSION_ID, workItem.id, {
+      owner,
+      expectedRevision: revision,
+      ...(mission.trueforgeSessionId === undefined
+        ? {}
+        : { trueforgeSessionId: mission.trueforgeSessionId }),
+      ...(mission.trueforgeSandboxId === undefined
+        ? {}
+        : { trueforgeSandboxId: mission.trueforgeSandboxId }),
+    });
+  }
+
+  async claimPrimaryTicket(
+    workItemId: string,
+    owner: string,
+    expectedRevision?: number,
+  ): Promise<WorkItem> {
+    const workItem = await this.missions.getWorkItem(PRIMARY_MISSION_ID, workItemId);
+    if (workItem.status !== "ready" && workItem.status !== "in_progress") {
+      throw new MissionDomainError(
+        "invalid_transition",
+        `Ticket ${workItem.id} is ${workItem.status}; only Ready tickets can enter execution.`,
+      );
+    }
+    return this.claimForExecution(workItem, owner, expectedRevision);
+  }
+
+  private async executeRepositoryInspection(workItem: WorkItem): Promise<void> {
+    const state = await this.missions.getState();
+    const inspectionEvidence = latestEvidenceForAttempt(
+      state.evidence,
+      workItem.id,
+      workItem.attempt,
+      "mcp",
+    );
+    if (inspectionEvidence?.result === "passed") {
+      await this.missions.transitionSystemWorkItem(PRIMARY_MISSION_ID, workItem.id, "proving", {
+        trigger: "execution",
+      });
+      await this.missions.transitionSystemWorkItem(PRIMARY_MISSION_ID, workItem.id, "done", {
+        trigger: "proof",
+      });
+      await this.persistInspectedWorkGraph(
+        { evidenceId: inspectionEvidence.id },
+        workItem.id,
+      );
+      await this.ensureWorkItems();
+      return;
+    }
+    let inspectionResult: unknown;
+    await this.executeClaimedWork(workItem.id, async () => {
+      const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
+      inspectionResult = await this.runner.inspectRepository({
+        missionId: PRIMARY_MISSION_ID,
+        workItemId: workItem.id,
+        ...(mission.trueforgeTurnId === undefined ? {} : { previousTurnId: mission.trueforgeTurnId }),
+      });
+      await this.requirePassedEvidence(workItem.id, "mcp");
+    });
+    if (inspectionResult === undefined) {
+      throw new MissionControlError(
+        "Completed repository inspection did not return authoritative repository facts.",
+      );
+    }
+    await this.missions.transitionSystemWorkItem(PRIMARY_MISSION_ID, workItem.id, "done", {
+      trigger: "proof",
+    });
+    await this.persistInspectedWorkGraph(inspectionResult, workItem.id);
+    await this.ensureWorkItems();
+  }
+
+  private async executeImplementation(workItem: WorkItem): Promise<void> {
+    const state = await this.missions.getState();
+    const completedTurn = latestEvidenceForAttempt(
+      state.evidence,
+      workItem.id,
+      workItem.attempt,
+      "trueforge",
+    );
+    if (
+      completedTurn?.result === "passed" &&
+      completedTurn.summary.startsWith("TrueForge turn finished with status done")
+    ) {
+      await this.missions.transitionSystemWorkItem(PRIMARY_MISSION_ID, workItem.id, "proving", {
+        trigger: "execution",
+      });
+      return;
+    }
+    const repositoryProof = state.evidence.find((evidence) =>
+      evidence.missionId === PRIMARY_MISSION_ID &&
+      evidence.source === "mcp" &&
+      evidence.result === "passed"
+    );
+    if (repositoryProof === undefined) {
+      throw new MissionControlError(
+        "Implementation cannot start before a successful read-only repository MCP interaction is persisted.",
+      );
+    }
+    const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
+    const repository = mission.repository;
+    if (repository === undefined) {
+      throw new MissionControlError("Implementation cannot start without a verified repository target.");
+    }
+    const details = evidenceDetails(repositoryProof);
+    const verifiedSha = typeof details?.commit_sha === "string"
+      ? details.commit_sha
+      : repository.ref;
+    await this.executeClaimedWork(workItem.id, async () => {
+      const currentMission = await this.missions.getMission(PRIMARY_MISSION_ID);
+      await this.runner.runTurn(
+        PRIMARY_MISSION_ID,
+        [
+          `Own the bounded implementation ticket: ${workItem.purpose}`,
+          `Mission objective: ${currentMission.objective}`,
+          `Acceptance criteria: ${workItem.acceptanceCriteria.join(" ")}`,
+          `Allowed files: ${(workItem.allowedFiles ?? []).join(", ")}`,
+          ...(workItem.requestedChanges === undefined
+            ? []
+            : [`Requested rework findings: ${workItem.requestedChanges.join(" ")}`]),
+          `Verified repository facts: ${repository.owner}/${repository.name} at full commit ${verifiedSha}.`,
+          `Use ${PRIMARY_SANDBOX_REPOSITORY_ROOT} as the one canonical absolute sandbox checkout root. Ensure the pinned repository is present there before edits; never use /workspace, a guessed cwd, or a nested checkout.`,
+          "Use the real persistent sandbox and configured tools. You may inspect, edit, install, test, recover from structured command failures, and optionally delegate through TrueForge; keep the turn agentic instead of following a shell micro-script.",
+          "Proof Board will independently measure the final persisted sandbox; narration is not proof.",
+          "Do not push, open a pull request, or perform any other remote mutation.",
+        ].join(" "),
+        {
+          workItemId: workItem.id,
+          ...(currentMission.trueforgeTurnId === undefined
+            ? {}
+            : { previousTurnId: currentMission.trueforgeTurnId }),
+        },
+      );
+      await this.requirePassedTurn(workItem.id);
+    });
+  }
+
+  private async executeClaimedWork(
+    workItemId: string,
+    operation: () => Promise<void>,
+  ): Promise<void> {
+    const workItem = await this.missions.getWorkItem(PRIMARY_MISSION_ID, workItemId);
+    if (workItem.status !== "in_progress" || workItem.claim === undefined) {
+      throw new MissionControlError(
+        `Ticket ${workItem.id} must be durably claimed before TrueForge execution.`,
+      );
+    }
+    await operation();
+    const current = await this.missions.getWorkItem(PRIMARY_MISSION_ID, workItemId);
+    if (current.status === "in_progress") {
+      await this.missions.transitionSystemWorkItem(PRIMARY_MISSION_ID, workItemId, "proving", {
+        trigger: "execution",
+      });
+    }
+  }
+
+  private async recordImplementationHandoff(
+    draft: ImplementationHandoffDraft,
+    workItemId: string,
+  ): Promise<void> {
     const requiredChecksPassed = draft.checks
       .filter((check) => check.required)
       .every((check) => check.result === "passed");
@@ -660,8 +965,8 @@ class MissionController {
       workItemId,
       result: requiredChecksPassed ? "done" : "partial",
       summary: requiredChecksPassed
-        ? "The delegated implementation returned a structured evidence handoff."
-        : "The delegated implementation returned a partial handoff with unresolved required checks.",
+        ? "Independent final-state proof established a structured implementation handoff."
+        : "Independent final-state proof returned a partial handoff with unresolved required checks.",
       filesChanged: draft.filesChanged,
       testsRun: [...new Set(draft.checks.map((check) => check.command))],
       decisions: draft.decisions,
@@ -675,19 +980,577 @@ class MissionController {
     });
   }
 
-  private async reviewImplementation(workItemId: string): Promise<void> {
-    const workItem = await this.missions.getWorkItem(PRIMARY_MISSION_ID, workItemId);
-    if (workItem.status === "complete") {
+  private async ensurePrimaryDeliveryApproval(): Promise<void> {
+    const state = await this.missions.getState();
+    const workItems = state.workItems.filter((item) => item.missionId === PRIMARY_MISSION_ID);
+    const implementation = workItems.find((item) => item.assignedRole === "implementer");
+    if (implementation === undefined) {
+      throw new MissionControlError(
+        "Delivery approval requires a bounded implementer ticket.",
+      );
+    }
+    if (implementation.status !== "awaiting_approval" || implementation.claim === undefined) {
+      throw new MissionControlError(
+        "Delivery approval requires the current implementer ticket to be awaiting human approval.",
+      );
+    }
+    const attempt = implementation.attempts.at(-1);
+    const handoff = state.handoffs
+      .filter((item) => item.missionId === PRIMARY_MISSION_ID && item.workItemId === implementation.id)
+      .at(-1);
+    const review = state.reviews
+      .filter((item) => item.missionId === PRIMARY_MISSION_ID && item.workItemId === implementation.id)
+      .at(-1);
+    if (
+      attempt === undefined ||
+      attempt.status !== "awaiting_approval" ||
+      handoff === undefined ||
+      handoff.result !== "done" ||
+      handoff.attempt !== implementation.attempt ||
+      review === undefined ||
+      review.outcome !== "accepted" ||
+      review.attempt !== implementation.attempt ||
+      review.handoffId !== handoff.id
+    ) {
+      throw new MissionControlError(
+        "Delivery approval requires the current attempt's completed proof and accepted independent review.",
+      );
+    }
+    const proofEvidenceIds = handoff.evidenceIds ?? [];
+    const proofEvidence = proofEvidenceIds.map((evidenceId) =>
+      state.evidence.find((item) => item.id === evidenceId),
+    );
+    if (
+      proofEvidence.length === 0 ||
+      proofEvidence.some((evidence) =>
+        evidence === undefined ||
+        evidence.missionId !== PRIMARY_MISSION_ID ||
+        evidence.workItemId !== implementation.id ||
+        evidence.attempt !== implementation.attempt ||
+        evidence.result !== "passed"
+      ) ||
+      !proofEvidence.some((evidence) => evidence?.source === "sandbox") ||
+      !proofEvidence.every(isDirectImplementationProofEvidence) ||
+      state.evidence.some((evidence) =>
+        evidence.workItemId === implementation.id &&
+        evidence.attempt === implementation.attempt &&
+        ["sandbox", "reviewer"].includes(evidence.source) &&
+        evidence.result === "failed"
+      )
+    ) {
+      throw new MissionControlError(
+        "Delivery approval requires current passed direct deterministic proof for the approved attempt.",
+      );
+    }
+    const reviewEvidence = state.evidence.find((evidence) =>
+      evidence.id === review.findingEvidenceId &&
+      evidence.missionId === PRIMARY_MISSION_ID &&
+      evidence.workItemId === implementation.id &&
+      evidence.attempt === implementation.attempt &&
+      evidence.source === "reviewer" &&
+      evidence.result === "passed"
+    );
+    if (reviewEvidence === undefined) {
+      throw new MissionControlError(
+        "Delivery approval requires the accepted review finding for the current attempt.",
+      );
+    }
+    const activeRequest = state.approvals.find((approval) =>
+      approval.missionId === PRIMARY_MISSION_ID &&
+      isPrimaryDeliveryApproval(approval) &&
+      ["pending", "approved"].includes(approval.decision) &&
+      Date.parse(approval.expiresAt) > Date.now(),
+    );
+    if (activeRequest !== undefined) {
+      requireApprovalRepositoryProof(state, activeRequest);
+      requireCurrentDeliveryApprovalCorrelation(
+        state,
+        activeRequest,
+        implementation,
+        handoff,
+        review,
+      );
+      const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
+      if (mission.status === "executing") {
+        await this.missions.transitionMission(PRIMARY_MISSION_ID, "awaiting_approval");
+      }
       return;
     }
-    if (workItem.status !== "ready_for_review") {
+    const plannerIds = new Set(
+      workItems.filter((item) => item.assignedRole === "planner").map((item) => item.id),
+    );
+    const repositoryProof = state.evidence.filter((evidence) =>
+      evidence.missionId === PRIMARY_MISSION_ID &&
+      evidence.workItemId !== undefined &&
+      plannerIds.has(evidence.workItemId) &&
+      evidence.source === "mcp" &&
+      evidence.result === "passed"
+    ).at(-1);
+    if (repositoryProof === undefined) {
+      throw new MissionControlError(
+        "Delivery approval requires current passed repository proof.",
+      );
+    }
+    const mission = state.missions.find((item) => item.id === PRIMARY_MISSION_ID);
+    if (mission === undefined) {
+      throw new MissionControlError("The primary mission is missing from durable state.");
+    }
+    requireBaselineRepositoryProof(mission, repositoryProof);
+    const deliveryHeadResult = await this.runner.inspectDeliveryHead({
+      missionId: PRIMARY_MISSION_ID,
+      target: PRIMARY_DELIVERY_TARGET,
+      workItemId: implementation.id,
+    });
+    const deliveryState = await this.missions.getState();
+    const { evidence: deliveryHeadProof, headSha } = deliveryHeadProofFromResult(
+      deliveryHeadResult,
+      deliveryState,
+    );
+    const deliveryTarget: PullRequestDeliveryTarget = {
+      ...PRIMARY_DELIVERY_TARGET,
+      headSha,
+    };
+    requireDeliveryHeadProof(deliveryHeadProof, deliveryTarget);
+    const evidenceIds = [...new Set([
+      repositoryProof.id,
+      deliveryHeadProof.id,
+      ...proofEvidenceIds,
+      reviewEvidence.id,
+    ])];
+    const pending = await this.runner.requestPullRequestApproval(
+      PRIMARY_MISSION_ID,
+      deliveryTarget,
+    );
+    if (
+      pending.target.owner !== deliveryTarget.owner ||
+      pending.target.repo !== deliveryTarget.repo ||
+      pending.target.base !== deliveryTarget.base ||
+      pending.target.head !== deliveryTarget.head ||
+      pending.target.title !== deliveryTarget.title ||
+      pending.target.body !== deliveryTarget.body ||
+      pending.target.headSha !== deliveryTarget.headSha
+    ) {
+      throw new MissionControlError(
+        "TrueForge returned a delivery approval for an artifact different from the verified head.",
+      );
+    }
+    const target = pullRequestApprovalTarget(deliveryTarget);
+    const approval = await this.missions.requestActionApproval(PRIMARY_MISSION_ID, {
+      action: "Open the verified delivery",
+      actionType: PRIMARY_CONSEQUENTIAL_ACTION,
+      target,
+      risk: "A remote repository mutation will create a pull request.",
+      rationale: "A human must authorize the verified change before it is published for review.",
+      expectedEffect: pullRequestExpectedEffect(deliveryTarget),
+      evidenceIds,
+      workItemId: implementation.id,
+      attempt: implementation.attempt,
+      handoffId: handoff.id,
+      reviewId: review.id,
+      ...(attempt.claim.trueforgeSandboxId === undefined
+        ? {}
+        : { trueforgeSandboxId: attempt.claim.trueforgeSandboxId }),
+      executionContext: approvalExecutionContext(pending),
+    });
+    requireCurrentDeliveryApprovalCorrelation(
+      { ...(await this.missions.getState()) },
+      approval,
+      implementation,
+      handoff,
+      review,
+    );
+    const currentMission = await this.missions.getMission(PRIMARY_MISSION_ID);
+    if (currentMission.status === "executing") {
+      await this.missions.transitionMission(PRIMARY_MISSION_ID, "awaiting_approval");
+    }
+  }
+
+  async decidePrimaryDelivery(
+    approvalId: string,
+    decision: "approved" | "rejected" | "cancelled",
+    decidedBy = "mission-operator",
+    expectedRevision?: number,
+  ): Promise<MissionView> {
+    const state = await this.missions.getState();
+    if (expectedRevision !== undefined && state.revision !== expectedRevision) {
+      throw new MissionDomainError(
+        "conflict",
+        `Mission state changed from revision ${expectedRevision}; reload before deciding delivery.`,
+      );
+    }
+    const approval = state.approvals.find((item) =>
+      item.id === approvalId && item.missionId === PRIMARY_MISSION_ID
+    );
+    if (approval === undefined) {
+      throw new MissionDomainError("not_found", "The requested approval was not found.");
+    }
+    const implementation = state.workItems.find((item) =>
+      item.missionId === PRIMARY_MISSION_ID &&
+      item.assignedRole === "implementer" &&
+      item.id === approval.workItemId,
+    );
+    const handoff = implementation === undefined
+      ? undefined
+      : state.handoffs
+          .filter((item) => item.missionId === PRIMARY_MISSION_ID && item.workItemId === implementation.id)
+          .at(-1);
+    const review = implementation === undefined
+      ? undefined
+      : state.reviews
+          .filter((item) => item.missionId === PRIMARY_MISSION_ID && item.workItemId === implementation.id)
+          .at(-1);
+    if (implementation === undefined || handoff === undefined || review === undefined) {
+      throw new MissionControlError(
+        "The delivery approval is not correlated to a current implementation review.",
+      );
+    }
+    requireCurrentDeliveryApprovalCorrelation(
+      state,
+      approval,
+      implementation,
+      handoff,
+      review,
+    );
+    requireApprovalRepositoryProof(state, approval);
+    const pending = deliveryApprovalFromState(approval);
+    const approvedHeadSha = pending.target.headSha;
+    if (approvedHeadSha === undefined) {
+      throw new MissionControlError("The approved delivery has no verified head identity.");
+    }
+    if (decision === "approved") {
+      await this.revalidatePrimaryDeliveryHead(pending.target, implementation.id);
+    }
+    const decisionState = await this.missions.getState();
+    const decisionApproval = decisionState.approvals.find((item) =>
+      item.id === approval.id && item.missionId === PRIMARY_MISSION_ID
+    );
+    const decisionImplementation = decisionState.workItems.find((item) =>
+      item.id === implementation.id && item.missionId === PRIMARY_MISSION_ID
+    );
+    const decisionHandoff = decisionState.handoffs
+      .filter((item) => item.missionId === PRIMARY_MISSION_ID && item.workItemId === implementation.id)
+      .at(-1);
+    const decisionReview = decisionState.reviews
+      .filter((item) => item.missionId === PRIMARY_MISSION_ID && item.workItemId === implementation.id)
+      .at(-1);
+    if (
+      decisionApproval === undefined ||
+      decisionImplementation === undefined ||
+      decisionHandoff === undefined ||
+      decisionReview === undefined
+    ) {
+      throw new MissionControlError(
+        "The delivery approval changed before the operator decision could be persisted.",
+      );
+    }
+    requireCurrentDeliveryApprovalCorrelation(
+      decisionState,
+      decisionApproval,
+      decisionImplementation,
+      decisionHandoff,
+      decisionReview,
+    );
+    requireApprovalRepositoryProof(decisionState, decisionApproval);
+    const decidedApproval = await this.missions.decideApproval(PRIMARY_MISSION_ID, approval.id, {
+      decision,
+      decidedBy,
+      expectedRevision: decisionState.revision,
+    });
+    if (decision !== "approved") {
+      const result = await this.runner.resolvePullRequestApproval(
+        PRIMARY_MISSION_ID,
+        pending,
+        decision,
+        implementation.id,
+      );
+      if (result !== null) {
+        throw new MissionControlError("A denied delivery unexpectedly returned a pull request result.");
+      }
+      await this.blockPrimaryDelivery(
+        `The operator ${decision} the protected delivery action; no pull request was created.`,
+      );
+      return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID);
+    }
+
+    try {
+      await this.missions.transitionSystemWorkItem(
+        PRIMARY_MISSION_ID,
+        implementation.id,
+        "delivering",
+        { trigger: "approval" },
+      );
+      const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
+      if (mission.status === "awaiting_approval") {
+        await this.missions.transitionMission(PRIMARY_MISSION_ID, "verifying");
+      }
+      return await this.completePrimaryDelivery(
+        decidedApproval,
+        pending,
+        decisionImplementation,
+        approvedHeadSha,
+      );
+    } catch (error) {
+      await this.recordMissionFailure(error);
+      await this.blockPrimaryDelivery(error);
+      throw error;
+    }
+  }
+
+  private async resumePrimaryDelivery(workItem: WorkItem): Promise<void> {
+    const state = await this.missions.getState();
+    const approval = state.approvals
+      .filter((item) =>
+        item.missionId === PRIMARY_MISSION_ID &&
+        item.workItemId === workItem.id &&
+        item.attempt === workItem.attempt &&
+        isPrimaryDeliveryApproval(item),
+      )
+      .at(-1);
+    if (approval === undefined || approval.decision !== "approved") {
+      throw new MissionControlError(
+        "A delivering ticket requires a persisted approved delivery action before it can resume.",
+      );
+    }
+    const implementation = state.workItems.find((item) => item.id === workItem.id);
+    const handoff = state.handoffs
+      .filter((item) => item.missionId === PRIMARY_MISSION_ID && item.workItemId === workItem.id)
+      .at(-1);
+    const review = state.reviews
+      .filter((item) => item.missionId === PRIMARY_MISSION_ID && item.workItemId === workItem.id)
+      .at(-1);
+    if (implementation === undefined || handoff === undefined || review === undefined) {
+      throw new MissionControlError(
+        "The delivering ticket has no current proof and review correlation to resume.",
+      );
+    }
+    requireCurrentDeliveryApprovalCorrelation(
+      state,
+      approval,
+      implementation,
+      handoff,
+      review,
+    );
+    requireApprovalRepositoryProof(state, approval);
+    const pending = deliveryApprovalFromState(approval);
+    const approvedHeadSha = pending.target.headSha;
+    if (approvedHeadSha === undefined) {
+      throw new MissionControlError("The approved delivery has no verified head identity.");
+    }
+    try {
+      if (implementation.status === "awaiting_approval") {
+        await this.missions.transitionSystemWorkItem(
+          PRIMARY_MISSION_ID,
+          implementation.id,
+          "delivering",
+          { trigger: "approval" },
+        );
+      }
+      const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
+      if (mission.status === "awaiting_approval") {
+        await this.missions.transitionMission(PRIMARY_MISSION_ID, "verifying");
+      }
+      await this.completePrimaryDelivery(
+        approval,
+        pending,
+        implementation,
+        approvedHeadSha,
+      );
+    } catch (error) {
+      await this.recordMissionFailure(error);
+      await this.blockPrimaryDelivery(error);
+      throw error;
+    }
+  }
+
+  private async completePrimaryDelivery(
+    approval: Approval,
+    pending: TrueForgeDeliveryApproval,
+    workItem: WorkItem,
+    approvedHeadSha: string,
+  ): Promise<MissionView> {
+    const deliveryAttemptRecord = await this.missions.recordDeliveryAttempt(
+      PRIMARY_MISSION_ID,
+      {
+        approvalId: approval.id,
+        workItemId: workItem.id,
+        attempt: workItem.attempt,
+        actionType: PRIMARY_CONSEQUENTIAL_ACTION,
+        expectedEffect: approval.expectedEffect,
+        target: deliveryAttemptTarget(pending.target),
+      },
+    );
+    const persistedReadback = persistedPullRequestReadback(
+      await this.missions.getState(),
+      approval,
+      workItem,
+    );
+    let result = persistedReadback;
+    if (result === null) {
+      if (deliveryAttemptRecord.created) {
+        result = await this.missions.executeProtectedAction(
+          PRIMARY_MISSION_ID,
+          {
+            action: PRIMARY_CONSEQUENTIAL_ACTION,
+            target: approval.target,
+            expectedEffect: approval.expectedEffect,
+            approvalId: approval.id,
+          },
+          () => this.runner.resolvePullRequestApproval(
+            PRIMARY_MISSION_ID,
+            pending,
+            "approved",
+            workItem.id,
+          ),
+        );
+      } else {
+        const reconcile = this.runner.reconcilePullRequestApproval;
+        if (reconcile === undefined) {
+          throw new MissionControlError(
+            "A previously started delivery requires read-only reconciliation before it can resume.",
+          );
+        }
+        result = await reconcile.call(
+          this.runner,
+          PRIMARY_MISSION_ID,
+          pending,
+          workItem.id,
+          deliveryAttemptRecord.attempt.pullRequest,
+        );
+      }
+    }
+    if (result === null) {
+      throw new MissionControlError("Approved delivery returned no pull request result.");
+    }
+    if (result.headSha !== approvedHeadSha) {
+      throw new MissionControlError(
+        "The delivered pull request head does not match the SHA approved by the operator.",
+      );
+    }
+    const deliveryExecutionOrigin = {
+      kind: "mcp" as const,
+      sessionId: result.sessionId,
+      turnId: result.turnId,
+      threadId: result.threadId,
+      toolCallId: result.toolCallId,
+    };
+    await this.missions.recordDeliveryAttemptResult(
+      PRIMARY_MISSION_ID,
+      deliveryAttemptRecord.attempt.id,
+      {
+        pullRequest: {
+          number: result.number,
+          url: result.url,
+          repositoryOwner: pending.target.owner,
+          repositoryName: pending.target.repo,
+          base: pending.target.base,
+          head: pending.target.head,
+          headSha: result.headSha,
+        },
+        executionOrigin: deliveryExecutionOrigin,
+      },
+    );
+    const evidence = await this.missions.addEvidence(PRIMARY_MISSION_ID, {
+      workItemId: workItem.id,
+      kind: "tool_result",
+      result: "passed",
+      source: "trueforge",
+      summary: `TrueForge created pull request #${result.number} in the approved fixture repository.`,
+      details: JSON.stringify({
+        tool: PRIMARY_CONSEQUENTIAL_ACTION,
+        repository: `${PRIMARY_DELIVERY_TARGET.owner}/${PRIMARY_DELIVERY_TARGET.repo}`,
+        base: PRIMARY_DELIVERY_TARGET.base,
+        head: PRIMARY_DELIVERY_TARGET.head,
+        head_sha: result.headSha,
+        head_sha_verified: true,
+        pull_request_number: result.number,
+        pull_request_url: result.url,
+        approval_id: approval.id,
+        attempt: workItem.attempt,
+      }),
+      executionOrigin: deliveryExecutionOrigin,
+    });
+    await this.missions.recordDelivery(PRIMARY_MISSION_ID, {
+      status: "delivered",
+      reference: result.url,
+      approvalId: approval.id,
+      workItemId: workItem.id,
+      attempt: workItem.attempt,
+      verificationSummary: `Verified evidence ${approval.evidenceIds.join(", ")} authorized the correlated pull request result ${evidence.id}.`,
+      pullRequest: {
+        number: result.number,
+        url: result.url,
+        repositoryOwner: PRIMARY_DELIVERY_TARGET.owner,
+        repositoryName: PRIMARY_DELIVERY_TARGET.repo,
+        base: PRIMARY_DELIVERY_TARGET.base,
+        head: PRIMARY_DELIVERY_TARGET.head,
+        headSha: result.headSha,
+      },
+      executionOrigin: deliveryExecutionOrigin,
+    });
+    await this.missions.completeDeliveryAttempt(
+      PRIMARY_MISSION_ID,
+      deliveryAttemptRecord.attempt.id,
+    );
+    return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID);
+  }
+
+  private async blockPrimaryDelivery(reason: unknown): Promise<void> {
+    const message = missionFailureReason(reason);
+    try {
+      const state = await this.missions.getState();
+      const workItem = state.workItems.find((item) =>
+        item.missionId === PRIMARY_MISSION_ID &&
+        item.assignedRole === "implementer" &&
+        ["awaiting_approval", "delivering"].includes(item.status) &&
+        item.claim !== undefined,
+      );
+      if (workItem !== undefined) {
+        await this.missions.transitionSystemWorkItem(PRIMARY_MISSION_ID, workItem.id, "blocked", {
+          trigger: "failure",
+          reason: message,
+        });
+      }
+      const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
+      if (![
+        "blocked",
+        "failed",
+        "delivered",
+      ].includes(mission.status) && missionTransitions[mission.status].includes("blocked")) {
+        await this.missions.transitionMission(PRIMARY_MISSION_ID, "blocked");
+      }
+    } catch {
+      // Preserve the original approval or delivery error when failure state is already durable.
+    }
+  }
+
+  private async revalidatePrimaryDeliveryHead(
+    target: PullRequestDeliveryTarget,
+    workItemId?: string,
+  ): Promise<void> {
+    const result = await this.runner.inspectDeliveryHead({
+      missionId: PRIMARY_MISSION_ID,
+      target,
+      ...(workItemId === undefined ? {} : { workItemId }),
+    });
+    const state = await this.missions.getState();
+    const { evidence, headSha } = deliveryHeadProofFromResult(result, state);
+    requireDeliveryHeadProof(evidence, target);
+    if (headSha !== target.headSha) {
+      throw new MissionControlError(
+        "The delivery head changed after approval; the protected pull request action was not allowed.",
+      );
+    }
+  }
+
+  private async reviewImplementation(workItemId: string): Promise<ReviewOutcome> {
+    const workItem = await this.missions.getWorkItem(PRIMARY_MISSION_ID, workItemId);
+    if (workItem.status === "complete") {
+      return "accepted";
+    }
+    if (workItem.status !== "ready_for_review" && workItem.status !== "proving") {
       throw new MissionControlError(
         "Independent verification requires the implementation to be ready for review.",
       );
-    }
-    if (workItem.delegation === undefined) {
-      await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, workItemId, "complete");
-      return;
     }
     const context = await this.missions.getReviewContext(PRIMARY_MISSION_ID, workItemId);
     const decision = await this.verifier.review(context);
@@ -698,11 +1561,7 @@ class MissionController {
       summary: decision.summary,
       finding: decision.finding,
     });
-    if (decision.outcome !== "accepted") {
-      throw new MissionControlError(
-        `Independent verification returned ${decision.outcome}: ${decision.finding}`,
-      );
-    }
+    return decision.outcome;
   }
 
   private async persistInspectedWorkGraph(
@@ -743,43 +1602,17 @@ class MissionController {
     if (mission.status === "draft") {
       mission = await this.missions.transitionMission(PRIMARY_MISSION_ID, "planning");
     }
-    if (mission.status === "planning" || mission.status === "blocked") {
+    if (mission.status === "planning") {
       await this.missions.transitionMission(PRIMARY_MISSION_ID, "executing");
     }
     const current = await this.missions.getMission(PRIMARY_MISSION_ID);
-    if (current.status !== "executing" && current.status !== "verifying") {
-      throw new MissionControlError(`Mission cannot run from ${current.status}.`);
-    }
-  }
-
-  private async executeWork(
-    workItemId: string,
-    operation: () => Promise<void>,
-    complete = true,
-  ): Promise<void> {
-    let item = await this.missions.getWorkItem(PRIMARY_MISSION_ID, workItemId);
-    if (item.status === "complete") {
-      return;
-    }
-    if (item.status === "blocked") {
-      item = await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, workItemId, "ready");
-    }
-    if (item.status === "backlog") {
-      item = await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, workItemId, "ready");
-    }
-    if (item.status === "ready") {
-      item = await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, workItemId, "in_progress");
-    }
-    if (item.status === "in_progress") {
-      await operation();
-      item = await this.missions.transitionWorkItem(
-        PRIMARY_MISSION_ID,
-        workItemId,
-        "ready_for_review",
+    if (current.status === "blocked") {
+      throw new MissionControlError(
+        "Mission is blocked; inspect the durable failure record before retrying the same ticket.",
       );
     }
-    if (complete && item.status === "ready_for_review") {
-      await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, workItemId, "complete");
+    if (!["executing", "awaiting_approval", "verifying"].includes(current.status)) {
+      throw new MissionControlError(`Mission cannot run from ${current.status}.`);
     }
   }
 
@@ -807,17 +1640,62 @@ class MissionController {
     }
   }
 
-  private async blockActiveWork(): Promise<void> {
+  private async recordMissionFailure(error: unknown): Promise<void> {
+    const reason = missionFailureReason(error);
+    const classification = missionFailureClassification(error);
+    try {
+      const state = await this.missions.getState();
+      const alreadyRecorded = state.evidence.some((item) =>
+        item.missionId === PRIMARY_MISSION_ID &&
+        item.result === "failed" &&
+        evidenceDetails(item)?.reason === reason,
+      );
+      if (alreadyRecorded) {
+        return;
+      }
+      const activeWorkItem = state.workItems.find((item) =>
+        item.missionId === PRIMARY_MISSION_ID &&
+        ["in_progress", "proving", "ready_for_review", "awaiting_approval", "delivering"].includes(item.status)
+      );
+      await this.missions.addEvidence(PRIMARY_MISSION_ID, {
+        ...(activeWorkItem === undefined ? {} : { workItemId: activeWorkItem.id }),
+        kind: "reviewer_finding",
+        result: "failed",
+        source: "system",
+        summary: "Mission execution failed closed; inspect the diagnostic snapshot for the cause.",
+        details: JSON.stringify({
+          failure_layer: classification.layer,
+          failure_category: classification.category,
+          reason,
+          ...(error instanceof TrueForgeIntegrationError
+            ? { operation: error.operation }
+            : {}),
+        }),
+      });
+    } catch {
+      // Preserve the original operation error when durable failure recording is unavailable.
+    }
+  }
+
+  private async blockActiveWork(error?: unknown): Promise<void> {
     try {
       const state = await this.missions.getState();
       const active = state.workItems.find(
         (item) =>
           item.missionId === PRIMARY_MISSION_ID &&
-          ["backlog", "ready", "in_progress", "ready_for_review"].includes(item.status) &&
-          (item.status === "in_progress" || item.status === "ready_for_review"),
+          ["in_progress", "proving", "ready_for_review", "awaiting_approval", "delivering"].includes(item.status) &&
+          item.claim !== undefined,
       );
       if (active !== undefined) {
-        await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, active.id, "blocked");
+        const reason = missionFailureReason(error ?? "TrueForge execution failed before the ticket could advance.");
+        if (["in_progress", "proving", "awaiting_approval", "delivering"].includes(active.status)) {
+          await this.missions.transitionSystemWorkItem(PRIMARY_MISSION_ID, active.id, "blocked", {
+            trigger: "failure",
+            reason,
+          });
+        } else {
+          await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, active.id, "blocked");
+        }
       }
       const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
       if (!["blocked", "failed", "delivered"].includes(mission.status)) {
@@ -827,6 +1705,383 @@ class MissionController {
       // Preserve the operation error if the durable failure state was already recorded.
     }
   }
+}
+
+function pullRequestApprovalTarget(target: PullRequestDeliveryTarget): string {
+  const verifiedHead = target.headSha === undefined ? target.head : `${target.head}@${target.headSha}`;
+  return `${target.owner}/${target.repo} base=${target.base} head=${verifiedHead}`;
+}
+
+function pullRequestExpectedEffect(target: PullRequestDeliveryTarget): string {
+  const verifiedHead = target.headSha === undefined ? target.head : `${target.head} at ${target.headSha}`;
+  return `Open one pull request in ${target.owner}/${target.repo} from verified head ${verifiedHead} into ${target.base}; do not merge or mutate any other repository state.`;
+}
+
+function approvalExecutionContext(
+  pending: TrueForgeDeliveryApproval,
+): NonNullable<Approval["executionContext"]> {
+  const context: NonNullable<Approval["executionContext"]> = {
+    sessionId: pending.sessionId,
+    turnId: pending.turnId,
+    threadId: pending.threadId,
+    toolCallId: pending.toolCallId,
+    serverName: pending.serverName,
+    toolName: pending.toolName,
+    repositoryOwner: pending.target.owner,
+    repositoryName: pending.target.repo,
+    base: pending.target.base,
+    head: pending.target.head,
+    title: pending.target.title,
+    body: pending.target.body,
+  };
+  if (pending.target.headSha !== undefined) {
+    context.headSha = pending.target.headSha;
+  }
+  return context;
+}
+
+function evidenceDetails(evidence: Evidence): Record<string, unknown> | null {
+  if (evidence.details === undefined) {
+    return null;
+  }
+  try {
+    const details = JSON.parse(evidence.details) as unknown;
+    return isRecord(details) ? details : null;
+  } catch {
+    return null;
+  }
+}
+
+function latestEvidenceForAttempt(
+  evidence: Evidence[],
+  workItemId: string,
+  attempt: number,
+  source: Evidence["source"],
+): Evidence | undefined {
+  return evidence
+    .filter((item) =>
+      item.workItemId === workItemId &&
+      item.source === source &&
+      (item.attempt ?? 0) === attempt,
+    )
+    .at(-1);
+}
+
+function requireBaselineRepositoryProof(
+  mission: Mission,
+  evidence: Evidence,
+): void {
+  const repository = mission.repository;
+  if (
+    repository === undefined ||
+    repository.owner !== PRIMARY_DELIVERY_FIXTURE.owner ||
+    repository.name !== PRIMARY_DELIVERY_FIXTURE.repository ||
+    repository.ref !== PRIMARY_DELIVERY_FIXTURE.baselineRef
+  ) {
+    throw new MissionControlError(
+      "Delivery approval requires the mission to start from the pinned fixture baseline.",
+    );
+  }
+  const details = evidenceDetails(evidence);
+  const argumentsValue = details !== null && isRecord(details.arguments)
+    ? details.arguments
+    : null;
+  const expectedUri =
+    `repo://${repository.owner}/${repository.name}/sha/${PRIMARY_DELIVERY_FIXTURE.baselineSha}`;
+  if (
+    details === null ||
+    argumentsValue === null ||
+    details.tool !== "get_commit" ||
+    details.provenance_kind !== "baseline" ||
+    details.repository_owner !== repository.owner ||
+    details.repository_name !== repository.name ||
+    details.requested_ref !== repository.ref ||
+    details.commit_sha !== PRIMARY_DELIVERY_FIXTURE.baselineSha ||
+    details.uri !== expectedUri ||
+    argumentsValue.owner !== repository.owner ||
+    argumentsValue.repo !== repository.name ||
+    argumentsValue.sha !== repository.ref ||
+    argumentsValue.detail !== "full_patch"
+  ) {
+    throw new MissionControlError(
+      "Delivery approval rejected evidence that does not prove the pinned baseline commit.",
+    );
+  }
+}
+
+function requireDeliveryHeadProof(
+  evidence: Evidence,
+  target: PullRequestDeliveryTarget,
+): void {
+  const details = evidenceDetails(evidence);
+  const argumentsValue = details !== null && isRecord(details.arguments)
+    ? details.arguments
+    : null;
+  const patches = details !== null && isRecord(details.patches) ? details.patches : null;
+  const expectedPatchEntries = Object.entries(PRIMARY_VERIFIED_DELIVERY_PATCHES);
+  const headSha = target.headSha;
+  const patchesMatch = patches !== null &&
+    Object.keys(patches).length === expectedPatchEntries.length &&
+    expectedPatchEntries.every(([filename, patch]) => patches[filename] === patch);
+  if (
+    headSha === undefined ||
+    !/^[0-9a-f]{40}$/i.test(headSha) ||
+    headSha === PRIMARY_DELIVERY_FIXTURE.baselineSha ||
+    details === null ||
+    argumentsValue === null ||
+    details.tool !== "get_commit" ||
+    details.provenance_kind !== "delivery_head" ||
+    details.repository_owner !== target.owner ||
+    details.repository_name !== target.repo ||
+    details.requested_ref !== target.head ||
+    details.baseline_sha !== PRIMARY_DELIVERY_FIXTURE.baselineSha ||
+    details.commit_sha !== headSha ||
+    details.uri !== `repo://${target.owner}/${target.repo}/sha/${headSha}` ||
+    argumentsValue.owner !== target.owner ||
+    argumentsValue.repo !== target.repo ||
+    argumentsValue.sha !== target.head ||
+    argumentsValue.detail !== "full_patch" ||
+    !patchesMatch
+  ) {
+    throw new MissionControlError(
+      "Delivery approval rejected a head that is unchanged from baseline or does not match the verified implementation.",
+    );
+  }
+}
+
+function deliveryHeadProofFromResult(
+  result: unknown,
+  state: MissionState,
+): { evidence: Evidence; headSha: string } {
+  if (!isRecord(result) || typeof result.evidenceId !== "string" || typeof result.commitSha !== "string") {
+    throw new MissionControlError("Delivery-head inspection returned no structured commit proof.");
+  }
+  const evidence = state.evidence.find((item) =>
+    item.id === result.evidenceId &&
+    item.missionId === PRIMARY_MISSION_ID &&
+    item.source === "mcp" &&
+    item.result === "passed"
+  );
+  if (evidence === undefined) {
+    throw new MissionControlError("Delivery-head inspection evidence is not durable mission proof.");
+  }
+  return { evidence, headSha: result.commitSha };
+}
+
+function requireApprovalRepositoryProof(
+  state: MissionState,
+  approval: Approval,
+): void {
+  const mission = state.missions.find((item) => item.id === approval.missionId);
+  const baselineEvidence = state.evidence.find((item) =>
+    approval.evidenceIds.includes(item.id) &&
+    item.missionId === approval.missionId &&
+    item.source === "mcp" &&
+    item.result === "passed" &&
+    evidenceDetails(item)?.provenance_kind === "baseline"
+  );
+  const headEvidence = state.evidence.find((item) =>
+    approval.evidenceIds.includes(item.id) &&
+    item.missionId === approval.missionId &&
+    item.source === "mcp" &&
+    item.result === "passed" &&
+    evidenceDetails(item)?.provenance_kind === "delivery_head"
+  );
+  const context = approval.executionContext;
+  if (mission === undefined || baselineEvidence === undefined || headEvidence === undefined || context?.headSha === undefined) {
+    throw new MissionControlError(
+      "Delivery approval requires separate baseline and verified delivery-head provenance.",
+    );
+  }
+  requireBaselineRepositoryProof(mission, baselineEvidence);
+  requireDeliveryHeadProof(headEvidence, {
+    owner: context.repositoryOwner,
+    repo: context.repositoryName,
+    base: context.base,
+    head: context.head,
+    headSha: context.headSha,
+    title: context.title,
+    body: context.body,
+  });
+}
+
+function requireCurrentDeliveryApprovalCorrelation(
+  state: MissionState,
+  approval: Approval,
+  workItem: WorkItem,
+  handoff: Handoff,
+  review: Review,
+): void {
+  const attempt = workItem.attempts.at(-1);
+  const proofEvidenceIds = handoff.evidenceIds ?? [];
+  const requiredEvidenceIds = [...new Set([
+    ...proofEvidenceIds,
+    review.findingEvidenceId,
+  ])];
+  const currentFinding = state.evidence.find((evidence) =>
+    evidence.workItemId === workItem.id &&
+    evidence.attempt === workItem.attempt &&
+    ["sandbox", "reviewer"].includes(evidence.source) &&
+    evidence.result === "failed",
+  );
+  if (currentFinding !== undefined) {
+    throw new MissionControlError(
+      `The delivery approval is stale; the current attempt has an unresolved ${currentFinding.source} finding.`,
+    );
+  }
+  if (
+    !isPrimaryDeliveryApproval(approval) ||
+    approval.workItemId !== workItem.id ||
+    approval.attempt !== workItem.attempt ||
+    (workItem.status !== "awaiting_approval" && workItem.status !== "delivering") ||
+    attempt === undefined ||
+    attempt.status !== workItem.status ||
+    approval.handoffId !== handoff.id ||
+    approval.reviewId !== review.id ||
+    handoff.result !== "done" ||
+    handoff.attempt !== workItem.attempt ||
+    review.outcome !== "accepted" ||
+    review.attempt !== workItem.attempt ||
+    review.handoffId !== handoff.id ||
+    (attempt.claim.trueforgeSandboxId !== undefined &&
+      approval.trueforgeSandboxId !== attempt.claim.trueforgeSandboxId) ||
+    requiredEvidenceIds.some((evidenceId) => !approval.evidenceIds.includes(evidenceId)) ||
+    proofEvidenceIds.some((evidenceId) => {
+      const evidence = state.evidence.find((item) => item.id === evidenceId);
+      return !isDirectImplementationProofEvidence(evidence);
+    }) ||
+    requiredEvidenceIds.some((evidenceId) => {
+      const evidence = state.evidence.find((item) => item.id === evidenceId);
+      return evidence === undefined ||
+        evidence.missionId !== PRIMARY_MISSION_ID ||
+        evidence.workItemId !== workItem.id ||
+        evidence.attempt !== workItem.attempt ||
+        evidence.result !== "passed";
+    })
+  ) {
+    throw new MissionControlError(
+      "The delivery approval is stale or does not match the current proven implementation attempt.",
+    );
+  }
+}
+
+function isDirectImplementationProofEvidence(evidence: Evidence | undefined): boolean {
+  return evidence?.source === "sandbox" &&
+    evidence.result === "passed" &&
+    evidenceDetails(evidence)?.proof_mode === IMPLEMENTATION_PROOF_MODE;
+}
+
+function persistedPullRequestReadback(
+  state: MissionState,
+  approval: Approval,
+  workItem: WorkItem,
+): TrueForgePullRequestResult | null {
+  const context = approval.executionContext;
+  if (context?.headSha === undefined) {
+    return null;
+  }
+  const expectedUrlPrefix = `https://github.com/${context.repositoryOwner}/${context.repositoryName}/pull/`;
+  const evidence = [...state.evidence].reverse().find((item) => {
+    const details = evidenceDetails(item);
+    return item.missionId === approval.missionId &&
+      item.workItemId === workItem.id &&
+      item.attempt === workItem.attempt &&
+      item.source === "mcp" &&
+      item.result === "passed" &&
+      details?.tool === "pull_request_read" &&
+      details.repository_owner === context.repositoryOwner &&
+      details.repository_name === context.repositoryName &&
+      details.base === context.base &&
+      details.head === context.head &&
+      details.head_sha === context.headSha &&
+      typeof details.pull_request_number === "number" &&
+      Number.isInteger(details.pull_request_number) &&
+      details.pull_request_number > 0 &&
+      typeof details.pull_request_url === "string" &&
+      details.pull_request_url === `${expectedUrlPrefix}${details.pull_request_number}` &&
+      item.executionOrigin?.kind === "mcp" &&
+      item.executionOrigin.sessionId === context.sessionId;
+  });
+  if (evidence === undefined) {
+    return null;
+  }
+  const details = evidenceDetails(evidence);
+  const number = details?.pull_request_number;
+  const url = details?.pull_request_url;
+  if (typeof number !== "number" || typeof url !== "string") {
+    return null;
+  }
+  return {
+    number,
+    url,
+    headSha: context.headSha,
+    sessionId: context.sessionId,
+    turnId: evidence.executionOrigin?.turnId ?? context.turnId,
+    threadId: context.threadId,
+    toolCallId: context.toolCallId,
+  };
+}
+
+function deliveryApprovalFromState(approval: Approval): TrueForgeDeliveryApproval {
+  const context = approval.executionContext;
+  if (!isPrimaryDeliveryApproval(approval) || context?.headSha === undefined) {
+    throw new MissionControlError(
+      "The persisted approval is not correlated to the exact fixture pull request action.",
+    );
+  }
+  return {
+    sessionId: context.sessionId,
+    turnId: context.turnId,
+    threadId: context.threadId,
+    toolCallId: context.toolCallId,
+    serverName: context.serverName,
+    toolName: "create_pull_request",
+    target: { ...PRIMARY_DELIVERY_TARGET, headSha: context.headSha },
+  };
+}
+
+function deliveryAttemptTarget(
+  target: PullRequestDeliveryTarget,
+): DeliveryAttemptTarget {
+  if (target.headSha === undefined) {
+    throw new MissionControlError(
+      "The durable delivery attempt requires a verified pull request head SHA.",
+    );
+  }
+  return {
+    repositoryOwner: target.owner,
+    repositoryName: target.repo,
+    base: target.base,
+    head: target.head,
+    headSha: target.headSha,
+    title: target.title,
+    body: target.body,
+  };
+}
+
+function isPrimaryDeliveryApproval(approval: Approval): boolean {
+  const context = approval.executionContext;
+  if (
+    context === undefined ||
+    context.headSha === undefined ||
+    !/^[0-9a-f]{40}$/i.test(context.headSha) ||
+    context.headSha === PRIMARY_DELIVERY_FIXTURE.baselineSha
+  ) {
+    return false;
+  }
+  const target = { ...PRIMARY_DELIVERY_TARGET, headSha: context.headSha };
+  return (
+    approval.actionType === PRIMARY_CONSEQUENTIAL_ACTION &&
+    approval.target === pullRequestApprovalTarget(target) &&
+    approval.expectedEffect === pullRequestExpectedEffect(target) &&
+    context.toolName === PRIMARY_CONSEQUENTIAL_ACTION &&
+    context.repositoryOwner === PRIMARY_DELIVERY_TARGET.owner &&
+    context.repositoryName === PRIMARY_DELIVERY_TARGET.repo &&
+    context.base === PRIMARY_DELIVERY_TARGET.base &&
+    context.head === PRIMARY_DELIVERY_TARGET.head &&
+    context.title === PRIMARY_DELIVERY_TARGET.title &&
+    context.body === PRIMARY_DELIVERY_TARGET.body
+  );
 }
 
 function verifiedInspectionFromResult(
@@ -961,7 +2216,38 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
   }
   const passedEvidence = evidence.filter((item) => item.result === "passed").length;
   const failedEvidence = evidence.filter((item) => item.result === "failed").length;
-  const completed = workItems.filter((item) => item.status === "complete").length;
+  const completed = workItems.filter((item) => ["done", "complete"].includes(item.status)).length;
+  const implementationItems = workItems.filter((item) => item.assignedRole === "implementer");
+  const reviewerItems = workItems.filter((item) => item.assignedRole === "reviewer");
+  const latestSandboxPreparation = [...missionEvidence].reverse().find((item) =>
+    item.source === "sandbox" &&
+    item.workItemId === undefined &&
+    item.summary.startsWith("Sandbox toolchain readiness")
+  );
+  const implementationExecutionFailed = implementationItems.some((item) =>
+    item.status === "blocked" ||
+    item.delegation?.status === "failed" ||
+    item.delegation?.status === "interrupted"
+  );
+  const executionComplete = implementationItems.length > 0 &&
+    implementationItems.every((item) => ["done", "complete"].includes(item.status));
+  const executionFailed = implementationExecutionFailed || (
+    !executionComplete && latestSandboxPreparation?.result === "failed"
+  );
+  const executionRunning = implementationItems.some((item) =>
+    ["in_progress", "proving", "ready_for_review", "awaiting_approval", "delivering"].includes(item.status)
+  ) || (
+    !executionComplete &&
+    !executionFailed &&
+    (mission.status === "planning" || mission.status === "executing")
+  );
+  const execution = executionFailed
+    ? "failed"
+    : executionComplete
+    ? "passed"
+    : executionRunning
+    ? "running"
+    : "not_started";
   const repositoryProof = latestProofResultForRole(
     missionEvidence,
     workItems,
@@ -971,19 +2257,19 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
   const sandboxProof = latestProofResultForRole(
     missionEvidence,
     workItems,
-    "reviewer",
+    ["implementer", "reviewer"],
     "sandbox",
   );
   const currentProofFailed = repositoryProof === "failed" || sandboxProof === "failed";
   const currentProofPassed = repositoryProof === "passed" && sandboxProof === "passed";
-  const verification = mission.status === "failed" || mission.status === "blocked"
+  const verificationRunning = reviewerItems.some((item) =>
+    item.status === "in_progress" || item.status === "ready_for_review"
+  ) || mission.status === "verifying";
+  const verification = currentProofFailed
     ? "failed"
-    : (mission.status === "verifying" || mission.status === "delivered") && currentProofPassed
+    : (["awaiting_approval", "verifying", "delivered"].includes(mission.status)) && currentProofPassed
     ? "passed"
-    : currentProofFailed
-    ? "failed"
-    : workItems.some((item) => item.status === "in_progress" || item.status === "ready_for_review")
-      || mission.status === "planning" || mission.status === "executing"
+    : verificationRunning
     ? "running"
     : "not_started";
 
@@ -996,6 +2282,12 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
     execution: {
       connected: mission.trueforgeSessionId !== undefined,
       resumed: mission.trueforgeTurnId !== undefined,
+    },
+    deliveryTarget: {
+      owner: PRIMARY_DELIVERY_TARGET.owner,
+      repo: PRIMARY_DELIVERY_TARGET.repo,
+      base: PRIMARY_DELIVERY_TARGET.base,
+      head: PRIMARY_DELIVERY_TARGET.head,
     },
   };
   if (mission.trueforgeSandboxId !== undefined) {
@@ -1013,6 +2305,7 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
       total: workItems.length,
       passedEvidence,
       failedEvidence,
+      execution,
       verification,
     },
     lanes: [
@@ -1021,8 +2314,10 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
       lane("prove", "Prove", workItems.filter((item) => item.assignedRole === "reviewer")),
       lane("approve", "Approve", []),
     ],
+    tickets: workItems.map(mapTicket),
     activity,
     evidence,
+    diagnostics: buildDiagnosticSnapshot(state, missionId),
     handoffs: state.handoffs
       .filter((item) => item.missionId === missionId)
       .map((item) => ({
@@ -1036,6 +2331,7 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
         openQuestions: [...item.openQuestions],
         memoryImpact: item.memoryImpact,
         createdAt: item.createdAt,
+        ...(item.attempt === undefined ? {} : { attempt: item.attempt }),
         ...(item.diffSummary === undefined ? {} : { diffSummary: item.diffSummary }),
         ...(item.checks === undefined ? {} : {
           checks: item.checks.map((check) => ({
@@ -1065,17 +2361,32 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
         evidenceIds: [...item.evidenceIds],
         findingEvidenceId: item.findingEvidenceId,
         createdAt: item.createdAt,
+        ...(item.attempt === undefined ? {} : { attempt: item.attempt }),
       })),
     approvals: state.approvals
       .filter((item) => item.missionId === missionId)
       .map((item) => ({
         id: item.id,
         action: item.action,
+        actionType: item.actionType,
         target: item.target,
         risk: item.risk,
+        rationale: item.rationale,
         expectedEffect: item.expectedEffect,
+        evidenceIds: [...item.evidenceIds],
         decision: item.decision,
         createdAt: item.createdAt,
+        expiresAt: item.expiresAt,
+        ...(item.workItemId === undefined ? {} : { workItemId: item.workItemId }),
+        ...(item.attempt === undefined ? {} : { attempt: item.attempt }),
+        ...(item.handoffId === undefined ? {} : { handoffId: item.handoffId }),
+        ...(item.reviewId === undefined ? {} : { reviewId: item.reviewId }),
+        ...(item.trueforgeSandboxId === undefined ? {} : { trueforgeSandboxId: item.trueforgeSandboxId }),
+        ...(item.decidedBy === undefined ? {} : { decidedBy: item.decidedBy }),
+        ...(item.decidedAt === undefined ? {} : { decidedAt: item.decidedAt }),
+        ...(item.executionContext === undefined
+          ? {}
+          : { executionContext: { ...item.executionContext } }),
       })),
     delivery: state.deliveries
       .filter((item) => item.missionId === missionId)
@@ -1086,9 +2397,48 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
           verificationSummary: item.verificationSummary,
           createdAt: item.createdAt,
           ...(item.reference === undefined ? {} : { reference: item.reference }),
+          ...(item.approvalId === undefined ? {} : { approvalId: item.approvalId }),
+          ...(item.workItemId === undefined ? {} : { workItemId: item.workItemId }),
+          ...(item.attempt === undefined ? {} : { attempt: item.attempt }),
+          ...(item.pullRequest === undefined
+            ? {}
+            : { pullRequest: { ...item.pullRequest } }),
+          ...(item.executionOrigin === undefined
+            ? {}
+            : { executionOrigin: { ...item.executionOrigin } }),
         };
         return delivery;
       }),
+  };
+}
+
+function mapTicket(item: WorkItem): MissionView["tickets"][number] {
+  return {
+    id: item.id,
+    title: item.title,
+    purpose: item.purpose,
+    acceptanceCriteria: [...item.acceptanceCriteria],
+    status: item.status,
+    dependsOn: [...item.dependsOn],
+    ...(item.assignedRole === undefined ? {} : { assignedRole: item.assignedRole }),
+    ...(item.requiredChecks === undefined ? {} : { requiredChecks: [...item.requiredChecks] }),
+    ...(item.allowedFiles === undefined ? {} : { allowedFiles: [...item.allowedFiles] }),
+    ...(item.executionAuthorization === undefined
+      ? {}
+      : { executionAuthorization: { ...item.executionAuthorization } }),
+    ...(item.claim === undefined ? {} : { claim: { ...item.claim } }),
+    attempt: item.attempt,
+    attempts: item.attempts.map((attempt) => ({
+      ...attempt,
+      authorization: { ...attempt.authorization },
+      requestedChanges: [...attempt.requestedChanges],
+      claim: { ...attempt.claim },
+    })),
+    ...(item.requestedChanges === undefined
+      ? {}
+      : { requestedChanges: [...item.requestedChanges] }),
+    ...(item.blockedReason === undefined ? {} : { blockedReason: item.blockedReason }),
+    ...(item.delegation === undefined ? {} : { delegation: { ...item.delegation } }),
   };
 }
 
@@ -1105,6 +2455,7 @@ function lane(id: "plan" | "execute" | "prove" | "approve", label: string, items
       dependsOn: [...item.dependsOn],
       ...(item.assignedRole === undefined ? {} : { assignedRole: item.assignedRole }),
       ...(item.requiredChecks === undefined ? {} : { requiredChecks: [...item.requiredChecks] }),
+      ...(item.allowedFiles === undefined ? {} : { allowedFiles: [...item.allowedFiles] }),
       ...(item.delegation === undefined ? {} : { delegation: { ...item.delegation } }),
     })),
   };
@@ -1113,11 +2464,14 @@ function lane(id: "plan" | "execute" | "prove" | "approve", label: string, items
 function latestProofResultForRole(
   evidence: Evidence[],
   workItems: WorkItem[],
-  role: "planner" | "implementer" | "reviewer",
+  role: "planner" | "implementer" | "reviewer" | ReadonlyArray<"planner" | "implementer" | "reviewer">,
   source: "mcp" | "sandbox",
 ): Evidence["result"] | undefined {
+  const roles = new Set(Array.isArray(role) ? role : [role]);
   const workItemIds = new Set(
-    workItems.filter((item) => item.assignedRole === role).map((item) => item.id),
+    workItems.filter((item) =>
+      item.assignedRole !== undefined && roles.has(item.assignedRole)
+    ).map((item) => item.id),
   );
   let latest: Evidence["result"] | undefined;
   for (const item of evidence) {
@@ -1142,6 +2496,12 @@ function mapEvidence(
     createdAt: evidence.createdAt,
     metadata,
   };
+  if (evidence.workItemId !== undefined) {
+    view.workItemId = evidence.workItemId;
+  }
+  if (evidence.attempt !== undefined) {
+    view.attempt = evidence.attempt;
+  }
   const title = evidence.workItemId === undefined ? undefined : titleByWorkId.get(evidence.workItemId);
   if (title !== undefined) {
     view.workItemTitle = title;
@@ -1212,6 +2572,7 @@ function mapActivity(evidence: Evidence): ActivityView {
     result: evidence.result,
     summary: evidence.summary,
     createdAt: evidence.createdAt,
+    ...(evidence.workItemId === undefined ? {} : { workItemId: evidence.workItemId }),
     category,
   };
 }
@@ -1316,16 +2677,82 @@ export function createMissionHttpApp(options: MissionHttpOptions) {
       if (request.method === "GET" && url.pathname === "/api/mission") {
         return jsonResponse({ mission: await controller.getPrimaryMission() });
       }
+      if (request.method === "GET" && url.pathname === "/api/mission/tickets") {
+        return jsonResponse(await primaryTicketsResponse(options.missions));
+      }
+      if (request.method === "GET" && url.pathname === "/api/mission/work-items") {
+        return jsonResponse(await primaryTicketsResponse(options.missions));
+      }
+      if (request.method === "GET" && url.pathname === "/api/mission/diagnostics") {
+        return jsonResponse({ diagnostics: await controller.getPrimaryDiagnostics() });
+      }
       if (request.method === "POST" && url.pathname === "/api/mission") {
         return jsonResponse({ mission: await controller.createOrOpenPrimaryMission() }, 201);
       }
       if (request.method === "POST" && url.pathname === "/api/mission/run") {
         return jsonResponse({ mission: await controller.runPrimaryMission() });
       }
+      const ticketStatusRoute = url.pathname.match(
+        /^\/api\/mission\/(?:tickets|work-items)\/([^/]+)\/status$/,
+      );
+      if (request.method === "PATCH" && ticketStatusRoute?.[1] !== undefined) {
+        const body = await requestRecord(request, "Ticket transition body");
+        const status = body.status;
+        if (status !== "backlog" && status !== "ready") {
+          throw new MissionDomainError(
+            "invalid_transition",
+            "Humans may move tickets between Backlog and Ready, or authorize Changes Requested rework by moving it to Ready; later states are system-owned.",
+          );
+        }
+        const actor = requiredRequestString(body.actor, "actor");
+        const expectedRevision = requestRevision(body);
+        const ticket = await options.missions.moveWorkItemByHuman(
+          PRIMARY_MISSION_ID,
+          decodeURIComponent(ticketStatusRoute[1]),
+          status,
+          {
+            actor,
+            ...(expectedRevision === undefined ? {} : { expectedRevision }),
+          },
+        );
+        return jsonResponse({
+          revision: (await options.missions.getState()).revision,
+          ticket: mapTicket(ticket),
+        });
+      }
+      const ticketClaimRoute = url.pathname.match(
+        /^\/api\/mission\/(?:tickets|work-items)\/([^/]+)\/claim$/,
+      );
+      if (request.method === "POST" && ticketClaimRoute?.[1] !== undefined) {
+        const body = await requestRecord(request, "Ticket claim body");
+        const owner = requiredRequestString(body.owner ?? body.agent, "owner");
+        const expectedRevision = requestRevision(body);
+        const ticket = await controller.claimPrimaryTicket(
+          decodeURIComponent(ticketClaimRoute[1]),
+          owner,
+          expectedRevision,
+        );
+        return jsonResponse({
+          revision: (await options.missions.getState()).revision,
+          ticket: mapTicket(ticket),
+        });
+      }
+      const approvalRoute = url.pathname.match(/^\/api\/mission\/approvals\/([^/]+)$/);
+      if (request.method === "POST" && approvalRoute?.[1] !== undefined) {
+        const { decision, decidedBy, expectedRevision } = await approvalDecisionFromRequest(request);
+        return jsonResponse({
+          mission: await controller.decidePrimaryDelivery(
+            decodeURIComponent(approvalRoute[1]),
+            decision,
+            decidedBy,
+            expectedRevision,
+          ),
+        });
+      }
       return jsonResponse({ error: "not_found", message: "Route not found." }, 404);
     } catch (error) {
       const status = error instanceof MissionDomainError
-        ? error.code === "not_found" ? 404 : 400
+        ? error.code === "not_found" ? 404 : error.code === "conflict" ? 409 : 400
         : error instanceof TrueForgeIntegrationError || error instanceof MissionControlError
         ? 502
         : 500;
@@ -1334,6 +2761,94 @@ export function createMissionHttpApp(options: MissionHttpOptions) {
       return jsonResponse({ error: "operation_failed", message, mission }, status);
     }
   }
+}
+
+async function primaryTicketsResponse(missions: MissionService): Promise<{
+  revision: number;
+  mission: { id: string; objective: string; status: Mission["status"] } | null;
+  tickets: MissionView["tickets"];
+}> {
+  const state = await missions.getState();
+  const mission = state.missions.find((item) => item.id === PRIMARY_MISSION_ID);
+  return {
+    revision: state.revision,
+    mission: mission === undefined
+      ? null
+      : { id: mission.id, objective: mission.objective, status: mission.status },
+    tickets: state.workItems
+      .filter((item) => item.missionId === PRIMARY_MISSION_ID)
+      .map(mapTicket),
+  };
+}
+
+async function requestRecord(
+  request: Request,
+  label: string,
+): Promise<Record<string, unknown>> {
+  let value: unknown;
+  try {
+    value = await request.json();
+  } catch {
+    throw new MissionDomainError("invalid_input", `${label} must be valid JSON.`);
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new MissionDomainError("invalid_input", `${label} must be an object.`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function requiredRequestString(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new MissionDomainError("invalid_input", `${label} must be a non-empty string.`);
+  }
+  return value.trim();
+}
+
+function requestRevision(body: Record<string, unknown>): number | undefined {
+  const value = body.expected_revision ?? body.expectedRevision ?? body.expected_version;
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new MissionDomainError(
+      "invalid_input",
+      "expected_revision must be a non-negative integer.",
+    );
+  }
+  return value;
+}
+
+async function approvalDecisionFromRequest(
+  request: Request,
+): Promise<{
+  decision: "approved" | "rejected" | "cancelled";
+  decidedBy: string;
+  expectedRevision?: number;
+}> {
+  let value: unknown;
+  try {
+    value = await request.json();
+  } catch {
+    throw new MissionDomainError("invalid_input", "Approval decision body must be valid JSON.");
+  }
+  if (!isRecord(value)) {
+    throw new MissionDomainError("invalid_input", "Approval decision body must be an object.");
+  }
+  const decision = value.decision;
+  if (decision !== "approved" && decision !== "rejected" && decision !== "cancelled") {
+    throw new MissionDomainError("invalid_input", "Approval decision is not supported.");
+  }
+  const rawActor = value.actor ?? value.decided_by ?? value.decidedBy;
+  const expectedRevision = requestRevision(value);
+  return {
+    decision,
+    decidedBy: rawActor === undefined
+      ? "mission-operator"
+      : requiredRequestString(rawActor, "actor"),
+    ...(expectedRevision === undefined
+      ? {}
+      : { expectedRevision }),
+  };
 }
 
 function semanticVerifierFromRunner(
@@ -1406,8 +2921,17 @@ function publicErrorMessage(error: unknown): string {
     if (error.operation.includes("inspect repository")) {
       return "Repository inspection failed. Check the configured runtime and repository connector.";
     }
+    if (error.operation.includes("prepare sandbox")) {
+      return sanitizePublicRuntimeError(error.message);
+    }
     if (error.operation.includes("sandbox")) {
       return "Sandbox verification failed. Check the configured runtime and sandbox provider.";
+    }
+    if (error.operation.includes("delegate work item")) {
+      return sanitizePublicRuntimeError(error.message);
+    }
+    if (error.operation.includes("collect implementation evidence")) {
+      return sanitizePublicRuntimeError(error.message);
     }
     return "The execution runtime is unavailable or could not complete the requested operation.";
   }
@@ -1415,11 +2939,64 @@ function publicErrorMessage(error: unknown): string {
     return error.message.slice(0, 240);
   }
   if (error instanceof MissionDomainError) {
+    if (/allowed file scope|outside .* scope|exit-preserving|content-bearing diff/i.test(error.message)) {
+      return sanitizePublicRuntimeError(error.message);
+    }
+    if (["conflict", "invalid_transition", "dependency_blocked", "invalid_input"].includes(error.code)) {
+      return error.message.slice(0, 240);
+    }
     return error.code === "not_found"
       ? "The requested mission state was not found."
       : "The mission state operation could not be completed.";
   }
   return "Mission Control could not complete the requested operation.";
+}
+
+function missionFailureReason(error: unknown): string {
+  const message = error instanceof Error
+    ? error.message
+    : "Mission Control encountered an unknown failure.";
+  return message
+    .replace(/authorization\s*[:=]\s*bearer\s+[^\s,;]+/gi, "[redacted]")
+    .replace(/\b(?:api[_-]?key|token|password|secret|credential|cookie)\s*[:=]\s*[^\s,;]+/gi, "[redacted]")
+    .replace(/\bBearer\s+[^\s,;]+/gi, "[redacted]")
+    .slice(0, 2_000);
+}
+
+function isRecoverableImplementationProofFailure(error: unknown): boolean {
+  if (error instanceof TrueForgeIntegrationError) {
+    return error.operation === "prove implementation" ||
+      error.operation === "run sandbox verification";
+  }
+  return error instanceof MissionDomainError &&
+    (error.code === "invalid_input" || error.code === "invalid_transition");
+}
+
+function missionFailureClassification(error: unknown): {
+  layer: DiagnosticFailureLayer;
+  category: DiagnosticFailureCategory;
+} {
+  if (error instanceof TrueForgeIntegrationError) {
+    const operation = error.operation.toLowerCase();
+    if (operation.includes("inspect") || operation.includes("repository")) {
+      return { layer: "tool", category: "mcp" };
+    }
+    if (operation.includes("sandbox")) {
+      return { layer: "tool", category: "sandbox" };
+    }
+    return { layer: "trueforge", category: "runtime" };
+  }
+  if (error instanceof MissionDomainError) {
+    return { layer: "proof_board", category: "policy" };
+  }
+  return { layer: "proof_board", category: "pipeline" };
+}
+
+function sanitizePublicRuntimeError(message: string): string {
+  return message
+    .replace(/(authorization\s*[:=]\s*bearer\s+)[^\s,;]+/gi, "$1[redacted]")
+    .replace(/((?:api[_-]?key|token|password|secret)\s*[:=]\s*)[^\s,;]+/gi, "$1[redacted]")
+    .slice(0, 240);
 }
 
 const INDEX_HTML = `<!doctype html>

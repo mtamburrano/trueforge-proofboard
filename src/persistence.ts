@@ -18,6 +18,8 @@ function errorCode(value: unknown): string | undefined {
 }
 
 export class JsonMissionRepository implements MissionRepository {
+  private writeQueue: Promise<void> = Promise.resolve();
+
   constructor(private readonly filePath: string) {
     if (filePath.trim().length === 0) {
       throw new MissionDomainError("invalid_input", "The mission state file path must not be empty.");
@@ -25,6 +27,46 @@ export class JsonMissionRepository implements MissionRepository {
   }
 
   async load(): Promise<MissionState | null> {
+    await this.writeQueue;
+    return this.loadCurrent();
+  }
+
+  async saveIfRevision(state: MissionState, expectedRevision: number): Promise<void> {
+    if (!Number.isInteger(expectedRevision) || expectedRevision < 0) {
+      throw new MissionDomainError(
+        "invalid_input",
+        "expectedRevision must be a non-negative integer.",
+      );
+    }
+    const validated = validateMissionState(state);
+    return this.enqueue(async () => {
+      const current = await this.loadCurrent();
+      const actualRevision = current?.revision ?? 0;
+      if (actualRevision !== expectedRevision) {
+        throw new MissionDomainError(
+          "conflict",
+          `Mission state changed from revision ${expectedRevision}; reload before saving again.`,
+        );
+      }
+      await this.writeValidated(validated);
+    });
+  }
+
+  async save(state: MissionState): Promise<void> {
+    const validated = validateMissionState(state);
+    return this.enqueue(() => this.writeValidated(validated));
+  }
+
+  private enqueue(operation: () => Promise<void>): Promise<void> {
+    const next = this.writeQueue.then(operation);
+    this.writeQueue = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    return next;
+  }
+
+  private async loadCurrent(): Promise<MissionState | null> {
     let raw: string;
     try {
       raw = await readFile(this.filePath, "utf8");
@@ -61,8 +103,7 @@ export class JsonMissionRepository implements MissionRepository {
     }
   }
 
-  async save(state: MissionState): Promise<void> {
-    const validated = validateMissionState(state);
+  private async writeValidated(validated: MissionState): Promise<void> {
     const directory = dirname(this.filePath);
     const temporaryPath = join(
       directory,

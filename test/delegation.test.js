@@ -12,7 +12,10 @@ import {
   TrueForgeIntegrationError,
   TrueForgeMissionRunner,
   buildWorkPacket,
+  DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
+  buildDelegatedWorkspaceDeltaCommand,
 } from "../dist/index.js";
+import { workspaceDeltaEvidenceDetails } from "./delegated-proof-fixture.js";
 
 function fixedClock() {
   return new Date("2026-08-27T12:00:00.000Z");
@@ -28,7 +31,46 @@ function fakeStream(events) {
   };
 }
 
-function delegatedEvents({ malformedCompletion = false, includeThread = true } = {}) {
+const WORKSPACE_TREE = "a".repeat(40);
+const WORKSPACE_END_TREE = "b".repeat(40);
+const WORKSPACE_SNAPSHOT_INTENT =
+  "Capture the coordinator-owned workspace tree before delegated implementation starts.";
+const WORKSPACE_DELTA_INTENT =
+  "Capture the coordinator-owned current work-item and cumulative mission workspace deltas after delegated implementation.";
+
+function coordinatorEvents(command, output, turnId, intent = WORKSPACE_SNAPSHOT_INTENT) {
+  const callId = `${turnId}-call`;
+  return [
+    { type: "turn.created", id: `${turnId}-created`, turnId, threadId: null, state: { status: "running" } },
+    {
+      type: "model.message",
+      id: `${turnId}-model`,
+      threadId: "main",
+      toolCalls: [{
+        id: callId,
+        function: { name: "exec", arguments: JSON.stringify({ intent, command }) },
+      }],
+    },
+    {
+      type: "tool.response",
+      id: `${turnId}-response`,
+      threadId: "main",
+      toolCallId: callId,
+      content: JSON.stringify({ success: true, response: { exitCode: 0, result: output } }),
+    },
+    { type: "turn.done", id: `${turnId}-done`, threadId: null, state: { status: "done", requiredActions: [] } },
+  ];
+}
+
+function workspaceDeltaFixture() {
+  return JSON.parse(workspaceDeltaEvidenceDetails({
+    startTreeRef: WORKSPACE_TREE,
+    missionStartTreeRef: WORKSPACE_TREE,
+    endTreeRef: WORKSPACE_END_TREE,
+  }));
+}
+
+function delegatedEvents({ malformedCompletion = false, includeThread = true, threadError } = {}) {
   const events = [
     {
       type: "turn.created",
@@ -54,6 +96,74 @@ function delegatedEvents({ malformedCompletion = false, includeThread = true } =
       },
     });
     events.push({
+      type: "model.message",
+      id: "event-proof-model",
+      createdAt: "2026-08-27T12:00:02.500Z",
+      threadId: "thread-subagent",
+      toolCalls: [
+        {
+          id: "call-proof-checks",
+          function: {
+            name: "exec",
+            arguments: JSON.stringify({ command: "npm run typecheck && npm test" }),
+          },
+        },
+        {
+          id: "call-proof-manifest",
+          function: {
+            name: "exec",
+            arguments: JSON.stringify({ command: "git status --porcelain=v1 -z --untracked-files=all" }),
+          },
+        },
+        {
+          id: "call-proof-diff",
+          function: { name: "exec", arguments: JSON.stringify({ command: "git diff" }) },
+        },
+      ],
+    });
+    events.push({
+      type: "tool.response",
+      id: "event-proof-checks-response",
+      createdAt: "2026-08-27T12:00:02.600Z",
+      threadId: "thread-subagent",
+      toolCallId: "call-proof-checks",
+      content: JSON.stringify({
+        success: true,
+        response: {
+          exitCode: 0,
+          result: "typecheck passed\ntests passed\n",
+        },
+      }),
+    });
+    events.push({
+      type: "tool.response",
+      id: "event-proof-manifest-response",
+      createdAt: "2026-08-27T12:00:02.650Z",
+      threadId: "thread-subagent",
+      toolCallId: "call-proof-manifest",
+      content: JSON.stringify({
+        success: true,
+        response: {
+          exitCode: 0,
+          result: " M src/index.ts\u0000 M test/index.test.js\u0000",
+        },
+      }),
+    });
+    events.push({
+      type: "tool.response",
+      id: "event-proof-diff-response",
+      createdAt: "2026-08-27T12:00:02.700Z",
+      threadId: "thread-subagent",
+      toolCallId: "call-proof-diff",
+      content: JSON.stringify({
+        success: true,
+        response: {
+          exitCode: 0,
+          result: "diff --git a/src/index.ts b/src/index.ts\n@@ -1 +1,2 @@\n+export const changed = true;\ndiff --git a/test/index.test.js b/test/index.test.js\n@@ -1 +1,2 @@\n+test(\"changed\", () => {});",
+        },
+      }),
+    });
+    events.push({
       type: "thread.done",
       id: "event-thread-done",
       createdAt: "2026-08-27T12:00:03.000Z",
@@ -61,7 +171,8 @@ function delegatedEvents({ malformedCompletion = false, includeThread = true } =
       title: "Bounded implementer",
       state: malformedCompletion
         ? { status: "done" }
-        : {
+        : threadError === undefined
+        ? {
             status: "done",
             output: {
               type: "model.message",
@@ -70,7 +181,8 @@ function delegatedEvents({ malformedCompletion = false, includeThread = true } =
               threadId: "thread-subagent",
               content: "The bounded work completed.",
             },
-          },
+          }
+        : { status: "error", error: threadError },
     });
   }
   events.push({
@@ -84,7 +196,8 @@ function delegatedEvents({ malformedCompletion = false, includeThread = true } =
 }
 
 function fakeClient(events) {
-  const calls = { create: [], turns: [] };
+  const calls = { create: [], updates: [], turns: [] };
+  let turnNumber = 0;
   return {
     calls,
     client: {
@@ -96,8 +209,29 @@ function fakeClient(events) {
         async get(sessionId) {
           return { data: { id: sessionId } };
         },
+        async update(sessionId, request) {
+          calls.updates.push({ sessionId, request });
+          return { data: { id: sessionId } };
+        },
         async createTurnStream(sessionId, request) {
           calls.turns.push({ sessionId, request });
+          const current = turnNumber++;
+          if (current === 0) {
+            return fakeStream(coordinatorEvents(
+              DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
+              `TRUEFORGE_WORKSPACE_TREE ${WORKSPACE_TREE}\n`,
+              "turn-workspace-start",
+            ));
+          }
+          if (current === 2) {
+            const delta = workspaceDeltaFixture();
+            return fakeStream(coordinatorEvents(
+              buildDelegatedWorkspaceDeltaCommand(WORKSPACE_TREE, WORKSPACE_TREE),
+              delta.output,
+              "turn-workspace-delta",
+              WORKSPACE_DELTA_INTENT,
+            ));
+          }
           return fakeStream(events);
         },
       },
@@ -109,7 +243,7 @@ async function delegatedFixture({ events = delegatedEvents(), repository = new I
   const missions = new MissionService(repository, fixedClock);
   const { client, calls } = fakeClient(events);
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "alibaba/qwen3-7-plus",
+    model: "alibaba/qwen3-8-max",
     dynamicSubAgents: true,
   });
   const mission = await runner.createMission({
@@ -123,6 +257,7 @@ async function delegatedFixture({ events = delegatedEvents(), repository = new I
     purpose: "Apply the requested change after inspection.",
     acceptanceCriteria: ["The bounded change is complete."],
     assignedRole: "implementer",
+    allowedFiles: ["src/index.ts", "test/index.test.js"],
     status: "ready",
   });
   await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
@@ -149,9 +284,13 @@ test("native dynamic delegation sends a bounded durable Work Packet and persists
 
   assert.equal(result.turnId, "turn-delegated");
   assert.equal(calls.create[0].agent.spec.config.dynamicSubAgents.enabled, true);
-  const prompt = calls.turns[0].request.input[0].content;
+  const prompt = calls.turns[1].request.input[0].content;
   assert.match(prompt, /Work Packet:/);
   assert.match(prompt, /Implement src\/index\.ts/);
+  assert.match(prompt, /allowedFiles/);
+  assert.match(prompt, /may modify only these explicitly allowed repository files/);
+  assert.match(prompt, /coordinator independently captures the complete current work-item delta/i);
+  assert.match(prompt, /git diff -- <allowed file>/);
   assert.match(prompt, /The bounded change is complete/);
   assert.doesNotMatch(prompt, /must not enter the packet/);
   assert.equal(dependency.id, "evidence-dependency");
@@ -165,6 +304,8 @@ test("native dynamic delegation sends a bounded durable Work Packet and persists
     startedAt: "2026-08-27T12:00:00.000Z",
     updatedAt: "2026-08-27T12:00:00.000Z",
     turnId: "turn-delegated",
+    startTreeRef: WORKSPACE_TREE,
+    missionStartTreeRef: WORKSPACE_TREE,
   });
   assert.equal(persisted.status, "in_progress");
 });
@@ -218,6 +359,31 @@ test("malformed or missing native subagent completion fails closed", async () =>
   assert.equal(item.delegation, undefined);
 });
 
+test("native subagent error reasons remain durable and visible", async () => {
+  const reason = "Agent loop stopped after the sandbox runtime reported npm was unavailable.";
+  const failed = await delegatedFixture({
+    events: delegatedEvents({ threadError: reason }),
+  });
+
+  await assert.rejects(
+    failed.runner.runTurn(failed.mission.id, "Delegate the bounded change.", {
+      workItemId: failed.workItem.id,
+      delegateToSubagent: true,
+    }),
+    (error) => error instanceof TrueForgeIntegrationError && error.message.includes(reason),
+  );
+
+  const state = await failed.missions.getState();
+  const item = state.workItems.find((candidate) => candidate.id === failed.workItem.id);
+  assert.equal(item.delegation.status, "failed");
+  assert.equal(item.delegation.error, reason);
+  const threadFailure = state.evidence.find((evidence) =>
+    evidence.summary.includes(reason)
+  );
+  assert.ok(threadFailure, "the concrete thread error should be recorded as runtime evidence");
+  assert.match(threadFailure.details, new RegExp(reason.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+});
+
 test("Work Packets contain only scoped durable state and domain delegation enforces readiness", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
   const mission = await missions.createMission({
@@ -238,6 +404,7 @@ test("Work Packets contain only scoped durable state and domain delegation enfor
     acceptanceCriteria: ["Child is complete."],
     dependsOn: [root.id],
     assignedRole: "implementer",
+    allowedFiles: ["src/index.ts"],
   });
   const packet = buildWorkPacket(mission, child, {
     workItems: (await missions.getState()).workItems,
@@ -265,9 +432,12 @@ test("Work Packets contain only scoped durable state and domain delegation enfor
   await missions.transitionWorkItem(mission.id, root.id, "complete");
   await missions.transitionWorkItem(mission.id, child.id, "ready");
   await missions.transitionWorkItem(mission.id, child.id, "in_progress");
+  await missions.attachTrueforgeWorkspaceBaseline(mission.id, WORKSPACE_TREE);
   const started = await missions.startWorkItemDelegation(mission.id, child.id, {
     owner: "bounded-implementer",
     threadId: "thread-child",
+    startTreeRef: WORKSPACE_TREE,
+    missionStartTreeRef: WORKSPACE_TREE,
   });
   assert.equal(started.delegation.status, "running");
 });

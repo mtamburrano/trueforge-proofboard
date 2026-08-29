@@ -1,4 +1,4 @@
-export const DEFAULT_TRUEFORGE_MODEL = "alibaba/qwen3-7-plus";
+export const DEFAULT_TRUEFORGE_MODEL = "alibaba/qwen3-8-max";
 
 export interface MissionRuntimeConfig {
   host: string;

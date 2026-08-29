@@ -11,6 +11,10 @@ import {
   MissionDomainError,
   MissionService,
 } from "../dist/index.js";
+import {
+  persistWorkspaceStart,
+  workspaceDeltaEvidenceDetails,
+} from "./delegated-proof-fixture.js";
 
 const ORIGIN = {
   kind: "trueforge",
@@ -32,6 +36,8 @@ async function reviewFixture({
   includeDiff = true,
   diffCommand = "git diff",
   diffOutput = "diff --git a/src/index.ts b/src/index.ts\n--- a/src/index.ts\n+++ b/src/index.ts\n@@ -1 +1,2 @@\n before\n+after\ndiff --git a/test/index.test.js b/test/index.test.js\n--- a/test/index.test.js\n+++ b/test/index.test.js\n@@ -1 +1,2 @@\n before\n+after",
+  allowedFiles = ["src/index.ts", "test/index.test.js"],
+  manifestFiles = ["src/index.ts", "test/index.test.js"],
 } = {}) {
   const missions = new MissionService(repository, fixedClock);
   const mission = await missions.createMission({
@@ -46,13 +52,14 @@ async function reviewFixture({
     acceptanceCriteria: ["The changed state is reviewed with passing checks."],
     requiredChecks: ["typecheck", "test"],
     assignedRole: "implementer",
+    allowedFiles,
     status: "ready",
   });
   await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
-  await missions.startWorkItemDelegation(mission.id, workItem.id, {
-    owner: "bounded-implementer",
-    threadId: ORIGIN.threadId,
+  await persistWorkspaceStart(missions, mission.id, workItem.id, {
+    sessionId: ORIGIN.sessionId,
     turnId: ORIGIN.turnId,
+    threadId: ORIGIN.threadId,
   });
   await missions.completeWorkItemDelegation(mission.id, workItem.id, {
     threadId: ORIGIN.threadId,
@@ -77,7 +84,26 @@ async function reviewFixture({
     summary: "The tests passed in the delegated execution.",
     executionOrigin: { ...ORIGIN, toolCallId: "call-review-test" },
   });
-  const evidenceIds = [typecheck.id, tests.id];
+  const manifest = await missions.addEvidence(mission.id, {
+    id: "evidence-review-manifest",
+    workItemId: workItem.id,
+    kind: "file_change",
+    result: "passed",
+    source: "trueforge",
+    summary: "The delegated execution returned the complete changed-file manifest.",
+    details: workspaceDeltaEvidenceDetails({
+      currentFiles: manifestFiles,
+      cumulativeFiles: manifestFiles,
+    }),
+    executionOrigin: {
+      kind: "trueforge",
+      sessionId: ORIGIN.sessionId,
+      turnId: "turn-workspace-delta",
+      threadId: "main",
+      toolCallId: "call-review-manifest",
+    },
+  });
+  const evidenceIds = [typecheck.id, tests.id, manifest.id];
   if (includeDiff) {
     const diff = await missions.addEvidence(mission.id, {
       id: "evidence-review-diff",
@@ -224,6 +250,8 @@ test("deterministic verifier derives acceptance, changes, and blocking from revi
 test("independent review rejects a content diff that contradicts the handoff files", async () => {
   const { missions, mission, workItem } = await reviewFixture({
     diffOutput: "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n before\n+after",
+    allowedFiles: ["src/index.ts", "test/index.test.js", "README.md"],
+    manifestFiles: ["README.md"],
   });
   const context = await missions.getReviewContext(mission.id, workItem.id);
   const decision = new DeterministicImplementationVerifier().review(context);
@@ -281,7 +309,10 @@ test("changes requested returns work to ready while preserving prior attempts an
   assert.equal(state.workItems[0].status, "ready");
   assert.equal(state.handoffs.length, 1);
   assert.equal(state.handoffs[0].id, handoff.id);
-  assert.deepEqual(state.evidence.slice(0, evidenceIds.length).map((item) => item.id), evidenceIds);
+  assert.deepEqual(
+    state.evidence.filter((item) => evidenceIds.includes(item.id)).map((item) => item.id),
+    evidenceIds,
+  );
   assert.equal(state.reviews.length, 1);
   assert.equal(state.reviews[0].id, review.id);
   assert.equal(state.evidence.at(-1).id, review.findingEvidenceId);

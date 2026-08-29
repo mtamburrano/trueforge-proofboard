@@ -42,6 +42,7 @@ function graph() {
         acceptanceCriteria: ["The requested behavior is implemented."],
         dependsOn: ["inspect"],
         assignedRole: "implementer",
+        allowedFiles: ["src/index.ts"],
       },
       {
         id: "verify",
@@ -77,21 +78,20 @@ test("the repository planner derives bounded work from verified inspection facts
     },
   });
 
-  assert.equal(planned.items.length, 4);
+  assert.equal(planned.items.length, 3);
   assert.deepEqual(planned.items.map((item) => item.assignedRole), [
     "planner",
-    "implementer",
     "implementer",
     "reviewer",
   ]);
   assert.deepEqual(planned.items.map((item) => item.dependsOn), [
     [],
     ["primary-inspect"],
-    ["primary-inspect"],
-    ["primary-implement-1-src-index-ts", "primary-implement-2-test-index-test-js"],
+    ["primary-implement"],
   ]);
   assert.equal(planned.items.every((item) => item.acceptanceCriteria.length > 0), true);
   assert.match(planned.items[1].purpose, /src\/index\.ts/);
+  assert.deepEqual(planned.items[1].allowedFiles, ["src/index.ts", "test/index.test.js"]);
   assert.match(planned.items[0].acceptanceCriteria[0], /sha256:verified/);
 
   const documentationPlan = planner.plan({
@@ -111,12 +111,9 @@ test("the repository planner derives bounded work from verified inspection facts
   assert.equal(documentationPlan.items.length, 3);
   assert.deepEqual(
     documentationPlan.items.map((item) => item.id),
-    ["primary-inspect", "primary-implement-1-docs-usage-md", "primary-verify"],
+    ["primary-inspect", "primary-implement", "primary-verify"],
   );
-  assert.notDeepEqual(
-    documentationPlan.items.map(({ id, dependsOn }) => ({ id, dependsOn })),
-    planned.items.map(({ id, dependsOn }) => ({ id, dependsOn })),
-  );
+  assert.deepEqual(documentationPlan.items[1].allowedFiles, ["docs/usage.md"]);
 });
 
 test("the primary objective authorizes both source and verified focused-test surfaces", () => {
@@ -144,10 +141,11 @@ test("the primary objective authorizes both source and verified focused-test sur
   const implementers = planned.items.filter((item) => item.assignedRole === "implementer");
   assert.deepEqual(
     implementers.map((item) => item.id),
-    ["primary-implement-1-src-index-ts", "primary-implement-2-test-index-test-js"],
+    ["primary-implement"],
   );
   assert.match(implementers[0].purpose, /src\/index\.ts/);
-  assert.match(implementers[1].purpose, /test\/index\.test\.js/);
+  assert.match(implementers[0].purpose, /test\/index\.test\.js/);
+  assert.deepEqual(implementers[0].allowedFiles, ["src/index.ts", "test/index.test.js"]);
   assert.deepEqual(
     planned.items.find((item) => item.assignedRole === "reviewer").dependsOn,
     implementers.map((item) => item.id),
@@ -227,6 +225,7 @@ test("invalid planning output fails closed without partially executable state", 
           acceptanceCriteria: ["Never executable."],
           dependsOn: ["cycle-a"],
           assignedRole: "implementer",
+          allowedFiles: ["src/index.ts"],
         },
       ],
     }),
@@ -260,6 +259,7 @@ test("graph-size bounds reject oversized and ambiguous plans", () => {
       acceptanceCriteria: ["The item is bounded."],
       dependsOn: [],
       assignedRole: "implementer",
+      allowedFiles: [`src/file-${index}.ts`],
     })),
   };
   assert.throws(() => validateWorkGraph(oversized), domainError("invalid_input"));

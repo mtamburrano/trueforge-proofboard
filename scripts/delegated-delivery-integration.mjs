@@ -5,6 +5,8 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 import {
+  buildDelegatedWorkspaceDeltaCommand,
+  DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
   JsonMissionRepository,
   MissionDomainError,
   MissionService,
@@ -28,6 +30,7 @@ export const DELEGATED_DELIVERY_FIXTURE = Object.freeze({
         dependsOn: [],
         assignedRole: "implementer",
         requiredChecks: ["typecheck", "test"],
+        allowedFiles: ["src/turn-1.ts", "test/turn-1.test.js"],
       },
       {
         id: "proof-loop-dependent",
@@ -37,6 +40,12 @@ export const DELEGATED_DELIVERY_FIXTURE = Object.freeze({
         dependsOn: ["proof-loop-root"],
         assignedRole: "implementer",
         requiredChecks: ["typecheck", "test"],
+        allowedFiles: [
+          "src/turn-2.ts",
+          "test/turn-2.test.js",
+          "src/turn-3.ts",
+          "test/turn-3.test.js",
+        ],
       },
       {
         id: "proof-loop-terminal",
@@ -46,6 +55,7 @@ export const DELEGATED_DELIVERY_FIXTURE = Object.freeze({
         dependsOn: ["proof-loop-dependent"],
         assignedRole: "implementer",
         requiredChecks: ["typecheck", "test"],
+        allowedFiles: ["src/turn-4.ts", "test/turn-4.test.js"],
       },
     ],
   },
@@ -63,6 +73,54 @@ function fakeStream(events) {
       }
     },
   };
+}
+
+const WORKSPACE_BASELINE_TREE = "a".repeat(40);
+const WORKSPACE_SNAPSHOT_INTENT =
+  "Capture the coordinator-owned workspace tree before delegated implementation starts.";
+const WORKSPACE_DELTA_INTENT =
+  "Capture the coordinator-owned current work-item and cumulative mission workspace deltas after delegated implementation.";
+
+function treeRefForAttempt(attempt) {
+  return String.fromCharCode("a".charCodeAt(0) + attempt - 1).repeat(40);
+}
+
+function coordinatorEvents(command, output, turnId, intent = WORKSPACE_SNAPSHOT_INTENT) {
+  const callId = `${turnId}-call`;
+  return [
+    { type: "turn.created", id: `${turnId}-created`, turnId, threadId: null, state: { status: "running" } },
+    {
+      type: "model.message",
+      id: `${turnId}-model`,
+      threadId: "main",
+      toolCalls: [{
+        id: callId,
+        function: { name: "exec", arguments: JSON.stringify({ intent, command }) },
+      }],
+    },
+    {
+      type: "tool.response",
+      id: `${turnId}-response`,
+      threadId: "main",
+      toolCallId: callId,
+      content: JSON.stringify({ success: true, response: { exitCode: 0, result: output } }),
+    },
+    { type: "turn.done", id: `${turnId}-done`, threadId: null, state: { status: "done", requiredActions: [] } },
+  ];
+}
+
+function workspaceDeltaOutput(startTreeRef, missionStartTreeRef, endTreeRef, currentFiles, cumulativeFiles) {
+  const statusOutput = (files) => files.map((file) => `M\t${file}`).join("\n");
+  return [
+    `TRUEFORGE_WORKSPACE_DELTA start=${startTreeRef} mission_start=${missionStartTreeRef} end=${endTreeRef}`,
+    "TRUEFORGE_WORKSPACE_DELTA current_begin",
+    statusOutput(currentFiles),
+    "TRUEFORGE_WORKSPACE_DELTA current_end",
+    "TRUEFORGE_WORKSPACE_DELTA cumulative_begin",
+    statusOutput(cumulativeFiles),
+    "TRUEFORGE_WORKSPACE_DELTA cumulative_end",
+    "",
+  ].join("\n");
 }
 
 function delegatedEvents(attempt, { malformedCompletion = false } = {}) {
@@ -115,6 +173,13 @@ function delegatedEvents(attempt, { malformedCompletion = false } = {}) {
           },
         },
         {
+          id: `call-manifest-${attempt}`,
+          function: {
+            name: "exec",
+            arguments: JSON.stringify({ command: "git status --porcelain=v1 -z --untracked-files=all" }),
+          },
+        },
+        {
           id: `call-diff-${attempt}`,
           function: {
             name: "exec",
@@ -127,6 +192,11 @@ function delegatedEvents(attempt, { malformedCompletion = false } = {}) {
       `event-check-response-${attempt}`,
       `call-check-${attempt}`,
       "typecheck passed\ntests passed\n",
+    ),
+    response(
+      `event-manifest-response-${attempt}`,
+      `call-manifest-${attempt}`,
+      ` M ${sourceFile}\u0000 M ${testFile}\u0000`,
     ),
     response(
       `event-diff-response-${attempt}`,
@@ -166,7 +236,8 @@ function delegatedEvents(attempt, { malformedCompletion = false } = {}) {
 }
 
 function fakeClient({ sessionId, malformedCompletion = false }) {
-  const calls = { create: [], get: [], turns: [] };
+  const calls = { create: [], get: [], updates: [], turns: [] };
+  let turnNumber = 0;
   return {
     calls,
     client: {
@@ -179,9 +250,45 @@ function fakeClient({ sessionId, malformedCompletion = false }) {
           calls.get.push(requestedSessionId);
           return { data: { id: requestedSessionId } };
         },
+        async update(requestedSessionId, request) {
+          calls.updates.push({ sessionId: requestedSessionId, request });
+          return { data: { id: requestedSessionId } };
+        },
         async createTurnStream(requestedSessionId, request) {
-          const attempt = `turn-${calls.turns.length + 1}`;
+          const currentTurnNumber = turnNumber++;
+          const attemptNumber = Math.floor(currentTurnNumber / 3) + 1;
+          const attempt = `turn-${attemptNumber}`;
           calls.turns.push({ sessionId: requestedSessionId, request });
+          if (currentTurnNumber % 3 === 0) {
+            const startTreeRef = treeRefForAttempt(attemptNumber);
+            return fakeStream(coordinatorEvents(
+              DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
+              `TRUEFORGE_WORKSPACE_TREE ${startTreeRef}\n`,
+              `turn-proof-loop-start-${attemptNumber}`,
+            ));
+          }
+          if (currentTurnNumber % 3 === 2) {
+            const startTreeRef = treeRefForAttempt(attemptNumber);
+            const endTreeRef = treeRefForAttempt(attemptNumber + 1);
+            const currentFiles = [`src/${attempt}.ts`, `test/${attempt}.test.js`];
+            const cumulativeFiles = Array.from({ length: attemptNumber }, (_, index) => {
+              const fileAttempt = `turn-${index + 1}`;
+              return [`src/${fileAttempt}.ts`, `test/${fileAttempt}.test.js`];
+            }).flat();
+            const command = buildDelegatedWorkspaceDeltaCommand(startTreeRef, WORKSPACE_BASELINE_TREE);
+            return fakeStream(coordinatorEvents(
+              command,
+              workspaceDeltaOutput(
+                startTreeRef,
+                WORKSPACE_BASELINE_TREE,
+                endTreeRef,
+                currentFiles,
+                cumulativeFiles,
+              ),
+              `turn-proof-loop-delta-${attemptNumber}`,
+              WORKSPACE_DELTA_INTENT,
+            ));
+          }
           return fakeStream(delegatedEvents(attempt, { malformedCompletion }));
         },
       },
@@ -191,7 +298,7 @@ function fakeClient({ sessionId, malformedCompletion = false }) {
 
 function runnerFor(missions, client) {
   return new TrueForgeMissionRunner(missions, client, {
-    model: "alibaba/qwen3-7-plus",
+    model: "alibaba/qwen3-8-max",
     dynamicSubAgents: true,
   });
 }
@@ -251,6 +358,7 @@ async function runMalformedScenario(repository) {
       {
         ...DELEGATED_DELIVERY_FIXTURE.graph.items[0],
         id: "proof-loop-malformed-root",
+        allowedFiles: ["src/turn-1.ts", "test/turn-1.test.js"],
       },
       {
         ...DELEGATED_DELIVERY_FIXTURE.graph.items[1],
@@ -276,7 +384,7 @@ async function runMalformedScenario(repository) {
     domainError("dependency_blocked"),
   );
   assert.equal(state.handoffs.filter((handoff) => handoff.missionId === mission.id).length, 0);
-  assert.equal(calls.turns.length, 1);
+  assert.equal(calls.turns.length, 2);
   return {
     missionId: mission.id,
     rootDelegationStatus: root.delegation.status,
@@ -285,12 +393,13 @@ async function runMalformedScenario(repository) {
   };
 }
 
-function twoNodeScenarioGraph(prefix) {
+function twoNodeScenarioGraph(prefix, rootAttempt = "turn-1") {
   return {
     items: [
       {
         ...DELEGATED_DELIVERY_FIXTURE.graph.items[0],
         id: `${prefix}-root`,
+        allowedFiles: [`src/${rootAttempt}.ts`, `test/${rootAttempt}.test.js`],
       },
       {
         ...DELEGATED_DELIVERY_FIXTURE.graph.items[1],
@@ -384,7 +493,7 @@ async function runBlockedReviewScenario(repository) {
   });
   await missions.transitionMission(mission.id, "planning");
   await missions.transitionMission(mission.id, "executing");
-  await missions.persistWorkGraph(mission.id, twoNodeScenarioGraph("proof-loop-blocked"));
+  await missions.persistWorkGraph(mission.id, twoNodeScenarioGraph("proof-loop-blocked", "turn-1"));
   await runImplementation(missions, runner, mission.id, "proof-loop-blocked-root", "blocked-root");
   const historyBeforeReview = {
     handoffs: (await missions.listHandoffs(mission.id, "proof-loop-blocked-root")).length,
@@ -406,7 +515,7 @@ async function runBlockedReviewScenario(repository) {
   const state = await missions.getState();
   assert.equal(state.handoffs.filter((item) => item.missionId === mission.id).length, historyBeforeReview.handoffs);
   assert.equal(
-    state.evidence.filter((item) => item.missionId === mission.id).length,
+    state.evidence.filter((item) => item.missionId === mission.id && item.workItemId === "proof-loop-blocked-root").length,
     historyBeforeReview.evidence + 1,
   );
   return {

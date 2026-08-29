@@ -5,10 +5,12 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  consequentialActions,
   InMemoryMissionRepository,
   JsonMissionRepository,
   MissionDomainError,
   MissionService,
+  requiresHumanApproval,
 } from "../dist/index.js";
 
 function fixedClock() {
@@ -18,6 +20,220 @@ function fixedClock() {
 function domainError(code) {
   return (error) => error instanceof MissionDomainError && error.code === code;
 }
+
+test("action policy keeps discovery read-only and defaults unknown mutations to approval", () => {
+  assert.deepEqual(consequentialActions, ["create_pull_request"]);
+  assert.equal(requiresHumanApproval("inspect_repository"), false);
+  assert.equal(requiresHumanApproval("run_sandbox_verification"), false);
+  assert.equal(requiresHumanApproval("create_pull_request"), true);
+  assert.equal(requiresHumanApproval("unclassified_remote_mutation"), true);
+});
+
+test("protected actions require a durable, matching, current approval", async () => {
+  let now = new Date("2026-08-26T16:00:00.000Z");
+  const service = new MissionService(
+    new InMemoryMissionRepository(),
+    () => now,
+  );
+  const mission = await service.createMission({
+    id: "mission-approval-policy",
+    objective: "Gate a remote delivery",
+  });
+  const evidence = await service.addEvidence(mission.id, {
+    id: "evidence-approval-policy",
+    kind: "test_result",
+    result: "passed",
+    source: "sandbox",
+    summary: "The verified delivery checks passed.",
+  });
+  const request = await service.requestActionApproval(mission.id, {
+    id: "approval-policy",
+    action: "Open the verified delivery",
+    actionType: "create_pull_request",
+    target: "example/proof-board@main",
+    rationale: "A remote repository mutation needs explicit human authorization.",
+    expectedEffect: "Open a pull request containing the verified change.",
+    evidenceIds: [evidence.id],
+  });
+
+  const persisted = await service.getState();
+  assert.equal(persisted.approvals[0].actionType, "create_pull_request");
+  assert.equal(
+    persisted.approvals[0].rationale,
+    "A remote repository mutation needs explicit human authorization.",
+  );
+  assert.deepEqual(persisted.approvals[0].evidenceIds, [evidence.id]);
+  assert.equal(typeof persisted.approvals[0].expiresAt, "string");
+
+  let executions = 0;
+  const action = {
+    action: "create_pull_request",
+    target: "example/proof-board@main",
+    expectedEffect: "Open a pull request containing the verified change.",
+    approvalId: request.id,
+  };
+  await assert.rejects(
+    service.executeProtectedAction(mission.id, { ...action, approvalId: undefined }, () => {
+      executions += 1;
+    }),
+    domainError("approval_blocked"),
+  );
+  assert.equal(executions, 0);
+  await assert.rejects(
+    service.executeProtectedAction(mission.id, action, () => {
+      executions += 1;
+    }),
+    domainError("approval_blocked"),
+  );
+  assert.equal(executions, 0);
+
+  await service.decideApproval(mission.id, request.id, {
+    decision: "rejected",
+    decidedBy: "human-reviewer",
+  });
+  await assert.rejects(
+    service.executeProtectedAction(mission.id, action, () => {
+      executions += 1;
+    }),
+    domainError("approval_blocked"),
+  );
+  assert.equal(executions, 0);
+
+  const approved = await service.requestActionApproval(mission.id, {
+    id: "approval-policy-approved",
+    action: "create_pull_request",
+    target: action.target,
+    rationale: "The verified evidence supports this remote change.",
+    expectedEffect: action.expectedEffect,
+    evidenceIds: [evidence.id],
+  });
+  await service.decideApproval(mission.id, approved.id, {
+    decision: "approved",
+    decidedBy: "human-reviewer",
+  });
+  const result = await service.executeProtectedAction(mission.id, {
+    ...action,
+    approvalId: approved.id,
+  }, () => {
+    executions += 1;
+    return "executed";
+  });
+  assert.equal(result, "executed");
+  assert.equal(executions, 1);
+
+  const readOnlyResult = await service.executeProtectedAction(mission.id, {
+    action: "inspect_repository",
+    target: "example/proof-board@main",
+    expectedEffect: "Read the pinned repository state.",
+  }, () => "discovered");
+  assert.equal(readOnlyResult, "discovered");
+
+  now = new Date("2026-08-26T16:30:00.000Z");
+  await assert.rejects(
+    service.executeProtectedAction(mission.id, {
+      action: "create_pull_request",
+      target: action.target,
+      expectedEffect: action.expectedEffect,
+      approvalId: approved.id,
+    }, () => {
+      executions += 1;
+    }),
+    domainError("approval_blocked"),
+  );
+  assert.equal(executions, 1);
+});
+
+test("malformed approval requests fail before persistence", async () => {
+  const service = new MissionService(new InMemoryMissionRepository(), fixedClock);
+  const mission = await service.createMission({
+    id: "mission-malformed-approval",
+    objective: "Reject malformed approval input",
+  });
+
+  await assert.rejects(
+    service.requestApproval(mission.id, {
+      action: "create_pull_request",
+      target: "example/proof-board@main",
+      expectedEffect: "Open a pull request.",
+      expiresAt: "not-a-timestamp",
+    }),
+    domainError("invalid_input"),
+  );
+  await assert.rejects(
+    service.requestApproval(mission.id, {
+      action: "create_pull_request",
+      target: "example/proof-board@main",
+      rationale: "",
+      expectedEffect: "Open a pull request.",
+    }),
+    domainError("invalid_input"),
+  );
+  await assert.rejects(
+    service.requestActionApproval(mission.id, {
+      action: "create_pull_request",
+      target: "example/proof-board@main",
+      rationale: "A remote mutation needs explicit approval.",
+      expectedEffect: "Open a pull request.",
+    }),
+    domainError("invalid_input"),
+  );
+  await assert.rejects(
+    service.requestActionApproval(mission.id, {
+      action: "create_pull_request",
+      target: "example/proof-board@main",
+      rationale: "A remote mutation needs explicit approval.",
+      expectedEffect: "Open a pull request.",
+      evidenceIds: [],
+    }),
+    domainError("invalid_input"),
+  );
+  assert.deepEqual((await service.getState()).approvals, []);
+});
+
+test("legacy evidence-less approvals load but cannot authorize protected actions", async () => {
+  const service = new MissionService(new InMemoryMissionRepository(), fixedClock);
+  const mission = await service.createMission({
+    id: "mission-legacy-approval",
+    objective: "Keep legacy approval state fail closed",
+  });
+  const evidence = await service.addEvidence(mission.id, {
+    id: "evidence-legacy-approval",
+    kind: "test_result",
+    result: "passed",
+    source: "sandbox",
+    summary: "The delivery checks passed.",
+  });
+  const approval = await service.requestActionApproval(mission.id, {
+    id: "approval-legacy-without-evidence",
+    action: "create_pull_request",
+    target: "example/proof-board@main",
+    rationale: "A remote mutation needs explicit approval.",
+    expectedEffect: "Open a pull request.",
+    evidenceIds: [evidence.id],
+  });
+  await service.decideApproval(mission.id, approval.id, {
+    decision: "approved",
+    decidedBy: "human-reviewer",
+  });
+
+  const legacyState = await service.getState();
+  legacyState.approvals[0].evidenceIds = [];
+  const reloaded = new MissionService(new InMemoryMissionRepository(legacyState), fixedClock);
+  let executions = 0;
+
+  await assert.rejects(
+    reloaded.executeProtectedAction(mission.id, {
+      action: "create_pull_request",
+      target: "example/proof-board@main",
+      expectedEffect: "Open a pull request.",
+      approvalId: approval.id,
+    }, () => {
+      executions += 1;
+    }),
+    domainError("approval_blocked"),
+  );
+  assert.equal(executions, 0);
+});
 
 test("work-item transitions enforce dependencies and a finite state machine", async () => {
   const service = new MissionService(new InMemoryMissionRepository(), fixedClock);
@@ -101,6 +317,20 @@ test("mission lifecycle stores typed evidence, handoffs, approvals, and delivery
     risk: "A remote change will be created.",
     expectedEffect: "Publish the verified patch for review.",
     evidenceIds: [evidence.id],
+    executionContext: {
+      sessionId: "session-delivery",
+      turnId: "turn-approval",
+      threadId: "thread-delivery",
+      toolCallId: "call-create-pr",
+      serverName: "github",
+      toolName: "create_pull_request",
+      repositoryOwner: "example",
+      repositoryName: "proof-board",
+      base: "main",
+      head: "verified-delivery",
+      title: "Publish the verified delivery",
+      body: "Contains only the independently verified fixture change.",
+    },
   });
 
   await service.transitionMission(mission.id, "awaiting_approval");
@@ -109,11 +339,61 @@ test("mission lifecycle stores typed evidence, handoffs, approvals, and delivery
     decidedBy: "human-reviewer",
   });
   await service.transitionMission(mission.id, "verifying");
+  await assert.rejects(
+    service.recordDelivery(mission.id, {
+      status: "delivered",
+      reference: "https://github.com/example/proof-board/pull/999",
+      verificationSummary: "An arbitrary reference must not count as delivery proof.",
+      approvalId: approval.id,
+    }),
+    domainError("invalid_input"),
+  );
+  assert.equal((await service.getMission(mission.id)).status, "verifying");
+  await assert.rejects(
+    service.recordDelivery(mission.id, {
+      status: "delivered",
+      reference: "https://github.com/example/proof-board/pull/1",
+      verificationSummary: "A result from another tool call must not count as delivery proof.",
+      approvalId: approval.id,
+      pullRequest: {
+        number: 1,
+        url: "https://github.com/example/proof-board/pull/1",
+        repositoryOwner: "example",
+        repositoryName: "proof-board",
+        base: "main",
+        head: "verified-delivery",
+      },
+      executionOrigin: {
+        kind: "mcp",
+        sessionId: "session-delivery",
+        turnId: "turn-unrelated-result",
+        threadId: "thread-delivery",
+        toolCallId: "call-unrelated",
+      },
+    }),
+    domainError("approval_blocked"),
+  );
   const delivery = await service.recordDelivery(mission.id, {
     id: "delivery-lifecycle",
     status: "delivered",
-    reference: "https://example.test/review/1",
+    reference: "https://github.com/example/proof-board/pull/1",
     verificationSummary: "Evidence and approval checks passed.",
+    approvalId: approval.id,
+    pullRequest: {
+      number: 1,
+      url: "https://github.com/example/proof-board/pull/1",
+      repositoryOwner: "example",
+      repositoryName: "proof-board",
+      base: "main",
+      head: "verified-delivery",
+    },
+    executionOrigin: {
+      kind: "mcp",
+      sessionId: "session-delivery",
+      turnId: "turn-delivery-result",
+      threadId: "thread-delivery",
+      toolCallId: "call-create-pr",
+    },
   });
 
   const state = await service.getState();
@@ -122,6 +402,9 @@ test("mission lifecycle stores typed evidence, handoffs, approvals, and delivery
   assert.equal(state.handoffs[0].result, "done");
   assert.equal(state.approvals[0].decision, "approved");
   assert.equal(delivery.status, "delivered");
+  assert.equal(delivery.pullRequest.number, 1);
+  assert.equal(delivery.approvalId, approval.id);
+  assert.equal(delivery.executionOrigin.turnId, "turn-delivery-result");
   assert.equal(handoff.memoryImpact, "medium");
 });
 

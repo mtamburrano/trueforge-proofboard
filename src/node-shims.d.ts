@@ -36,6 +36,7 @@ declare module "node:http" {
   }
 
   interface Server {
+    address(): string | { port: number } | null;
     listen(port: number, host: string, callback: () => void): void;
   }
 
