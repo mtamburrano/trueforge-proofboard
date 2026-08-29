@@ -1865,6 +1865,17 @@ function requireCurrentDeliveryApprovalCorrelation(
     ...proofEvidenceIds,
     review.findingEvidenceId,
   ])];
+  const currentFinding = state.evidence.find((evidence) =>
+    evidence.workItemId === workItem.id &&
+    evidence.attempt === workItem.attempt &&
+    ["sandbox", "reviewer"].includes(evidence.source) &&
+    evidence.result === "failed",
+  );
+  if (currentFinding !== undefined) {
+    throw new MissionControlError(
+      `The delivery approval is stale; the current attempt has an unresolved ${currentFinding.source} finding.`,
+    );
+  }
   if (
     !isPrimaryDeliveryApproval(approval) ||
     approval.workItemId !== workItem.id ||
