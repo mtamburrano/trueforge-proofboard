@@ -332,10 +332,12 @@ function zeroToolEvents(
   turnId = "turn-1",
   {
     content = "I completed the turn without invoking a tool.",
+    includeSandboxCreated = false,
+    sandboxId = "sandbox-1",
     turnState = { status: "done", requiredActions: [] },
   } = {},
 ) {
-  return [
+  const events = [
     {
       type: "turn.created",
       id: `${turnId}-created`,
@@ -344,6 +346,17 @@ function zeroToolEvents(
       turnId,
       state: { status: "running" },
     },
+  ];
+  if (includeSandboxCreated) {
+    events.push({
+      type: "sandbox.created",
+      id: `${turnId}-sandbox`,
+      createdAt: "2026-08-29T08:00:00.500Z",
+      threadId: null,
+      sandboxId,
+    });
+  }
+  events.push(
     {
       type: "model.message",
       id: `${turnId}-model`,
@@ -358,7 +371,8 @@ function zeroToolEvents(
       threadId: null,
       state: turnState,
     },
-  ];
+  );
+  return events;
 }
 
 function pullRequestReadbackEvents(
@@ -1349,10 +1363,12 @@ test("repository-read coordinator retries one completed zero-tool turn on the sa
   assert.equal((await missions.getState()).missions[0].trueforgeTurnId, "turn-2");
 });
 
-test("sandbox proof retries at most twice after completed zero-tool omissions", async () => {
+test("sandbox proof retries twice after consecutive zero-tool omissions and preserves continuity", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client, calls } = fakeClient((turnId) =>
-    turnId === "turn-1" ? zeroToolEvents(turnId) : sandboxEvents(turnId),
+    turnId === "turn-1" || turnId === "turn-2"
+      ? zeroToolEvents(turnId, { includeSandboxCreated: true })
+      : sandboxEvents(turnId),
   );
   const runner = new TrueForgeMissionRunner(missions, client, {
     model: "openai/gpt-5-6-luna",
@@ -1368,14 +1384,42 @@ test("sandbox proof retries at most twice after completed zero-tool omissions", 
   });
 
   assert.equal(verification.exitCode, 0);
-  assert.equal(calls.turns.length, 2);
-  assert.equal(calls.turns[1].request.previousTurnId, "turn-1");
+  assert.equal(calls.turns.length, 3);
+  assert.deepEqual(
+    calls.turns.map((turn) => turn.request.previousTurnId),
+    [undefined, "turn-1", "turn-2"],
+  );
+  assert.deepEqual(calls.turns.map((turn) => turn.sessionId), [
+    "session-created",
+    "session-created",
+    "session-created",
+  ]);
+  assert.deepEqual(
+    calls.turns.map((turn) => turn.events.find((event) => event.type === "sandbox.created")?.sandboxId),
+    ["sandbox-1", "sandbox-1", "sandbox-1"],
+  );
+  assert.equal(
+    calls.turns[0].events.some((event) => event.type === "model.message" && (event.toolCalls ?? []).length > 0),
+    false,
+  );
+  assert.equal(
+    calls.turns[1].events.some((event) => event.type === "model.message" && (event.toolCalls ?? []).length > 0),
+    false,
+  );
   assert.match(calls.turns[1].request.input[0].content, /previous coordinator turn emitted no tool call/i);
+  assert.match(calls.turns[2].request.input[0].content, /previous coordinator turn emitted no tool call/i);
   assert.match(calls.turns[1].request.input[0].content, /node --test/);
   assert.equal(calls.updates.length, 2);
-  assert.equal(calls.turns[0].sessionId, "session-created");
-  assert.equal(calls.turns[1].sessionId, "session-created");
   assert.equal((await missions.getState()).missions[0].trueforgeSandboxId, "sandbox-1");
+  const finalExecCalls = calls.turns[2].events
+    .filter((event) => event.type === "model.message")
+    .flatMap((event) => event.toolCalls ?? [])
+    .filter((call) => call.function?.name === "exec");
+  assert.equal(finalExecCalls.length, 1);
+  assert.deepEqual(JSON.parse(finalExecCalls[0].function.arguments), {
+    intent: SANDBOX_VERIFICATION_INTENT,
+    command: "node --test",
+  });
 });
 
 test("zero-tool coordinator recovery stops after three completed attempts", async () => {
