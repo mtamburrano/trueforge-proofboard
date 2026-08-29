@@ -635,6 +635,7 @@ export interface RepositoryInspectionInput {
   missionId: string;
   path?: string;
   workItemId?: string;
+  previousTurnId?: string;
   mcpServerName?: string;
   toolName?: string;
 }
@@ -1060,6 +1061,54 @@ export class TrueForgeMissionRunner {
     return this.missions.createMission(missionInput);
   }
 
+  /** Claim the queue item once, then bind it to a validated persistent TrueForge session. */
+  async claimReadyWorkItem(
+    missionId: string,
+    workItemId: string,
+    owner: string,
+    expectedRevision?: number,
+  ): Promise<WorkItem> {
+    const normalizedOwner = requiredString(owner, "work item owner", "claim work item");
+    let mission = await this.missions.getMission(missionId);
+    let workItem = await this.missions.getWorkItem(missionId, workItemId);
+    if (workItem.status === "ready") {
+      workItem = await this.missions.claimReadyWorkItem(missionId, workItemId, {
+        owner: normalizedOwner,
+        ...(expectedRevision === undefined ? {} : { expectedRevision }),
+        ...(mission.trueforgeSessionId === undefined
+          ? {}
+          : { trueforgeSessionId: mission.trueforgeSessionId }),
+        ...(mission.trueforgeSandboxId === undefined
+          ? {}
+          : { trueforgeSandboxId: mission.trueforgeSandboxId }),
+      });
+    } else if (workItem.status !== "in_progress" || workItem.claim?.owner === undefined) {
+      throw new TrueForgeIntegrationError(
+        "claim work item",
+        `Work item ${workItem.id} is not ready for TrueForge execution; it is ${workItem.status}.`,
+      );
+    } else if (workItem.claim.owner !== normalizedOwner) {
+      throw new TrueForgeIntegrationError(
+        "claim work item",
+        `Work item ${workItem.id} is already claimed by a different execution owner.`,
+      );
+    }
+
+    const existingSessionId = mission.trueforgeSessionId ?? workItem.claim?.trueforgeSessionId;
+    const session = await this.resolveSession(existingSessionId);
+    if (mission.trueforgeSessionId === undefined) {
+      await this.missions.attachTrueforgeSession(mission.id, session.sessionId);
+    }
+    mission = await this.missions.getMission(missionId);
+    await this.missions.attachWorkItemExecution(missionId, workItemId, {
+      trueforgeSessionId: mission.trueforgeSessionId ?? session.sessionId,
+      ...(mission.trueforgeSandboxId === undefined
+        ? {}
+        : { trueforgeSandboxId: mission.trueforgeSandboxId }),
+    });
+    return this.missions.getWorkItem(missionId, workItemId);
+  }
+
   async resumeMission(missionId: string): Promise<MissionSession> {
     const mission = await this.missions.getMission(missionId);
     if (mission.trueforgeSessionId === undefined) {
@@ -1080,6 +1129,8 @@ export class TrueForgeMissionRunner {
     instruction: string,
     options: RunTurnOptions = {},
   ): Promise<TrueForgeTurnResult> {
+    const mission = await this.missions.getMission(missionId);
+    const previousTurnId = options.previousTurnId ?? mission.trueforgeTurnId;
     const delegatedWorkItem = options.delegateToSubagent === true && options.workItemId !== undefined
       ? await this.missions.getWorkItem(missionId, options.workItemId)
       : undefined;
@@ -1088,13 +1139,12 @@ export class TrueForgeMissionRunner {
       : await this.prepareLockedRepositoryBeforeDelegation(
           missionId,
           delegatedWorkItem.id,
-          options.previousTurnId,
+          previousTurnId,
         );
     const workspaceStartPreviousTurnId = delegatedWorkItem === undefined
       ? undefined
       : repositoryPreparation?.turnId ??
-        options.previousTurnId ??
-        (await this.missions.getMission(missionId)).trueforgeTurnId;
+        previousTurnId;
     let workspaceStart: DelegatedWorkspaceStart | undefined;
     if (delegatedWorkItem !== undefined) {
       try {
@@ -1117,7 +1167,10 @@ export class TrueForgeMissionRunner {
       missionId,
       instruction,
       workspaceStart === undefined
-        ? options
+        ? {
+            ...options,
+            ...(previousTurnId === undefined ? {} : { previousTurnId }),
+          }
         : {
             ...options,
             previousTurnId: workspaceStart.turnId,
@@ -2102,6 +2155,10 @@ export class TrueForgeMissionRunner {
       if (input.workItemId !== undefined) {
         inspectionOptions.workItemId = input.workItemId;
       }
+      const previousTurnId = input.previousTurnId ?? mission.trueforgeTurnId;
+      if (previousTurnId !== undefined) {
+        inspectionOptions.previousTurnId = previousTurnId;
+      }
       execution = await this.executeCoordinatorTurn(
         mission.id,
         lockedFixture
@@ -2676,6 +2733,15 @@ export class TrueForgeMissionRunner {
             );
           }
           await this.missions.attachTrueforgeSandbox(mission.id, sandboxId);
+          if (options.workItemId !== undefined) {
+            const activeWorkItem = await this.missions.getWorkItem(mission.id, options.workItemId);
+            if (activeWorkItem.claim !== undefined) {
+              await this.missions.attachWorkItemExecution(mission.id, activeWorkItem.id, {
+                trueforgeSessionId: session.sessionId,
+                trueforgeSandboxId: sandboxId,
+              });
+            }
+          }
         }
         if (options.delegateToSubagent === true && workItem !== undefined) {
           if (event.type === "thread.created") {
@@ -3927,9 +3993,9 @@ function buildLockedFixtureInspectionInstruction(
   }
   return [
     `Use the configured MCP server ${serverName}.`,
-    `Use get_commit with this exact JSON object: ${JSON.stringify(lockedFixtureArguments())}.`,
-    `The returned commit must include the exact patches for ${LOCKED_FIXTURE_FILES.join(" and ")}.`,
-    "Make no other MCP calls during this turn. If a completed turn emits no tool call, the bounded coordinator may repeat this exact operation; any emitted tool call must use these exact arguments.",
+    `Use get_commit for ${LOCKED_FIXTURE_OWNER}/${LOCKED_FIXTURE_REPO} and the pinned repository ref ${LOCKED_FIXTURE_REF}.`,
+    `Request full_patch detail. The returned commit must resolve to the exact full SHA ${LOCKED_FIXTURE_SHA} and include the exact patches for ${LOCKED_FIXTURE_FILES.join(" and ")}.`,
+    "Make no other MCP calls during this turn. If a completed turn emits no tool call, the bounded coordinator may repeat the read once; request formatting may vary, but every observed tool call must remain a read-only get_commit for this repository.",
     "Use the MCP response as the only source of repository facts; do not use the host filesystem, canned data, or final-answer narration.",
     "Stop after the read.",
   ].join(" ");
@@ -4589,7 +4655,10 @@ function parsePullRequestReadbackResponse(
 }
 
 function pullRequestResponseCandidates(event: TrueForgeApi.TurnStreamingEvent): unknown[] {
-  const root = parseMaybeJson(recordValue(event).content);
+  return responseValueCandidates(parseMaybeJson(recordValue(event).content));
+}
+
+function responseValueCandidates(root: unknown): unknown[] {
   const candidates: unknown[] = [];
   const visit = (value: unknown, depth: number): void => {
     if (depth > 8 || value === null || value === undefined) {
@@ -5263,8 +5332,11 @@ function verifyLockedFixtureInspection(
   if (responseValue.isError === true) {
     return inspectionFailure("get_commit MCP returned an error result.");
   }
-  const verifiedPayload = parseLockedFixtureObject(responseValue);
-  if (verifiedPayload === null) {
+  const verifiedPayload = responseValueCandidates(responseValue)
+    .filter(isRecord)
+    .map(parseLockedFixtureObject)
+    .find((candidate): candidate is NonNullable<typeof candidate> => candidate !== null);
+  if (verifiedPayload === undefined || verifiedPayload === null) {
     return inspectionFailure(
       "get_commit MCP response did not contain the pinned SHA and expected file patches.",
     );
@@ -5408,16 +5480,46 @@ function lockedFixtureArgumentsMatch(
   actual: Record<string, unknown>,
   expected: Record<string, unknown>,
 ): boolean {
+  if (actual.owner !== expected.owner || actual.repo !== expected.repo) {
+    return false;
+  }
+  const refKeys = ["sha", "ref"].filter((key) =>
+    Object.prototype.hasOwnProperty.call(actual, key),
+  );
+  if (refKeys.length !== 1) {
+    return false;
+  }
+  const requestedRef = actual[refKeys[0] as string];
+  if (typeof requestedRef !== "string" || requestedRef.trim().length === 0) {
+    return false;
+  }
   if (
-    Object.prototype.hasOwnProperty.call(actual, "page") &&
-    actual.page !== 1
+    /^[0-9a-f]{7,40}$/i.test(requestedRef.trim()) &&
+    !String(expected.sha).toLowerCase().startsWith(requestedRef.trim().toLowerCase())
   ) {
     return false;
   }
-  const withoutOptionalPage = Object.fromEntries(
-    Object.entries(actual).filter(([key]) => key !== "page"),
-  );
-  return argumentsExactlyMatch(withoutOptionalPage, expected);
+  const allowedKeys = new Set(["owner", "repo", "sha", "ref", "detail", "page", "perPage"]);
+  if (Object.keys(actual).some((key) => !allowedKeys.has(key))) {
+    return false;
+  }
+  if (actual.detail !== undefined && actual.detail !== "full_patch") {
+    return false;
+  }
+  if (
+    actual.page !== undefined &&
+    (actual.page !== 1 || !Number.isInteger(actual.page))
+  ) {
+    return false;
+  }
+  const perPage = actual.perPage;
+  if (
+    perPage !== undefined &&
+    (typeof perPage !== "number" || !Number.isInteger(perPage) || perPage < 1 || perPage > 100)
+  ) {
+    return false;
+  }
+  return true;
 }
 
 interface CoordinatorExecProvenance {

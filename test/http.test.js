@@ -60,6 +60,7 @@ class TestMissionRunner {
   async inspectRepository(input) {
     this.operationLog.push("inspect");
     this.calls.inspect += 1;
+    await this.missions.attachTrueforgeTurn(input.missionId, "test-inspection-turn");
     if (this.secretInspectionError) {
       throw new TrueForgeIntegrationError(
         "inspect repository",
@@ -339,6 +340,22 @@ async function json(response) {
   return payload;
 }
 
+async function authorizeTicket(app, ticketId, actor = "test-operator") {
+  const current = await json(await app.request("/api/mission"));
+  const ticket = current.mission.tickets.find((item) => item.id === ticketId);
+  assert.ok(ticket, `Ticket ${ticketId} should exist before authorization.`);
+  const response = await app.request(`/api/mission/tickets/${ticketId}/status`, {
+    method: "PATCH",
+    body: JSON.stringify({
+      status: "ready",
+      actor,
+      expected_revision: current.mission.revision,
+    }),
+  });
+  assert.equal(response.status, 200);
+  return json(response);
+}
+
 test("initial mission route and static application assets load", async () => {
   const { app } = testApp();
 
@@ -588,379 +605,136 @@ test("blocked missions expose one safe diagnostic snapshot with exact tool failu
   assert.doesNotMatch(serialized, /details/);
 });
 
-test("run mission uses the runtime adapters and exposes passed proof", async () => {
+test("run mission executes only the human-authorized queue ticket and preserves continuity", async () => {
   const { app, runner } = testApp();
 
+  await app.request("/api/mission", { method: "POST" });
+  const initial = await json(await app.request("/api/mission"));
+  const inspectTicket = initial.mission.tickets.find((item) => item.assignedRole === "planner");
+  assert.equal(inspectTicket.status, "backlog");
+
+  await authorizeTicket(app, inspectTicket.id);
   const response = await app.request("/api/mission/run", { method: "POST" });
   assert.equal(response.status, 200);
-  const payload = await json(response);
-  assert.equal(payload.mission.mission.status, "awaiting_approval");
-  assert.equal(payload.mission.progress.complete, 3);
-  assert.equal(payload.mission.progress.execution, "passed");
-  assert.equal(payload.mission.progress.verification, "passed");
-  assert.deepEqual(payload.mission.evidence.map((item) => item.source).sort(), [
-    "mcp",
-    "mcp",
-    "sandbox",
-    "sandbox",
-    "sandbox",
-  ]);
-  assert.equal(payload.mission.approvals.length, 1);
-  assert.equal(payload.mission.approvals[0].actionType, "create_pull_request");
-  assert.equal(
-    payload.mission.approvals[0].target,
-    "mtamburrano/proofboard-demo-fixture base=main head=proofboard-verified-delivery@8bb22a62b3714f699204cb0d5c440fcb7f0a09e1",
-  );
-  assert.match(payload.mission.approvals[0].expectedEffect, /proofboard-demo-fixture/);
-  assert.match(payload.mission.approvals[0].rationale, /human/);
-  assert.equal(payload.mission.approvals[0].evidenceIds.length > 0, true);
-  assert.equal(payload.mission.approvals[0].executionContext.sessionId, "test-session-durable");
-  assert.equal(payload.mission.approvals[0].executionContext.toolCallId, "test-create-pull-request-call");
-  assert.equal(payload.mission.approvals[0].executionContext.headSha, "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1");
-  assert.notEqual(
-    payload.mission.approvals[0].executionContext.headSha,
-    PRIMARY_DELIVERY_FIXTURE.baselineSha,
-  );
-  assert.equal(runner.deliveryCalls.requested.length, 1);
-  assert.equal(runner.deliveryCalls.protectedOperations, 0);
-  assert.deepEqual(runner.operationLog.slice(0, 3), [
-    "inspect",
-    "execute",
-    "prove",
-  ]);
-  assert.deepEqual(runner.calls, { create: 1, inspect: 1, headInspect: 1, turn: 1, sandbox: 1 });
-  assert.deepEqual(
-    runner.turnInputs.map((input) => input.options.workItemId),
-    ["primary-implement"],
-  );
-  assert.match(runner.turnInputs[0].instruction, /src\/index\.ts/);
-  assert.match(
-    runner.turnInputs[0].instruction,
-    /Changes remain limited to the verified file scope: src\/index\.ts, test\/index\.test\.js/,
-  );
-  assert.match(
-    runner.turnInputs[0].instruction,
-    /Allowed files for this work item: src\/index\.ts, test\/index\.test\.js/,
-  );
-  assert.match(runner.turnInputs[0].instruction, /install tools, clone or check out the repository/i);
-  assert.match(runner.turnInputs[0].instruction, new RegExp(PRIMARY_SANDBOX_REPOSITORY_ROOT.replaceAll("/", "\\/")));
-  assert.match(runner.turnInputs[0].instruction, /sandbox may start empty/i);
-  assert.match(runner.turnInputs[0].instruction, /never assume \/workspace/i);
-  assert.match(runner.turnInputs[0].instruction, /recover from a failed guessed cwd or command setup/i);
-  assert.match(runner.turnInputs[0].instruction, /optionally use dynamic subagents/i);
-  assert.equal(runner.turnInputs[0].options.delegateToSubagent, undefined);
-  assert.deepEqual(runner.sandboxInputs[0], {
-    missionId: PRIMARY_MISSION_ID,
-    workItemId: "primary-implement",
-  });
-  assert.equal(PRIMARY_VERIFICATION_COMMAND, "npm test");
+  const inspected = await json(response);
+  assert.equal(inspected.mission.mission.status, "executing");
+  assert.equal(inspected.mission.tickets.find((item) => item.id === inspectTicket.id).status, "done");
+  const implementTicket = inspected.mission.tickets.find((item) => item.assignedRole === "implementer");
+  assert.equal(implementTicket.status, "backlog");
+  assert.equal(inspected.mission.approvals.length, 0);
+  assert.deepEqual(runner.operationLog, ["inspect"]);
+  assert.equal(runner.calls.inspect, 1);
+  assert.equal(runner.calls.turn, 0);
 
-  const serialized = JSON.stringify(payload);
+  await authorizeTicket(app, implementTicket.id);
+  const implementationResponse = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(implementationResponse.status, 200);
+  const implemented = await json(implementationResponse);
+  const implementedTicket = implemented.mission.tickets.find((item) => item.id === implementTicket.id);
+  assert.equal(implementedTicket.status, "proving");
+  assert.equal(implementedTicket.claim.owner, "trueforge-worker");
+  assert.equal(implementedTicket.claim.trueforgeSessionId, "test-session-durable");
+  assert.equal(implementedTicket.executionAuthorization.authorizedBy, "test-operator");
+  assert.equal(implemented.mission.mission.execution.sandboxId, "test-sandbox-durable");
+  assert.equal(implemented.mission.approvals.length, 0);
+  assert.deepEqual(runner.operationLog, ["inspect", "execute"]);
+  assert.deepEqual(runner.calls, { create: 1, inspect: 1, headInspect: 0, turn: 1, sandbox: 0 });
+  assert.deepEqual(runner.turnInputs.map((input) => input.options.workItemId), [implementTicket.id]);
+  assert.equal(runner.turnInputs[0].options.previousTurnId, "test-inspection-turn");
+  assert.match(runner.turnInputs[0].instruction, /Verified repository facts: mtamburrano\/proofboard-demo-fixture at full commit/);
+  assert.match(runner.turnInputs[0].instruction, /Allowed files: src\/index\.ts, test\/index\.test\.js/);
+  assert.match(runner.turnInputs[0].instruction, new RegExp(PRIMARY_SANDBOX_REPOSITORY_ROOT.replaceAll("/", "\\/")));
+  assert.match(runner.turnInputs[0].instruction, /real persistent sandbox/i);
+  assert.match(runner.turnInputs[0].instruction, /Do not push, open a pull request, or perform any other remote mutation/i);
+  const serialized = JSON.stringify(implemented);
   assert.doesNotMatch(serialized, /must-not-reach-browser|provider_secret/);
 });
 
-test("unrelated repository evidence cannot authorize the configured delivery target", async () => {
-  const { app, runner } = testApp(new InMemoryMissionRepository(), {
-    inspectionRepository: {
-      owner: "mtamburrano",
-      repository: "trueforge-proofboard",
-      baselineRef: PRIMARY_DELIVERY_FIXTURE.baselineRef,
-      baselineSha: PRIMARY_DELIVERY_FIXTURE.baselineSha,
-    },
-  });
-
-  const response = await app.request("/api/mission/run", { method: "POST" });
-  assert.equal(response.status, 502);
-  const payload = await json(response);
-  assert.equal(payload.mission.mission.status, "blocked");
-  assert.equal(payload.mission.approvals.length, 0);
-  assert.equal(runner.deliveryCalls.requested.length, 0);
-  assert.equal(runner.deliveryCalls.protectedOperations, 0);
-});
-
-test("an unchanged baseline head cannot authorize delivery", async () => {
-  const { app, runner } = testApp(new InMemoryMissionRepository(), {
-    deliveryHeadSha: PRIMARY_DELIVERY_FIXTURE.baselineSha,
-  });
-
-  const response = await app.request("/api/mission/run", { method: "POST" });
-  assert.equal(response.status, 502);
-  const payload = await json(response);
-  assert.equal(payload.mission.approvals.length, 0);
-  assert.equal(runner.calls.headInspect, 1);
-  assert.equal(runner.deliveryCalls.requested.length, 0);
-});
-
-test("a delivery head whose diff differs from verified work cannot authorize delivery", async () => {
-  const { app, runner } = testApp(new InMemoryMissionRepository(), {
-    deliveryHeadPatches: {
-      ...PRIMARY_VERIFIED_DELIVERY_PATCHES,
-      "src/index.ts": `${PRIMARY_VERIFIED_DELIVERY_PATCHES["src/index.ts"]}\n+unverified change`,
-    },
-  });
-
-  const response = await app.request("/api/mission/run", { method: "POST" });
-  assert.equal(response.status, 502);
-  const payload = await json(response);
-  assert.equal(payload.mission.approvals.length, 0);
-  assert.equal(runner.calls.headInspect, 1);
-  assert.equal(runner.deliveryCalls.requested.length, 0);
-});
-
-test("a persisted approval cannot outlive the repository provenance that authorized it", async () => {
-  const initial = testApp();
-  const run = await json(await initial.app.request("/api/mission/run", { method: "POST" }));
-  const approval = run.mission.approvals[0];
-  const staleState = await initial.missions.getState();
-  const repositoryProof = staleState.evidence.find((item) => item.source === "mcp");
-  const details = JSON.parse(repositoryProof.details);
-  details.repository_name = "unrelated-repository";
-  details.arguments.repo = "unrelated-repository";
-  repositoryProof.details = JSON.stringify(details);
-
-  const recovered = testApp(new InMemoryMissionRepository(staleState));
-  const response = await recovered.app.request(`/api/mission/approvals/${approval.id}`, {
-    method: "POST",
-    body: JSON.stringify({ decision: "approved" }),
-  });
-  assert.equal(response.status, 502);
-  const payload = await json(response);
-  assert.equal(payload.mission.approvals[0].decision, "pending");
-  assert.equal(payload.mission.delivery.length, 0);
-  assert.equal(recovered.runner.deliveryCalls.protectedOperations, 0);
-});
-
-test("rejecting or cancelling the exact pending delivery invokes no protected operation", async () => {
-  for (const decision of ["rejected", "cancelled"]) {
-    const { app, runner } = testApp();
-    const run = await json(await app.request("/api/mission/run", { method: "POST" }));
-    const approval = run.mission.approvals[0];
-
-    const response = await app.request(`/api/mission/approvals/${approval.id}`, {
-      method: "POST",
-      body: JSON.stringify({ decision }),
-    });
-    assert.equal(response.status, 200);
-    const payload = await json(response);
-    assert.equal(payload.mission.mission.status, "blocked");
-    assert.equal(payload.mission.approvals[0].decision, decision);
-    assert.equal(payload.mission.delivery.length, 0);
-    assert.equal(runner.deliveryCalls.protectedOperations, 0);
-    assert.equal(runner.deliveryCalls.resolved.length, 1);
-    assert.equal(runner.deliveryCalls.resolved[0].decision, decision);
-    assert.equal(
-      runner.deliveryCalls.resolved[0].pending.toolCallId,
-      "test-create-pull-request-call",
-    );
-
-    const recovered = await json(await app.request("/api/mission"));
-    assert.equal(recovered.mission.approvals[0].decision, decision);
-    assert.equal(recovered.mission.delivery.length, 0);
-  }
-});
-
-test("approving the exact pending delivery records one correlated pull request result", async () => {
-  const { app, missions, runner } = testApp();
-  const run = await json(await app.request("/api/mission/run", { method: "POST" }));
-  const approval = run.mission.approvals[0];
-
-  const response = await app.request(`/api/mission/approvals/${approval.id}`, {
-    method: "POST",
-    body: JSON.stringify({ decision: "approved" }),
-  });
-  assert.equal(response.status, 200);
-  const payload = await json(response);
-  assert.equal(payload.mission.mission.status, "delivered");
-  assert.equal(payload.mission.approvals[0].decision, "approved");
-  assert.equal(payload.mission.delivery.length, 1);
-  assert.equal(payload.mission.delivery[0].reference, "https://github.com/mtamburrano/proofboard-demo-fixture/pull/73");
-  assert.deepEqual(payload.mission.delivery[0].pullRequest, {
-    number: 73,
-    url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/73",
-    repositoryOwner: "mtamburrano",
-    repositoryName: "proofboard-demo-fixture",
-    base: "main",
-    head: "proofboard-verified-delivery",
-    headSha: "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1",
-  });
-  assert.equal(payload.mission.delivery[0].executionOrigin.sessionId, "test-session-durable");
-  assert.equal(payload.mission.delivery[0].executionOrigin.turnId, "test-delivery-result-turn");
-  assert.equal(payload.mission.delivery[0].executionOrigin.toolCallId, "test-create-pull-request-call");
-  assert.equal(runner.deliveryCalls.protectedOperations, 1);
-  assert.equal(runner.deliveryCalls.resolved.length, 1);
-
-  const state = await missions.getState();
-  const deliveryEvidence = state.evidence.find((item) =>
-    item.summary.includes("created pull request #73")
-  );
-  assert.equal(deliveryEvidence.result, "passed");
-  assert.equal(deliveryEvidence.executionOrigin.sessionId, "test-session-durable");
-  assert.equal(deliveryEvidence.executionOrigin.turnId, "test-delivery-result-turn");
-  assert.equal(deliveryEvidence.executionOrigin.toolCallId, "test-create-pull-request-call");
-  assert.equal(state.deliveries[0].approvalId, approval.id);
-
-  const replay = await app.request(`/api/mission/approvals/${approval.id}`, {
-    method: "POST",
-    body: JSON.stringify({ decision: "approved" }),
-  });
-  assert.equal(replay.status, 400);
-  assert.equal(runner.deliveryCalls.protectedOperations, 1);
-});
-
-test("a moved delivery head leaves the approval pending and invokes no protected operation", async () => {
+test("run mission requires an explicit Ready authorization and performs no provider call otherwise", async () => {
   const { app, runner } = testApp();
-  const run = await json(await app.request("/api/mission/run", { method: "POST" }));
-  const approval = run.mission.approvals[0];
-  runner.deliveryHeadSha = "9cc33b73c4825f7aa5d3b1ce6c5510fc8e1b20f2";
-
-  const response = await app.request(`/api/mission/approvals/${approval.id}`, {
-    method: "POST",
-    body: JSON.stringify({ decision: "approved" }),
-  });
-  assert.equal(response.status, 502);
-  const payload = await json(response);
-  assert.equal(payload.mission.approvals[0].decision, "pending");
-  assert.equal(payload.mission.delivery.length, 0);
-  assert.equal(runner.deliveryCalls.protectedOperations, 0);
-  assert.equal(runner.deliveryCalls.resolved.length, 0);
-  assert.equal(runner.calls.headInspect, 2);
-});
-
-test("failed sandbox proof remains visibly failed and blocks the mission", async () => {
-  const { app } = testApp(new InMemoryMissionRepository(), { failSandbox: true });
+  await app.request("/api/mission", { method: "POST" });
 
   const response = await app.request("/api/mission/run", { method: "POST" });
-  assert.equal(response.status, 502);
+  assert.equal(response.status, 400);
   const payload = await json(response);
-  assert.equal(payload.mission.mission.status, "blocked");
-  assert.equal(payload.mission.progress.execution, "failed");
-  assert.equal(payload.mission.progress.verification, "failed");
-  const sandbox = payload.mission.evidence.find((item) => item.source === "sandbox");
-  assert.equal(sandbox.result, "failed");
-  assert.equal(sandbox.metadata.exitCode, 1);
-  assert.equal(payload.mission.evidence.some(
-    (item) => item.source === "sandbox" && item.result === "passed",
-  ), false);
+  assert.match(payload.message, /No ticket is Ready|Backlog.*Ready/i);
+  assert.equal(payload.mission.mission.status, "draft");
+  assert.equal(payload.mission.tickets.find((item) => item.assignedRole === "planner").status, "backlog");
+  assert.deepEqual(runner.calls, { create: 1, inspect: 0, headInspect: 0, turn: 0, sandbox: 0 });
+  assert.equal(runner.deliveryCalls.requested.length, 0);
 });
 
-test("a successful retry uses current proof while preserving historical failure", async () => {
-  const { app, runner } = testApp(new InMemoryMissionRepository(), { failSandbox: true });
-
-  const failedResponse = await app.request("/api/mission/run", { method: "POST" });
-  assert.equal(failedResponse.status, 502);
-  const failed = await json(failedResponse);
-  assert.equal(failed.mission.mission.status, "blocked");
-  assert.equal(failed.mission.progress.verification, "failed");
-
-  runner.failSandbox = false;
-  const retryResponse = await app.request("/api/mission/run", { method: "POST" });
-  const retried = await json(retryResponse);
-  assert.equal(retryResponse.status, 200, JSON.stringify(retried));
-  assert.equal(retried.mission.mission.status, "awaiting_approval");
-  assert.equal(retried.mission.progress.verification, "passed");
-  assert.equal(retried.mission.progress.failedEvidence, 1);
-  assert.deepEqual(
-    retried.mission.evidence
-      .filter((item) => item.source === "sandbox")
-      .map((item) => item.result)
-      .sort(),
-    ["failed", "passed", "passed", "passed"],
-  );
-  assert.deepEqual(runner.calls, { create: 1, inspect: 1, headInspect: 1, turn: 2, sandbox: 2 });
-});
-
-test("the primary controller persists every injected verifier outcome with review history", async () => {
-  const planner = {
-    plan() {
-      return {
-        items: [
-          {
-            id: "primary-inspect",
-            title: "Inspect the verified repository",
-            purpose: "Establish the repository facts required for bounded implementation.",
-            acceptanceCriteria: ["The repository inspection is correlated and persisted."],
-            dependsOn: [],
-            assignedRole: "planner",
-          },
-          {
-            id: "controller-implement",
-            title: "Implement the bounded source change",
-            purpose: "Apply the requested change only to src/index.ts.",
-            acceptanceCriteria: ["The source change satisfies the requested behavior."],
-            dependsOn: ["primary-inspect"],
-            assignedRole: "implementer",
-            requiredChecks: ["typecheck", "test"],
-            allowedFiles: ["src/index.ts"],
-          },
-          {
-            id: "controller-verify",
-            title: "Verify the bounded source change",
-            purpose: "Run independent verification after implementation review.",
-            acceptanceCriteria: ["The independent verification passes."],
-            dependsOn: ["controller-implement"],
-            assignedRole: "reviewer",
-          },
-        ],
-      };
-    },
-  };
-  const decisions = [
-    { outcome: "accepted", expectedStatus: "complete" },
-    { outcome: "changes_requested", expectedStatus: "ready" },
-    { outcome: "blocked", expectedStatus: "blocked" },
-  ];
-
-  for (const scenario of decisions) {
-    const contexts = [];
-    const verifier = {
-      review(context) {
-        contexts.push(context);
-        return {
-          outcome: scenario.outcome,
-          reviewer: "injected-independent-verifier",
-          summary: `Injected verifier returned ${scenario.outcome}.`,
-          finding: `Durable ${scenario.outcome} finding.`,
-        };
-      },
-    };
-    const { app, missions } = testApp(new InMemoryMissionRepository(), {
-      planner,
-      verifier,
-      structuredHandoff: true,
-    });
-
-    const response = await app.request("/api/mission/run", { method: "POST" });
-    assert.equal(response.status === 200, scenario.outcome === "accepted");
-    const state = await missions.getState();
-    const implementation = state.workItems.find((item) => item.id === "controller-implement");
-    assert.equal(implementation.status, scenario.expectedStatus);
-    assert.equal(contexts.length, 1);
-    assert.deepEqual(contexts[0].actualFilesChanged, ["src/index.ts"]);
-    assert.equal(state.reviews.length, 1);
-    assert.equal(state.reviews[0].outcome, scenario.outcome);
-    assert.equal(state.handoffs.length, 1);
-    assert.equal(state.handoffs[0].result, "done");
-    assert.equal(
-      state.evidence.some((item) => item.id === state.reviews[0].findingEvidenceId),
-      true,
-    );
-  }
-});
-
-test("integration errors expose bounded public text without upstream secrets", async () => {
-  const { app } = testApp(new InMemoryMissionRepository(), { secretInspectionError: true });
+test("repository execution failure blocks the authorized ticket with bounded public diagnostics", async () => {
+  const { app, runner } = testApp(new InMemoryMissionRepository(), { secretInspectionError: true });
+  await app.request("/api/mission", { method: "POST" });
+  const initial = await json(await app.request("/api/mission"));
+  const inspectTicket = initial.mission.tickets.find((item) => item.assignedRole === "planner");
+  await authorizeTicket(app, inspectTicket.id);
 
   const response = await app.request("/api/mission/run", { method: "POST" });
   assert.equal(response.status, 502);
   const payload = await json(response);
   assert.match(payload.message, /Repository inspection failed/);
   assert.equal(payload.mission.mission.status, "blocked");
+  assert.equal(payload.mission.tickets.find((item) => item.id === inspectTicket.id).status, "blocked");
+  assert.equal(runner.calls.inspect, 1);
+  assert.equal(runner.deliveryCalls.requested.length, 0);
 
   const serialized = JSON.stringify(payload);
   assert.doesNotMatch(
     serialized,
-    /live-token|live-key|live-password|Authorization|Bearer|API_KEY|PASSWORD/i,
+    /live-token|live-key|live-password|Bearer|API_KEY|live-secret/i,
   );
+});
+
+test("a blocked queue does not silently retry or resurrect the failed execution", async () => {
+  const { app, runner } = testApp(new InMemoryMissionRepository(), { secretInspectionError: true });
+  await app.request("/api/mission", { method: "POST" });
+  const initial = await json(await app.request("/api/mission"));
+  const inspectTicket = initial.mission.tickets.find((item) => item.assignedRole === "planner");
+  await authorizeTicket(app, inspectTicket.id);
+  assert.equal((await app.request("/api/mission/run", { method: "POST" })).status, 502);
+
+  runner.secretInspectionError = false;
+  const retry = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(retry.status, 400);
+  const payload = await json(retry);
+  assert.equal(payload.mission.mission.status, "blocked");
+  assert.equal(runner.calls.inspect, 1);
+});
+
+test("the primary controller leaves review and remote delivery for later authorized queue stages", async () => {
+  const reviewed = [];
+  const verifier = {
+    review(context) {
+      reviewed.push(context);
+      return {
+        outcome: "accepted",
+        reviewer: "test-reviewer",
+        summary: "accepted",
+        finding: "accepted",
+      };
+    },
+  };
+  const { app, runner, missions } = testApp(new InMemoryMissionRepository(), { verifier });
+  await app.request("/api/mission", { method: "POST" });
+  const initial = await json(await app.request("/api/mission"));
+  const inspectTicket = initial.mission.tickets.find((item) => item.assignedRole === "planner");
+  await authorizeTicket(app, inspectTicket.id);
+  await app.request("/api/mission/run", { method: "POST" });
+
+  const planned = await json(await app.request("/api/mission"));
+  const implementTicket = planned.mission.tickets.find((item) => item.assignedRole === "implementer");
+  await authorizeTicket(app, implementTicket.id);
+  const response = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(response.status, 200);
+  const state = await missions.getState();
+  assert.equal(state.workItems.find((item) => item.id === implementTicket.id).status, "proving");
+  assert.equal(reviewed.length, 0);
+  assert.equal(state.handoffs.length, 0);
+  assert.equal(state.reviews.length, 0);
+  assert.equal(state.approvals.length, 0);
+  assert.equal(runner.deliveryCalls.requested.length, 0);
 });
 
 test("Mission Control defaults to Alibaba Qwen and accepts an explicit model selector", () => {
@@ -991,6 +765,10 @@ test("a fresh service recovers the same mission and evidence from isolated JSON 
   const filePath = path.join(directory, "mission-state.json");
   try {
     const first = testApp(new JsonMissionRepository(filePath));
+    await first.app.request("/api/mission", { method: "POST" });
+    const initial = await json(await first.app.request("/api/mission"));
+    const inspectTicket = initial.mission.tickets.find((item) => item.assignedRole === "planner");
+    await authorizeTicket(first.app, inspectTicket.id);
     const run = await first.app.request("/api/mission/run", { method: "POST" });
     assert.equal(run.status, 200);
     const before = await json(run);
@@ -998,9 +776,10 @@ test("a fresh service recovers the same mission and evidence from isolated JSON 
     const second = testApp(new JsonMissionRepository(filePath));
     const after = await json(await second.app.request("/api/mission"));
     assert.equal(after.mission.mission.id, before.mission.mission.id);
-    assert.equal(after.mission.mission.status, "awaiting_approval");
+    assert.equal(after.mission.mission.status, "executing");
     assert.equal(after.mission.revision, before.mission.revision);
     assert.deepEqual(after.mission.evidence, before.mission.evidence);
+    assert.equal(after.mission.tickets.find((item) => item.id === inspectTicket.id).status, "done");
     assert.equal(second.runner.calls.create, 0);
   } finally {
     await rm(directory, { recursive: true, force: true });

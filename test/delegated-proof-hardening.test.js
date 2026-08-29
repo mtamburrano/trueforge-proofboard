@@ -1707,96 +1707,59 @@ test("legacy primary missions are upgraded without losing their history", async 
   assert.equal(response.status, 201);
   const state = await missions.getState();
   const implementer = state.workItems.find((item) => item.id === "primary-implement");
+  const inspector = state.workItems.find((item) => item.id === "primary-inspect");
   assert.equal(state.evidence.some((evidence) => evidence.id === history.id), true);
   assert.equal(implementer.acceptanceCriteria.length > 0, true);
   assert.deepEqual(implementer.requiredChecks, ["typecheck", "test"]);
+  assert.equal(inspector.status, "backlog");
+
+  await missions.moveWorkItemByHuman(PRIMARY_MISSION_ID, inspector.id, "ready", {
+    actor: "legacy-migration-operator",
+  });
 
   const run = await app.request("/api/mission/run", { method: "POST" });
   assert.equal(run.status, 200);
   const afterRun = await missions.getState();
-  assert.equal(afterRun.missions[0].status, "awaiting_approval");
-  assert.equal(afterRun.workItems.filter((item) => item.status === "complete").length, 3);
+  assert.equal(afterRun.missions[0].status, "executing");
+  assert.equal(afterRun.workItems.filter((item) => item.status === "done").length, 1);
   assert.equal(afterRun.evidence.some((evidence) => evidence.id === history.id), true);
-  const manifest = afterRun.evidence.find((evidence) => evidence.kind === "file_change");
-  assert.equal(manifest?.source, "sandbox");
-  assert.equal(manifest?.executionOrigin?.threadId, undefined);
+  assert.equal(afterRun.evidence.some((evidence) => evidence.kind === "file_change"), false);
 });
 
-test("production app wires bounded contract review and fails closed on invalid results", async () => {
+test("production app leaves contract review and delivery behind later queue authorizations", async () => {
   const observedContexts = [];
-  const cases = [
-    {
-      label: "valid semantic review",
-      options: {
-        semanticReview(context) {
-          observedContexts.push(context);
-          return {
-            outcome: "accepted",
-            reviewer: "local-contract-reviewer",
-            summary: "The bounded implementation satisfies the contract.",
-            finding: "No blocking findings.",
-          };
-        },
-      },
-      status: 200,
-      outcome: "accepted",
+  const missions = new MissionService(
+    new InMemoryMissionRepository(legacyPrimaryState()),
+    fixedClock,
+  );
+  const runner = new LegacyPrimaryRunner(missions, {
+    semanticReview(context) {
+      observedContexts.push(context);
+      return {
+        outcome: "accepted",
+        reviewer: "local-contract-reviewer",
+        summary: "The bounded implementation satisfies the contract.",
+        finding: "No blocking findings.",
+      };
     },
-    {
-      label: "unavailable semantic review",
-      options: { exposeSemanticReview: false },
-      status: 502,
-      outcome: "changes_requested",
-    },
-    {
-      label: "malformed semantic review",
-      options: { semanticReview: null },
-      status: 502,
-      outcome: "changes_requested",
-    },
-    {
-      label: "invalid semantic review",
-      options: {
-        semanticReview: {
-          outcome: "accepted",
-          reviewer: "",
-          summary: "The result is malformed.",
-          finding: "The reviewer identity is missing.",
-        },
-      },
-      status: 502,
-      outcome: "changes_requested",
-    },
-  ];
+  });
+  const app = createMissionHttpApp({ missions, runner });
 
-  for (const reviewCase of cases) {
-    const missions = new MissionService(
-      new InMemoryMissionRepository(legacyPrimaryState()),
-      fixedClock,
-    );
-    const runner = new LegacyPrimaryRunner(missions, reviewCase.options);
-    const app = createMissionHttpApp({ missions, runner });
+  assert.equal((await app.request("/api/mission", { method: "POST" })).status, 201);
+  const stateBeforeRun = await missions.getState();
+  const inspector = stateBeforeRun.workItems.find((item) => item.id === "primary-inspect");
+  await missions.moveWorkItemByHuman(PRIMARY_MISSION_ID, inspector.id, "ready", {
+    actor: "queue-operator",
+  });
+  const response = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(response.status, 200);
 
-    assert.equal(
-      (await app.request("/api/mission", { method: "POST" })).status,
-      201,
-      reviewCase.label,
-    );
-    const response = await app.request("/api/mission/run", { method: "POST" });
-    assert.equal(response.status, reviewCase.status, reviewCase.label);
-
-    const state = await missions.getState();
-    const review = state.reviews.at(-1);
-    assert.equal(review?.outcome, reviewCase.outcome, reviewCase.label);
-    if (reviewCase.status === 200) {
-      const context = observedContexts.at(-1);
-      assert.ok(context, reviewCase.label);
-      assert.deepEqual(context.actualFilesChanged, ["src/index.ts", "test/index.test.js"]);
-      assert.match(context.actualDiff, /getNextDeliveryStage/);
-      assert.equal(context.workItem.purpose.length > 0, true);
-      assert.equal(context.workItem.acceptanceCriteria.length > 0, true);
-      assert.deepEqual(context.checks.map((check) => check.result), ["passed", "passed"]);
-    }
-  }
+  const state = await missions.getState();
+  assert.equal(observedContexts.length, 0);
+  assert.equal(state.reviews.length, 0);
+  assert.equal(state.handoffs.length, 0);
+  assert.equal(state.approvals.length, 0);
+  assert.equal(state.workItems.find((item) => item.id === "primary-implement").status, "backlog");
 });
 
 class LegacyPrimaryRunner {

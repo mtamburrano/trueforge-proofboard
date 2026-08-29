@@ -18,16 +18,73 @@ export const missionStatuses = [
 
 export type MissionStatus = (typeof missionStatuses)[number];
 
-export const workItemStatuses = [
+/** Product-facing ticket lifecycle. Blocked is an exceptional failure state. */
+export const ticketStatuses = [
   "backlog",
   "ready",
   "in_progress",
-  "ready_for_review",
-  "complete",
+  "proving",
+  "changes_requested",
+  "awaiting_approval",
+  "delivering",
+  "done",
   "blocked",
 ] as const;
 
-export type WorkItemStatus = (typeof workItemStatuses)[number];
+export const productLifecycleStatuses = ticketStatuses;
+export type TicketStatus = (typeof ticketStatuses)[number];
+
+/**
+ * These values are accepted while reconnecting older mission snapshots. New
+ * queue operations always write the product lifecycle values above.
+ */
+export const legacyWorkItemStatuses = ["ready_for_review", "complete"] as const;
+export type LegacyWorkItemStatus = (typeof legacyWorkItemStatuses)[number];
+export type WorkItemStatus = TicketStatus | LegacyWorkItemStatus;
+export const workItemStatuses = ticketStatuses;
+const persistedWorkItemStatuses = [...ticketStatuses, ...legacyWorkItemStatuses] as const;
+
+export type WorkItemTransitionTrigger =
+  | "human"
+  | "claim"
+  | "execution"
+  | "proof"
+  | "approval"
+  | "delivery"
+  | "failure"
+  | "retry"
+  | "legacy";
+
+export interface WorkItemTransitionOptions {
+  trigger?: WorkItemTransitionTrigger;
+  actor?: string;
+  expectedRevision?: number;
+  reason?: string;
+}
+
+export interface WorkItemExecutionAuthorization {
+  authorizedBy: string;
+  authorizedAt: string;
+}
+
+export interface WorkItemClaim {
+  owner: string;
+  claimedAt: string;
+  trueforgeSessionId?: string;
+  trueforgeSandboxId?: string;
+}
+
+export interface HumanWorkItemTransitionInput {
+  actor: string;
+  expectedRevision?: number;
+}
+
+export interface ClaimWorkItemInput {
+  owner: string;
+  expectedRevision?: number;
+  trueforgeSessionId?: string;
+  trueforgeSandboxId?: string;
+}
 
 export const executionRoles = ["planner", "implementer", "reviewer"] as const;
 export type ExecutionRole = (typeof executionRoles)[number];
@@ -149,15 +206,35 @@ export const missionTransitions: Readonly<{
   blocked: ["planning", "executing", "failed"],
 };
 
+export const humanWorkItemTransitions: Readonly<{
+  [status in TicketStatus]: readonly TicketStatus[];
+}> = {
+  backlog: ["ready"],
+  ready: ["backlog"],
+  in_progress: [],
+  proving: [],
+  changes_requested: [],
+  awaiting_approval: [],
+  delivering: [],
+  done: [],
+  blocked: [],
+};
+
+/** All persisted edges, including compatibility edges for pre-pivot snapshots. */
 export const workItemTransitions: Readonly<{
   [status in WorkItemStatus]: readonly WorkItemStatus[];
 }> = {
   backlog: ["ready", "blocked"],
-  ready: ["in_progress", "blocked"],
-  in_progress: ["ready_for_review", "blocked"],
+  ready: ["backlog", "in_progress", "blocked"],
+  in_progress: ["proving", "ready_for_review", "blocked"],
+  proving: ["changes_requested", "awaiting_approval", "blocked"],
+  changes_requested: ["in_progress", "blocked"],
+  awaiting_approval: ["delivering", "blocked"],
+  delivering: ["done", "blocked"],
+  done: [],
+  blocked: ["ready", "in_progress"],
   ready_for_review: ["complete", "blocked"],
   complete: [],
-  blocked: ["ready", "blocked"],
 };
 
 export interface RepositoryTarget {
@@ -192,6 +269,10 @@ export interface WorkItem {
   assignedRole?: ExecutionRole;
   requiredChecks?: string[];
   allowedFiles?: string[];
+  executionAuthorization?: WorkItemExecutionAuthorization;
+  /** A claim is intentionally retained after failure so work cannot be double-claimed. */
+  claim?: WorkItemClaim;
+  blockedReason?: string;
   delegation?: WorkItemDelegation;
 }
 
@@ -377,6 +458,7 @@ export interface MissionState {
 export interface MissionRepository {
   load(): Promise<MissionState | null>;
   save(state: MissionState): Promise<void>;
+  saveIfRevision?(state: MissionState, expectedRevision: number): Promise<void>;
 }
 
 export interface CreateMissionInput {
@@ -418,6 +500,11 @@ export interface FailWorkItemDelegationInput {
   error: string;
   turnId?: string;
   interrupted?: boolean;
+}
+
+export interface WorkItemExecutionBindingInput {
+  trueforgeSessionId: string;
+  trueforgeSandboxId?: string;
 }
 
 export interface RecordEvidenceInput {
@@ -495,6 +582,7 @@ export interface DecideApprovalInput {
 export type MissionDomainErrorCode =
   | "invalid_input"
   | "not_found"
+  | "conflict"
   | "invalid_transition"
   | "dependency_blocked"
   | "approval_blocked"
@@ -940,6 +1028,42 @@ function validateWorkItemDelegation(
   return result;
 }
 
+function validateWorkItemExecutionAuthorization(
+  value: unknown,
+  label: string,
+): WorkItemExecutionAuthorization {
+  const authorization = objectValue(value, label);
+  return {
+    authorizedBy: requiredString(authorization.authorizedBy, `${label}.authorizedBy`, 200),
+    authorizedAt: timestamp(authorization.authorizedAt, `${label}.authorizedAt`),
+  };
+}
+
+function validateWorkItemClaim(value: unknown, label: string): WorkItemClaim {
+  const claim = objectValue(value, label);
+  const trueforgeSessionId = optionalString(
+    claim.trueforgeSessionId,
+    `${label}.trueforgeSessionId`,
+    200,
+  );
+  const trueforgeSandboxId = optionalString(
+    claim.trueforgeSandboxId,
+    `${label}.trueforgeSandboxId`,
+    200,
+  );
+  const result: WorkItemClaim = {
+    owner: requiredString(claim.owner, `${label}.owner`, 200),
+    claimedAt: timestamp(claim.claimedAt, `${label}.claimedAt`),
+  };
+  if (trueforgeSessionId !== undefined) {
+    result.trueforgeSessionId = trueforgeSessionId;
+  }
+  if (trueforgeSandboxId !== undefined) {
+    result.trueforgeSandboxId = trueforgeSandboxId;
+  }
+  return result;
+}
+
 function validateWorkItem(value: unknown, label: string): WorkItem {
   const workItem = objectValue(value, label);
   const assignedRole = optionalString(workItem.assignedRole, `${label}.assignedRole`, 30);
@@ -949,6 +1073,7 @@ function validateWorkItem(value: unknown, label: string): WorkItem {
     MAX_WORK_ITEM_REQUIRED_CHECKS,
   );
   const allowedFiles = optionalFilePathArray(workItem.allowedFiles, `${label}.allowedFiles`);
+  const blockedReason = optionalString(workItem.blockedReason, `${label}.blockedReason`, 2_000);
   const rawAcceptanceCriteria = workItem.acceptanceCriteria ?? workItem.acceptanceConditions;
   const acceptanceCriteria = rawAcceptanceCriteria === undefined
     ? []
@@ -963,7 +1088,7 @@ function validateWorkItem(value: unknown, label: string): WorkItem {
     title: requiredString(workItem.title, `${label}.title`, 500),
     purpose: requiredString(workItem.purpose, `${label}.purpose`, 4_000),
     acceptanceCriteria,
-    status: enumValue(workItem.status, workItemStatuses, `${label}.status`),
+    status: enumValue(workItem.status, persistedWorkItemStatuses, `${label}.status`),
     dependsOn: stringArray(workItem.dependsOn, `${label}.dependsOn`),
     createdAt: timestamp(workItem.createdAt, `${label}.createdAt`),
     updatedAt: timestamp(workItem.updatedAt, `${label}.updatedAt`),
@@ -979,6 +1104,18 @@ function validateWorkItem(value: unknown, label: string): WorkItem {
   }
   if (allowedFiles !== undefined) {
     result.allowedFiles = allowedFiles;
+  }
+  if (workItem.executionAuthorization !== undefined) {
+    result.executionAuthorization = validateWorkItemExecutionAuthorization(
+      workItem.executionAuthorization,
+      `${label}.executionAuthorization`,
+    );
+  }
+  if (workItem.claim !== undefined) {
+    result.claim = validateWorkItemClaim(workItem.claim, `${label}.claim`);
+  }
+  if (blockedReason !== undefined) {
+    result.blockedReason = blockedReason;
   }
   if (workItem.delegation !== undefined) {
     result.delegation = validateWorkItemDelegation(workItem.delegation, `${label}.delegation`);
@@ -1465,6 +1602,15 @@ export function validateMissionState(value: unknown): MissionState {
     if (!missions.has(workItem.missionId)) {
       fail("invalid_input", `Work item ${workItem.id} references an unknown mission.`);
     }
+    if (
+      workItem.claim !== undefined &&
+      (workItem.status === "backlog" || workItem.status === "ready")
+    ) {
+      fail(
+        "invalid_input",
+        `Claimed work item ${workItem.id} cannot remain in ${workItem.status} state.`,
+      );
+    }
     for (const dependencyId of workItem.dependsOn) {
       const dependency = workItems.get(dependencyId);
       if (dependency === undefined) {
@@ -1476,7 +1622,8 @@ export function validateMissionState(value: unknown): MissionState {
       if (dependencyId === workItem.id) {
         fail("invalid_input", `Work item ${workItem.id} cannot depend on itself.`);
       }
-      if (workItem.status !== "backlog" && workItem.status !== "blocked" && dependency.status !== "complete") {
+      if (workItem.status !== "backlog" && workItem.status !== "blocked" &&
+          !isCompletedWorkItemStatus(dependency.status)) {
         fail("invalid_input", `Work item ${workItem.id} has an incomplete dependency for its status.`);
       }
     }
@@ -1574,7 +1721,7 @@ export function validateMissionState(value: unknown): MissionState {
   }
 
   for (const workItem of result.workItems) {
-    if (isStructuredImplementationWorkItem(workItem) && workItem.status === "complete") {
+    if (isStructuredImplementationWorkItem(workItem) && isCompletedWorkItemStatus(workItem.status)) {
       ensureAcceptedIndependentReview(result, workItem);
     }
   }
@@ -1657,6 +1804,17 @@ export class InMemoryMissionRepository implements MissionRepository {
   async save(state: MissionState): Promise<void> {
     this.state = clone(validateMissionState(state));
   }
+
+  async saveIfRevision(state: MissionState, expectedRevision: number): Promise<void> {
+    const actualRevision = this.state?.revision ?? 0;
+    if (actualRevision !== expectedRevision) {
+      fail(
+        "conflict",
+        `Mission state changed from revision ${expectedRevision}; reload before saving again.`,
+      );
+    }
+    this.state = clone(validateMissionState(state));
+  }
 }
 
 function findMission(state: MissionState, missionId: string): Mission {
@@ -1675,6 +1833,34 @@ function findWorkItem(state: MissionState, missionId: string, workItemId: string
     fail("not_found", `Work item ${workItemId} was not found in mission ${missionId}.`);
   }
   return workItem;
+}
+
+function isCompletedWorkItemStatus(status: WorkItemStatus): boolean {
+  return status === "done" || status === "complete";
+}
+
+function isProductWorkItemStatus(status: WorkItemStatus): status is TicketStatus {
+  return (ticketStatuses as readonly string[]).includes(status);
+}
+
+function validateExpectedRevision(value: unknown): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    fail("invalid_input", "expectedRevision must be a non-negative integer.");
+  }
+  return value;
+}
+
+function ensureExpectedRevision(state: MissionState, expectedRevision: number | undefined): void {
+  if (expectedRevision === undefined) {
+    return;
+  }
+  const expected = validateExpectedRevision(expectedRevision);
+  if (state.revision !== expected) {
+    fail(
+      "conflict",
+      `Mission state changed from revision ${expected}; reload the ticket before retrying.`,
+    );
+  }
 }
 
 function ensureOpen(mission: Mission): void {
@@ -1701,7 +1887,7 @@ function ensureUniqueEntityId(state: MissionState, id: string): void {
 function ensureDependenciesComplete(state: MissionState, workItem: WorkItem): void {
   const incomplete = workItem.dependsOn.filter((dependencyId) => {
     const dependency = state.workItems.find((item) => item.id === dependencyId);
-    return dependency === undefined || dependency.status !== "complete";
+    return dependency === undefined || !isCompletedWorkItemStatus(dependency.status);
   });
   if (incomplete.length > 0) {
     fail(
@@ -1713,7 +1899,7 @@ function ensureDependenciesComplete(state: MissionState, workItem: WorkItem): vo
 
 function ensureAllWorkComplete(state: MissionState, missionId: string): void {
   const incomplete = state.workItems
-    .filter((item) => item.missionId === missionId && item.status !== "complete")
+    .filter((item) => item.missionId === missionId && !isCompletedWorkItemStatus(item.status))
     .map((item) => item.id);
   if (incomplete.length > 0) {
     fail(
@@ -2305,6 +2491,13 @@ export class MissionService {
     );
   }
 
+  async listWorkItems(missionId: string): Promise<WorkItem[]> {
+    const state = await this.getState();
+    const normalizedMissionId = normalizedId(missionId, "missionId");
+    findMission(state, normalizedMissionId);
+    return clone(state.workItems.filter((item) => item.missionId === normalizedMissionId));
+  }
+
   async getEvidence(missionId: string, evidenceId: string): Promise<Evidence> {
     const state = await this.getState();
     const normalizedMissionId = normalizedId(missionId, "missionId");
@@ -2377,8 +2570,243 @@ export class MissionService {
       normalizedId(workItemId, "workItemId"),
     );
     return workItem.status === "ready" && workItem.dependsOn.every((dependencyId) =>
-      state.workItems.some((item) => item.id === dependencyId && item.status === "complete"),
+      state.workItems.some((item) => item.id === dependencyId && isCompletedWorkItemStatus(item.status)),
     );
+  }
+
+  /**
+   * Apply the only status changes a human may make from the board. The actor
+   * and expected revision are persisted/checked together with the mutation so
+   * a stale browser cannot silently overwrite another operator's decision.
+   */
+  async moveWorkItemByHuman(
+    missionId: string,
+    workItemId: string,
+    status: "backlog" | "ready",
+    input: HumanWorkItemTransitionInput,
+  ): Promise<WorkItem> {
+    const actor = requiredString(input.actor, "actor", 200);
+    if (status === "ready") {
+      return this.authorizeWorkItem(missionId, workItemId, {
+        actor,
+        ...(input.expectedRevision === undefined
+          ? {}
+          : { expectedRevision: input.expectedRevision }),
+      });
+    }
+    return this.revokeWorkItemAuthorization(missionId, workItemId, {
+      actor,
+      ...(input.expectedRevision === undefined
+        ? {}
+        : { expectedRevision: input.expectedRevision }),
+    });
+  }
+
+  async authorizeWorkItem(
+    missionId: string,
+    workItemId: string,
+    input: HumanWorkItemTransitionInput,
+  ): Promise<WorkItem> {
+    return this.mutate((state, now) => {
+      ensureExpectedRevision(state, input.expectedRevision);
+      const normalizedMissionId = normalizedId(missionId, "missionId");
+      const mission = findMission(state, normalizedMissionId);
+      ensureOpen(mission);
+      const workItem = findWorkItem(
+        state,
+        normalizedMissionId,
+        normalizedId(workItemId, "workItemId"),
+      );
+      if (workItem.status !== "backlog") {
+        fail(
+          "invalid_transition",
+          `Work item ${workItem.id} can only be authorized from backlog, not ${workItem.status}.`,
+        );
+      }
+      if (workItem.claim !== undefined) {
+        fail("invalid_transition", `Work item ${workItem.id} has already been claimed.`);
+      }
+      ensureDependenciesComplete(state, workItem);
+      const actor = requiredString(input.actor, "actor", 200);
+      workItem.executionAuthorization = {
+        authorizedBy: actor,
+        authorizedAt: now,
+      };
+      delete workItem.blockedReason;
+      workItem.status = "ready";
+      workItem.updatedAt = now;
+      return workItem;
+    });
+  }
+
+  async revokeWorkItemAuthorization(
+    missionId: string,
+    workItemId: string,
+    input: HumanWorkItemTransitionInput,
+  ): Promise<WorkItem> {
+    return this.mutate((state, now) => {
+      ensureExpectedRevision(state, input.expectedRevision);
+      const normalizedMissionId = normalizedId(missionId, "missionId");
+      const mission = findMission(state, normalizedMissionId);
+      ensureOpen(mission);
+      const workItem = findWorkItem(
+        state,
+        normalizedMissionId,
+        normalizedId(workItemId, "workItemId"),
+      );
+      if (workItem.status !== "ready") {
+        fail(
+          "invalid_transition",
+          `Work item ${workItem.id} can only be returned to backlog from ready, not ${workItem.status}.`,
+        );
+      }
+      if (workItem.claim !== undefined) {
+        fail(
+          "invalid_transition",
+          `Work item ${workItem.id} cannot return to backlog after it has been claimed.`,
+        );
+      }
+      requiredString(input.actor, "actor", 200);
+      delete workItem.executionAuthorization;
+      workItem.status = "backlog";
+      workItem.updatedAt = now;
+      return workItem;
+    });
+  }
+
+  /** Claim is a one-way, system-owned handoff from an authorized queue item. */
+  async claimWorkItem(
+    missionId: string,
+    workItemId: string,
+    input: ClaimWorkItemInput,
+  ): Promise<WorkItem> {
+    return this.mutate((state, now) => {
+      ensureExpectedRevision(state, input.expectedRevision);
+      const normalizedMissionId = normalizedId(missionId, "missionId");
+      const mission = findMission(state, normalizedMissionId);
+      ensureOpen(mission);
+      const workItem = findWorkItem(
+        state,
+        normalizedMissionId,
+        normalizedId(workItemId, "workItemId"),
+      );
+      if (workItem.status !== "ready") {
+        fail(
+          "invalid_transition",
+          `Work item ${workItem.id} can only be claimed from ready, not ${workItem.status}.`,
+        );
+      }
+      if (workItem.executionAuthorization === undefined) {
+        fail(
+          "invalid_transition",
+          `Work item ${workItem.id} cannot be claimed before human execution authorization.`,
+        );
+      }
+      if (workItem.claim !== undefined) {
+        fail("invalid_transition", `Work item ${workItem.id} has already been claimed.`);
+      }
+      ensureDependenciesComplete(state, workItem);
+      const owner = requiredString(input.owner, "owner", 200);
+      const trueforgeSessionId = optionalString(
+        input.trueforgeSessionId,
+        "trueforgeSessionId",
+        200,
+      );
+      const trueforgeSandboxId = optionalString(
+        input.trueforgeSandboxId,
+        "trueforgeSandboxId",
+        200,
+      );
+      workItem.claim = {
+        owner,
+        claimedAt: now,
+        ...(trueforgeSessionId === undefined ? {} : { trueforgeSessionId }),
+        ...(trueforgeSandboxId === undefined ? {} : { trueforgeSandboxId }),
+      };
+      workItem.status = "in_progress";
+      workItem.updatedAt = now;
+      return workItem;
+    });
+  }
+
+  async claimReadyWorkItem(
+    missionId: string,
+    workItemId: string,
+    input: ClaimWorkItemInput,
+  ): Promise<WorkItem> {
+    return this.claimWorkItem(missionId, workItemId, input);
+  }
+
+  async resumeChangesRequestedWorkItem(
+    missionId: string,
+    workItemId: string,
+    expectedRevision?: number,
+  ): Promise<WorkItem> {
+    return this.transitionSystemWorkItem(missionId, workItemId, "in_progress", {
+      trigger: "claim",
+      ...(expectedRevision === undefined ? {} : { expectedRevision }),
+    });
+  }
+
+  async transitionSystemWorkItem(
+    missionId: string,
+    workItemId: string,
+    status: TicketStatus,
+    options: Omit<WorkItemTransitionOptions, "trigger"> & {
+      trigger: Exclude<WorkItemTransitionTrigger, "human" | "legacy">;
+    },
+  ): Promise<WorkItem> {
+    return this.mutate((state, now) => {
+      ensureExpectedRevision(state, options.expectedRevision);
+      const normalizedMissionId = normalizedId(missionId, "missionId");
+      const mission = findMission(state, normalizedMissionId);
+      ensureOpen(mission);
+      const workItem = findWorkItem(
+        state,
+        normalizedMissionId,
+        normalizedId(workItemId, "workItemId"),
+      );
+      const nextStatus = enumValue(status, ticketStatuses, "status");
+      const fromStatus = workItem.status;
+      if (!isProductWorkItemStatus(fromStatus)) {
+        fail(
+          "invalid_transition",
+          `Legacy work item ${workItem.id} must be migrated before system transitions are used.`,
+        );
+      }
+      const legal =
+        (options.trigger === "claim" &&
+          ((fromStatus === "ready" && nextStatus === "in_progress") ||
+            (fromStatus === "changes_requested" && nextStatus === "in_progress"))) ||
+        (options.trigger === "execution" && fromStatus === "in_progress" && nextStatus === "proving") ||
+        (options.trigger === "proof" && fromStatus === "proving" &&
+          (["changes_requested", "awaiting_approval", "blocked"].includes(nextStatus) ||
+            (nextStatus === "done" && workItem.assignedRole !== "implementer"))) ||
+        (options.trigger === "approval" && fromStatus === "awaiting_approval" && nextStatus === "delivering") ||
+        (options.trigger === "delivery" && fromStatus === "delivering" && nextStatus === "done") ||
+        (options.trigger === "failure" &&
+          ["ready", "in_progress", "proving", "changes_requested", "awaiting_approval", "delivering"]
+            .includes(fromStatus) && nextStatus === "blocked") ||
+        (options.trigger === "retry" && fromStatus === "blocked" && nextStatus === "in_progress");
+      if (!legal) {
+        fail(
+          "invalid_transition",
+          `Work item ${workItem.id} cannot transition from ${fromStatus} to ${nextStatus} through ${options.trigger}.`,
+        );
+      }
+      if (["in_progress", "proving", "changes_requested", "awaiting_approval", "delivering", "done"]
+        .includes(nextStatus) && workItem.claim === undefined) {
+        fail("invalid_transition", `Work item ${workItem.id} has no durable claim.`);
+      }
+      if (nextStatus === "blocked") {
+        workItem.blockedReason = requiredString(options.reason, "reason", 2_000);
+      } else {
+        delete workItem.blockedReason;
+      }
+      workItem.status = nextStatus;
+      workItem.updatedAt = now;
+      return workItem;
+    });
   }
 
   async createMission(input: CreateMissionInput): Promise<Mission> {
@@ -2445,6 +2873,64 @@ export class MissionService {
       mission.trueforgeSandboxId = requiredString(sandboxId, "trueforgeSandboxId", 200);
       mission.updatedAt = now;
       return mission;
+    });
+  }
+
+  async attachWorkItemExecution(
+    missionId: string,
+    workItemId: string,
+    input: WorkItemExecutionBindingInput,
+  ): Promise<WorkItem> {
+    return this.mutate((state, now) => {
+      const normalizedMissionId = normalizedId(missionId, "missionId");
+      const mission = findMission(state, normalizedMissionId);
+      ensureOpen(mission);
+      const workItem = findWorkItem(
+        state,
+        normalizedMissionId,
+        normalizedId(workItemId, "workItemId"),
+      );
+      if (workItem.claim === undefined) {
+        fail(
+          "invalid_transition",
+          `Work item ${workItem.id} must be claimed before execution can be bound.`,
+        );
+      }
+      const trueforgeSessionId = requiredString(
+        input.trueforgeSessionId,
+        "trueforgeSessionId",
+        200,
+      );
+      const trueforgeSandboxId = optionalString(
+        input.trueforgeSandboxId,
+        "trueforgeSandboxId",
+        200,
+      );
+      if (
+        workItem.claim.trueforgeSessionId !== undefined &&
+        workItem.claim.trueforgeSessionId !== trueforgeSessionId
+      ) {
+        fail(
+          "invalid_transition",
+          `Work item ${workItem.id} is already bound to a different TrueForge session.`,
+        );
+      }
+      if (
+        trueforgeSandboxId !== undefined &&
+        workItem.claim.trueforgeSandboxId !== undefined &&
+        workItem.claim.trueforgeSandboxId !== trueforgeSandboxId
+      ) {
+        fail(
+          "invalid_transition",
+          `Work item ${workItem.id} is already bound to a different TrueForge sandbox.`,
+        );
+      }
+      workItem.claim.trueforgeSessionId = trueforgeSessionId;
+      if (trueforgeSandboxId !== undefined) {
+        workItem.claim.trueforgeSandboxId = trueforgeSandboxId;
+      }
+      workItem.updatedAt = now;
+      return workItem;
     });
   }
 
@@ -2519,7 +3005,7 @@ export class MissionService {
       const workItems = validatedGraph.items.map((planned) => {
         const prior = existingById.get(planned.id);
         const dependenciesComplete = planned.dependsOn.every((dependencyId) =>
-          state.workItems.some((item) => item.id === dependencyId && item.status === "complete"),
+          state.workItems.some((item) => item.id === dependencyId && isCompletedWorkItemStatus(item.status)),
         );
         const status = prior === undefined
           ? dependenciesComplete ? "ready" : "backlog"
@@ -2557,6 +3043,15 @@ export class MissionService {
         }
         if (prior?.delegation !== undefined) {
           workItem.delegation = clone(prior.delegation);
+        }
+        if (prior?.executionAuthorization !== undefined) {
+          workItem.executionAuthorization = clone(prior.executionAuthorization);
+        }
+        if (prior?.claim !== undefined) {
+          workItem.claim = clone(prior.claim);
+        }
+        if (prior?.blockedReason !== undefined) {
+          workItem.blockedReason = prior.blockedReason;
         }
         return workItem;
       });
@@ -2643,6 +3138,17 @@ export class MissionService {
         fail(
           "invalid_transition",
           `Work item ${workItem.id} delegation does not match the mission workspace baseline tree reference.`,
+        );
+      }
+      if (workItem.claim === undefined) {
+        workItem.claim = {
+          owner,
+          claimedAt: now,
+        };
+      } else if (workItem.claim.owner !== owner) {
+        fail(
+          "invalid_transition",
+          `Work item ${workItem.id} is already claimed by ${workItem.claim.owner}.`,
         );
       }
       workItem.delegation = {
@@ -2808,8 +3314,33 @@ export class MissionService {
     missionId: string,
     workItemId: string,
     status: WorkItemStatus,
+    options: WorkItemTransitionOptions = {},
   ): Promise<WorkItem> {
+    if (options.trigger === "human") {
+      if (status !== "backlog" && status !== "ready") {
+        fail("invalid_transition", "Humans may only move tickets between backlog and ready.");
+      }
+      if (options.actor === undefined) {
+        fail("invalid_input", "A human ticket transition requires an actor.");
+      }
+      return this.moveWorkItemByHuman(missionId, workItemId, status, {
+        actor: options.actor,
+        ...(options.expectedRevision === undefined
+          ? {}
+          : { expectedRevision: options.expectedRevision }),
+      });
+    }
+    if (options.trigger !== undefined && options.trigger !== "legacy") {
+      return this.transitionSystemWorkItem(missionId, workItemId, status as TicketStatus, {
+        trigger: options.trigger,
+        ...(options.expectedRevision === undefined
+          ? {}
+          : { expectedRevision: options.expectedRevision }),
+        ...(options.reason === undefined ? {} : { reason: options.reason }),
+      });
+    }
     return this.mutate((state, now) => {
+      ensureExpectedRevision(state, options.expectedRevision);
       const normalizedMissionId = normalizedId(missionId, "missionId");
       const mission = findMission(state, normalizedMissionId);
       ensureOpen(mission);
@@ -2818,7 +3349,7 @@ export class MissionService {
         normalizedMissionId,
         normalizedId(workItemId, "workItemId"),
       );
-      const nextStatus = enumValue(status, workItemStatuses, "status");
+      const nextStatus = enumValue(status, persistedWorkItemStatuses, "status");
       if (nextStatus === workItem.status || !workItemTransitions[workItem.status].includes(nextStatus)) {
         fail(
           "invalid_transition",
@@ -2828,12 +3359,17 @@ export class MissionService {
       if (nextStatus === "ready" || nextStatus === "in_progress") {
         ensureDependenciesComplete(state, workItem);
       }
-      if (nextStatus === "ready_for_review" && isStructuredImplementationWorkItem(workItem)) {
+      if ((nextStatus === "ready_for_review" || nextStatus === "proving") &&
+          isStructuredImplementationWorkItem(workItem)) {
         ensureSuccessfulImplementationHandoff(state, workItem);
       }
-      if (nextStatus === "complete" && isStructuredImplementationWorkItem(workItem)) {
+      if ((nextStatus === "complete" || nextStatus === "done") &&
+          isStructuredImplementationWorkItem(workItem)) {
         ensureSuccessfulImplementationHandoff(state, workItem);
         ensureAcceptedIndependentReview(state, workItem);
+      }
+      if (nextStatus !== "blocked") {
+        delete workItem.blockedReason;
       }
       workItem.status = nextStatus;
       workItem.updatedAt = now;
@@ -2848,10 +3384,10 @@ export class MissionService {
       ensureOpen(mission);
       const workItemId = normalizedId(input.workItemId, "workItemId");
       const workItem = findWorkItem(state, normalizedMissionId, workItemId);
-      if (workItem.status !== "ready_for_review") {
+      if (workItem.status !== "ready_for_review" && workItem.status !== "proving") {
         fail(
           "invalid_transition",
-          `Work item ${workItem.id} must be ready for review before an independent review is recorded.`,
+          `Work item ${workItem.id} must be proving before an independent review is recorded.`,
         );
       }
       const context = buildReviewContext(state, normalizedMissionId, workItemId);
@@ -2905,11 +3441,18 @@ export class MissionService {
       };
       state.evidence.push(findingEvidence);
       state.reviews.push(review);
+      const legacyReview = workItem.status === "ready_for_review";
       workItem.status = outcome === "accepted"
-        ? "complete"
+        ? legacyReview ? "complete" : "awaiting_approval"
         : outcome === "changes_requested"
-        ? "ready"
+        ? legacyReview ? "ready" : "changes_requested"
         : "blocked";
+      if (legacyReview && outcome === "changes_requested") {
+        // Older mission snapshots treated a requested change as a fresh ready
+        // attempt. Queue tickets retain their claim and use the explicit
+        // changes_requested -> in_progress repair path instead.
+        delete workItem.claim;
+      }
       workItem.updatedAt = now;
       return review;
     });
@@ -3295,11 +3838,23 @@ export class MissionService {
   private mutate<T>(mutator: (state: MissionState, now: string) => T): Promise<T> {
     const operation = this.pending.then(async () => {
       const current = await this.ensureState();
+      const expectedRevision = current.revision;
       const next = clone(current);
       const result = mutator(next, this.currentTimestamp());
       next.revision += 1;
       const validated = validateMissionState(next);
-      await this.repository.save(validated);
+      try {
+        if (this.repository.saveIfRevision !== undefined) {
+          await this.repository.saveIfRevision(validated, expectedRevision);
+        } else {
+          await this.repository.save(validated);
+        }
+      } catch (error) {
+        if (error instanceof MissionDomainError && error.code === "conflict") {
+          this.state = null;
+        }
+        throw error;
+      }
       this.state = validated;
       return clone(result);
     });

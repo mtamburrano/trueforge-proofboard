@@ -78,8 +78,14 @@ export interface MissionRunner {
   runTurn(
     missionId: string,
     instruction: string,
-    options: { workItemId: string; delegateToSubagent?: boolean },
+    options: { workItemId: string; previousTurnId?: string; delegateToSubagent?: boolean },
   ): Promise<TrueForgeTurnResult>;
+  claimReadyWorkItem?(
+    missionId: string,
+    workItemId: string,
+    owner: string,
+    expectedRevision?: number,
+  ): Promise<WorkItem>;
   proveImplementation(input: ImplementationProofInput): Promise<ImplementationHandoffDraft>;
   runSandboxVerification(input: SandboxVerificationInput): Promise<unknown>;
   requestPullRequestApproval(
@@ -204,6 +210,7 @@ export interface EvidenceView {
   kind: Evidence["kind"];
   summary: string;
   createdAt: string;
+  workItemId?: string;
   workItemTitle?: string;
   metadata: Record<string, string | number>;
   executionOrigin?: Evidence["executionOrigin"];
@@ -248,6 +255,7 @@ export interface ActivityView {
   result: Evidence["result"] | "active";
   summary: string;
   createdAt: string;
+  workItemId?: string;
   category: "session" | "runtime" | "repository" | "sandbox" | "narration";
 }
 
@@ -260,6 +268,7 @@ export interface MissionView {
     createdAt: string;
     updatedAt: string;
     repository?: { owner: string; name: string; ref: string };
+    deliveryTarget?: { owner: string; repo: string; base: string; head: string };
     execution: { connected: boolean; resumed: boolean; sandboxId?: string };
   };
   progress: {
@@ -285,6 +294,22 @@ export interface MissionView {
       allowedFiles?: string[];
       delegation?: WorkItem["delegation"];
     }>;
+  }>;
+  /** Queue-first board payload; lanes remain for clients using the original view. */
+  tickets: Array<{
+    id: string;
+    title: string;
+    purpose: string;
+    acceptanceCriteria: string[];
+    status: WorkItem["status"];
+    dependsOn: string[];
+    assignedRole?: WorkItem["assignedRole"];
+    requiredChecks?: string[];
+    allowedFiles?: string[];
+    executionAuthorization?: WorkItem["executionAuthorization"];
+    claim?: WorkItem["claim"];
+    blockedReason?: string;
+    delegation?: WorkItem["delegation"];
   }>;
   activity: ActivityView[];
   evidence: EvidenceView[];
@@ -536,127 +561,220 @@ class MissionController {
     const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
     if (needsPrimaryWorkGraphUpgrade(workItems)) {
       if (mission.status !== "delivered" && mission.status !== "failed") {
-        await this.missions.persistWorkGraph(
+        const upgraded = await this.missions.persistWorkGraph(
           PRIMARY_MISSION_ID,
           buildLegacyPrimaryWorkGraph(mission),
         );
+        for (const item of upgraded) {
+          if (item.status === "ready" && item.claim === undefined && item.executionAuthorization === undefined) {
+            await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, item.id, "backlog");
+          }
+        }
       }
       return;
     }
     if (workItems.length > 0) {
       validateWorkGraph({ items: workItems });
+      // A pre-claim primary root may have been created by the legacy graph
+      // bootstrap. Keep it in the visible queue until a human authorizes it.
+      for (const item of workItems) {
+        if (item.status === "ready" && item.claim === undefined && item.executionAuthorization === undefined) {
+          await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, item.id, "backlog");
+        }
+      }
       return;
     }
-    await this.missions.persistWorkGraph(
+    const created = await this.missions.persistWorkGraph(
       PRIMARY_MISSION_ID,
       buildPreflightWorkGraph(mission),
     );
+    for (const item of created) {
+      if (item.status === "ready") {
+        await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, item.id, "backlog");
+      }
+    }
   }
 
   private async executePrimaryMission(): Promise<MissionView> {
     await this.createOrOpenPrimaryMission();
+    const queued = await this.nextQueueWorkItem();
+    if (queued === undefined) {
+      throw new MissionDomainError(
+        "invalid_transition",
+        "No ticket is Ready for execution. Move a Backlog ticket to Ready to authorize the next run.",
+      );
+    }
     try {
       await this.prepareMissionForExecution();
-      let state = await this.missions.getState();
-      const inspectionItems = state.workItems.filter((item) =>
-        item.missionId === PRIMARY_MISSION_ID &&
-        item.assignedRole === "planner" &&
-        item.dependsOn.length === 0
-      );
-      if (inspectionItems.length !== 1 || inspectionItems[0] === undefined) {
-        throw new MissionControlError(
-          "Planning requires exactly one executable repository-inspection root.",
-        );
-      }
-      const inspectionItem = inspectionItems[0];
-      let inspectionResult: unknown;
-      await this.executeWork(inspectionItem.id, async () => {
-        inspectionResult = await this.runner.inspectRepository({
-          missionId: PRIMARY_MISSION_ID,
-          workItemId: inspectionItem.id,
-        });
-        await this.requirePassedEvidence(inspectionItem.id, "mcp");
-      });
-      if (inspectionResult !== undefined) {
-        await this.persistInspectedWorkGraph(inspectionResult, inspectionItem.id);
+      const workItem = await this.claimForExecution(queued, "trueforge-worker");
+      if (workItem.assignedRole === "planner") {
+        await this.executeRepositoryInspection(workItem);
+      } else if (workItem.assignedRole === "implementer") {
+        await this.executeImplementation(workItem);
       } else {
-        const plannedState = await this.missions.getState();
-        const hasExecutableGraph = plannedState.workItems.some((item) =>
-          item.missionId === PRIMARY_MISSION_ID && item.assignedRole === "implementer"
-        ) && plannedState.workItems.some((item) =>
-          item.missionId === PRIMARY_MISSION_ID && item.assignedRole === "reviewer"
-        );
-        if (!hasExecutableGraph) {
-          throw new MissionControlError(
-            "Completed repository inspection did not produce executable work.",
-          );
-        }
-      }
-
-      state = await this.missions.getState();
-      const implementers = state.workItems.filter((item) =>
-        item.missionId === PRIMARY_MISSION_ID && item.assignedRole === "implementer"
-      );
-      const reviewers = state.workItems.filter((item) =>
-        item.missionId === PRIMARY_MISSION_ID && item.assignedRole === "reviewer"
-      );
-      if (implementers.length !== 1 || reviewers.length !== 1) {
         throw new MissionControlError(
-          "Planning must produce one bounded implementation and one verification step.",
+          `Ready ticket ${workItem.id} has no executable implementation role.`,
         );
-      }
-      for (const implementer of implementers) {
-        await this.executeWork(implementer.id, async () => {
-          await this.runner.runTurn(
-            PRIMARY_MISSION_ID,
-            [
-              `Own the implementation for this bounded work item: ${implementer.purpose}`,
-              `Acceptance criteria: ${implementer.acceptanceCriteria.join(" ")}`,
-              `Allowed files for this work item: ${(implementer.allowedFiles ?? []).join(", ")}`,
-              `Prepare the sandbox and repository as needed, starting from the pinned repository ${PRIMARY_REPOSITORY.owner}/${PRIMARY_REPOSITORY.name}@${PRIMARY_REPOSITORY.ref}.`,
-              `Use ${PRIMARY_SANDBOX_REPOSITORY_ROOT} as the one canonical absolute sandbox checkout root. The sandbox may start empty; never assume /workspace or another provider-specific working directory. If that root is absent or is not the pinned checkout, clone the pinned repository into exactly that path or repair it there and check out the pinned ref before editing.`,
-              "Use absolute-root git/npm commands and do not rely on a guessed cwd, transient cd, relative repository discovery, or a nested checkout.",
-              "You may install tools, clone or check out the repository, edit, test, retry failed commands, and optionally use dynamic subagents; keep this implementation turn agentic. Recover from a failed guessed cwd or command setup by inspecting its structured exit result, correcting it against the canonical root, and continuing rather than treating one guessed-cwd failure as shell or sandbox unavailability.",
-              "Proof Board will independently measure the final repository, diff, and checks after this turn; narration is not proof.",
-              "Do not push, open a pull request, or perform any other remote mutation.",
-            ].join(" "),
-            { workItemId: implementer.id },
-          );
-          await this.requirePassedTurn(implementer.id);
-          const proof = await this.runner.proveImplementation({
-            missionId: PRIMARY_MISSION_ID,
-            workItemId: implementer.id,
-          });
-          await this.recordImplementationHandoff(proof, implementer.id);
-        }, false);
-        await this.reviewImplementation(implementer.id);
-      }
-      for (const reviewer of reviewers) {
-        await this.executeWork(reviewer.id, async () => {
-          const reviewState = await this.missions.getState();
-          const acceptedImplementationIds = new Set(reviewState.reviews
-            .filter((review) =>
-              review.missionId === PRIMARY_MISSION_ID && review.outcome === "accepted"
-            )
-            .map((review) => review.workItemId));
-          if (implementers.some((item) => !acceptedImplementationIds.has(item.id))) {
-            throw new MissionControlError(
-              "Verification cannot complete before independent implementation review is accepted.",
-            );
-          }
-        });
-      }
-
-      await this.ensurePrimaryDeliveryApproval();
-      const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
-      if (mission.status === "executing" || mission.status === "verifying") {
-        await this.missions.transitionMission(PRIMARY_MISSION_ID, "awaiting_approval");
       }
       return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID);
     } catch (error) {
       await this.recordMissionFailure(error);
-      await this.blockActiveWork();
+      await this.blockActiveWork(error);
       throw error;
+    }
+  }
+
+  private async nextQueueWorkItem(): Promise<WorkItem | undefined> {
+    const state = await this.missions.getState();
+    const items = state.workItems.filter((item) => item.missionId === PRIMARY_MISSION_ID);
+    const active = items.filter((item) => item.status === "in_progress" && item.claim !== undefined);
+    if (active.length > 1) {
+      throw new MissionControlError("Only one TrueForge ticket may execute at a time.");
+    }
+    if (active[0] !== undefined) {
+      return active[0];
+    }
+    return items.find((item) =>
+      item.status === "ready" &&
+      item.claim === undefined &&
+      item.executionAuthorization !== undefined,
+    );
+  }
+
+  private async claimForExecution(
+    workItem: WorkItem,
+    owner: string,
+    expectedRevision?: number,
+  ): Promise<WorkItem> {
+    const revision = expectedRevision ?? (await this.missions.getState()).revision;
+    if (this.runner.claimReadyWorkItem !== undefined) {
+      return this.runner.claimReadyWorkItem(
+        PRIMARY_MISSION_ID,
+        workItem.id,
+        workItem.claim?.owner ?? owner,
+        workItem.status === "ready" ? revision : undefined,
+      );
+    }
+    if (workItem.status === "in_progress") {
+      if (workItem.claim === undefined) {
+        throw new MissionControlError(`In-progress ticket ${workItem.id} has no durable claim.`);
+      }
+      return workItem;
+    }
+    const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
+    return this.missions.claimReadyWorkItem(PRIMARY_MISSION_ID, workItem.id, {
+      owner,
+      expectedRevision: revision,
+      ...(mission.trueforgeSessionId === undefined
+        ? {}
+        : { trueforgeSessionId: mission.trueforgeSessionId }),
+      ...(mission.trueforgeSandboxId === undefined
+        ? {}
+        : { trueforgeSandboxId: mission.trueforgeSandboxId }),
+    });
+  }
+
+  async claimPrimaryTicket(
+    workItemId: string,
+    owner: string,
+    expectedRevision?: number,
+  ): Promise<WorkItem> {
+    const workItem = await this.missions.getWorkItem(PRIMARY_MISSION_ID, workItemId);
+    if (workItem.status !== "ready" && workItem.status !== "in_progress") {
+      throw new MissionDomainError(
+        "invalid_transition",
+        `Ticket ${workItem.id} is ${workItem.status}; only Ready tickets can enter execution.`,
+      );
+    }
+    return this.claimForExecution(workItem, owner, expectedRevision);
+  }
+
+  private async executeRepositoryInspection(workItem: WorkItem): Promise<void> {
+    let inspectionResult: unknown;
+    await this.executeClaimedWork(workItem.id, async () => {
+      const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
+      inspectionResult = await this.runner.inspectRepository({
+        missionId: PRIMARY_MISSION_ID,
+        workItemId: workItem.id,
+        ...(mission.trueforgeTurnId === undefined ? {} : { previousTurnId: mission.trueforgeTurnId }),
+      });
+      await this.requirePassedEvidence(workItem.id, "mcp");
+    });
+    if (inspectionResult === undefined) {
+      throw new MissionControlError(
+        "Completed repository inspection did not return authoritative repository facts.",
+      );
+    }
+    await this.missions.transitionSystemWorkItem(PRIMARY_MISSION_ID, workItem.id, "done", {
+      trigger: "proof",
+    });
+    await this.persistInspectedWorkGraph(inspectionResult, workItem.id);
+    await this.ensureWorkItems();
+  }
+
+  private async executeImplementation(workItem: WorkItem): Promise<void> {
+    const state = await this.missions.getState();
+    const repositoryProof = state.evidence.find((evidence) =>
+      evidence.missionId === PRIMARY_MISSION_ID &&
+      evidence.source === "mcp" &&
+      evidence.result === "passed"
+    );
+    if (repositoryProof === undefined) {
+      throw new MissionControlError(
+        "Implementation cannot start before a successful read-only repository MCP interaction is persisted.",
+      );
+    }
+    const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
+    const repository = mission.repository;
+    if (repository === undefined) {
+      throw new MissionControlError("Implementation cannot start without a verified repository target.");
+    }
+    const details = evidenceDetails(repositoryProof);
+    const verifiedSha = typeof details?.commit_sha === "string"
+      ? details.commit_sha
+      : repository.ref;
+    await this.executeClaimedWork(workItem.id, async () => {
+      const currentMission = await this.missions.getMission(PRIMARY_MISSION_ID);
+      await this.runner.runTurn(
+        PRIMARY_MISSION_ID,
+        [
+          `Own the bounded implementation ticket: ${workItem.purpose}`,
+          `Mission objective: ${currentMission.objective}`,
+          `Acceptance criteria: ${workItem.acceptanceCriteria.join(" ")}`,
+          `Allowed files: ${(workItem.allowedFiles ?? []).join(", ")}`,
+          `Verified repository facts: ${repository.owner}/${repository.name} at full commit ${verifiedSha}.`,
+          `Use ${PRIMARY_SANDBOX_REPOSITORY_ROOT} as the one canonical absolute sandbox checkout root. Ensure the pinned repository is present there before edits; never use /workspace, a guessed cwd, or a nested checkout.`,
+          "Use the real persistent sandbox and configured tools. You may inspect, edit, install, test, recover from structured command failures, and optionally delegate through TrueForge; keep the turn agentic instead of following a shell micro-script.",
+          "Proof Board will independently measure the final persisted sandbox; narration is not proof.",
+          "Do not push, open a pull request, or perform any other remote mutation.",
+        ].join(" "),
+        {
+          workItemId: workItem.id,
+          ...(currentMission.trueforgeTurnId === undefined
+            ? {}
+            : { previousTurnId: currentMission.trueforgeTurnId }),
+        },
+      );
+      await this.requirePassedTurn(workItem.id);
+    });
+  }
+
+  private async executeClaimedWork(
+    workItemId: string,
+    operation: () => Promise<void>,
+  ): Promise<void> {
+    const workItem = await this.missions.getWorkItem(PRIMARY_MISSION_ID, workItemId);
+    if (workItem.status !== "in_progress" || workItem.claim === undefined) {
+      throw new MissionControlError(
+        `Ticket ${workItem.id} must be durably claimed before TrueForge execution.`,
+      );
+    }
+    await operation();
+    const current = await this.missions.getWorkItem(PRIMARY_MISSION_ID, workItemId);
+    if (current.status === "in_progress") {
+      await this.missions.transitionSystemWorkItem(PRIMARY_MISSION_ID, workItemId, "proving", {
+        trigger: "execution",
+      });
     }
   }
 
@@ -978,43 +1096,17 @@ class MissionController {
     if (mission.status === "draft") {
       mission = await this.missions.transitionMission(PRIMARY_MISSION_ID, "planning");
     }
-    if (mission.status === "planning" || mission.status === "blocked") {
+    if (mission.status === "planning") {
       await this.missions.transitionMission(PRIMARY_MISSION_ID, "executing");
     }
     const current = await this.missions.getMission(PRIMARY_MISSION_ID);
-    if (current.status !== "executing" && current.status !== "verifying") {
-      throw new MissionControlError(`Mission cannot run from ${current.status}.`);
-    }
-  }
-
-  private async executeWork(
-    workItemId: string,
-    operation: () => Promise<void>,
-    complete = true,
-  ): Promise<void> {
-    let item = await this.missions.getWorkItem(PRIMARY_MISSION_ID, workItemId);
-    if (item.status === "complete") {
-      return;
-    }
-    if (item.status === "blocked") {
-      item = await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, workItemId, "ready");
-    }
-    if (item.status === "backlog") {
-      item = await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, workItemId, "ready");
-    }
-    if (item.status === "ready") {
-      item = await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, workItemId, "in_progress");
-    }
-    if (item.status === "in_progress") {
-      await operation();
-      item = await this.missions.transitionWorkItem(
-        PRIMARY_MISSION_ID,
-        workItemId,
-        "ready_for_review",
+    if (current.status === "blocked") {
+      throw new MissionControlError(
+        "Mission is blocked; inspect the durable failure record before retrying the same ticket.",
       );
     }
-    if (complete && item.status === "ready_for_review") {
-      await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, workItemId, "complete");
+    if (current.status !== "executing" && current.status !== "verifying") {
+      throw new MissionControlError(`Mission cannot run from ${current.status}.`);
     }
   }
 
@@ -1079,17 +1171,25 @@ class MissionController {
     }
   }
 
-  private async blockActiveWork(): Promise<void> {
+  private async blockActiveWork(error?: unknown): Promise<void> {
     try {
       const state = await this.missions.getState();
       const active = state.workItems.find(
         (item) =>
           item.missionId === PRIMARY_MISSION_ID &&
-          ["backlog", "ready", "in_progress", "ready_for_review"].includes(item.status) &&
-          (item.status === "in_progress" || item.status === "ready_for_review"),
+          (item.status === "in_progress" || item.status === "ready_for_review") &&
+          item.claim !== undefined,
       );
       if (active !== undefined) {
-        await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, active.id, "blocked");
+        const reason = missionFailureReason(error ?? "TrueForge execution failed before the ticket could advance.");
+        if (active.status === "in_progress") {
+          await this.missions.transitionSystemWorkItem(PRIMARY_MISSION_ID, active.id, "blocked", {
+            trigger: "failure",
+            reason,
+          });
+        } else {
+          await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, active.id, "blocked");
+        }
       }
       const mission = await this.missions.getMission(PRIMARY_MISSION_ID);
       if (!["blocked", "failed", "delivered"].includes(mission.status)) {
@@ -1526,6 +1626,12 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
       connected: mission.trueforgeSessionId !== undefined,
       resumed: mission.trueforgeTurnId !== undefined,
     },
+    deliveryTarget: {
+      owner: PRIMARY_DELIVERY_TARGET.owner,
+      repo: PRIMARY_DELIVERY_TARGET.repo,
+      base: PRIMARY_DELIVERY_TARGET.base,
+      head: PRIMARY_DELIVERY_TARGET.head,
+    },
   };
   if (mission.trueforgeSandboxId !== undefined) {
     missionView.execution.sandboxId = mission.trueforgeSandboxId;
@@ -1551,6 +1657,7 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
       lane("prove", "Prove", workItems.filter((item) => item.assignedRole === "reviewer")),
       lane("approve", "Approve", []),
     ],
+    tickets: workItems.map(mapTicket),
     activity,
     evidence,
     diagnostics: buildDiagnosticSnapshot(state, missionId),
@@ -1639,6 +1746,26 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
   };
 }
 
+function mapTicket(item: WorkItem): MissionView["tickets"][number] {
+  return {
+    id: item.id,
+    title: item.title,
+    purpose: item.purpose,
+    acceptanceCriteria: [...item.acceptanceCriteria],
+    status: item.status,
+    dependsOn: [...item.dependsOn],
+    ...(item.assignedRole === undefined ? {} : { assignedRole: item.assignedRole }),
+    ...(item.requiredChecks === undefined ? {} : { requiredChecks: [...item.requiredChecks] }),
+    ...(item.allowedFiles === undefined ? {} : { allowedFiles: [...item.allowedFiles] }),
+    ...(item.executionAuthorization === undefined
+      ? {}
+      : { executionAuthorization: { ...item.executionAuthorization } }),
+    ...(item.claim === undefined ? {} : { claim: { ...item.claim } }),
+    ...(item.blockedReason === undefined ? {} : { blockedReason: item.blockedReason }),
+    ...(item.delegation === undefined ? {} : { delegation: { ...item.delegation } }),
+  };
+}
+
 function lane(id: "plan" | "execute" | "prove" | "approve", label: string, items: WorkItem[]) {
   return {
     id,
@@ -1693,6 +1820,9 @@ function mapEvidence(
     createdAt: evidence.createdAt,
     metadata,
   };
+  if (evidence.workItemId !== undefined) {
+    view.workItemId = evidence.workItemId;
+  }
   const title = evidence.workItemId === undefined ? undefined : titleByWorkId.get(evidence.workItemId);
   if (title !== undefined) {
     view.workItemTitle = title;
@@ -1763,6 +1893,7 @@ function mapActivity(evidence: Evidence): ActivityView {
     result: evidence.result,
     summary: evidence.summary,
     createdAt: evidence.createdAt,
+    ...(evidence.workItemId === undefined ? {} : { workItemId: evidence.workItemId }),
     category,
   };
 }
@@ -1867,6 +1998,12 @@ export function createMissionHttpApp(options: MissionHttpOptions) {
       if (request.method === "GET" && url.pathname === "/api/mission") {
         return jsonResponse({ mission: await controller.getPrimaryMission() });
       }
+      if (request.method === "GET" && url.pathname === "/api/mission/tickets") {
+        return jsonResponse(await primaryTicketsResponse(options.missions));
+      }
+      if (request.method === "GET" && url.pathname === "/api/mission/work-items") {
+        return jsonResponse(await primaryTicketsResponse(options.missions));
+      }
       if (request.method === "GET" && url.pathname === "/api/mission/diagnostics") {
         return jsonResponse({ diagnostics: await controller.getPrimaryDiagnostics() });
       }
@@ -1875,6 +2012,51 @@ export function createMissionHttpApp(options: MissionHttpOptions) {
       }
       if (request.method === "POST" && url.pathname === "/api/mission/run") {
         return jsonResponse({ mission: await controller.runPrimaryMission() });
+      }
+      const ticketStatusRoute = url.pathname.match(
+        /^\/api\/mission\/(?:tickets|work-items)\/([^/]+)\/status$/,
+      );
+      if (request.method === "PATCH" && ticketStatusRoute?.[1] !== undefined) {
+        const body = await requestRecord(request, "Ticket transition body");
+        const status = body.status;
+        if (status !== "backlog" && status !== "ready") {
+          throw new MissionDomainError(
+            "invalid_transition",
+            "Humans may only move tickets between Backlog and Ready; later states are system-owned.",
+          );
+        }
+        const actor = requiredRequestString(body.actor, "actor");
+        const expectedRevision = requestRevision(body);
+        const ticket = await options.missions.moveWorkItemByHuman(
+          PRIMARY_MISSION_ID,
+          decodeURIComponent(ticketStatusRoute[1]),
+          status,
+          {
+            actor,
+            ...(expectedRevision === undefined ? {} : { expectedRevision }),
+          },
+        );
+        return jsonResponse({
+          revision: (await options.missions.getState()).revision,
+          ticket: mapTicket(ticket),
+        });
+      }
+      const ticketClaimRoute = url.pathname.match(
+        /^\/api\/mission\/(?:tickets|work-items)\/([^/]+)\/claim$/,
+      );
+      if (request.method === "POST" && ticketClaimRoute?.[1] !== undefined) {
+        const body = await requestRecord(request, "Ticket claim body");
+        const owner = requiredRequestString(body.owner ?? body.agent, "owner");
+        const expectedRevision = requestRevision(body);
+        const ticket = await controller.claimPrimaryTicket(
+          decodeURIComponent(ticketClaimRoute[1]),
+          owner,
+          expectedRevision,
+        );
+        return jsonResponse({
+          revision: (await options.missions.getState()).revision,
+          ticket: mapTicket(ticket),
+        });
       }
       const approvalRoute = url.pathname.match(/^\/api\/mission\/approvals\/([^/]+)$/);
       if (request.method === "POST" && approvalRoute?.[1] !== undefined) {
@@ -1889,7 +2071,7 @@ export function createMissionHttpApp(options: MissionHttpOptions) {
       return jsonResponse({ error: "not_found", message: "Route not found." }, 404);
     } catch (error) {
       const status = error instanceof MissionDomainError
-        ? error.code === "not_found" ? 404 : 400
+        ? error.code === "not_found" ? 404 : error.code === "conflict" ? 409 : 400
         : error instanceof TrueForgeIntegrationError || error instanceof MissionControlError
         ? 502
         : 500;
@@ -1898,6 +2080,61 @@ export function createMissionHttpApp(options: MissionHttpOptions) {
       return jsonResponse({ error: "operation_failed", message, mission }, status);
     }
   }
+}
+
+async function primaryTicketsResponse(missions: MissionService): Promise<{
+  revision: number;
+  mission: { id: string; objective: string; status: Mission["status"] } | null;
+  tickets: MissionView["tickets"];
+}> {
+  const state = await missions.getState();
+  const mission = state.missions.find((item) => item.id === PRIMARY_MISSION_ID);
+  return {
+    revision: state.revision,
+    mission: mission === undefined
+      ? null
+      : { id: mission.id, objective: mission.objective, status: mission.status },
+    tickets: state.workItems
+      .filter((item) => item.missionId === PRIMARY_MISSION_ID)
+      .map(mapTicket),
+  };
+}
+
+async function requestRecord(
+  request: Request,
+  label: string,
+): Promise<Record<string, unknown>> {
+  let value: unknown;
+  try {
+    value = await request.json();
+  } catch {
+    throw new MissionDomainError("invalid_input", `${label} must be valid JSON.`);
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new MissionDomainError("invalid_input", `${label} must be an object.`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function requiredRequestString(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new MissionDomainError("invalid_input", `${label} must be a non-empty string.`);
+  }
+  return value.trim();
+}
+
+function requestRevision(body: Record<string, unknown>): number | undefined {
+  const value = body.expected_revision ?? body.expectedRevision ?? body.expected_version;
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new MissionDomainError(
+      "invalid_input",
+      "expected_revision must be a non-negative integer.",
+    );
+  }
+  return value;
 }
 
 async function approvalDecisionFromRequest(
@@ -2009,6 +2246,9 @@ function publicErrorMessage(error: unknown): string {
   if (error instanceof MissionDomainError) {
     if (/allowed file scope|outside .* scope|exit-preserving|content-bearing diff/i.test(error.message)) {
       return sanitizePublicRuntimeError(error.message);
+    }
+    if (["conflict", "invalid_transition", "dependency_blocked", "invalid_input"].includes(error.code)) {
+      return error.message.slice(0, 240);
     }
     return error.code === "not_found"
       ? "The requested mission state was not found."

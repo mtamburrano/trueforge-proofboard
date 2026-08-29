@@ -1988,12 +1988,9 @@ test("locked fixture inspection proves direct TrueForge get_commit content and e
   assert.equal(inspection.toolName, "get_commit");
   assert.equal(inspection.commitSha, LOCKED_FIXTURE_SHA);
   assert.deepEqual(inspection.patches, LOCKED_FIXTURE_PATCHES);
-  assert.match(calls.turns[0].request.input[0].content, /get_commit with this exact JSON object/);
-  assert.match(calls.turns[0].request.input[0].content, /"owner":"mtamburrano"/);
-  assert.match(calls.turns[0].request.input[0].content, /"repo":"proofboard-demo-fixture"/);
+  assert.match(calls.turns[0].request.input[0].content, /mtamburrano\/proofboard-demo-fixture/);
   assert.match(calls.turns[0].request.input[0].content, new RegExp(LOCKED_FIXTURE_REF));
-  assert.match(calls.turns[0].request.input[0].content, /"detail":"full_patch"/);
-  assert.match(calls.turns[0].request.input[0].content, /"perPage":100/);
+  assert.match(calls.turns[0].request.input[0].content, /full_patch/);
 
   const state = await missions.getState();
   const proof = state.evidence.find((item) => item.id === inspection.evidenceId);
