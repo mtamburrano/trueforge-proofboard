@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import vm from "node:vm";
 
 import {
   InMemoryMissionRepository,
@@ -92,6 +93,40 @@ test("Proof Board UI keeps durable polling, drawer, activity, proof, and approva
   assert.match(styleSheet, /\.proof-check-list/);
   assert.match(styleSheet, /\.provenance-strip/);
   assert.match(styleSheet, /\.activity-details/);
+});
+
+test("Agent activity excludes deterministic proof and control-plane activity", () => {
+  const runtimeSource = appScript.slice(
+    appScript.indexOf("function ticketActivity"),
+    appScript.indexOf("function latestHandoff"),
+  );
+  const { activitySurface, ticketRuntimeActivity } = vm.runInNewContext(`${runtimeSource}\n({ activitySurface, ticketRuntimeActivity })`);
+  const categories = ["repository", "runtime", "narration", "session", "sandbox", "approval", "delivery"];
+  const activity = categories.map((category) => ({
+    category,
+    workItemId: "ticket-runtime-boundary",
+    summary: `${category} activity`,
+    createdAt: "2026-08-30T00:00:00.000Z",
+  }));
+
+  assert.deepEqual(
+    ticketRuntimeActivity(
+      { id: "ticket-runtime-boundary", title: "Runtime boundary" },
+      { activity },
+    ).map((item) => item.category),
+    ["repository", "runtime", "narration", "session"],
+  );
+  assert.deepEqual(
+    categories.map((category) => activitySurface(category)),
+    ["runtime", "runtime", "runtime", "runtime", "proof", "control-plane", "control-plane"],
+  );
+  assert.match(appScript, /drawer-runtime[^\n]*data-provenance-surface="runtime"[\s\S]*renderTicketActivity\(activity\)/);
+  assert.match(appScript, /drawer-proof[^\n]*data-provenance-surface="proof"[\s\S]*renderTicketEvidence\(evidence\)/);
+  assert.match(appScript, /approval-facts[^\n]*data-provenance-surface="control-plane"/);
+  assert.match(appScript, /delivery-result delivery-card[^\n]*data-provenance-surface="control-plane"/);
+  assert.match(appScript, /data-provenance-surface="\$\{escapeHtml\(activitySurface\(item\.category\)\)\}"/);
+  assert.match(appScript, /renderApprovalBody\(approval\)/);
+  assert.match(appScript, /renderDeliveryBody\(delivery\)/);
 });
 
 test("ticket cards open a non-blocking drawer while queue transitions stay in the drawer", () => {
