@@ -300,7 +300,6 @@ function renderBoardColumn(column, view, count) {
 function renderTicketCard(ticket, view) {
   const status = effectiveStatus(ticket);
   const canDrag = canDragTicket(ticket);
-  const targetStatus = status === "changes_requested" ? "ready" : ticket.status === "backlog" ? "ready" : "backlog";
   const repository = view.mission.repository;
   const target = view.mission.deliveryTarget;
   const scope = ticket.allowedFiles ?? [];
@@ -325,10 +324,7 @@ function renderTicketCard(ticket, view) {
   const findingsBadge = status === "changes_requested" && findings.length > 0
     ? `<span class="badge finding-badge">${findings.length} unresolved finding${findings.length === 1 ? "" : "s"}</span>`
     : "";
-  const actionLabel = status === "changes_requested"
-    ? "Authorize bounded rework"
-    : targetStatus === "ready" ? "Authorize execution" : "Return to Backlog";
-  return `<article class="ticket-card ${canDrag ? "human-movable" : "system-owned"}" data-ticket-card data-ticket-id="${escapeHtml(ticket.id)}" data-status="${escapeHtml(columnForStatus(status))}" role="button" aria-labelledby="ticket-title-${safeId}" aria-haspopup="dialog" aria-controls="ticket-drawer" aria-expanded="${selectedTicketId === ticket.id ? "true" : "false"}" draggable="${canDrag}" tabindex="0"><div class="ticket-card-topline"><span class="ticket-contract-label">Work contract</span>${chip(status)}</div><h3 id="ticket-title-${safeId}">${escapeHtml(ticket.title)}</h3><p class="ticket-objective"><span>Objective</span> ${escapeHtml(ticket.purpose)}</p><div class="ticket-facts">${repository ? `<span title="Pinned repository"><strong>${escapeHtml(repository.owner)}/${escapeHtml(repository.name)}</strong> · base ${escapeHtml(target?.base ?? "—")}</span>` : ""}${criteria.length ? `<span title="Acceptance criteria">${criteria.length} acceptance condition${criteria.length === 1 ? "" : "s"}</span>` : ""}</div>${scope.length ? `<div class="ticket-scope" aria-label="Allowed file scope">${scope.slice(0, 3).map((file) => `<code>${escapeHtml(file)}</code>`).join("")}${scope.length > 3 ? `<span class="badge">+${scope.length - 3} files</span>` : ""}</div>` : ""}<div class="ticket-card-meta">${authorizationBadge}${claimBadge}${attemptBadge}${findingsBadge}${dependencyBlocked ? `<span class="badge dependency-badge">Dependency blocked</span>` : ticket.dependsOn.length ? `<span class="badge">${ticket.dependsOn.length} dependenc${ticket.dependsOn.length === 1 ? "y" : "ies"}</span>` : ""}</div>${renderTicketSignal(ticket, view, status)}<div class="ticket-card-actions">${canDrag ? `<button class="compact-action ticket-transition" type="button" data-ticket-transition="${escapeHtml(ticket.id)}" data-target-status="${targetStatus}">${actionLabel}</button>` : ""}<button class="compact-action ticket-inspect" type="button" data-ticket-open="${escapeHtml(ticket.id)}">Inspect contract</button></div></article>`;
+  return `<article class="ticket-card ${canDrag ? "human-movable" : "system-owned"}" data-ticket-card data-ticket-id="${escapeHtml(ticket.id)}" data-status="${escapeHtml(columnForStatus(status))}" role="button" aria-labelledby="ticket-title-${safeId}" aria-haspopup="dialog" aria-controls="ticket-drawer" aria-expanded="${selectedTicketId === ticket.id ? "true" : "false"}" draggable="${canDrag}" tabindex="0"><div class="ticket-card-topline"><span class="ticket-contract-label">Work contract</span>${chip(status)}</div><h3 id="ticket-title-${safeId}">${escapeHtml(ticket.title)}</h3><p class="ticket-objective"><span>Objective</span> ${escapeHtml(ticket.purpose)}</p><div class="ticket-facts">${repository ? `<span title="Pinned repository"><strong>${escapeHtml(repository.owner)}/${escapeHtml(repository.name)}</strong> · base ${escapeHtml(target?.base ?? "—")}</span>` : ""}${criteria.length ? `<span title="Acceptance criteria">${criteria.length} acceptance condition${criteria.length === 1 ? "" : "s"}</span>` : ""}</div>${scope.length ? `<div class="ticket-scope" aria-label="Allowed file scope">${scope.slice(0, 3).map((file) => `<code>${escapeHtml(file)}</code>`).join("")}${scope.length > 3 ? `<span class="badge">+${scope.length - 3} files</span>` : ""}</div>` : ""}<div class="ticket-card-meta">${authorizationBadge}${claimBadge}${attemptBadge}${findingsBadge}${dependencyBlocked ? `<span class="badge dependency-badge">Dependency blocked</span>` : ticket.dependsOn.length ? `<span class="badge">${ticket.dependsOn.length} dependenc${ticket.dependsOn.length === 1 ? "y" : "ies"}</span>` : ""}</div>${renderTicketSignal(ticket, view, status)}</article>`;
 }
 
 function renderTicketSignal(ticket, view, status) {
@@ -404,7 +400,7 @@ function renderTicketDrawer(ticket, view) {
     const dependency = ticketById(view, dependencyId);
     return `<li>${escapeHtml(dependency?.title ?? dependencyId)}${dependency ? " · " + chip(effectiveStatus(dependency)) : ""}</li>`;
   }).join("");
-  return `<button class="ticket-drawer-scrim" type="button" data-drawer-close aria-label="Close ticket details"></button><aside id="ticket-drawer" class="ticket-drawer" role="dialog" aria-modal="true" aria-labelledby="ticket-drawer-title" tabindex="-1"><header class="drawer-header"><div><p class="drawer-eyebrow">Proof ticket · ${escapeHtml(ticket.assignedRole ?? "pipeline")}</p><h2 id="ticket-drawer-title">${escapeHtml(ticket.title)}</h2></div><button id="close-ticket-drawer" class="compact-action" type="button" aria-label="Close ticket drawer">Close</button></header><div class="drawer-status-row">${chip(status)}${ticket.attempt > 0 ? `<span class="badge attempt-badge">Attempt ${ticket.attempt}</span>` : ""}${ticket.executionAuthorization ? `<span class="badge authorization-badge">Authorized by ${escapeHtml(ticket.executionAuthorization.authorizedBy)}</span>` : ""}${ticket.claim ? `<span class="badge">${status === "changes_requested" ? "Prior claim" : "Claimed"} by ${escapeHtml(ticket.claim.owner)}</span>` : ""}</div><section class="drawer-section"><p class="section-kicker">Objective</p><p class="drawer-objective">${escapeHtml(ticket.purpose)}</p></section><section class="drawer-section"><p class="section-kicker">Work contract</p><dl class="ticket-meta">${repository ? `<div><dt>Repository</dt><dd>${escapeHtml(repository.owner)}/${escapeHtml(repository.name)}</dd></div><div><dt>Base</dt><dd>${escapeHtml(target?.base ?? "—")}</dd></div><div><dt>Pinned ref</dt><dd><code>${escapeHtml(repository.ref)}</code></dd></div>` : ""}<div><dt>Allowed files</dt><dd>${ticket.allowedFiles?.length ? ticket.allowedFiles.map((file) => `<code>${escapeHtml(file)}</code>`).join("<br>") : "Mission scope"}</dd></div><div><dt>Required checks</dt><dd>${ticket.requiredChecks?.length ? ticket.requiredChecks.join(", ") : "Pipeline-defined"}</dd></div><div><dt>Attempt</dt><dd>${ticket.attempt > 0 ? ticket.attempt : "Not claimed"}</dd></div><div><dt>Claim</dt><dd>${ticket.claim ? escapeHtml(ticket.claim.owner) + " · " + escapeHtml(formatTime(ticket.claim.claimedAt)) : "Unclaimed"}</dd></div><div><dt>TrueForge binding</dt><dd>${ticket.claim?.trueforgeSessionId ? `session ${escapeHtml(shortRef(ticket.claim.trueforgeSessionId))}` : attempt?.claim?.trueforgeSessionId ? `session ${escapeHtml(shortRef(attempt.claim.trueforgeSessionId))}` : "Not connected"}${ticket.claim?.trueforgeSandboxId ? ` · sandbox ${escapeHtml(shortRef(ticket.claim.trueforgeSandboxId))}` : attempt?.claim?.trueforgeSandboxId ? ` · sandbox ${escapeHtml(shortRef(attempt.claim.trueforgeSandboxId))}` : ""}</dd></div></dl></section><section class="drawer-section"><p class="section-kicker">Acceptance</p><ul class="acceptance-list">${ticket.acceptanceCriteria?.map((criterion) => `<li>${escapeHtml(criterion)}</li>`).join("") || "<li>No acceptance conditions recorded.</li>"}</ul></section><section class="drawer-section"><p class="section-kicker">Dependencies</p><ul class="dependency-list">${dependencies || "<li>None</li>"}</ul>${ticket.blockedReason ? `<p class="drawer-failure"><strong>Blocker:</strong> ${escapeHtml(ticket.blockedReason)}</p>` : ""}</section>${renderReworkContext(ticket, status)}<section class="drawer-section drawer-gate"><p class="section-kicker">Authorization</p>${renderDrawerAuthorization(ticket, view)}</section><section class="drawer-section"><p class="section-kicker">Current state</p>${renderTicketSignal(ticket, view, status)}${approval ? `<div class="drawer-approval">${renderApprovalBody(approval)}</div>` : ""}${delivery ? renderDeliveryBody(delivery) : ""}</section><section class="drawer-section"><p class="section-kicker">Attempt history</p>${renderAttemptHistory(ticket)}</section><section class="drawer-section"><p class="section-kicker">Review history</p>${renderReviewHistory(reviews)}</section><section class="drawer-section"><p class="section-kicker">TrueForge activity</p>${renderTicketActivity(activity)}</section><section class="drawer-section"><p class="section-kicker">Ticket evidence</p>${renderTicketEvidence(evidence)}</section></aside>`;
+  return `<aside id="ticket-drawer" class="ticket-drawer" role="dialog" aria-modal="false" aria-labelledby="ticket-drawer-title" tabindex="-1"><header class="drawer-header"><div><p class="drawer-eyebrow">Proof ticket · ${escapeHtml(ticket.assignedRole ?? "pipeline")}</p><h2 id="ticket-drawer-title">${escapeHtml(ticket.title)}</h2></div><button id="close-ticket-drawer" class="compact-action" type="button" aria-label="Close ticket drawer">Close</button></header><div class="drawer-status-row">${chip(status)}${ticket.attempt > 0 ? `<span class="badge attempt-badge">Attempt ${ticket.attempt}</span>` : ""}${ticket.executionAuthorization ? `<span class="badge authorization-badge">Authorized by ${escapeHtml(ticket.executionAuthorization.authorizedBy)}</span>` : ""}${ticket.claim ? `<span class="badge">${status === "changes_requested" ? "Prior claim" : "Claimed"} by ${escapeHtml(ticket.claim.owner)}</span>` : ""}</div><section class="drawer-section"><p class="section-kicker">Objective</p><p class="drawer-objective">${escapeHtml(ticket.purpose)}</p></section><section class="drawer-section"><p class="section-kicker">Work contract</p><dl class="ticket-meta">${repository ? `<div><dt>Repository</dt><dd>${escapeHtml(repository.owner)}/${escapeHtml(repository.name)}</dd></div><div><dt>Base</dt><dd>${escapeHtml(target?.base ?? "—")}</dd></div><div><dt>Pinned ref</dt><dd><code>${escapeHtml(repository.ref)}</code></dd></div>` : ""}<div><dt>Allowed files</dt><dd>${ticket.allowedFiles?.length ? ticket.allowedFiles.map((file) => `<code>${escapeHtml(file)}</code>`).join("<br>") : "Mission scope"}</dd></div><div><dt>Required checks</dt><dd>${ticket.requiredChecks?.length ? ticket.requiredChecks.join(", ") : "Pipeline-defined"}</dd></div><div><dt>Attempt</dt><dd>${ticket.attempt > 0 ? ticket.attempt : "Not claimed"}</dd></div><div><dt>Claim</dt><dd>${ticket.claim ? escapeHtml(ticket.claim.owner) + " · " + escapeHtml(formatTime(ticket.claim.claimedAt)) : "Unclaimed"}</dd></div><div><dt>TrueForge binding</dt><dd>${ticket.claim?.trueforgeSessionId ? `session ${escapeHtml(shortRef(ticket.claim.trueforgeSessionId))}` : attempt?.claim?.trueforgeSessionId ? `session ${escapeHtml(shortRef(attempt.claim.trueforgeSessionId))}` : "Not connected"}${ticket.claim?.trueforgeSandboxId ? ` · sandbox ${escapeHtml(shortRef(ticket.claim.trueforgeSandboxId))}` : attempt?.claim?.trueforgeSandboxId ? ` · sandbox ${escapeHtml(shortRef(attempt.claim.trueforgeSandboxId))}` : ""}</dd></div></dl></section><section class="drawer-section"><p class="section-kicker">Acceptance</p><ul class="acceptance-list">${ticket.acceptanceCriteria?.map((criterion) => `<li>${escapeHtml(criterion)}</li>`).join("") || "<li>No acceptance conditions recorded.</li>"}</ul></section><section class="drawer-section"><p class="section-kicker">Dependencies</p><ul class="dependency-list">${dependencies || "<li>None</li>"}</ul>${ticket.blockedReason ? `<p class="drawer-failure"><strong>Blocker:</strong> ${escapeHtml(ticket.blockedReason)}</p>` : ""}</section>${renderReworkContext(ticket, status)}<section class="drawer-section drawer-gate"><p class="section-kicker">Authorization</p>${renderDrawerAuthorization(ticket, view)}</section><section class="drawer-section"><p class="section-kicker">Current state</p>${renderTicketSignal(ticket, view, status)}${approval ? `<div class="drawer-approval">${renderApprovalBody(approval)}</div>` : ""}${delivery ? renderDeliveryBody(delivery) : ""}</section><section class="drawer-section"><p class="section-kicker">Attempt history</p>${renderAttemptHistory(ticket)}</section><section class="drawer-section"><p class="section-kicker">Review history</p>${renderReviewHistory(reviews)}</section><section class="drawer-section"><p class="section-kicker">TrueForge activity</p>${renderTicketActivity(activity)}</section><section class="drawer-section"><p class="section-kicker">Ticket evidence</p>${renderTicketEvidence(evidence)}</section></aside>`;
 }
 
 function renderReworkContext(ticket, status) {
@@ -473,7 +469,6 @@ function bindMissionInteractions(view) {
   document.querySelector("#run-mission")?.addEventListener("click", runMission);
   document.querySelector("#copy-diagnostics")?.addEventListener("click", () => copyDiagnostics(view.diagnostics));
   document.querySelector("#close-ticket-drawer")?.addEventListener("click", closeTicketDrawer);
-  document.querySelector("[data-drawer-close]")?.addEventListener("click", closeTicketDrawer);
   document.querySelectorAll("[data-approval-decision]").forEach((button) => button.addEventListener("click", decideApproval));
   document.querySelectorAll("[data-ticket-transition]").forEach((button) => button.addEventListener("click", transitionTicket));
   document.querySelectorAll("[data-ticket-open]").forEach((button) => button.addEventListener("click", (event) => {
@@ -553,11 +548,8 @@ function closeTicketDrawer() {
   window.requestAnimationFrame(() => opener?.isConnected && opener.focus());
 }
 
-async function moveTicket(ticket, targetStatus) {
+async function moveTicket(ticket, targetStatus, button = null) {
   const isRework = ticket.status === "changes_requested" && targetStatus === "ready";
-  const button = [...document.querySelectorAll("[data-ticket-transition]")].find((candidate) =>
-    candidate.dataset.ticketTransition === ticket.id && candidate.dataset.targetStatus === targetStatus,
-  );
   await withBusy(button, async () => {
     try {
       await api("/api/mission/tickets/" + encodeURIComponent(ticket.id) + "/status", {
@@ -580,7 +572,7 @@ async function transitionTicket(event) {
   event.stopPropagation();
   const ticket = ticketById(currentView, event.currentTarget.dataset.ticketTransition);
   const target = event.currentTarget.dataset.targetStatus;
-  if (canHumanMove(ticket, target)) await moveTicket(ticket, target);
+  if (canHumanMove(ticket, target)) await moveTicket(ticket, target, event.currentTarget);
   else showMessage("error", "That lifecycle transition is owned by the Proof Board pipeline.");
 }
 
@@ -660,6 +652,10 @@ async function decideApproval(event) {
 }
 
 async function withBusy(button, operation) {
+  if (button === null) {
+    await operation();
+    return;
+  }
   if (!(button instanceof HTMLButtonElement) || button.getAttribute("aria-busy") === "true") return;
   button.disabled = true;
   button.setAttribute("aria-busy", "true");
@@ -727,20 +723,6 @@ async function loadMission() {
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && selectedTicketId !== null) {
     closeTicketDrawer();
-    return;
-  }
-  const drawer = document.querySelector("#ticket-drawer");
-  if (drawer === null || !drawer.contains(document.activeElement) || event.key !== "Tab") return;
-  const focusable = [...drawer.querySelectorAll("button, a[href], [tabindex]:not([tabindex='-1'])")].filter((element) => !element.disabled);
-  if (focusable.length === 0) return;
-  const first = focusable[0];
-  const last = focusable[focusable.length - 1];
-  if (event.shiftKey && document.activeElement === first) {
-    event.preventDefault();
-    last.focus();
-  } else if (!event.shiftKey && document.activeElement === last) {
-    event.preventDefault();
-    first.focus();
   }
 });
 

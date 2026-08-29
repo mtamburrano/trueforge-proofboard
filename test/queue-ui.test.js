@@ -61,6 +61,24 @@ test("Proof Board UI keeps durable polling, drawer, activity, proof, and approva
   assert.match(styleSheet, /\.drawer-rework/);
 });
 
+test("ticket cards open a non-blocking drawer while queue transitions stay in the drawer", () => {
+  const cardSource = appScript.slice(
+    appScript.indexOf("function renderTicketCard"),
+    appScript.indexOf("function renderTicketSignal"),
+  );
+  assert.match(cardSource, /role="button"/);
+  assert.doesNotMatch(cardSource, /Inspect contract|ticket-transition|Authorize execution/);
+  assert.match(appScript, /event\.key !== "Enter" && event\.key !== " "/);
+  assert.match(appScript, /function renderDrawerAuthorization/);
+  assert.match(appScript, /data-ticket-transition/);
+  assert.match(appScript, /Authorize execution/);
+  assert.match(appScript, /aria-modal="false"/);
+  assert.doesNotMatch(appScript, /ticket-drawer-scrim|aria-modal="true"/);
+  assert.doesNotMatch(styleSheet, /ticket-drawer-scrim|ticket-card-actions/);
+  assert.match(styleSheet, /box-shadow: -18px 0 32px/);
+  assert.match(styleSheet, /border: 1px solid var\(--color-border-strong\)/);
+});
+
 test("mission view correlates card activity and evidence to the durable ticket", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
   await missions.createMission({

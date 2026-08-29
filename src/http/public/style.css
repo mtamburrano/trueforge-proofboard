@@ -630,9 +630,6 @@ button[aria-busy="true"]::after {
 .approval-signal strong { color: #f1d27a; }
 .delivery-signal strong { color: var(--color-secondary); }
 .done-signal strong { color: #7ce8db; }
-.ticket-card-actions { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 9px; }
-.ticket-card-actions button { min-height: 27px; padding: 4px 7px; font-size: 10px; }
-.ticket-inspect { margin-left: auto; }
 .checkpoint-grid { display: grid; grid-template-columns: minmax(0, .78fr) minmax(0, 1.22fr); gap: var(--space-3); margin-top: var(--space-5); }
 .checkpoint-panel { min-width: 0; padding: var(--space-4); }
 .checkpoint-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-3); }
@@ -649,8 +646,7 @@ button[aria-busy="true"]::after {
 .delivery-result p { margin: 5px 0 0; color: var(--color-muted); font-size: 11px; overflow-wrap: anywhere; }
 .delivery-card { border-left: 2px solid var(--color-success); }
 .operations-heading { margin-top: var(--space-5); }
-.ticket-drawer-scrim { position: fixed; z-index: 29; inset: 0; width: 100%; height: 100%; border: 0; border-radius: 0; background: rgba(8, 9, 10, .72); cursor: default; }
-.ticket-drawer { position: fixed; z-index: 30; top: 49px; right: 0; bottom: 0; width: min(570px, 94vw); overflow-y: auto; padding: var(--space-5); border-left: 1px solid var(--color-border-strong); background: var(--color-surface); box-shadow: var(--shadow-overlay); }
+.ticket-drawer { position: fixed; z-index: 30; top: 49px; right: 0; bottom: 0; width: min(570px, 94vw); overflow-y: auto; padding: var(--space-5); border: 1px solid var(--color-border-strong); border-right: 0; background: var(--color-surface); box-shadow: -18px 0 32px rgba(8, 9, 10, .38); }
 .drawer-header { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--space-3); padding-bottom: var(--space-4); border-bottom: 1px solid var(--color-border); }
 .drawer-header h2 { margin: 2px 0 0; color: #f0f5ff; font-size: 20px; line-height: 1.2; overflow-wrap: anywhere; }
 .drawer-eyebrow { margin: 0; color: var(--color-muted-dim); font: 700 10px/1.2 var(--font-mono); letter-spacing: .06em; text-transform: uppercase; }

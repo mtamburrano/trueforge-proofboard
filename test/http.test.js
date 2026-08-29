@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
+import { request as nodeHttpRequest } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -18,6 +19,7 @@ import {
   IMPLEMENTATION_PROOF_MODE,
   TrueForgeIntegrationError,
   createMissionHttpApp,
+  createMissionNodeServer,
   resolveMissionRuntimeConfig,
 } from "../dist/index.js";
 
@@ -393,6 +395,60 @@ function testApp(repository = new InMemoryMissionRepository(), options = {}) {
   };
 }
 
+async function listenOnIsolatedSocket(server) {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "trueforge-proofboard-node-http-"));
+  const socketPath = path.join(directory, "mission.sock");
+  try {
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(socketPath, resolve);
+    });
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true });
+    throw error;
+  }
+  return {
+    socketPath,
+    async close() {
+      await closeNodeServer(server);
+      await rm(directory, { recursive: true, force: true });
+    },
+  };
+}
+
+async function closeNodeServer(server) {
+  await new Promise((resolve, reject) => {
+    server.close((error) => error === undefined ? resolve() : reject(error));
+  });
+}
+
+function requestOverSocket(socketPath, { requestPath, method = "GET", headers = {}, body }) {
+  return new Promise((resolve, reject) => {
+    const request = nodeHttpRequest({
+      socketPath,
+      path: requestPath,
+      method,
+      agent: false,
+      headers: { connection: "close", ...headers },
+    }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => resolve({
+        status: response.statusCode,
+        headers: response.headers,
+        body: Buffer.concat(chunks).toString("utf8"),
+      }));
+    });
+    request.on("error", reject);
+    request.end(body);
+  });
+}
+
+function socketJson(response) {
+  assert.equal(response.headers["cache-control"], "no-store");
+  return JSON.parse(response.body);
+}
+
 async function json(response) {
   const payload = await response.json();
   assert.equal(response.headers.get("cache-control"), "no-store");
@@ -532,6 +588,91 @@ test("cross-origin browser state changes are rejected while same-origin changes 
   });
   assert.equal(acceptedResponse.status, 201);
   assert.equal(runner.calls.create, 1);
+});
+
+test("the real Node HTTP bridge forwards browser JSON bodies and rejects malformed JSON", async () => {
+  const { app } = testApp();
+  await app.request("/api/mission", { method: "POST" });
+  const server = createMissionNodeServer(app, { host: "127.0.0.1", port: 0 });
+  const isolatedServer = await listenOnIsolatedSocket(server);
+  const origin = "http://mission.local";
+
+  try {
+    const initialResponse = await requestOverSocket(isolatedServer.socketPath, {
+      requestPath: "/api/mission",
+      headers: { host: "mission.local" },
+    });
+    assert.equal(initialResponse.status, 200);
+    const initial = socketJson(initialResponse);
+    const ignoredBody = "{}";
+    const bodylessGetResponse = await requestOverSocket(isolatedServer.socketPath, {
+      requestPath: "/api/mission",
+      headers: {
+        host: "mission.local",
+        "content-length": String(Buffer.byteLength(ignoredBody)),
+      },
+      body: ignoredBody,
+    });
+    assert.equal(bodylessGetResponse.status, 200);
+    const bodylessHeadResponse = await requestOverSocket(isolatedServer.socketPath, {
+      requestPath: "/api/mission",
+      method: "HEAD",
+      headers: {
+        host: "mission.local",
+        "content-length": String(Buffer.byteLength(ignoredBody)),
+      },
+      body: ignoredBody,
+    });
+    assert.equal(bodylessHeadResponse.status, 404);
+    const ticket = initial.mission.tickets.find((item) => item.status === "backlog");
+    assert.ok(ticket, "The local fixture should expose a Backlog ticket.");
+
+    const requestPath = `/api/mission/tickets/${encodeURIComponent(ticket.id)}/status`;
+    const transitionBody = JSON.stringify({
+      status: "ready",
+      actor: "browser-operator",
+      expected_revision: initial.mission.revision,
+    });
+    const transitionResponse = await requestOverSocket(isolatedServer.socketPath, {
+      requestPath,
+      method: "PATCH",
+      headers: {
+        host: "mission.local",
+        "content-type": "application/json",
+        origin,
+        "content-length": String(Buffer.byteLength(transitionBody)),
+      },
+      body: transitionBody,
+    });
+    assert.equal(transitionResponse.status, 200);
+    const transitioned = socketJson(transitionResponse);
+    assert.equal(transitioned.ticket.id, ticket.id);
+    assert.equal(transitioned.ticket.status, "ready");
+    assert.equal(transitioned.ticket.executionAuthorization.authorizedBy, "browser-operator");
+
+    const malformedBody = "{\"status\":\"backlog\"";
+    const malformedResponse = await requestOverSocket(isolatedServer.socketPath, {
+      requestPath,
+      method: "PATCH",
+      headers: {
+        host: "mission.local",
+        "content-type": "application/json",
+        origin,
+        "content-length": String(Buffer.byteLength(malformedBody)),
+      },
+      body: malformedBody,
+    });
+    assert.equal(malformedResponse.status, 400);
+    const malformed = socketJson(malformedResponse);
+    assert.match(malformed.message, /valid JSON/);
+
+    const afterMalformed = await json(await app.request("/api/mission"));
+    const persistedTicket = afterMalformed.mission.tickets.find((item) => item.id === ticket.id);
+    assert.equal(persistedTicket.status, "ready");
+    assert.equal(persistedTicket.executionAuthorization.authorizedBy, "browser-operator");
+  } finally {
+    await isolatedServer.close();
+  }
 });
 
 test("concurrent primary mission creation shares one durable create operation", async () => {
