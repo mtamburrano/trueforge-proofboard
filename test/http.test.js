@@ -13,6 +13,7 @@ import {
   PRIMARY_VERIFIED_DELIVERY_PATCHES,
   PRIMARY_MISSION_ID,
   PRIMARY_MISSION_OBJECTIVE,
+  PRIMARY_SANDBOX_REPOSITORY_ROOT,
   PRIMARY_VERIFICATION_COMMAND,
   TrueForgeIntegrationError,
   createMissionHttpApp,
@@ -642,6 +643,10 @@ test("run mission uses the runtime adapters and exposes passed proof", async () 
     /Allowed files for this work item: src\/index\.ts, test\/index\.test\.js/,
   );
   assert.match(runner.turnInputs[0].instruction, /install tools, clone or check out the repository/i);
+  assert.match(runner.turnInputs[0].instruction, new RegExp(PRIMARY_SANDBOX_REPOSITORY_ROOT.replaceAll("/", "\\/")));
+  assert.match(runner.turnInputs[0].instruction, /sandbox may start empty/i);
+  assert.match(runner.turnInputs[0].instruction, /never assume \/workspace/i);
+  assert.match(runner.turnInputs[0].instruction, /recover from a failed guessed cwd or command setup/i);
   assert.match(runner.turnInputs[0].instruction, /optionally use dynamic subagents/i);
   assert.equal(runner.turnInputs[0].options.delegateToSubagent, undefined);
   assert.deepEqual(runner.sandboxInputs[0], {

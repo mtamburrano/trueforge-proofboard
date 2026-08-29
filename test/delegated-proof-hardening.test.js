@@ -18,6 +18,7 @@ import {
   PRIMARY_MISSION_ID,
   PRIMARY_MISSION_OBJECTIVE,
   PRIMARY_REPOSITORY,
+  PRIMARY_SANDBOX_REPOSITORY_ROOT,
   RepositoryWorkGraphPlanner,
   TrueForgeMissionRunner,
   DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
@@ -271,8 +272,8 @@ function workspaceDeltaEvents({
 function repositorySetupEvents({
   turnId = "turn-repository-setup",
   commands = [
-    `git clone --no-checkout ${LOCKED_REPOSITORY_REMOTE_URL} .`,
-    `git checkout --quiet --detach ${PRIMARY_REPOSITORY.ref}`,
+    `git clone --no-checkout ${LOCKED_REPOSITORY_REMOTE_URL} ${PRIMARY_SANDBOX_REPOSITORY_ROOT}`,
+    `git -C ${PRIMARY_SANDBOX_REPOSITORY_ROOT} checkout --quiet --detach ${PRIMARY_REPOSITORY.ref}`,
   ],
   exitCodes = commands.map(() => 0),
   intents = commands.map((command) => `Prepare the local repository with ${command}.`),
@@ -321,7 +322,7 @@ function repositorySetupEvents({
 function repositoryProofEvents({
   repository = `${PRIMARY_REPOSITORY.owner}/${PRIMARY_REPOSITORY.name}`,
   sha = PRIMARY_REPOSITORY.ref,
-  root = "/workspace",
+  root = PRIMARY_SANDBOX_REPOSITORY_ROOT,
   cwd = root,
   remoteUrl = `https://github.com/${repository}.git`,
   exitCode = 0,
@@ -1053,13 +1054,13 @@ test("empty locked fixture sandboxes are prepared before the workspace snapshot 
   );
   assert.match(fixture.turnRequests[0].request.input[0].content, /bounded setup\/mutation/i);
   assert.doesNotMatch(fixture.turnRequests[0].request.input[0].content, /Call the sandbox tool exec exactly once/);
-  assert.match(fixture.turnRequests[0].request.input[0].content, /persistent sandbox's default\/current workspace root/i);
-  assert.match(fixture.turnRequests[0].request.input[0].content, /clone or repair the repository directly in `\.`/i);
+  assert.match(fixture.turnRequests[0].request.input[0].content, /canonical absolute sandbox checkout root/i);
+  assert.match(fixture.turnRequests[0].request.input[0].content, /clone.*canonical.*absolute path|clone.*\/tmp\/proofboard-workspace/i);
   assert.deepEqual(sandboxInstructionArguments(fixture.turnRequests[1].request), {
     intent: LOCKED_REPOSITORY_PREPARATION_INTENT,
     command: LOCKED_REPOSITORY_PROOF_COMMAND,
   });
-  assert.match(fixture.turnRequests[1].request.input[0].content, /no added cd, cwd, or wrapper/i);
+  assert.match(fixture.turnRequests[1].request.input[0].content, /cwd may be omitted or exactly "\/"|no added cd/i);
   assert.equal(fixture.turnRequests[2].request.previousTurnId, "turn-repository-proof");
   assert.match(
     fixture.turnRequests[2].request.input[0].content,
@@ -1119,11 +1120,11 @@ test("empty locked fixture sandboxes are prepared before the workspace snapshot 
   assert.ok(preparation);
   assert.equal(preparation.result, "passed");
   assert.match(preparation.details, /"baseline_sha":"590aa8a6d72c580f61fc1b19d33e9876bc0feb9b"/);
-  assert.match(preparation.details, /"workspace_root":"\/workspace"/);
+  assert.match(preparation.details, new RegExp(`"workspace_root":"${PRIMARY_SANDBOX_REPOSITORY_ROOT.replaceAll("/", "\\/")}"`));
   assert.equal(LOCKED_REPOSITORY_PREPARATION_COMMAND, LOCKED_REPOSITORY_PROOF_COMMAND);
-  assert.match(LOCKED_REPOSITORY_PROOF_COMMAND, /git config --get remote\.origin\.url/);
-  assert.match(LOCKED_REPOSITORY_PROOF_COMMAND, /git status --porcelain=v1/);
-  assert.match(LOCKED_REPOSITORY_PROOF_COMMAND, /git rev-parse --abbrev-ref HEAD/);
+  assert.match(LOCKED_REPOSITORY_PROOF_COMMAND, /git -C .* config --get remote\.origin\.url/);
+  assert.match(LOCKED_REPOSITORY_PROOF_COMMAND, /git -C .* status --porcelain=v1/);
+  assert.match(LOCKED_REPOSITORY_PROOF_COMMAND, /git -C .* rev-parse --abbrev-ref HEAD/);
   assert.doesNotMatch(LOCKED_REPOSITORY_PROOF_COMMAND, /sed|if \[|remote_identity|worktree_status/);
   assert.doesNotMatch(LOCKED_REPOSITORY_PROOF_COMMAND, /git clone|git checkout|git push|create_pull_request/);
 });
@@ -1197,8 +1198,8 @@ test("locked repository preparation rejects transient or nested workspace setup 
 test("locked repository proof rejects a nested repository root even when setup completed", async () => {
   const fixture = await lockedRepositoryRunnerFixture({
     preparation: {
-      cwd: "/workspace",
-      root: "/workspace/locked-repository",
+      cwd: PRIMARY_SANDBOX_REPOSITORY_ROOT,
+      root: `${PRIMARY_SANDBOX_REPOSITORY_ROOT}/locked-repository`,
     },
   });
 
@@ -1256,7 +1257,10 @@ test("real locked repository preparation handles a fresh clone and rejects a dir
       boundary.workspacePath,
       boundary.gitEnv,
     );
-    const command = LOCKED_REPOSITORY_PROOF_COMMAND;
+    const command = LOCKED_REPOSITORY_PROOF_COMMAND.replaceAll(
+      PRIMARY_SANDBOX_REPOSITORY_ROOT,
+      boundary.workspacePath,
+    );
     const prepared = await execFileAsync("sh", ["-c", command], {
       cwd: boundary.workspacePath,
       env: { ...process.env, ...boundary.gitEnv },

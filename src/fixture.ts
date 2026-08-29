@@ -7,6 +7,8 @@ export const PRIMARY_DELIVERY_FIXTURE = {
   head: "proofboard-verified-delivery",
 } as const;
 
+export const PRIMARY_SANDBOX_REPOSITORY_ROOT = "/tmp/proofboard-workspace" as const;
+
 export const PRIMARY_VERIFIED_DELIVERY_FILES = {
   "src/index.ts": [
     "export const productName = \"TrueForge Proof Board\" as const;",

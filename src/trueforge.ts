@@ -33,6 +33,7 @@ import {
 import {
   PRIMARY_DELIVERY_FIXTURE,
   PRIMARY_VERIFIED_DELIVERY_PATCHES,
+  PRIMARY_SANDBOX_REPOSITORY_ROOT,
 } from "./fixture.js";
 
 export interface TrueForgeClientOptions {
@@ -213,8 +214,8 @@ const SANDBOX_NODE_SOURCE_SETUP_URL =
   `https://deb.nodesource.com/setup_${SANDBOX_NODE_SOURCE_MAJOR}.x`;
 export const DELEGATED_COMPLETE_CHANGED_FILES_COMMAND =
   "git status --porcelain=v1 -z --untracked-files=all";
-export const IMPLEMENTATION_REPOSITORY_DISCOVERY_COMMAND =
-  "find . -maxdepth 4 -type d -name .git -print";
+export const IMPLEMENTATION_REPOSITORY_IDENTITY_COMMAND =
+  `git -C ${PRIMARY_SANDBOX_REPOSITORY_ROOT} config --get remote.origin.url`;
 export { DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND } from "./diff.js";
 
 /**
@@ -224,13 +225,14 @@ export { DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND } from "./diff.js";
 export const LOCKED_REPOSITORY_PROOF_COMMAND = [
   "set -eu",
   "unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE",
+  `repository_root="$(git -C ${PRIMARY_SANDBOX_REPOSITORY_ROOT} rev-parse --show-toplevel)"`,
   "printf 'TRUEFORGE_REPOSITORY_PROOF\\n'",
-  "pwd -P",
-  "git config --get remote.origin.url",
-  "git rev-parse --show-toplevel",
-  "git rev-parse --verify HEAD",
-  "git rev-parse --abbrev-ref HEAD",
-  "git status --porcelain=v1 --untracked-files=all",
+  "printf '%s\\n' \"$repository_root\"",
+  `git -C ${PRIMARY_SANDBOX_REPOSITORY_ROOT} config --get remote.origin.url`,
+  "printf '%s\\n' \"$repository_root\"",
+  `git -C ${PRIMARY_SANDBOX_REPOSITORY_ROOT} rev-parse --verify HEAD`,
+  `git -C ${PRIMARY_SANDBOX_REPOSITORY_ROOT} rev-parse --abbrev-ref HEAD`,
+  `git -C ${PRIMARY_SANDBOX_REPOSITORY_ROOT} status --porcelain=v1 --untracked-files=all`,
 ].join("; ");
 
 /** Compatibility names now point at the deterministic proof, never setup. */
@@ -356,11 +358,19 @@ export function buildDelegatedTurnInstruction(
     );
   }
   const allowedFiles = packet.workItem.allowedFiles ?? [];
+  const repositoryGuidance = packet.workItem.role === "implementer"
+    ? [
+        `Use ${PRIMARY_SANDBOX_REPOSITORY_ROOT} as the one canonical absolute sandbox checkout root for repository work. The sandbox may start empty; never assume /workspace or another provider-specific working directory.`,
+        `Ensure the pinned repository from the Work Packet is cloned or checked out at exactly ${PRIMARY_SANDBOX_REPOSITORY_ROOT} before editing; do not create a nested checkout or rely on a transient cwd.`,
+        "Recover from a failed guessed cwd or command setup by inspecting its structured exit result, correcting the command against the canonical root, and continuing in this agentic turn; one failed guessed cwd is not evidence that the shell or sandbox is unavailable.",
+      ]
+    : [];
   return [
     "Use TrueForge's native dynamic subagent capability.",
     "Delegate this bounded work item to exactly one dynamic subagent; the parent coordinator must not perform the work itself.",
     `Work Packet: ${JSON.stringify(packet)}`,
     `Coordinator instruction: ${instruction.trim()}`,
+    ...repositoryGuidance,
     `The subagent may modify only these explicitly allowed repository files: ${allowedFiles.join(", ")}. Any observed change outside this scope fails the handoff.`,
     "The subagent may use only the configured tools and the repository/evidence context in this packet. It must execute every required check through an exit-preserving command, then capture a bounded content-bearing git diff through the delegated thread's tool restricted to the allowed files (for example, git diff -- <allowed file>). The coordinator independently captures the complete current work-item delta from a pre-delegation sandbox tree and compares it with the scoped diff and both the work-item and mission scopes; do not substitute narration for either proof. Return control after the subagent finishes.",
     "End with a machine-readable IMPLEMENTATION_HANDOFF object containing decisions and openQuestions. The coordinator will independently correlate changed files and check results to the observed tool responses.",
@@ -995,6 +1005,7 @@ const defaultInstructions = [
   "Work only on the supplied mission objective and active work item.",
   "Inspect before changing anything and use the attached MCP tools for repository facts.",
   "Run generated commands only through the configured sandbox.",
+  `For repository-backed implementation work, use ${PRIMARY_SANDBOX_REPOSITORY_ROOT} as the canonical absolute checkout root; the sandbox may start empty, so never assume /workspace or another provider-specific cwd. Recover from a failed cwd or command by inspecting its structured result and continuing with the canonical root.`,
   "Return concrete evidence and stop before consequential remote mutations unless approval is present.",
 ].join(" ");
 
@@ -1191,21 +1202,8 @@ export class TrueForgeMissionRunner {
     }
 
     try {
-      const discovery = await this.measureImplementationState(
-        mission.id,
-        workItem.id,
-        IMPLEMENTATION_REPOSITORY_DISCOVERY_COMMAND,
-        "Locate the completed Git repository in the persisted sandbox.",
-      );
-      const repositoryRoot = implementationRepositoryRoot(discovery.verified.stdout);
-      if (repositoryRoot === null) {
-        throw new TrueForgeIntegrationError(
-          "prove implementation",
-          "Independent proof found no unique completed Git repository within the sandbox workspace.",
-        );
-      }
-
-      const remoteCommand = gitAtRepository(repositoryRoot, "config --get remote.origin.url");
+      const repositoryRoot = PRIMARY_SANDBOX_REPOSITORY_ROOT;
+      const remoteCommand = IMPLEMENTATION_REPOSITORY_IDENTITY_COMMAND;
       const remote = await this.measureImplementationState(
         mission.id,
         workItem.id,
@@ -1304,28 +1302,16 @@ export class TrueForgeMissionRunner {
         });
       }
 
-      const discoveryEvidence = await this.missions.addEvidence(mission.id, {
-        workItemId: workItem.id,
-        kind: "tool_result",
-        result: "passed",
-        source: "sandbox",
-        summary: `Independent proof located the completed repository at ${repositoryRoot}.`,
-        details: JSON.stringify({
-          command: IMPLEMENTATION_REPOSITORY_DISCOVERY_COMMAND,
-          repository_root: repositoryRoot,
-          observed_exec_count: discovery.verified.observedExecCount,
-        }),
-        executionOrigin: sandboxMeasurementOrigin(discovery),
-      });
       const identityEvidence = await this.missions.addEvidence(mission.id, {
         workItemId: workItem.id,
         kind: "tool_result",
         result: "passed",
         source: "sandbox",
-        summary: `Independent proof verified repository ${expectedRepository}.`,
+        summary: `Independent proof verified repository ${expectedRepository} at ${repositoryRoot}.`,
         details: JSON.stringify({
           command: remoteCommand,
           repository: expectedRepository,
+          repository_root: repositoryRoot,
           remote_url: remote.verified.stdout.trim(),
         }),
         executionOrigin: sandboxMeasurementOrigin(remote),
@@ -1407,7 +1393,6 @@ export class TrueForgeMissionRunner {
         decisions: [],
         openQuestions: [],
         evidenceIds: [
-          discoveryEvidence.id,
           identityEvidence.id,
           ancestryEvidence.id,
           statusEvidence.id,
@@ -1416,7 +1401,7 @@ export class TrueForgeMissionRunner {
         ],
         executionOrigin: {
           kind: "sandbox",
-          sessionId: discovery.sessionId,
+          sessionId: remote.sessionId,
         },
       };
     } catch (error) {
@@ -3558,37 +3543,21 @@ export class TrueForgeMissionRunner {
   }
 }
 
-function implementationRepositoryRoot(output: string): string | null {
-  const candidates = output.replace(/\r\n/g, "\n").split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
-  if (candidates.length !== 1) {
-    return null;
-  }
-  const gitDirectory = candidates[0];
-  if (
-    gitDirectory === undefined ||
-    !/^\.\/(?:[A-Za-z0-9._-]+\/)*\.git$/.test(gitDirectory)
-  ) {
-    return null;
-  }
-  return gitDirectory === "./.git" ? "." : gitDirectory.slice(0, -"/.git".length);
-}
-
 function gitAtRepository(repositoryRoot: string, argumentsValue: string): string {
-  if (repositoryRoot !== "." && !/^\.\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+$/.test(repositoryRoot)) {
+  if (repositoryRoot !== PRIMARY_SANDBOX_REPOSITORY_ROOT) {
     throw new TrueForgeIntegrationError(
       "prove implementation",
-      "Independent proof rejected an unsafe repository path.",
+      "Independent proof rejected a repository path outside the canonical sandbox root.",
     );
   }
-  return repositoryRoot === "."
-    ? `git ${argumentsValue}`
-    : `git -C ${repositoryRoot} ${argumentsValue}`;
+  return `git -C ${repositoryRoot} ${argumentsValue}`;
 }
 
 function implementationCheckCommand(repositoryRoot: string, name: string): string | null {
-  const prefix = repositoryRoot === "." ? "" : ` --prefix ${repositoryRoot}`;
+  if (repositoryRoot !== PRIMARY_SANDBOX_REPOSITORY_ROOT) {
+    return null;
+  }
+  const prefix = ` --prefix ${repositoryRoot}`;
   if (name === "typecheck") {
     return `npm${prefix} run typecheck`;
   }
@@ -4005,6 +3974,7 @@ function buildSandboxVerificationInstruction(
       ? "Record the sandbox identity before executing the command."
       : `Reuse the persisted sandbox ${mission.trueforgeSandboxId} and do not create a replacement sandbox.`,
     "Do not run the command on the host, do not use a different execution tool, and do not fabricate the result.",
+    "For an absolute, cwd-independent proof command, cwd may be omitted or exactly `/`; /workspace and every other cwd are rejected, as are unrelated extra arguments.",
     "Return the structured sandbox response after the command completes.",
   ].join(" ");
 }
@@ -4056,7 +4026,8 @@ function buildLockedRepositoryPreparationInstruction(
     mission.trueforgeSandboxId === undefined
       ? "Use the newly created sandbox and keep all setup calls on the coordinator root thread."
       : `Reuse the persisted sandbox ${mission.trueforgeSandboxId} and do not create a replacement sandbox.`,
-    "The locked worktree must end at the persistent sandbox's default/current workspace root. Run setup from that root and clone or repair the repository directly in `.`; do not create a nested repository and do not rely on a transient `cd`, because the separate proof turn starts from the default root again.",
+    `Use ${PRIMARY_SANDBOX_REPOSITORY_ROOT} as the one canonical absolute sandbox checkout root. The sandbox may start empty; never assume /workspace or another provider-specific working directory. Ensure ${LOCKED_FIXTURE_OWNER}/${LOCKED_FIXTURE_REPO}@${LOCKED_FIXTURE_SHA} is cloned or checked out at exactly ${PRIMARY_SANDBOX_REPOSITORY_ROOT}; clone into that absolute path when it is absent and repair/reuse it there when it exists. Do not create a nested repository or rely on a transient cwd, because the separate proof turn addresses the canonical root directly.`,
+    "Recover from a failed guessed cwd or command setup by inspecting its structured exit result, correcting the command against the canonical root, and continuing within this bounded setup phase; do not treat one failed guessed cwd as sandbox or shell unavailability.",
     "Local clone, fetch, checkout, and worktree preparation are allowed; do not push, create a branch, commit, open a pull request, or perform any other remote mutation.",
     "Do not use MCP servers, subagents, parallel tool calls, the host, or agent narration as proof. A separate exact read-only measurement will verify origin, SHA, cleanliness, detached state, workspace root, and sandbox identity.",
   ].join(" ");
@@ -4071,7 +4042,7 @@ function buildLockedRepositoryProofInstruction(
     LOCKED_REPOSITORY_PROOF_COMMAND,
     toolName,
     LOCKED_REPOSITORY_PREPARATION_INTENT,
-  ) + " This is the deterministic measurement/proof phase; do not repair the repository if the proof fails. Run the exact measurement from the sandbox default/current workspace root with no added cd, cwd, or wrapper; TypeScript will require that measured workspace root and repository root are identical, so a nested or transiently selected worktree fails closed.";
+  ) + ` This is the deterministic measurement/proof phase; do not repair the repository if the proof fails. The command addresses ${PRIMARY_SANDBOX_REPOSITORY_ROOT} directly and is cwd-independent; run it with cwd omitted or exactly "/" and no added cd, wrapper, or unrelated argument. /workspace, other cwd values, nested repositories, and a different sandbox fail closed.`;
 }
 
 function buildSandboxVerificationIntent(): string {
@@ -4829,7 +4800,6 @@ function parseExecutionResponse(
   if (!isRecord(response) ||
       typeof response.exitCode !== "number" ||
       !Number.isInteger(response.exitCode) ||
-      response.exitCode < 0 ||
       typeof response.result !== "string") {
     return null;
   }
@@ -5464,6 +5434,7 @@ function coordinatorExecProvenance(
   expectedCommand: string,
   expectedExecutionArguments: Readonly<Record<string, unknown>> = {},
   requireExactCommand = false,
+  allowRootCwd = false,
 ): CoordinatorExecProvenance | null {
   if (!isRecord(argumentsValue)) {
     return null;
@@ -5489,7 +5460,16 @@ function coordinatorExecProvenance(
     return null;
   }
   const expectedKeys = ["intent", "command", ...expectedExecutionKeys].sort();
-  const actualKeys = Object.keys(argumentsValue).sort();
+  const actualKeys = Object.keys(argumentsValue)
+    .filter((key) => !(allowRootCwd && key === "cwd"))
+    .sort();
+  if (
+    allowRootCwd &&
+    Object.prototype.hasOwnProperty.call(argumentsValue, "cwd") &&
+    argumentsValue.cwd !== "/"
+  ) {
+    return null;
+  }
   if (
     actualKeys.length !== expectedKeys.length ||
     actualKeys.some((key, index) => key !== expectedKeys[index])
@@ -5505,6 +5485,39 @@ function coordinatorExecProvenance(
     intent,
     command: normalizeSafeWorkingDirectoryPrefix(actualCommand),
   };
+}
+
+function coordinatorExecArgumentFailureReason(
+  argumentsValue: unknown,
+  expectedCommand: string,
+  allowRootCwd: boolean,
+): string {
+  if (!isRecord(argumentsValue)) {
+    return "arguments were not a JSON object";
+  }
+  if (boundedCoordinatorExecIntent(argumentsValue.intent) === null) {
+    return "arguments did not contain a bounded intent";
+  }
+  if (typeof argumentsValue.command !== "string" || argumentsValue.command.trim().length === 0) {
+    return "arguments did not contain a command";
+  }
+  if (argumentsValue.command.trim() !== expectedCommand.trim()) {
+    return "the command did not match the required canonical command";
+  }
+  const unsupportedKeys = Object.keys(argumentsValue).filter((key) =>
+    key !== "intent" && key !== "command" &&
+    !(allowRootCwd && key === "cwd" && argumentsValue.cwd === "/")
+  );
+  if (unsupportedKeys.length > 0) {
+    if (unsupportedKeys.length === 1 && unsupportedKeys[0] === "cwd") {
+      const observedCwd = typeof argumentsValue.cwd === "string"
+        ? JSON.stringify(argumentsValue.cwd)
+        : "a non-string value";
+      return `cwd must be omitted or exactly "/" for anchored proof (observed ${observedCwd})`;
+    }
+    return `unsupported extra argument${unsupportedKeys.length === 1 ? "" : "s"}: ${unsupportedKeys.join(", ")}`;
+  }
+  return "arguments did not match the required canonical shape";
 }
 
 function isCoordinatorRootThread(threadId: string | null): boolean {
@@ -5750,8 +5763,12 @@ function unsafeSandboxSetupCommand(command: string): boolean {
   if (/\b(?:cd|pushd|popd)\b/i.test(command)) {
     return true;
   }
-  return /\bgit\s+clone\b/i.test(command) &&
-    !/\bgit\s+clone\b[\s\S]*\s\.\s*(?:[;&]|$)/i.test(command);
+  const cloneCommands = [...command.matchAll(/\bgit\s+clone\b([^;&\n]*)/gi)];
+  return cloneCommands.some((match) => {
+    const tokens = match[1]?.trim().split(/\s+/) ?? [];
+    const target = tokens.at(-1)?.replace(/^['"]|['"]$/g, "");
+    return target !== PRIMARY_SANDBOX_REPOSITORY_ROOT;
+  });
 }
 
 function verifyBoundedSandboxSetup(
@@ -5933,19 +5950,17 @@ function verifySandboxExecution(
       `Expected exactly one coordinator-owned ${toolName} sandbox call on the TrueForge root thread.`,
     );
   }
-  const canonicalCalls = executionCalls.filter(
-    (call) => isCoordinatorRootThread(call.threadId) &&
-      coordinatorExecProvenance(call.arguments, command, {}, true) !== null,
-  );
-  if (canonicalCalls.length !== 1) {
+  if (execution === undefined) {
     return sandboxFailure(
-      `Expected exactly one canonical ${toolName} sandbox call, found ${canonicalCalls.length}.`,
+      `Expected exactly one canonical ${toolName} sandbox call, found 0 observed exec calls; no coordinator exec was emitted.`,
     );
   }
-  const call = canonicalCalls[0];
-  if (call === undefined || !isRecord(call.arguments)) {
-    return sandboxFailure(`${toolName} sandbox arguments were not a JSON object.`);
+  if (coordinatorExecProvenance(execution.arguments, command, {}, true, true) === null) {
+    return sandboxFailure(
+      `${toolName} sandbox call was observed but its arguments were not canonical: ${coordinatorExecArgumentFailureReason(execution.arguments, command, true)}.`,
+    );
   }
+  const call = execution;
   const response = toolResponseForCall(events, call.id);
   if (response === undefined) {
     return sandboxFailure(`${toolName} sandbox call has no structured response.`);
@@ -6110,6 +6125,23 @@ function normalizeAbsoluteSandboxPath(value: string): string | null {
   return "/" + segments.join("/");
 }
 
+function canonicalSandboxPath(value: string): string | null {
+  const normalized = normalizeAbsoluteSandboxPath(value);
+  const canonical = normalizeAbsoluteSandboxPath(PRIMARY_SANDBOX_REPOSITORY_ROOT);
+  if (normalized === null || canonical === null) {
+    return null;
+  }
+  if (normalized === canonical) {
+    return canonical;
+  }
+  // macOS exposes /tmp through the physical /private/tmp path. Treat that
+  // symlink spelling as the same canonical checkout, but no other root.
+  const physicalTmpAlias = canonical.startsWith("/tmp/")
+    ? `/private${canonical}`
+    : null;
+  return normalized === physicalTmpAlias ? canonical : null;
+}
+
 function verifyLockedRepositoryPreparation(
   events: TrueForgeApi.TurnStreamingEvent[],
   command: string,
@@ -6141,12 +6173,13 @@ function verifyLockedRepositoryPreparation(
       "the repository proof did not contain an exec call",
     );
   }
-  if (coordinatorExecProvenance(call.arguments, command, {}, true) === null) {
+  if (coordinatorExecProvenance(call.arguments, command, {}, true, true) === null) {
     return sandboxPhaseFailure(
       operation,
       phase,
       events,
-      "The coordinator-owned repository proof call did not match the required exact read-only command and intent",
+      "The coordinator-owned repository proof call did not match the required exact read-only command and intent: " +
+        coordinatorExecArgumentFailureReason(call.arguments, command, true),
     );
   }
   const response = toolResponseForCall(events, call.id);
@@ -6230,13 +6263,21 @@ function verifyLockedRepositoryPreparation(
       "failed postcondition: repository proof returned a non-absolute workspace or repository root",
     );
   }
-  if (workspaceRoot !== repositoryRoot) {
+  const canonicalRoot = canonicalSandboxPath(PRIMARY_SANDBOX_REPOSITORY_ROOT);
+  const canonicalWorkspaceRoot = canonicalSandboxPath(proof.workspaceRoot);
+  const canonicalRepositoryRoot = canonicalSandboxPath(proof.repositoryRoot);
+  if (
+    canonicalRoot === null ||
+    canonicalWorkspaceRoot !== canonicalRoot ||
+    canonicalRepositoryRoot !== canonicalRoot
+  ) {
     return sandboxPhaseFailure(
       operation,
       phase,
       events,
-      "failed postcondition: repository root " + repositoryRoot +
-        " is not the persistent/default sandbox workspace root " + workspaceRoot,
+      "failed postcondition: repository proof returned workspace root " + workspaceRoot +
+        " and repository root " + repositoryRoot +
+        "; expected the canonical sandbox checkout root " + PRIMARY_SANDBOX_REPOSITORY_ROOT,
     );
   }
   if (proof.status.trim().length > 0) {

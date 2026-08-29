@@ -44,6 +44,7 @@ import {
   PRIMARY_DELIVERY_FIXTURE,
   PRIMARY_VERIFIED_DELIVERY_FILES,
   PRIMARY_VERIFIED_DELIVERY_PATCHES,
+  PRIMARY_SANDBOX_REPOSITORY_ROOT,
 } from "../fixture.js";
 
 export const PRIMARY_MISSION_ID = "primary-mission";
@@ -613,7 +614,9 @@ class MissionController {
               `Acceptance criteria: ${implementer.acceptanceCriteria.join(" ")}`,
               `Allowed files for this work item: ${(implementer.allowedFiles ?? []).join(", ")}`,
               `Prepare the sandbox and repository as needed, starting from the pinned repository ${PRIMARY_REPOSITORY.owner}/${PRIMARY_REPOSITORY.name}@${PRIMARY_REPOSITORY.ref}.`,
-              "You may install tools, clone or check out the repository, edit, test, retry failed commands, and optionally use dynamic subagents.",
+              `Use ${PRIMARY_SANDBOX_REPOSITORY_ROOT} as the one canonical absolute sandbox checkout root. The sandbox may start empty; never assume /workspace or another provider-specific working directory. If that root is absent or is not the pinned checkout, clone the pinned repository into exactly that path or repair it there and check out the pinned ref before editing.`,
+              "Use absolute-root git/npm commands and do not rely on a guessed cwd, transient cd, relative repository discovery, or a nested checkout.",
+              "You may install tools, clone or check out the repository, edit, test, retry failed commands, and optionally use dynamic subagents; keep this implementation turn agentic. Recover from a failed guessed cwd or command setup by inspecting its structured exit result, correcting it against the canonical root, and continuing rather than treating one guessed-cwd failure as shell or sandbox unavailability.",
               "Proof Board will independently measure the final repository, diff, and checks after this turn; narration is not proof.",
               "Do not push, open a pull request, or perform any other remote mutation.",
             ].join(" "),

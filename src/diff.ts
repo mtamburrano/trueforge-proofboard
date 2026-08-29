@@ -1,3 +1,5 @@
+import { PRIMARY_SANDBOX_REPOSITORY_ROOT } from "./fixture.js";
+
 export interface ContentDiffEvidenceLike {
   kind: string;
   result: string;
@@ -323,6 +325,12 @@ export function isCompleteChangedFilesCommand(command: string): boolean {
 
 function normalizeGitWorkingDirectory(command: string): string | null {
   const normalized = normalizeCommand(command);
+  const canonicalMatch = normalized.match(
+    new RegExp(`^git -C ${escapeRegExp(PRIMARY_SANDBOX_REPOSITORY_ROOT)} (.+)$`),
+  );
+  if (canonicalMatch !== null) {
+    return canonicalMatch[1] === undefined ? null : `git ${canonicalMatch[1]}`;
+  }
   const match = normalized.match(/^git -C (\.\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+) (.+)$/);
   if (match === null) {
     return normalized.startsWith("git ") ? normalized : null;

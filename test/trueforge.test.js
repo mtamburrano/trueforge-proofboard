@@ -4,11 +4,11 @@ import test from "node:test";
 import {
   COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
   DEFAULT_TRUEFORGE_ITERATION_LIMIT,
-  IMPLEMENTATION_REPOSITORY_DISCOVERY_COMMAND,
   InMemoryMissionRepository,
   MAX_TRUEFORGE_ITERATION_LIMIT,
   MissionService,
   PRIMARY_VERIFIED_DELIVERY_PATCHES,
+  PRIMARY_SANDBOX_REPOSITORY_ROOT,
   SANDBOX_SETUP_EXEC_LIMIT,
   SANDBOX_SETUP_ITERATION_LIMIT,
   SANDBOX_TOOLCHAIN_PROOF_COMMAND,
@@ -2833,9 +2833,8 @@ test("failed MCP verification is durable and blocks the mission", async () => {
 });
 
 test("independent implementation proof measures final facts after normal agentic execution", async () => {
-  const repositoryRoot = "./work/proofboard-demo-fixture";
+  const repositoryRoot = PRIMARY_SANDBOX_REPOSITORY_ROOT;
   const commands = [
-    IMPLEMENTATION_REPOSITORY_DISCOVERY_COMMAND,
     `git -C ${repositoryRoot} config --get remote.origin.url`,
     `git -C ${repositoryRoot} merge-base --is-ancestor ${LOCKED_FIXTURE_SHA} HEAD`,
     `git -C ${repositoryRoot} status --porcelain=v1 -z --untracked-files=all`,
@@ -2844,7 +2843,6 @@ test("independent implementation proof measures final facts after normal agentic
     `npm --prefix ${repositoryRoot} test`,
   ];
   const outputs = [
-    `${repositoryRoot}/.git\n`,
     "https://github.com/mtamburrano/proofboard-demo-fixture.git\n",
     "",
     " M src/index.ts\u0000 M test/index.test.js\u0000",
@@ -2872,6 +2870,7 @@ test("independent implementation proof measures final facts after normal agentic
       sandboxArguments: {
         intent: "Measure one independent final-state fact.",
         command: commands[index],
+        ...(index % 2 === 1 ? { cwd: "/" } : {}),
       },
       sandboxResult: {
         success: true,
@@ -2917,6 +2916,8 @@ test("independent implementation proof measures final facts after normal agentic
   assert.equal(proof.executionOrigin.kind, "sandbox");
   assert.equal(proof.executionOrigin.threadId, undefined);
   assert.equal(calls.turns.length, commands.length);
+  assert.equal(commands.every((command) => command.includes(repositoryRoot)), true);
+  assert.equal(commands.some((command) => /find \\./.test(command)), false);
   assert.equal(calls.turns[0].request.previousTurnId, "turn-agentic-execution");
   assert.equal(calls.turns.every((turn, index) =>
     sandboxInstructionArguments(turn.request).command === commands[index]
@@ -2946,16 +2947,14 @@ test("independent implementation proof measures final facts after normal agentic
 });
 
 test("independent implementation proof rejects out-of-scope final changes before checks", async () => {
-  const repositoryRoot = "./proofboard-demo-fixture";
+  const repositoryRoot = PRIMARY_SANDBOX_REPOSITORY_ROOT;
   const commands = [
-    IMPLEMENTATION_REPOSITORY_DISCOVERY_COMMAND,
     `git -C ${repositoryRoot} config --get remote.origin.url`,
     `git -C ${repositoryRoot} merge-base --is-ancestor ${LOCKED_FIXTURE_SHA} HEAD`,
     `git -C ${repositoryRoot} status --porcelain=v1 -z --untracked-files=all`,
     `git -C ${repositoryRoot} diff --no-ext-diff --binary ${LOCKED_FIXTURE_SHA} --`,
   ];
   const outputs = [
-    `${repositoryRoot}/.git\n`,
     "git@github.com:mtamburrano/proofboard-demo-fixture.git\n",
     "",
     " M src/index.ts\u0000?? package.json\u0000",
@@ -3130,7 +3129,7 @@ test("sandbox verification rejects incomplete or unsafe proof", async () => {
     {
       label: "missing intent",
       options: { sandboxArguments: { command: "node --test" } },
-      error: /Expected exactly one canonical exec sandbox call, found 0/,
+      error: /bounded intent/,
     },
     {
       label: "unbounded intent",
@@ -3140,7 +3139,7 @@ test("sandbox verification rejects incomplete or unsafe proof", async () => {
           command: "node --test",
         },
       },
-      error: /Expected exactly one canonical exec sandbox call, found 0/,
+      error: /bounded intent/,
     },
     {
       label: "wrong command",
@@ -3150,7 +3149,7 @@ test("sandbox verification rejects incomplete or unsafe proof", async () => {
           command: "npm test",
         },
       },
-      error: /Expected exactly one canonical exec sandbox call, found 0/,
+      error: /required canonical command/,
     },
     {
       label: "extra argument",
@@ -3161,7 +3160,34 @@ test("sandbox verification rejects incomplete or unsafe proof", async () => {
           cwd: "/tmp",
         },
       },
-      error: /Expected exactly one canonical exec sandbox call, found 0/,
+      error: /cwd must be omitted or exactly "\/".*\/tmp/,
+    },
+    {
+      label: "provider working directory",
+      options: {
+        sandboxArguments: {
+          intent: SANDBOX_VERIFICATION_INTENT,
+          command: "node --test",
+          cwd: "/workspace",
+        },
+      },
+      error: /cwd must be omitted or exactly "\/".*\/workspace/,
+    },
+    {
+      label: "malformed arguments",
+      options: { sandboxArguments: "not-an-object" },
+      error: /arguments were not a JSON object/,
+    },
+    {
+      label: "root working directory",
+      options: {
+        sandboxArguments: {
+          intent: SANDBOX_VERIFICATION_INTENT,
+          command: "node --test",
+          cwd: "/",
+        },
+      },
+      expectedSuccess: true,
     },
     {
       label: "unexpected environment",
@@ -3172,7 +3198,7 @@ test("sandbox verification rejects incomplete or unsafe proof", async () => {
           env: { NODE_ENV: "test" },
         },
       },
-      error: /Expected exactly one canonical exec sandbox call, found 0/,
+      error: /unsupported extra argument.*env/,
     },
     {
       label: "missing sandbox creation",
@@ -3253,6 +3279,11 @@ test("sandbox verification rejects incomplete or unsafe proof", async () => {
       error: /exec sandbox command exited with code 1/,
     },
     {
+      label: "runtime failure exit code",
+      exitCode: -1,
+      error: /exec sandbox command exited with code -1/,
+    },
+    {
       label: "non-string result",
       options: {
         sandboxResult: {
@@ -3295,19 +3326,28 @@ test("sandbox verification rejects incomplete or unsafe proof", async () => {
       objective: `Reject ${fixture.label} sandbox proof`,
     });
 
-    await assert.rejects(
-      runner.runSandboxVerification({ missionId: mission.id, command: "node --test" }),
-      (error) => {
-        assert.equal(error.operation, "run sandbox verification", fixture.label);
-        assert.match(error.message, fixture.error, fixture.label);
-        return true;
-      },
-    );
+    if (fixture.expectedSuccess === true) {
+      const verification = await runner.runSandboxVerification({ missionId: mission.id, command: "node --test" });
+      assert.equal(verification.exitCode, 0, fixture.label);
+    } else {
+      await assert.rejects(
+        runner.runSandboxVerification({ missionId: mission.id, command: "node --test" }),
+        (error) => {
+          assert.equal(error.operation, "run sandbox verification", fixture.label);
+          assert.match(error.message, fixture.error, fixture.label);
+          return true;
+        },
+      );
+    }
     const state = await missions.getState();
-    assert.equal(state.missions[0].status, "blocked", fixture.label);
+    assert.equal(
+      state.missions[0].status,
+      fixture.expectedSuccess === true ? "draft" : "blocked",
+      fixture.label,
+    );
     assert.equal(
       state.evidence.some((item) => item.source === "sandbox" && item.result === "passed"),
-      false,
+      fixture.expectedSuccess === true,
       fixture.label,
     );
   }
