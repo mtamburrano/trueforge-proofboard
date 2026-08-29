@@ -62,8 +62,13 @@ const completeChangedFilesStatusOptionsWithNul = [
 
 export const DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND = [
   "set -eu",
-  "repository_root=\"$(git rev-parse --show-toplevel)\"",
-  "cd \"$repository_root\"",
+  "unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR",
+  `canonical_root="${PRIMARY_SANDBOX_REPOSITORY_ROOT}"`,
+  "canonical_physical_root=\"$(cd \"$canonical_root\" && pwd -P)\"",
+  "repository_root=\"$(git -C \"$canonical_root\" rev-parse --show-toplevel)\"",
+  "repository_physical_root=\"$(cd \"$repository_root\" && pwd -P)\"",
+  "if [ \"$repository_physical_root\" != \"$canonical_physical_root\" ]; then exit 1; fi",
+  "cd \"$repository_physical_root\"",
   "snapshot_index=\"$(mktemp)\"",
   "trap 'rm -f \"$snapshot_index\"' EXIT",
   "GIT_INDEX_FILE=\"$snapshot_index\" git read-tree HEAD",
@@ -82,8 +87,13 @@ export function buildDelegatedWorkspaceDeltaCommand(
   assertTreeRef(missionStartTreeRef);
   return [
     "set -eu",
-    "repository_root=\"$(git rev-parse --show-toplevel)\"",
-    "cd \"$repository_root\"",
+    "unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR",
+    `canonical_root="${PRIMARY_SANDBOX_REPOSITORY_ROOT}"`,
+    "canonical_physical_root=\"$(cd \"$canonical_root\" && pwd -P)\"",
+    "repository_root=\"$(git -C \"$canonical_root\" rev-parse --show-toplevel)\"",
+    "repository_physical_root=\"$(cd \"$repository_root\" && pwd -P)\"",
+    "if [ \"$repository_physical_root\" != \"$canonical_physical_root\" ]; then exit 1; fi",
+    "cd \"$repository_physical_root\"",
     "snapshot_index=\"$(mktemp)\"",
     "trap 'rm -f \"$snapshot_index\"' EXIT",
     "GIT_INDEX_FILE=\"$snapshot_index\" git read-tree HEAD",

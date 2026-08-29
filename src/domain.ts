@@ -482,6 +482,37 @@ export interface Delivery {
   executionOrigin?: ExecutionOrigin;
 }
 
+export const deliveryAttemptStatuses = ["pending", "completed"] as const;
+export type DeliveryAttemptStatus = (typeof deliveryAttemptStatuses)[number];
+
+/** The exact remote effect that a durable delivery attempt is allowed to reconcile. */
+export interface DeliveryAttemptTarget {
+  repositoryOwner: string;
+  repositoryName: string;
+  base: string;
+  head: string;
+  headSha: string;
+  title: string;
+  body: string;
+}
+
+/** Durable intent and, once available, result for one approved remote mutation. */
+export interface DeliveryAttempt {
+  id: string;
+  missionId: string;
+  approvalId: string;
+  workItemId: string;
+  attempt: number;
+  actionType: string;
+  expectedEffect: string;
+  target: DeliveryAttemptTarget;
+  status: DeliveryAttemptStatus;
+  createdAt: string;
+  updatedAt: string;
+  pullRequest?: PullRequestReference;
+  executionOrigin?: ExecutionOrigin;
+}
+
 export interface MissionState {
   schemaVersion: 1;
   revision: number;
@@ -492,6 +523,7 @@ export interface MissionState {
   reviews: Review[];
   approvals: Approval[];
   deliveries: Delivery[];
+  deliveryAttempts: DeliveryAttempt[];
 }
 
 export interface MissionRepository {
@@ -620,6 +652,26 @@ export interface RecordDeliveryInput {
   executionOrigin?: ExecutionOrigin;
 }
 
+export interface RecordDeliveryAttemptInput {
+  approvalId: string;
+  workItemId: string;
+  attempt: number;
+  actionType?: string;
+  expectedEffect: string;
+  target: DeliveryAttemptTarget;
+  id?: string;
+}
+
+export interface DeliveryAttemptRecord {
+  attempt: DeliveryAttempt;
+  created: boolean;
+}
+
+export interface RecordDeliveryAttemptResultInput {
+  pullRequest: PullRequestReference;
+  executionOrigin: ExecutionOrigin;
+}
+
 export interface DecideApprovalInput {
   decision: "approved" | "rejected" | "cancelled";
   decidedBy: string;
@@ -656,6 +708,7 @@ export function createEmptyMissionState(): MissionState {
     reviews: [],
     approvals: [],
     deliveries: [],
+    deliveryAttempts: [],
   };
 }
 
@@ -1717,6 +1770,75 @@ function validateDelivery(value: unknown, label: string): Delivery {
   return result;
 }
 
+function validateDeliveryAttemptTarget(
+  value: unknown,
+  label: string,
+): DeliveryAttemptTarget {
+  const target = objectValue(value, label);
+  const headSha = requiredString(target.headSha, `${label}.headSha`, 500);
+  if (!/^[0-9a-f]{40}$/i.test(headSha)) {
+    return fail("invalid_input", `${label}.headSha must be a 40-character hexadecimal SHA.`);
+  }
+  return {
+    repositoryOwner: requiredString(target.repositoryOwner, `${label}.repositoryOwner`, 200),
+    repositoryName: requiredString(target.repositoryName, `${label}.repositoryName`, 200),
+    base: requiredString(target.base, `${label}.base`, 500),
+    head: requiredString(target.head, `${label}.head`, 500),
+    headSha,
+    title: requiredString(target.title, `${label}.title`, 500),
+    body: requiredString(target.body, `${label}.body`, 4_000),
+  };
+}
+
+function validateDeliveryAttempt(value: unknown, label: string): DeliveryAttempt {
+  const attempt = objectValue(value, label);
+  const attemptNumber = nonNegativeInteger(attempt.attempt, `${label}.attempt`);
+  if (attemptNumber === 0) {
+    return fail("invalid_input", `${label}.attempt must be greater than zero.`);
+  }
+  const pullRequest = attempt.pullRequest === undefined
+    ? undefined
+    : validatePullRequestReference(attempt.pullRequest, `${label}.pullRequest`);
+  const executionOrigin = attempt.executionOrigin === undefined
+    ? undefined
+    : validateExecutionOrigin(attempt.executionOrigin, `${label}.executionOrigin`);
+  if (pullRequest !== undefined && pullRequest.headSha === undefined) {
+    return fail("invalid_input", `${label}.pullRequest.headSha is required for a delivery attempt.`);
+  }
+  if ((pullRequest === undefined) !== (executionOrigin === undefined)) {
+    return fail(
+      "invalid_input",
+      `${label} must persist its pull request and execution origin together.`,
+    );
+  }
+  const status = enumValue(attempt.status, deliveryAttemptStatuses, `${label}.status`);
+  if (status === "completed" && pullRequest === undefined) {
+    return fail("invalid_input", `${label} cannot be completed without a persisted pull request result.`);
+  }
+  const result: DeliveryAttempt = {
+    id: identifier(attempt.id, `${label}.id`),
+    missionId: identifier(attempt.missionId, `${label}.missionId`),
+    approvalId: identifier(attempt.approvalId, `${label}.approvalId`),
+    workItemId: identifier(attempt.workItemId, `${label}.workItemId`),
+    attempt: attemptNumber,
+    actionType: normalizeActionType(
+      requiredString(attempt.actionType, `${label}.actionType`, 200),
+    ),
+    expectedEffect: requiredString(attempt.expectedEffect, `${label}.expectedEffect`),
+    target: validateDeliveryAttemptTarget(attempt.target, `${label}.target`),
+    status,
+    createdAt: timestamp(attempt.createdAt, `${label}.createdAt`),
+    updatedAt: timestamp(attempt.updatedAt, `${label}.updatedAt`),
+  };
+  if (pullRequest !== undefined) {
+    result.pullRequest = pullRequest;
+  }
+  if (executionOrigin !== undefined) {
+    result.executionOrigin = executionOrigin;
+  }
+  return result;
+}
+
 function validateRevision(value: unknown): number {
   if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
     return fail("invalid_input", "revision must be a non-negative integer.");
@@ -1734,6 +1856,7 @@ function ensureUniqueIds(state: MissionState): void {
     state.reviews,
     state.approvals,
     state.deliveries,
+    state.deliveryAttempts,
   ];
   for (const collection of collections) {
     for (const entity of collection) {
@@ -1797,6 +1920,9 @@ export function validateMissionState(value: unknown): MissionState {
     ),
     deliveries: arrayValue(state.deliveries, "state.deliveries").map((item, index) =>
       validateDelivery(item, `state.deliveries[${index}]`),
+    ),
+    deliveryAttempts: arrayValue(state.deliveryAttempts ?? [], "state.deliveryAttempts").map((item, index) =>
+      validateDeliveryAttempt(item, `state.deliveryAttempts[${index}]`),
     ),
   };
 
@@ -2096,6 +2222,72 @@ export function validateMissionState(value: unknown): MissionState {
     }
   }
 
+  for (const deliveryAttempt of result.deliveryAttempts) {
+    const approval = result.approvals.find((item) => item.id === deliveryAttempt.approvalId);
+    const workItem = result.workItems.find((item) => item.id === deliveryAttempt.workItemId);
+    if (
+      !missions.has(deliveryAttempt.missionId) ||
+      approval === undefined ||
+      approval.missionId !== deliveryAttempt.missionId ||
+      workItem === undefined ||
+      workItem.missionId !== deliveryAttempt.missionId
+    ) {
+      fail("invalid_input", `Delivery attempt ${deliveryAttempt.id} references an invalid mission, approval, or work item.`);
+    }
+    if (
+      approval.decision !== "approved" ||
+      approval.actionType !== PRIMARY_CONSEQUENTIAL_ACTION ||
+      deliveryAttempt.actionType !== approval.actionType ||
+      deliveryAttempt.expectedEffect !== approval.expectedEffect ||
+      approval.workItemId !== deliveryAttempt.workItemId ||
+      approval.attempt !== deliveryAttempt.attempt ||
+      workItem.attempt !== deliveryAttempt.attempt
+    ) {
+      fail("invalid_input", `Delivery attempt ${deliveryAttempt.id} is not correlated to its approved work-item attempt.`);
+    }
+    const context = approval.executionContext;
+    if (
+      context === undefined ||
+      context.headSha === undefined ||
+      context.repositoryOwner !== deliveryAttempt.target.repositoryOwner ||
+      context.repositoryName !== deliveryAttempt.target.repositoryName ||
+      context.base !== deliveryAttempt.target.base ||
+      context.head !== deliveryAttempt.target.head ||
+      context.headSha !== deliveryAttempt.target.headSha ||
+      context.title !== deliveryAttempt.target.title ||
+      context.body !== deliveryAttempt.target.body
+    ) {
+      fail("invalid_input", `Delivery attempt ${deliveryAttempt.id} does not preserve the approved target.`);
+    }
+    if (deliveryAttempt.pullRequest !== undefined) {
+      const pullRequest = deliveryAttempt.pullRequest;
+      const executionOrigin = deliveryAttempt.executionOrigin;
+      if (
+        pullRequest.repositoryOwner !== deliveryAttempt.target.repositoryOwner ||
+        pullRequest.repositoryName !== deliveryAttempt.target.repositoryName ||
+        pullRequest.base !== deliveryAttempt.target.base ||
+        pullRequest.head !== deliveryAttempt.target.head ||
+        pullRequest.headSha !== deliveryAttempt.target.headSha ||
+        executionOrigin?.kind !== "mcp" ||
+        executionOrigin.sessionId !== approval.executionContext?.sessionId ||
+        executionOrigin.threadId !== approval.executionContext?.threadId ||
+        executionOrigin.toolCallId !== approval.executionContext?.toolCallId
+      ) {
+        fail("invalid_input", `Delivery attempt ${deliveryAttempt.id} has an uncorrelated pull request result.`);
+      }
+    }
+    if (deliveryAttempt.status === "completed" && !result.deliveries.some((delivery) =>
+      delivery.missionId === deliveryAttempt.missionId &&
+      delivery.status === "delivered" &&
+      delivery.approvalId === deliveryAttempt.approvalId &&
+      delivery.workItemId === deliveryAttempt.workItemId &&
+      delivery.attempt === deliveryAttempt.attempt &&
+      delivery.pullRequest?.url === deliveryAttempt.pullRequest?.url
+    )) {
+      fail("invalid_input", `Completed delivery attempt ${deliveryAttempt.id} has no matching delivered record.`);
+    }
+  }
+
   for (const mission of result.missions) {
     const deliveries = result.deliveries.filter((delivery) => delivery.missionId === mission.id);
     if (mission.status === "delivered" && !deliveries.some((delivery) => delivery.status === "delivered")) {
@@ -2199,6 +2391,7 @@ function ensureUniqueEntityId(state: MissionState, id: string): void {
     ...state.reviews,
     ...state.approvals,
     ...state.deliveries,
+    ...state.deliveryAttempts,
   ].some((entity) => entity.id === id);
   if (exists) {
     fail("invalid_input", `Entity ID ${id} is already in use.`);
@@ -2538,6 +2731,55 @@ function ensureApprovedDelivery(
   ensureApprovalEvidence(state, approval);
   ensureCurrentApprovalCorrelation(state, approval);
   return approval;
+}
+
+function ensureDeliveryAttemptMatchesApproval(
+  approval: Approval,
+  target: DeliveryAttemptTarget,
+  actionType: string,
+  expectedEffect: string,
+): void {
+  const context = approval.executionContext;
+  if (
+    context === undefined ||
+    context.headSha === undefined ||
+    approval.actionType !== PRIMARY_CONSEQUENTIAL_ACTION ||
+    actionType !== approval.actionType ||
+    expectedEffect !== approval.expectedEffect ||
+    context.repositoryOwner !== target.repositoryOwner ||
+    context.repositoryName !== target.repositoryName ||
+    context.base !== target.base ||
+    context.head !== target.head ||
+    context.headSha !== target.headSha ||
+    context.title !== target.title ||
+    context.body !== target.body
+  ) {
+    fail(
+      "approval_blocked",
+      "The durable delivery attempt does not match the exact approved repository, base, head, SHA, or effect.",
+    );
+  }
+}
+
+function ensureDeliveryAttemptResultMatchesTarget(
+  deliveryAttempt: DeliveryAttempt,
+  pullRequest: PullRequestReference,
+  executionOrigin: ExecutionOrigin,
+): void {
+  if (
+    pullRequest.headSha === undefined ||
+    pullRequest.repositoryOwner !== deliveryAttempt.target.repositoryOwner ||
+    pullRequest.repositoryName !== deliveryAttempt.target.repositoryName ||
+    pullRequest.base !== deliveryAttempt.target.base ||
+    pullRequest.head !== deliveryAttempt.target.head ||
+    pullRequest.headSha !== deliveryAttempt.target.headSha ||
+    executionOrigin.kind !== "mcp"
+  ) {
+    fail(
+      "approval_blocked",
+      "The reconciled pull request result does not match the exact approved delivery attempt.",
+    );
+  }
 }
 
 type StructuredHandoffRecord = Handoff & {
@@ -4345,6 +4587,205 @@ export class MissionService {
     return operation();
   }
 
+  /**
+   * Persist the intent for a consequential delivery before invoking its remote
+   * mutation. The created flag lets concurrent controllers distinguish the
+   * owner of the first attempt from a reconnect that must reconcile instead.
+   */
+  async recordDeliveryAttempt(
+    missionId: string,
+    input: RecordDeliveryAttemptInput,
+  ): Promise<DeliveryAttemptRecord> {
+    return this.mutate((state, now) => {
+      const normalizedMissionId = normalizedId(missionId, "missionId");
+      const mission = findMission(state, normalizedMissionId);
+      ensureOpen(mission);
+      const normalizedApprovalId = normalizedId(input.approvalId, "approvalId");
+      const normalizedWorkItemId = normalizedId(input.workItemId, "workItemId");
+      const workItem = findWorkItem(state, normalizedMissionId, normalizedWorkItemId);
+      const attempt = nonNegativeInteger(input.attempt, "attempt");
+      if (attempt === 0) {
+        fail("invalid_input", "attempt must be greater than zero.");
+      }
+      if (workItem.attempt !== attempt) {
+        fail(
+          "approval_blocked",
+          `Delivery attempt ${attempt} does not match work item ${workItem.id} attempt ${workItem.attempt}.`,
+        );
+      }
+      const approval = ensureApprovedDelivery(
+        state,
+        normalizedMissionId,
+        normalizedApprovalId,
+        now,
+      );
+      if (
+        approval.workItemId !== normalizedWorkItemId ||
+        approval.attempt !== attempt
+      ) {
+        fail(
+          "approval_blocked",
+          "The durable delivery attempt is not correlated to the approved work-item attempt.",
+        );
+      }
+      const actionType = normalizeActionType(
+        requiredString(input.actionType ?? approval.actionType, "actionType", 200),
+      );
+      const expectedEffect = requiredString(input.expectedEffect, "expectedEffect");
+      const target = validateDeliveryAttemptTarget(input.target, "target");
+      ensureDeliveryAttemptMatchesApproval(approval, target, actionType, expectedEffect);
+
+      const existing = state.deliveryAttempts.find((candidate) =>
+        candidate.missionId === normalizedMissionId &&
+        candidate.approvalId === normalizedApprovalId &&
+        candidate.workItemId === normalizedWorkItemId &&
+        candidate.attempt === attempt,
+      );
+      if (existing !== undefined) {
+        if (
+          existing.actionType !== actionType ||
+          existing.expectedEffect !== expectedEffect ||
+          JSON.stringify(existing.target) !== JSON.stringify(target)
+        ) {
+          fail(
+            "approval_blocked",
+            `Delivery attempt ${existing.id} has a different approved target or expected effect.`,
+          );
+        }
+        return { attempt: existing, created: false };
+      }
+
+      const id = input.id === undefined
+        ? newId("delivery-attempt")
+        : normalizedId(input.id, "deliveryAttempt.id");
+      ensureUniqueEntityId(state, id);
+      const deliveryAttempt: DeliveryAttempt = {
+        id,
+        missionId: normalizedMissionId,
+        approvalId: normalizedApprovalId,
+        workItemId: normalizedWorkItemId,
+        attempt,
+        actionType,
+        expectedEffect,
+        target,
+        status: "pending",
+        createdAt: now,
+        updatedAt: now,
+      };
+      state.deliveryAttempts.push(deliveryAttempt);
+      return { attempt: deliveryAttempt, created: true };
+    });
+  }
+
+  /** Persist the first observed remote result before recording the final delivery. */
+  async recordDeliveryAttemptResult(
+    missionId: string,
+    deliveryAttemptId: string,
+    input: RecordDeliveryAttemptResultInput,
+  ): Promise<DeliveryAttempt> {
+    return this.mutate((state, now) => {
+      const normalizedMissionId = normalizedId(missionId, "missionId");
+      const deliveryAttempt = state.deliveryAttempts.find((candidate) =>
+        candidate.id === normalizedId(deliveryAttemptId, "deliveryAttemptId") &&
+        candidate.missionId === normalizedMissionId,
+      );
+      if (deliveryAttempt === undefined) {
+        fail(
+          "not_found",
+          `Delivery attempt ${deliveryAttemptId} was not found in mission ${normalizedMissionId}.`,
+        );
+      }
+      const approval = state.approvals.find((candidate) =>
+        candidate.id === deliveryAttempt.approvalId &&
+        candidate.missionId === normalizedMissionId,
+      );
+      if (approval === undefined) {
+        fail(
+          "approval_blocked",
+          `Delivery attempt ${deliveryAttempt.id} has no matching approved action.`,
+        );
+      }
+      const pullRequest = validatePullRequestReference(input.pullRequest, "pullRequest");
+      const executionOrigin = validateExecutionOrigin(input.executionOrigin, "executionOrigin");
+      ensureDeliveryAttemptResultMatchesTarget(deliveryAttempt, pullRequest, executionOrigin);
+      if (
+        executionOrigin.kind !== "mcp" ||
+        executionOrigin.sessionId !== approval.executionContext?.sessionId ||
+        executionOrigin.threadId !== approval.executionContext?.threadId ||
+        executionOrigin.toolCallId !== approval.executionContext?.toolCallId
+      ) {
+        fail(
+          "approval_blocked",
+          "The delivery result execution origin does not match the approved tool call.",
+        );
+      }
+      if (
+        deliveryAttempt.pullRequest !== undefined ||
+        deliveryAttempt.executionOrigin !== undefined
+      ) {
+        if (
+          JSON.stringify(deliveryAttempt.pullRequest) !== JSON.stringify(pullRequest)
+        ) {
+          fail(
+            "approval_blocked",
+            `Delivery attempt ${deliveryAttempt.id} already has a different remote result.`,
+          );
+        }
+        return deliveryAttempt;
+      }
+      deliveryAttempt.pullRequest = pullRequest;
+      deliveryAttempt.executionOrigin = executionOrigin;
+      deliveryAttempt.updatedAt = now;
+      return deliveryAttempt;
+    });
+  }
+
+  /** Mark a result-bearing attempt complete only after its delivered record is durable. */
+  async completeDeliveryAttempt(
+    missionId: string,
+    deliveryAttemptId: string,
+  ): Promise<DeliveryAttempt> {
+    return this.mutate((state, now) => {
+      const normalizedMissionId = normalizedId(missionId, "missionId");
+      const deliveryAttempt = state.deliveryAttempts.find((candidate) =>
+        candidate.id === normalizedId(deliveryAttemptId, "deliveryAttemptId") &&
+        candidate.missionId === normalizedMissionId,
+      );
+      if (deliveryAttempt === undefined) {
+        fail(
+          "not_found",
+          `Delivery attempt ${deliveryAttemptId} was not found in mission ${normalizedMissionId}.`,
+        );
+      }
+      if (deliveryAttempt.status === "completed") {
+        return deliveryAttempt;
+      }
+      if (deliveryAttempt.pullRequest === undefined || deliveryAttempt.executionOrigin === undefined) {
+        fail(
+          "invalid_transition",
+          `Delivery attempt ${deliveryAttempt.id} cannot complete before its remote result is persisted.`,
+        );
+      }
+      const delivered = state.deliveries.some((delivery) =>
+        delivery.missionId === normalizedMissionId &&
+        delivery.status === "delivered" &&
+        delivery.approvalId === deliveryAttempt.approvalId &&
+        delivery.workItemId === deliveryAttempt.workItemId &&
+        delivery.attempt === deliveryAttempt.attempt &&
+        delivery.pullRequest?.url === deliveryAttempt.pullRequest?.url,
+      );
+      if (!delivered) {
+        fail(
+          "invalid_transition",
+          `Delivery attempt ${deliveryAttempt.id} cannot complete before its delivered record is durable.`,
+        );
+      }
+      deliveryAttempt.status = "completed";
+      deliveryAttempt.updatedAt = now;
+      return deliveryAttempt;
+    });
+  }
+
   async executeAction<T>(
     missionId: string,
     input: ActionExecutionInput,
@@ -4516,6 +4957,30 @@ export class MissionService {
         delivery.executionOrigin = executionOrigin;
       }
       state.deliveries.push(delivery);
+      if (
+        status === "delivered" &&
+        approvedDelivery !== undefined &&
+        workItemId !== undefined &&
+        attempt !== undefined &&
+        pullRequest !== undefined
+      ) {
+        const deliveryAttempt = state.deliveryAttempts.find((candidate) =>
+          candidate.missionId === normalizedMissionId &&
+          candidate.approvalId === approvedDelivery?.id &&
+          candidate.workItemId === workItemId &&
+          candidate.attempt === attempt,
+        );
+        if (deliveryAttempt !== undefined) {
+          if (deliveryAttempt.pullRequest?.url !== pullRequest.url) {
+            fail(
+              "approval_blocked",
+              `Delivery attempt ${deliveryAttempt.id} does not match the delivered pull request.`,
+            );
+          }
+          deliveryAttempt.status = "completed";
+          deliveryAttempt.updatedAt = now;
+        }
+      }
       if (status === "delivered" && deliveryWorkItem !== undefined && deliveryWorkItem.status === "delivering") {
         updateCurrentAttempt(deliveryWorkItem, "done");
         delete deliveryWorkItem.requestedChanges;

@@ -11,6 +11,8 @@ const MAX_DAYTONA_RESULT_LENGTH = 2_000_000;
 export interface DaytonaSandboxExecutorOptions {
   apiKey: string;
   toolboxBaseUrl?: string;
+  /** Explicit opt-in for HTTP only when the toolbox endpoint is loopback. */
+  allowInsecureLoopbackForDevelopment?: boolean;
   commandTimeoutSeconds?: number;
   requestTimeoutMs?: number;
   fetch?: typeof fetch;
@@ -24,7 +26,10 @@ export function createDaytonaSandboxExecutor(
   options: DaytonaSandboxExecutorOptions,
 ): SandboxCommandExecutor {
   const apiKey = requiredTrimmedText(options.apiKey, "Daytona API key");
-  const toolboxBaseUrl = normalizeToolboxBaseUrl(options.toolboxBaseUrl);
+  const toolboxBaseUrl = normalizeToolboxBaseUrl(
+    options.toolboxBaseUrl,
+    options.allowInsecureLoopbackForDevelopment === true,
+  );
   const commandTimeoutSeconds = positiveInteger(
     options.commandTimeoutSeconds ?? DEFAULT_DAYTONA_COMMAND_TIMEOUT_SECONDS,
     "Daytona command timeout",
@@ -109,7 +114,10 @@ export function createDaytonaSandboxExecutor(
   };
 }
 
-function normalizeToolboxBaseUrl(value: string | undefined): string {
+function normalizeToolboxBaseUrl(
+  value: string | undefined,
+  allowInsecureLoopbackForDevelopment: boolean,
+): string {
   const raw = value?.trim() || DEFAULT_DAYTONA_TOOLBOX_BASE_URL;
   let url: URL;
   try {
@@ -117,13 +125,37 @@ function normalizeToolboxBaseUrl(value: string | undefined): string {
   } catch {
     throw new Error("Daytona toolbox base URL must be a valid URL.");
   }
-  if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username || url.password) {
-    throw new Error("Daytona toolbox base URL must use HTTP(S) without embedded credentials.");
+  if (
+    url.username ||
+    url.password ||
+    url.protocol !== "https:" &&
+      !(url.protocol === "http:" &&
+        allowInsecureLoopbackForDevelopment &&
+        isLoopbackHostname(url.hostname))
+  ) {
+    throw new Error(
+      "Daytona toolbox base URL must use HTTPS; HTTP is allowed only for explicit loopback development or test use.",
+    );
   }
   url.search = "";
   url.hash = "";
   url.pathname = url.pathname.replace(/\/+$/, "");
   return url.toString().replace(/\/$/, "");
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (normalized === "localhost" || normalized === "::1") {
+    return true;
+  }
+  const octets = normalized.split(".");
+  return (
+    octets.length === 4 &&
+    octets[0] === "127" &&
+    octets.every((octet) =>
+      /^\d+$/.test(octet) && Number(octet) >= 0 && Number(octet) <= 255
+    )
+  );
 }
 
 function requiredValue(value: string, label: string): string {

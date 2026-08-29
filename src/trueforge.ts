@@ -13,6 +13,7 @@ import {
   MissionDomainError,
   MissionService,
   MissionState,
+  PullRequestReference,
   WorkGraphDefinition,
   WorkItem,
   ReviewContext,
@@ -1070,7 +1071,7 @@ function defaultRepositoryMcpServer(
       "get_commit",
       ...(config.deliveryToolName === undefined
         ? []
-        : [config.deliveryToolName, PULL_REQUEST_READ_TOOL_NAME]),
+        : [config.deliveryToolName, PULL_REQUEST_READ_TOOL_NAME, "search_pull_requests"]),
     ]),
   ];
   const server: TrueForgeApi.McpServer = {
@@ -2038,6 +2039,133 @@ export class TrueForgeMissionRunner {
       headSha: readback.headSha,
       sessionId: execution.sessionId,
       turnId: execution.turnId,
+      threadId: pending.threadId,
+      toolCallId: pending.toolCallId,
+    };
+  }
+
+  /**
+   * Reconcile a previously started delivery using read-only GitHub operations.
+   * This method is intentionally separate from resolvePullRequestApproval so a
+   * reconnect can never replay create_pull_request after the durable intent
+   * exists.
+   */
+  async reconcilePullRequestApproval(
+    missionId: string,
+    pending: TrueForgeDeliveryApproval,
+    workItemId?: string,
+    knownPullRequest?: PullRequestReference,
+  ): Promise<TrueForgePullRequestResult | null> {
+    const target = validatePullRequestDeliveryTarget(pending.target);
+    validatePendingDeliveryApproval(pending, target);
+    const mission = await this.missions.getMission(missionId);
+    if (mission.trueforgeSessionId !== pending.sessionId) {
+      throw new TrueForgeIntegrationError(
+        "reconcile pull request approval",
+        "The pending approval is not correlated to the mission TrueForge session.",
+      );
+    }
+    ensureDeliveryMcpConfigured(this.config, pending.serverName);
+
+    let pullRequest: ParsedPullRequestCreation;
+    let previousTurnId = pending.turnId;
+    if (knownPullRequest !== undefined) {
+      const known = canonicalPullRequestUrl(knownPullRequest.url, target);
+      if (
+        known === null ||
+        known.number !== knownPullRequest.number ||
+        knownPullRequest.repositoryOwner !== target.owner ||
+        knownPullRequest.repositoryName !== target.repo ||
+        knownPullRequest.base !== target.base ||
+        knownPullRequest.head !== target.head ||
+        knownPullRequest.headSha !== target.headSha
+      ) {
+        throw new TrueForgeIntegrationError(
+          "reconcile pull request approval",
+          "The persisted delivery result does not match the exact approved repository, base, head, and SHA.",
+        );
+      }
+      pullRequest = known;
+    } else {
+      const execution = await this.executeTurn(
+        missionId,
+        buildPullRequestReconciliationInstruction(pending.serverName, target),
+        { previousTurnId: pending.turnId },
+      );
+      previousTurnId = execution.turnId;
+      requireCompletedTurn(
+        execution.rawEvents,
+        "reconcile pull request approval",
+        "pull request reconciliation",
+      );
+      const initialization = execution.rawEvents.find((event) => event.type === "mcp.initialize");
+      const initializedServers = initialization === undefined
+        ? undefined
+        : recordValue(initialization).mcpServers;
+      if (
+        !Array.isArray(initializedServers) ||
+        !initializedServers.some((server) => isRecord(server) && server.name === pending.serverName)
+      ) {
+        throw new TrueForgeIntegrationError(
+          "reconcile pull request approval",
+          `MCP server ${pending.serverName} was not initialized for read-only pull request reconciliation.`,
+        );
+      }
+      const calls = observedToolCalls(execution.rawEvents);
+      const searchCalls = calls.filter((call) =>
+        call.name === "search_pull_requests" &&
+        isRecord(call.arguments) &&
+        argumentsExactlyMatch(call.arguments, pullRequestSearchArguments(target))
+      );
+      if (calls.length !== 1 || searchCalls.length !== 1) {
+        throw new TrueForgeIntegrationError(
+          "reconcile pull request approval",
+          "Pull request reconciliation must contain exactly one canonical read-only search_pull_requests call and no other tool calls.",
+        );
+      }
+      const searchCall = searchCalls[0];
+      if (searchCall === undefined) {
+        throw new TrueForgeIntegrationError(
+          "reconcile pull request approval",
+          "The pull request reconciliation search call was not recorded.",
+        );
+      }
+      const response = toolResponseForCall(
+        execution.rawEvents,
+        searchCall.id,
+        searchCall.threadId ?? undefined,
+      );
+      if (response?.type !== "tool.response") {
+        throw new TrueForgeIntegrationError(
+          "reconcile pull request approval",
+          "The pull request reconciliation search returned no structured response.",
+        );
+      }
+      const candidates = parsePullRequestReconciliationResponse(response, target);
+      if (candidates.length !== 1) {
+        throw new TrueForgeIntegrationError(
+          "reconcile pull request approval",
+          candidates.length === 0
+            ? "No pull request matched the exact approved repository, base, head, and SHA during reconciliation."
+            : "More than one pull request matched the exact approved delivery during reconciliation.",
+        );
+      }
+      pullRequest = candidates[0] as ParsedPullRequestCreation;
+    }
+
+    const readback = await this.verifyCreatedPullRequest(
+      missionId,
+      target,
+      pullRequest,
+      pending.serverName,
+      previousTurnId,
+      workItemId,
+    );
+    return {
+      ...pullRequest,
+      headSha: readback.headSha,
+      sessionId: pending.sessionId,
+      turnId: previousTurnId,
       threadId: pending.threadId,
       toolCallId: pending.toolCallId,
     };
@@ -3877,11 +4005,12 @@ function ensureDeliveryMcpConfigured(
     (!enabledTools.includes(toolName) && !enabledTools.includes("@all")) ||
     (!enabledTools.includes("get_commit") && !enabledTools.includes("@all")) ||
     (!enabledTools.includes(PULL_REQUEST_READ_TOOL_NAME) && !enabledTools.includes("@all")) ||
+    (!enabledTools.includes("search_pull_requests") && !enabledTools.includes("@all")) ||
     (!approvalTools.includes(toolName) && !approvalTools.includes("@all"))
   ) {
     throw new TrueForgeIntegrationError(
       "request pull request approval",
-      `MCP server ${serverName} must expose ${toolName}, get_commit, and ${PULL_REQUEST_READ_TOOL_NAME}, and require native approval for ${toolName}.`,
+      `MCP server ${serverName} must expose ${toolName}, get_commit, ${PULL_REQUEST_READ_TOOL_NAME}, and search_pull_requests, and require native approval for ${toolName}.`,
     );
   }
 }
@@ -3956,6 +4085,18 @@ function pullRequestReadArguments(
   };
 }
 
+function pullRequestSearchArguments(
+  target: PullRequestDeliveryTarget,
+): Record<string, unknown> {
+  return {
+    query: `repo:${target.owner}/${target.repo} is:pr head:${target.owner}:${target.head} base:${target.base}`,
+    owner: target.owner,
+    repo: target.repo,
+    page: 1,
+    perPage: 100,
+  };
+}
+
 function buildPullRequestDeliveryInstruction(
   serverName: string,
   target: PullRequestDeliveryTarget,
@@ -3980,6 +4121,19 @@ function buildPullRequestReadbackInstruction(
     "This is a read-only post-create verification; do not call any write or destructive tool.",
     `Verify that the response is pull request #${number} in ${target.owner}/${target.repo}, targeting base ${target.base} from head ${target.head}, with the approved head SHA ${target.headSha}.`,
     "Stop after the read and return the structured MCP response.",
+  ].join(" ");
+}
+
+function buildPullRequestReconciliationInstruction(
+  serverName: string,
+  target: PullRequestDeliveryTarget,
+): string {
+  return [
+    `Use the configured MCP server ${serverName}.`,
+    `Call search_pull_requests exactly once with this JSON object: ${JSON.stringify(pullRequestSearchArguments(target))}.`,
+    "This is a read-only reconciliation after a possibly interrupted delivery; do not call create_pull_request or any other write or destructive tool.",
+    `Return only pull requests that can be verified against ${target.owner}/${target.repo}, base ${target.base}, head ${target.head}, and approved head SHA ${target.headSha}; an exact read-back will verify the selected result before delivery continues.`,
+    "Stop after the search and return the structured MCP response.",
   ].join(" ");
 }
 
@@ -4731,6 +4885,24 @@ function parsePullRequestDeliveryResponse(
     return url;
   }
   return null;
+}
+
+function parsePullRequestReconciliationResponse(
+  event: TrueForgeApi.TurnStreamingEvent,
+  target: PullRequestDeliveryTarget,
+): ParsedPullRequestCreation[] {
+  const candidates = new Map<string, ParsedPullRequestCreation>();
+  for (const candidate of pullRequestResponseCandidates(event)) {
+    if (!isRecord(candidate)) {
+      continue;
+    }
+    const url = canonicalPullRequestUrl(pullRequestUrl(candidate), target);
+    if (url === null || !declaredPullRequestNumberMatches(candidate, url.number)) {
+      continue;
+    }
+    candidates.set(`${url.number}:${url.url}`, url);
+  }
+  return [...candidates.values()];
 }
 
 function pullRequestHeadSha(candidate: Record<string, unknown>): string | null {

@@ -457,6 +457,63 @@ function pullRequestReadbackEvents(
   ];
 }
 
+function pullRequestSearchEvents(
+  turnId = "turn-2",
+  items = [{ number: 42, html_url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/42" }],
+) {
+  return [
+    {
+      type: "turn.created",
+      id: `${turnId}-created`,
+      createdAt: "2026-08-28T08:01:03.000Z",
+      threadId: null,
+      turnId,
+      state: { status: "running" },
+    },
+    {
+      type: "mcp.initialize",
+      id: `${turnId}-mcp`,
+      createdAt: "2026-08-28T08:01:04.000Z",
+      threadId: "thread-reconcile",
+      mcpServers: [{ name: "github" }],
+    },
+    {
+      type: "model.message",
+      id: `${turnId}-message`,
+      createdAt: "2026-08-28T08:01:05.000Z",
+      threadId: "thread-reconcile",
+      toolCalls: [{
+        id: `${turnId}-search-call`,
+        function: {
+          name: "search_pull_requests",
+          arguments: JSON.stringify({
+            query: "repo:mtamburrano/proofboard-demo-fixture is:pr head:mtamburrano:proofboard-verified-delivery base:main",
+            owner: "mtamburrano",
+            repo: "proofboard-demo-fixture",
+            page: 1,
+            perPage: 100,
+          }),
+        },
+      }],
+    },
+    {
+      type: "tool.response",
+      id: `${turnId}-response`,
+      createdAt: "2026-08-28T08:01:06.000Z",
+      threadId: "thread-reconcile",
+      toolCallId: `${turnId}-search-call`,
+      content: JSON.stringify({ isError: false, structuredContent: { items } }),
+    },
+    {
+      type: "turn.done",
+      id: `${turnId}-done`,
+      createdAt: "2026-08-28T08:01:07.000Z",
+      threadId: null,
+      state: { status: "done", requiredActions: [] },
+    },
+  ];
+}
+
 function deliveryApprovalEvents(turnId, target, readbackOptions = {}) {
   if (turnId === "turn-1") {
     const toolArguments = { ...target };
@@ -1648,8 +1705,8 @@ test("pull request delivery pauses one exact TrueForge tool call and resumes onl
     deliveryToolName: "create_pull_request",
     mcpServers: [{
       name: "github",
-      enableTools: ["create_pull_request", "get_commit", "pull_request_read"],
-      preloadTools: ["create_pull_request", "get_commit", "pull_request_read"],
+      enableTools: ["create_pull_request", "get_commit", "pull_request_read", "search_pull_requests"],
+      preloadTools: ["create_pull_request", "get_commit", "pull_request_read", "search_pull_requests"],
       requireApprovalForTools: ["create_pull_request"],
     }],
   });
@@ -1716,6 +1773,113 @@ test("pull request delivery pauses one exact TrueForge tool call and resumes onl
   assert.equal(calls.turns.length, 4);
 });
 
+test("reconciliation searches read-only and verifies one exact approved pull request", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const target = {
+    owner: "mtamburrano",
+    repo: "proofboard-demo-fixture",
+    base: "main",
+    head: "proofboard-verified-delivery",
+    headSha: VERIFIED_DELIVERY_HEAD_SHA,
+    title: "Verified fixture delivery",
+    body: "Verified fixture delivery body.",
+  };
+  const { client, calls } = fakeClient((turnId) => {
+    if (turnId === "turn-1") return deliveryApprovalEvents(turnId, target);
+    if (turnId === "turn-2") return pullRequestSearchEvents(turnId);
+    if (turnId === "turn-3") {
+      return pullRequestReadbackEvents(turnId, {
+        owner: target.owner,
+        repo: target.repo,
+        base: target.base,
+        head: target.head,
+        headSha: target.headSha,
+      });
+    }
+    throw new Error(`Unexpected reconciliation turn ${turnId}.`);
+  });
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-4-mini",
+    mcpServerName: "github",
+    deliveryToolName: "create_pull_request",
+    mcpServers: [{
+      name: "github",
+      enableTools: ["create_pull_request", "get_commit", "pull_request_read", "search_pull_requests"],
+      preloadTools: ["create_pull_request", "get_commit", "pull_request_read", "search_pull_requests"],
+      requireApprovalForTools: ["create_pull_request"],
+    }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-delivery-reconciliation",
+    objective: "Adopt an already-created exact delivery pull request",
+    repository: { owner: target.owner, name: target.repo, ref: LOCKED_FIXTURE_REF },
+  });
+  const pending = await runner.requestPullRequestApproval(mission.id, target);
+  const result = await runner.reconcilePullRequestApproval(mission.id, pending);
+
+  assert.deepEqual(result, {
+    number: 42,
+    url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/42",
+    headSha: VERIFIED_DELIVERY_HEAD_SHA,
+    sessionId: "session-created",
+    turnId: "turn-2",
+    threadId: "thread-delivery",
+    toolCallId: "call-create-pr",
+  });
+  assert.match(calls.turns[1].request.input[0].content, /search_pull_requests exactly once/);
+  assert.match(calls.turns[1].request.input[0].content, /head:mtamburrano:proofboard-verified-delivery/);
+  assert.equal(calls.turns[2].request.previousTurnId, "turn-2");
+  assert.equal(calls.turns.length, 3);
+});
+
+test("reconciliation rejects missing or ambiguous search results before any create retry", async () => {
+  const target = {
+    owner: "mtamburrano",
+    repo: "proofboard-demo-fixture",
+    base: "main",
+    head: "proofboard-verified-delivery",
+    headSha: VERIFIED_DELIVERY_HEAD_SHA,
+    title: "Verified fixture delivery",
+    body: "Verified fixture delivery body.",
+  };
+  for (const [label, items, expected] of [
+    ["missing", [], /No pull request matched/],
+    ["ambiguous", [
+      { number: 42, html_url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/42" },
+      { number: 43, html_url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/43" },
+    ], /More than one pull request matched/],
+  ]) {
+    const missions = new MissionService(new InMemoryMissionRepository());
+    const { client, calls } = fakeClient((turnId) => {
+      if (turnId === "turn-1") return deliveryApprovalEvents(turnId, target);
+      if (turnId === "turn-2") return pullRequestSearchEvents(turnId, items);
+      throw new Error(`Unexpected failed reconciliation turn ${turnId}.`);
+    });
+    const runner = new TrueForgeMissionRunner(missions, client, {
+      model: "openai/gpt-5-4-mini",
+      mcpServerName: "github",
+      deliveryToolName: "create_pull_request",
+      mcpServers: [{
+        name: "github",
+        enableTools: ["create_pull_request", "get_commit", "pull_request_read", "search_pull_requests"],
+        requireApprovalForTools: ["create_pull_request"],
+      }],
+    });
+    const mission = await runner.createMission({
+      id: `mission-delivery-reconciliation-${label}`,
+      objective: "Fail closed on an unsafe reconciliation result",
+      repository: { owner: target.owner, name: target.repo, ref: LOCKED_FIXTURE_REF },
+    });
+    const pending = await runner.requestPullRequestApproval(mission.id, target);
+    await assert.rejects(
+      runner.reconcilePullRequestApproval(mission.id, pending),
+      expected,
+      label,
+    );
+    assert.equal(calls.turns.length, 2, label);
+  }
+});
+
 test("post-create pull request read-back rejects a missing or mismatched head SHA", async () => {
   for (const [label, readbackOptions] of [
     ["missing", { includeHeadSha: false }],
@@ -1740,8 +1904,8 @@ test("post-create pull request read-back rejects a missing or mismatched head SH
       deliveryToolName: "create_pull_request",
       mcpServers: [{
         name: "github",
-        enableTools: ["create_pull_request", "get_commit", "pull_request_read"],
-        preloadTools: ["create_pull_request", "get_commit", "pull_request_read"],
+        enableTools: ["create_pull_request", "get_commit", "pull_request_read", "search_pull_requests"],
+        preloadTools: ["create_pull_request", "get_commit", "pull_request_read", "search_pull_requests"],
         requireApprovalForTools: ["create_pull_request"],
       }],
     });
@@ -1826,7 +1990,7 @@ test("rejecting or cancelling a TrueForge delivery approval returns no protected
       mcpServerName: "github",
       mcpServers: [{
         name: "github",
-        enableTools: ["create_pull_request", "get_commit", "pull_request_read"],
+        enableTools: ["create_pull_request", "get_commit", "pull_request_read", "search_pull_requests"],
         requireApprovalForTools: ["create_pull_request"],
       }],
     });
@@ -1910,8 +2074,8 @@ test("a delivery-head race blocks the approval allow before any protected operat
     deliveryToolName: "create_pull_request",
     mcpServers: [{
       name: "github",
-      enableTools: ["create_pull_request", "get_commit", "pull_request_read"],
-      preloadTools: ["create_pull_request", "get_commit", "pull_request_read"],
+      enableTools: ["create_pull_request", "get_commit", "pull_request_read", "search_pull_requests"],
+      preloadTools: ["create_pull_request", "get_commit", "pull_request_read", "search_pull_requests"],
       requireApprovalForTools: ["create_pull_request"],
     }],
   });
@@ -3071,6 +3235,49 @@ test("direct Daytona proof execution targets the requested sandbox without a Tru
     exitCode: 0,
     stdout: "proof output\n",
   });
+});
+
+test("Daytona rejects bearer-authenticated HTTP endpoints unless loopback development is explicit", async () => {
+  assert.throws(
+    () => createDaytonaSandboxExecutor({
+      apiKey: "daytona-test-secret",
+      toolboxBaseUrl: "http://proxy.example/toolbox",
+      fetch: async () => ({ ok: true, status: 200, async json() { return { exitCode: 0, result: "" }; } }),
+    }),
+    /must use HTTPS/i,
+  );
+  assert.throws(
+    () => createDaytonaSandboxExecutor({
+      apiKey: "daytona-test-secret",
+      toolboxBaseUrl: "http://127.0.0.1:8080/toolbox",
+      fetch: async () => ({ ok: true, status: 200, async json() { return { exitCode: 0, result: "" }; } }),
+    }),
+    /must use HTTPS/i,
+  );
+
+  const requests = [];
+  const executor = createDaytonaSandboxExecutor({
+    apiKey: "daytona-test-secret",
+    toolboxBaseUrl: "http://127.0.0.1:8080/toolbox",
+    allowInsecureLoopbackForDevelopment: true,
+    fetch: async (url, init) => {
+      requests.push({ url: String(url), init });
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { exitCode: 0, result: "loopback proof\n" };
+        },
+      };
+    },
+  });
+  const result = await executor.execute({
+    sandboxId: "sandbox-loopback",
+    command: "true",
+  });
+  assert.equal(requests.length, 1);
+  assert.match(requests[0].url, /^http:\/\/127\.0\.0\.1:8080\/toolbox\//);
+  assert.equal(result.stdout, "loopback proof\n");
 });
 
 test("sandbox verification persists the command, output summary, and exit status", async () => {

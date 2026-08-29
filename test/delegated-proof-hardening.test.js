@@ -968,6 +968,21 @@ test("coordinator workspace proof turns request their exact sandbox exec command
   });
 });
 
+test("delegated workspace snapshots and deltas reject ambient repository roots", () => {
+  const commands = [
+    DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
+    buildDelegatedWorkspaceDeltaCommand(WORKSPACE_START_TREE, WORKSPACE_END_TREE),
+  ];
+  for (const command of commands) {
+    assert.match(command, new RegExp(`canonical_root="${PRIMARY_SANDBOX_REPOSITORY_ROOT}"`));
+    assert.match(command, /git -C \"\$canonical_root\"/);
+    assert.match(command, /canonical_physical_root/);
+    assert.match(command, /repository_physical_root/);
+    assert.match(command, /if \[ \"\$repository_physical_root\" != \"\$canonical_physical_root\" \]/);
+    assert.doesNotMatch(command, /repository_root=\"\$\(git rev-parse --show-toplevel\)\"/);
+  }
+});
+
 test("coordinator workspace proof accepts root main and rejects dynamic child execs", async () => {
   const accepted = await runnerFixture({
     workspaceSnapshotThreadId: "main",

@@ -8,12 +8,14 @@ import {
 } from "../diagnostics.js";
 import {
   Approval,
+  DeliveryAttemptTarget,
   Evidence,
   Handoff,
   Mission,
   MissionDomainError,
   MissionService,
   MissionState,
+  PullRequestReference,
   Review,
   ReviewContext,
   ReviewOutcome,
@@ -99,6 +101,12 @@ export interface MissionRunner {
     pending: TrueForgeDeliveryApproval,
     decision: "approved" | "rejected" | "cancelled",
     workItemId?: string,
+  ): Promise<TrueForgePullRequestResult | null>;
+  reconcilePullRequestApproval?(
+    missionId: string,
+    pending: TrueForgeDeliveryApproval,
+    workItemId?: string,
+    knownPullRequest?: PullRequestReference,
   ): Promise<TrueForgePullRequestResult | null>;
   reviewContract?(context: ReviewContext): Promise<ImplementationReviewDecision>;
 }
@@ -1360,26 +1368,56 @@ class MissionController {
     workItem: WorkItem,
     approvedHeadSha: string,
   ): Promise<MissionView> {
+    const deliveryAttemptRecord = await this.missions.recordDeliveryAttempt(
+      PRIMARY_MISSION_ID,
+      {
+        approvalId: approval.id,
+        workItemId: workItem.id,
+        attempt: workItem.attempt,
+        actionType: PRIMARY_CONSEQUENTIAL_ACTION,
+        expectedEffect: approval.expectedEffect,
+        target: deliveryAttemptTarget(pending.target),
+      },
+    );
     const persistedReadback = persistedPullRequestReadback(
       await this.missions.getState(),
       approval,
       workItem,
     );
-    const result = persistedReadback ?? await this.missions.executeProtectedAction(
-        PRIMARY_MISSION_ID,
-        {
-          action: PRIMARY_CONSEQUENTIAL_ACTION,
-          target: approval.target,
-          expectedEffect: approval.expectedEffect,
-          approvalId: approval.id,
-        },
-        () => this.runner.resolvePullRequestApproval(
+    let result = persistedReadback;
+    if (result === null) {
+      if (deliveryAttemptRecord.created) {
+        result = await this.missions.executeProtectedAction(
+          PRIMARY_MISSION_ID,
+          {
+            action: PRIMARY_CONSEQUENTIAL_ACTION,
+            target: approval.target,
+            expectedEffect: approval.expectedEffect,
+            approvalId: approval.id,
+          },
+          () => this.runner.resolvePullRequestApproval(
+            PRIMARY_MISSION_ID,
+            pending,
+            "approved",
+            workItem.id,
+          ),
+        );
+      } else {
+        const reconcile = this.runner.reconcilePullRequestApproval;
+        if (reconcile === undefined) {
+          throw new MissionControlError(
+            "A previously started delivery requires read-only reconciliation before it can resume.",
+          );
+        }
+        result = await reconcile.call(
+          this.runner,
           PRIMARY_MISSION_ID,
           pending,
-          "approved",
           workItem.id,
-        ),
-      );
+          deliveryAttemptRecord.attempt.pullRequest,
+        );
+      }
+    }
     if (result === null) {
       throw new MissionControlError("Approved delivery returned no pull request result.");
     }
@@ -1388,6 +1426,29 @@ class MissionController {
         "The delivered pull request head does not match the SHA approved by the operator.",
       );
     }
+    const deliveryExecutionOrigin = {
+      kind: "mcp" as const,
+      sessionId: result.sessionId,
+      turnId: result.turnId,
+      threadId: result.threadId,
+      toolCallId: result.toolCallId,
+    };
+    await this.missions.recordDeliveryAttemptResult(
+      PRIMARY_MISSION_ID,
+      deliveryAttemptRecord.attempt.id,
+      {
+        pullRequest: {
+          number: result.number,
+          url: result.url,
+          repositoryOwner: pending.target.owner,
+          repositoryName: pending.target.repo,
+          base: pending.target.base,
+          head: pending.target.head,
+          headSha: result.headSha,
+        },
+        executionOrigin: deliveryExecutionOrigin,
+      },
+    );
     const evidence = await this.missions.addEvidence(PRIMARY_MISSION_ID, {
       workItemId: workItem.id,
       kind: "tool_result",
@@ -1406,13 +1467,7 @@ class MissionController {
         approval_id: approval.id,
         attempt: workItem.attempt,
       }),
-      executionOrigin: {
-        kind: "mcp",
-        sessionId: result.sessionId,
-        turnId: result.turnId,
-        threadId: result.threadId,
-        toolCallId: result.toolCallId,
-      },
+      executionOrigin: deliveryExecutionOrigin,
     });
     await this.missions.recordDelivery(PRIMARY_MISSION_ID, {
       status: "delivered",
@@ -1430,14 +1485,12 @@ class MissionController {
         head: PRIMARY_DELIVERY_TARGET.head,
         headSha: result.headSha,
       },
-      executionOrigin: {
-        kind: "mcp",
-        sessionId: result.sessionId,
-        turnId: result.turnId,
-        threadId: result.threadId,
-        toolCallId: result.toolCallId,
-      },
+      executionOrigin: deliveryExecutionOrigin,
     });
+    await this.missions.completeDeliveryAttempt(
+      PRIMARY_MISSION_ID,
+      deliveryAttemptRecord.attempt.id,
+    );
     return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID);
   }
 
@@ -1984,6 +2037,25 @@ function deliveryApprovalFromState(approval: Approval): TrueForgeDeliveryApprova
     serverName: context.serverName,
     toolName: "create_pull_request",
     target: { ...PRIMARY_DELIVERY_TARGET, headSha: context.headSha },
+  };
+}
+
+function deliveryAttemptTarget(
+  target: PullRequestDeliveryTarget,
+): DeliveryAttemptTarget {
+  if (target.headSha === undefined) {
+    throw new MissionControlError(
+      "The durable delivery attempt requires a verified pull request head SHA.",
+    );
+  }
+  return {
+    repositoryOwner: target.owner,
+    repositoryName: target.repo,
+    base: target.base,
+    head: target.head,
+    headSha: target.headSha,
+    title: target.title,
+    body: target.body,
   };
 }
 

@@ -30,6 +30,7 @@ class TestMissionRunner {
       failSandbox = false,
       secretInspectionError = false,
       createGate,
+      reconciliationResult = "found",
       inspectionRepository = PRIMARY_DELIVERY_FIXTURE,
       deliveryHeadSha = "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1",
       deliveryHeadPatches = PRIMARY_VERIFIED_DELIVERY_PATCHES,
@@ -40,6 +41,7 @@ class TestMissionRunner {
     this.failSandbox = failSandbox;
     this.secretInspectionError = secretInspectionError;
     this.createGate = createGate;
+    this.reconciliationResult = reconciliationResult;
     this.inspectionRepository = inspectionRepository;
     this.deliveryHeadSha = deliveryHeadSha;
     this.deliveryHeadPatches = deliveryHeadPatches;
@@ -47,7 +49,7 @@ class TestMissionRunner {
     this.sandboxInputs = [];
     this.operationLog = [];
     this.turnInputs = [];
-    this.deliveryCalls = { requested: [], resolved: [], protectedOperations: 0, lifecycle: [] };
+    this.deliveryCalls = { requested: [], resolved: [], reconciled: [], protectedOperations: 0, lifecycle: [] };
     this.calls = { create: 0, inspect: 0, headInspect: 0, turn: 0, sandbox: 0 };
   }
 
@@ -382,6 +384,22 @@ class TestMissionRunner {
     });
     return result;
   }
+
+  async reconcilePullRequestApproval(missionId, pending, workItemId, knownPullRequest) {
+    this.deliveryCalls.reconciled.push({ missionId, pending, workItemId, knownPullRequest });
+    if (this.reconciliationResult === null) {
+      return null;
+    }
+    return {
+      number: 73,
+      url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/73",
+      headSha: pending.target.headSha,
+      sessionId: pending.sessionId,
+      turnId: "test-reconciliation-turn",
+      threadId: pending.threadId,
+      toolCallId: pending.toolCallId,
+    };
+  }
 }
 
 function testApp(repository = new InMemoryMissionRepository(), options = {}) {
@@ -593,7 +611,11 @@ test("cross-origin browser state changes are rejected while same-origin changes 
 test("the real Node HTTP bridge forwards browser JSON bodies and rejects malformed JSON", async () => {
   const { app } = testApp();
   await app.request("/api/mission", { method: "POST" });
-  const server = createMissionNodeServer(app, { host: "127.0.0.1", port: 0 });
+  const server = createMissionNodeServer(app, {
+    host: "127.0.0.1",
+    port: 0,
+    allowedOrigins: ["http://mission.local"],
+  });
   const isolatedServer = await listenOnIsolatedSocket(server);
   const origin = "http://mission.local";
 
@@ -604,6 +626,17 @@ test("the real Node HTTP bridge forwards browser JSON bodies and rejects malform
     });
     assert.equal(initialResponse.status, 200);
     const initial = socketJson(initialResponse);
+    const hostileResponse = await requestOverSocket(isolatedServer.socketPath, {
+      requestPath: "/api/mission",
+      method: "POST",
+      headers: {
+        host: "attacker.example",
+        origin: "http://attacker.example",
+      },
+    });
+    assert.equal(hostileResponse.status, 400);
+    assert.equal(socketJson(hostileResponse).error, "invalid_host");
+    assert.equal((await json(await app.request("/api/mission"))).mission.mission.status, "draft");
     const ignoredBody = "{}";
     const bodylessGetResponse = await requestOverSocket(isolatedServer.socketPath, {
       requestPath: "/api/mission",
@@ -1201,6 +1234,95 @@ test("approved delivery advances the same attempt through read-back before Done"
   assert.equal(readback.attempt, 1);
   assert.equal(delivered.mission.progress.execution, "passed");
   assert.equal(delivered.mission.progress.verification, "passed");
+});
+
+test("a reconnect reconciles a durable delivery intent without replaying create_pull_request", async () => {
+  const repository = new InMemoryMissionRepository();
+  const first = testApp(repository);
+  const { implementTicket, approval } = await reachDeliveryApproval(first.app);
+  const context = approval.executionContext;
+  await first.missions.decideApproval(PRIMARY_MISSION_ID, approval.id, {
+    decision: "approved",
+    decidedBy: "release-operator",
+  });
+  await first.missions.transitionSystemWorkItem(PRIMARY_MISSION_ID, implementTicket.id, "delivering", {
+    trigger: "approval",
+  });
+  await first.missions.transitionMission(PRIMARY_MISSION_ID, "verifying");
+  const intent = await first.missions.recordDeliveryAttempt(PRIMARY_MISSION_ID, {
+    approvalId: approval.id,
+    workItemId: implementTicket.id,
+    attempt: approval.attempt,
+    expectedEffect: approval.expectedEffect,
+    target: {
+      repositoryOwner: context.repositoryOwner,
+      repositoryName: context.repositoryName,
+      base: context.base,
+      head: context.head,
+      headSha: context.headSha,
+      title: context.title,
+      body: context.body,
+    },
+  });
+  assert.equal(intent.created, true);
+
+  const restoredMissions = new MissionService(repository);
+  const restoredRunner = new TestMissionRunner(restoredMissions);
+  const restoredApp = createMissionHttpApp({ missions: restoredMissions, runner: restoredRunner });
+  const response = await restoredApp.request("/api/mission/run", { method: "POST" });
+  assert.equal(response.status, 200);
+  const delivered = await json(response);
+  assert.equal(delivered.mission.mission.status, "delivered");
+  assert.equal(restoredRunner.deliveryCalls.protectedOperations, 0);
+  assert.equal(restoredRunner.deliveryCalls.resolved.length, 0);
+  assert.equal(restoredRunner.deliveryCalls.reconciled.length, 1);
+  assert.equal(restoredRunner.deliveryCalls.reconciled[0].knownPullRequest, undefined);
+  const state = await restoredMissions.getState();
+  assert.equal(state.deliveryAttempts.length, 1);
+  assert.equal(state.deliveryAttempts[0].status, "completed");
+  assert.equal(state.deliveryAttempts[0].pullRequest.number, 73);
+});
+
+test("a missing reconciled pull request fails closed without replaying the protected mutation", async () => {
+  const repository = new InMemoryMissionRepository();
+  const first = testApp(repository);
+  const { implementTicket, approval } = await reachDeliveryApproval(first.app);
+  const context = approval.executionContext;
+  await first.missions.decideApproval(PRIMARY_MISSION_ID, approval.id, {
+    decision: "approved",
+    decidedBy: "release-operator",
+  });
+  await first.missions.transitionSystemWorkItem(PRIMARY_MISSION_ID, implementTicket.id, "delivering", {
+    trigger: "approval",
+  });
+  await first.missions.transitionMission(PRIMARY_MISSION_ID, "verifying");
+  await first.missions.recordDeliveryAttempt(PRIMARY_MISSION_ID, {
+    approvalId: approval.id,
+    workItemId: implementTicket.id,
+    attempt: approval.attempt,
+    expectedEffect: approval.expectedEffect,
+    target: {
+      repositoryOwner: context.repositoryOwner,
+      repositoryName: context.repositoryName,
+      base: context.base,
+      head: context.head,
+      headSha: context.headSha,
+      title: context.title,
+      body: context.body,
+    },
+  });
+
+  const restoredMissions = new MissionService(repository);
+  const restoredRunner = new TestMissionRunner(restoredMissions, { reconciliationResult: null });
+  const restoredApp = createMissionHttpApp({ missions: restoredMissions, runner: restoredRunner });
+  const response = await restoredApp.request("/api/mission/run", { method: "POST" });
+  assert.equal(response.status, 502);
+  assert.equal(restoredRunner.deliveryCalls.protectedOperations, 0);
+  assert.equal(restoredRunner.deliveryCalls.resolved.length, 0);
+  const state = await restoredMissions.getState();
+  assert.equal(state.missions[0].status, "blocked");
+  assert.equal(state.deliveryAttempts[0].status, "pending");
+  assert.equal(state.deliveries.length, 0);
 });
 
 test("rejecting or cancelling delivery blocks the ticket without a protected operation", async () => {

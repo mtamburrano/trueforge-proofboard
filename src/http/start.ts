@@ -40,8 +40,8 @@ const runner = new TrueForgeMissionRunner(
     ...(sandboxExecutor === undefined ? {} : { sandboxExecutor }),
     mcpServers: [{
       name: githubServer,
-      enableTools: ["get_file_contents", "get_commit", "create_pull_request", "pull_request_read"],
-      preloadTools: ["get_file_contents", "get_commit", "create_pull_request", "pull_request_read"],
+      enableTools: ["get_file_contents", "get_commit", "create_pull_request", "pull_request_read", "search_pull_requests"],
+      preloadTools: ["get_file_contents", "get_commit", "create_pull_request", "pull_request_read", "search_pull_requests"],
       requireApprovalForTools: ["create_pull_request"],
     }],
   },
