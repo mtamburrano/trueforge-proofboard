@@ -428,7 +428,7 @@ async function lockedRepositoryRunnerFixture({ preparation = {}, setup = {}, fai
     },
   };
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "local/locked-repository-fixture",
+    model: "openai/gpt-5.2",
     dynamicSubAgents: true,
   });
   const mission = await runner.createMission({
@@ -710,7 +710,7 @@ async function runnerFixture({
     },
   };
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "local/test-model",
+    model: "openai/gpt-5.2",
     dynamicSubAgents: true,
   });
   const mission = await runner.createMission({
@@ -1497,7 +1497,7 @@ async function runSequentialWorkspaceScenario({ forbiddenOnSecond = false } = {}
     },
   };
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "local/sequential-fixture",
+    model: "openai/gpt-5.2",
     dynamicSubAgents: true,
   });
   const mission = await runner.createMission({

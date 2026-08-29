@@ -57,6 +57,65 @@ export interface TrueForgeMissionConfig {
 export type TrueForgeCoordinatorToolSurface = "repository-read" | "sandbox-exec";
 export type TrueForgeCoordinatorPhase = "repository-read" | "bounded-setup" | "deterministic-proof";
 
+export interface DeterministicCoordinatorModelCapabilityPolicy {
+  readonly provider: string;
+  readonly model: string;
+  readonly forcedToolChoice: "named";
+  readonly disableThinking: boolean;
+}
+
+/**
+ * Exact, locally reviewed model/provider capabilities for coordinator turns.
+ * New entries must carry a documented provider configuration and a regression.
+ */
+export const DETERMINISTIC_COORDINATOR_MODEL_CAPABILITY_POLICIES = [
+  {
+    provider: "alibaba",
+    model: "qwen3-8-max",
+    forcedToolChoice: "named",
+    disableThinking: true,
+  },
+  {
+    provider: "alibaba",
+    model: "qwen3-7-plus",
+    forcedToolChoice: "named",
+    disableThinking: true,
+  },
+  {
+    provider: "openai",
+    model: "gpt-5.2",
+    forcedToolChoice: "named",
+    disableThinking: false,
+  },
+] as const satisfies readonly DeterministicCoordinatorModelCapabilityPolicy[];
+
+const deterministicCoordinatorPolicyByModel = new Map(
+  DETERMINISTIC_COORDINATOR_MODEL_CAPABILITY_POLICIES.map((policy) => [
+    `${policy.provider}/${policy.model}`,
+    policy,
+  ]),
+);
+
+export function resolveDeterministicCoordinatorModelPolicy(
+  model: string,
+): DeterministicCoordinatorModelCapabilityPolicy {
+  const normalizedModel = model.trim();
+  if (normalizedModel.length === 0) {
+    throw new MissionDomainError("invalid_input", "TrueForge model must not be empty.");
+  }
+  const policy = deterministicCoordinatorPolicyByModel.get(normalizedModel);
+  if (policy === undefined) {
+    const validatedModels = DETERMINISTIC_COORDINATOR_MODEL_CAPABILITY_POLICIES
+      .map((entry) => `${entry.provider}/${entry.model}`)
+      .join(", ");
+    throw new MissionDomainError(
+      "invalid_input",
+      `TrueForge deterministic coordinator model policy is not validated for "${normalizedModel}". Add an exact documented provider/model policy before starting a mission; capability probing and prompt-only tool enforcement are not supported. Validated models: ${validatedModels}.`,
+    );
+  }
+  return policy;
+}
+
 export interface TrueForgeEventStream extends AsyncIterable<TrueForgeApi.TurnStreamingEvent> {
   withMetadata?: () => AsyncIterable<{ data: TrueForgeApi.TurnStreamingEvent }>;
 }
@@ -869,10 +928,14 @@ function buildCoordinatorAgentSpecForSurface(
     repositoryToolName?: string;
   } = {},
 ): TrueForgeApi.AgentSpec {
+  const coordinatorToolName = surface === "repository-read"
+    ? options.repositoryToolName ?? "get_commit"
+    : "exec";
+  const modelPolicy = resolveDeterministicCoordinatorModelPolicy(config.model);
   const mcpServers = surface === "repository-read"
     ? [coordinatorRepositoryReadMcpServer(
         options.mcpServerName ?? config.mcpServerName ?? "github",
-        options.repositoryToolName ?? "get_commit",
+        coordinatorToolName,
       )]
     : [];
   const spec = buildMissionAgentSpec({
@@ -890,9 +953,32 @@ function buildCoordinatorAgentSpecForSurface(
       ...spec.model,
       params: {
         ...(spec.model.params ?? {}),
-        parallelToolCalls: false,
+        ...buildDeterministicCoordinatorModelParams(modelPolicy, coordinatorToolName),
       },
     },
+  };
+}
+
+function buildDeterministicCoordinatorModelParams(
+  policy: DeterministicCoordinatorModelCapabilityPolicy,
+  toolName: string,
+): NonNullable<TrueForgeApi.AgentSpec["model"]["params"]> {
+  const toolChoice = policy.forcedToolChoice === "named"
+    ? {
+        type: "function" as const,
+        function: { name: toolName },
+      }
+    : undefined;
+  if (toolChoice === undefined) {
+    throw new MissionDomainError(
+      "invalid_input",
+      `TrueForge deterministic coordinator policy for ${policy.provider}/${policy.model} does not define a forced tool choice.`,
+    );
+  }
+  return {
+    ...(policy.disableThinking ? { enable_thinking: false } : {}),
+    parallelToolCalls: false,
+    tool_choice: toolChoice,
   };
 }
 
@@ -947,6 +1033,7 @@ export class TrueForgeMissionRunner {
   ) {}
 
   async createMission(input: CreateMissionInput): Promise<Mission> {
+    resolveDeterministicCoordinatorModelPolicy(this.config.model);
     const session = await this.resolveSession(input.trueforgeSessionId);
     const missionInput: CreateMissionInput = {
       objective: input.objective,
