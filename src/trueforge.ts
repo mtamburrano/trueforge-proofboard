@@ -60,32 +60,46 @@ export type TrueForgeCoordinatorPhase = "repository-read" | "bounded-setup" | "d
 export interface DeterministicCoordinatorModelCapabilityPolicy {
   readonly provider: string;
   readonly model: string;
-  readonly forcedToolChoice: "named";
-  readonly disableThinking: boolean;
+  readonly providerParams: Readonly<Record<string, unknown>>;
 }
 
 /**
  * Exact, locally reviewed model/provider capabilities for coordinator turns.
- * New entries must carry a documented provider configuration and a regression.
+ * These are only provider parameters the current TrueForge runtime forwards;
+ * named tool selection is intentionally not represented because that runtime
+ * does not enforce it. New entries must carry a documented provider
+ * configuration and a regression.
  */
 export const DETERMINISTIC_COORDINATOR_MODEL_CAPABILITY_POLICIES = [
   {
     provider: "alibaba",
     model: "qwen3-8-max",
-    forcedToolChoice: "named",
-    disableThinking: true,
+    providerParams: {
+      enable_thinking: false,
+      parallel_tool_calls: false,
+    },
   },
   {
     provider: "alibaba",
-    model: "qwen3-7-plus",
-    forcedToolChoice: "named",
-    disableThinking: true,
+    model: "qwen3-7-flash",
+    providerParams: {
+      enable_thinking: false,
+      parallel_tool_calls: false,
+    },
   },
   {
     provider: "openai",
-    model: "gpt-5.2",
-    forcedToolChoice: "named",
-    disableThinking: false,
+    model: "gpt-5.4-mini",
+    providerParams: {
+      parallel_tool_calls: false,
+    },
+  },
+  {
+    provider: "openai",
+    model: "gpt-5-6-luna",
+    providerParams: {
+      parallel_tool_calls: false,
+    },
   },
 ] as const satisfies readonly DeterministicCoordinatorModelCapabilityPolicy[];
 
@@ -170,6 +184,7 @@ const DELEGATED_WORKSPACE_SNAPSHOT_INTENT =
 const DELEGATED_WORKSPACE_DELTA_INTENT =
   "Capture the coordinator-owned current work-item and cumulative mission workspace deltas after delegated implementation.";
 const MAX_COORDINATOR_EXEC_INTENT_LENGTH = 1_200;
+export const MAX_COORDINATOR_ZERO_TOOL_RETRIES = 2;
 const PULL_REQUEST_READ_TOOL_NAME = "pull_request_read";
 
 /**
@@ -953,7 +968,7 @@ function buildCoordinatorAgentSpecForSurface(
       ...spec.model,
       params: {
         ...(spec.model.params ?? {}),
-        ...buildDeterministicCoordinatorModelParams(modelPolicy, coordinatorToolName),
+        ...buildDeterministicCoordinatorModelParams(modelPolicy),
       },
     },
   };
@@ -961,25 +976,8 @@ function buildCoordinatorAgentSpecForSurface(
 
 function buildDeterministicCoordinatorModelParams(
   policy: DeterministicCoordinatorModelCapabilityPolicy,
-  toolName: string,
 ): NonNullable<TrueForgeApi.AgentSpec["model"]["params"]> {
-  const toolChoice = policy.forcedToolChoice === "named"
-    ? {
-        type: "function" as const,
-        function: { name: toolName },
-      }
-    : undefined;
-  if (toolChoice === undefined) {
-    throw new MissionDomainError(
-      "invalid_input",
-      `TrueForge deterministic coordinator policy for ${policy.provider}/${policy.model} does not define a forced tool choice.`,
-    );
-  }
-  return {
-    ...(policy.disableThinking ? { enable_thinking: false } : {}),
-    parallelToolCalls: false,
-    tool_choice: toolChoice,
-  };
+  return { ...policy.providerParams };
 }
 
 function coordinatorRepositoryReadMcpServer(
@@ -2126,6 +2124,7 @@ export class TrueForgeMissionRunner {
         {
           ...inspectionOptions,
           coordinatorToolSurface: "repository-read",
+          coordinatorPhase: "repository-read",
           coordinatorMcpServerName: mcpServerName,
           coordinatorExpectedToolName: toolName,
         },
@@ -2236,6 +2235,7 @@ export class TrueForgeMissionRunner {
         buildDeliveryHeadInspectionInstruction(target, mcpServerName),
         {
           coordinatorToolSurface: "repository-read",
+          coordinatorPhase: "repository-read",
           coordinatorMcpServerName: mcpServerName,
           coordinatorExpectedToolName: "get_commit",
         },
@@ -2545,10 +2545,30 @@ export class TrueForgeMissionRunner {
         ),
         "bound coordinator runtime",
       );
-      execution = await this.executeTurn(missionId, instruction, {
+      const retryAllowed = coordinatorZeroToolRetryAllowed(options.coordinatorPhase);
+      const expectedToolName = options.coordinatorExpectedToolName ??
+        (options.coordinatorToolSurface === "repository-read" ? "get_commit" : "exec");
+      let previousTurnId = options.previousTurnId;
+      for (let attempt = 0; ; attempt += 1) {
+        const attemptInstruction = attempt === 0
+          ? instruction
+          : buildCoordinatorZeroToolRetryInstruction(instruction, expectedToolName);
+        const attemptOptions: InternalRunTurnOptions = {
           ...options,
           coordinatorRuntime: true,
-      });
+          ...(previousTurnId === undefined ? {} : { previousTurnId }),
+        };
+        execution = await this.executeTurn(missionId, attemptInstruction, attemptOptions);
+        if (
+          !retryAllowed ||
+          attempt >= MAX_COORDINATOR_ZERO_TOOL_RETRIES ||
+          coordinatorAttemptEmittedToolActivity(execution.rawEvents) ||
+          !coordinatorAttemptCompleted(execution.rawEvents)
+        ) {
+          break;
+        }
+        previousTurnId = execution.turnId;
+      }
     } catch (error) {
       operationFailed = true;
       operationError = error;
@@ -3939,7 +3959,7 @@ function buildLockedFixtureInspectionInstruction(
     `Use the configured MCP server ${serverName}.`,
     `Use get_commit with this exact JSON object: ${JSON.stringify(lockedFixtureArguments())}.`,
     `The returned commit must include the exact patches for ${LOCKED_FIXTURE_FILES.join(" and ")}.`,
-    "Make no other MCP calls. If the first call is missing, malformed, or uses different arguments, stop; never retry with a corrective request.",
+    "Make no other MCP calls during this turn. If a completed turn emits no tool call, the bounded coordinator may repeat this exact operation; any emitted tool call must use these exact arguments.",
     "Use the MCP response as the only source of repository facts; do not use the host filesystem, canned data, or final-answer narration.",
     "Stop after the read.",
   ].join(" ");
@@ -3965,7 +3985,7 @@ function buildDeliveryHeadInspectionInstruction(
     `Use the configured MCP server ${serverName}.`,
     `Use get_commit with this exact JSON object: ${JSON.stringify(deliveryHeadArguments(target))}.`,
     `The returned commit must differ from baseline ${PRIMARY_DELIVERY_FIXTURE.baselineSha} and contain the verified delivery patches.`,
-    "Make no other MCP calls and never retry with a corrective request.",
+    "Make no other MCP calls during this turn. If a completed turn emits no tool call, the bounded coordinator may repeat this exact operation; any emitted tool call must use these exact arguments.",
     "Use the MCP response as the only source of delivery-head facts; do not mutate the repository.",
     "Stop after the read.",
   ].join(" ");
@@ -4239,6 +4259,52 @@ interface TurnCompletion {
 interface TurnCompletionOptions {
   allowCoordinatorIterationStop?: boolean;
   expectedToolName?: string;
+}
+
+function coordinatorZeroToolRetryAllowed(
+  phase: TrueForgeCoordinatorPhase | undefined,
+): boolean {
+  return phase === "repository-read" || phase === "deterministic-proof";
+}
+
+function coordinatorAttemptEmittedToolActivity(
+  events: TrueForgeApi.TurnStreamingEvent[],
+): boolean {
+  return events.some((event) => {
+    if (event.type.startsWith("tool.")) {
+      return true;
+    }
+    if (event.type !== "model.message" && event.type !== "model.message.delta") {
+      return false;
+    }
+    const toolCalls = recordValue(event).toolCalls;
+    return Array.isArray(toolCalls) && toolCalls.length > 0;
+  });
+}
+
+function coordinatorAttemptCompleted(
+  events: TrueForgeApi.TurnStreamingEvent[],
+): boolean {
+  const doneEvents = events.filter((event) => event.type === "turn.done");
+  const done = doneEvents.at(-1);
+  if (done === undefined) {
+    return false;
+  }
+  const completion = turnCompletion(done);
+  return completion.status === "done" &&
+    completion.requiredActions !== null &&
+    completion.requiredActions.length === 0;
+}
+
+function buildCoordinatorZeroToolRetryInstruction(
+  instruction: string,
+  expectedToolName: string,
+): string {
+  return [
+    instruction,
+    `The previous coordinator turn emitted no tool call. Repeat the exact required operation now: emit exactly one ${expectedToolName} tool call with the same required arguments, command, thread, and verifier.`,
+    "Do not substitute, relax, or narrate instead of the required operation.",
+  ].join(" ");
 }
 
 function turnCompletion(event: TrueForgeApi.TurnStreamingEvent): TurnCompletion {

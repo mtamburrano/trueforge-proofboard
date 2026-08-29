@@ -298,7 +298,7 @@ function fakeClient({ sessionId, malformedCompletion = false }) {
 
 function runnerFor(missions, client) {
   return new TrueForgeMissionRunner(missions, client, {
-    model: "alibaba/qwen3-7-plus",
+    model: "alibaba/qwen3-8-max",
     dynamicSubAgents: true,
   });
 }

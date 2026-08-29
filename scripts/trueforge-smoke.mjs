@@ -2,7 +2,7 @@ import { pathToFileURL } from "node:url";
 
 export const DEFAULTS = Object.freeze({
   baseUrl: "http://localhost:8790",
-  model: "alibaba/qwen3-7-plus",
+  model: "alibaba/qwen3-8-max",
   githubServer: "github",
   githubOwner: "mtamburrano",
   githubRepo: "trueforge-proofboard",

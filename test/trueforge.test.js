@@ -328,6 +328,39 @@ function lockedCommitEvents(
   ];
 }
 
+function zeroToolEvents(
+  turnId = "turn-1",
+  {
+    content = "I completed the turn without invoking a tool.",
+    turnState = { status: "done", requiredActions: [] },
+  } = {},
+) {
+  return [
+    {
+      type: "turn.created",
+      id: `${turnId}-created`,
+      createdAt: "2026-08-29T08:00:00.000Z",
+      threadId: null,
+      turnId,
+      state: { status: "running" },
+    },
+    {
+      type: "model.message",
+      id: `${turnId}-model`,
+      createdAt: "2026-08-29T08:00:01.000Z",
+      threadId: "main",
+      content,
+    },
+    {
+      type: "turn.done",
+      id: `${turnId}-done`,
+      createdAt: "2026-08-29T08:00:02.000Z",
+      threadId: null,
+      state: turnState,
+    },
+  ];
+}
+
 function pullRequestReadbackEvents(
   turnId = "turn-4",
   {
@@ -775,7 +808,7 @@ test("runner creates a TrueForge session and maps safe runtime evidence", async 
   const missions = new MissionService(repository, () => new Date("2026-08-26T16:00:00.000Z"));
   const { client, calls } = fakeClient();
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_file_contents"] }],
   });
 
@@ -818,7 +851,7 @@ test("runner provisions a missing Debian 12 sandbox toolchain before delegated w
       : sandboxToolchainProofEvents(turnId),
   { passAgentSpec: true });
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-sandbox-preparation",
@@ -838,7 +871,7 @@ test("runner provisions a missing Debian 12 sandbox toolchain before delegated w
     SANDBOX_SETUP_ITERATION_LIMIT,
   );
   assert.equal(calls.updates[0].request.agent.spec.mcpServers.length, 0);
-  assert.equal(calls.updates[0].request.agent.spec.model.params.parallelToolCalls, false);
+  assert.equal(calls.updates[0].request.agent.spec.model.params.parallel_tool_calls, false);
   assert.equal(calls.updates[0].request.agent.spec.config.dynamicSubAgents.enabled, false);
   assert.equal(
     calls.updates[1].request.agent.spec.config.iterationLimit,
@@ -875,7 +908,7 @@ test("bounded sandbox setup accepts a paraphrased exec intent before exact proof
     "Provision the sandbox runtime and confirm it is usable before delegated work.";
   const { client, calls } = fakeClient((turnId, agentSpec) => {
     if (agentSpec?.config?.iterationLimit === SANDBOX_SETUP_ITERATION_LIMIT) {
-      assert.equal(agentSpec?.model?.params?.parallelToolCalls, false);
+      assert.equal(agentSpec?.model?.params?.parallel_tool_calls, false);
       return sandboxSetupEvents(turnId, {
         intents: [paraphrasedIntent, paraphrasedIntent],
       });
@@ -884,7 +917,7 @@ test("bounded sandbox setup accepts a paraphrased exec intent before exact proof
     return sandboxToolchainProofEvents(turnId);
   }, { passAgentSpec: true });
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-sandbox-paraphrased-intent",
@@ -926,7 +959,7 @@ test("sandbox proof failure blocks without a corrective repair turn and restores
     return sandboxToolchainProofEvents(turnId, { nodeVersion: "v18.20.4" });
   }, { passAgentSpec: true });
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-sandbox-proof-failure",
@@ -972,7 +1005,7 @@ test("sandbox setup budget exhaustion fails closed before deterministic proof", 
     });
   }, { passAgentSpec: true });
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-sandbox-setup-budget",
@@ -1015,7 +1048,7 @@ test("bounded setup accepts its four-exec maximum with a separate completion ite
     return sandboxToolchainProofEvents(turnId);
   }, { passAgentSpec: true });
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-sandbox-setup-max-exec-boundary",
@@ -1061,7 +1094,7 @@ test("Debian 12 setup guidance recovers from stock Node 18 before independent pr
       : sandboxToolchainProofEvents(turnId),
   { passAgentSpec: true });
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-sandbox-debian-12-node18-recovery",
@@ -1118,7 +1151,7 @@ test("coordinator sandbox readiness and verification require root main call and 
       : sandboxEvents(turnId, 0, [], fixture.options),
     { passAgentSpec: true });
     const runner = new TrueForgeMissionRunner(missions, client, {
-      model: "openai/gpt-5.2",
+      model: "openai/gpt-5.4-mini",
     });
     const mission = await runner.createMission({
       id: `mission-sandbox-root-thread-${index}`,
@@ -1148,7 +1181,7 @@ test("coordinator sandbox turns are runtime-bounded and stop cleanly after the c
   const { client, calls } = fakeClient((turnId, agentSpec) => {
     const isBounded =
       agentSpec?.config?.iterationLimit === COORDINATOR_TRUEFORGE_ITERATION_LIMIT &&
-      agentSpec?.model?.params?.parallelToolCalls === false;
+      agentSpec?.model?.params?.parallel_tool_calls === false;
     if (!isBounded) {
       return sandboxEvents(turnId, 0, [], {
         additionalSandboxCalls: [
@@ -1168,7 +1201,7 @@ test("coordinator sandbox turns are runtime-bounded and stop cleanly after the c
     });
   }, { passAgentSpec: true });
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-runtime-bounded-coordinator",
@@ -1196,7 +1229,7 @@ test("coordinator sandbox turns are runtime-bounded and stop cleanly after the c
     calls.updates[0].request.agent.spec.config.iterationLimit,
     COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
   );
-  assert.equal(calls.updates[0].request.agent.spec.model.params.parallelToolCalls, false);
+  assert.equal(calls.updates[0].request.agent.spec.model.params.parallel_tool_calls, false);
   assert.equal(
     calls.updates[1].request.agent.spec.config.iterationLimit,
     DEFAULT_TRUEFORGE_ITERATION_LIMIT,
@@ -1215,57 +1248,47 @@ test("coordinator sandbox turns are runtime-bounded and stop cleanly after the c
 test("mission agent specs use a bounded non-twelve default iteration limit", () => {
   assert.equal(DEFAULT_TRUEFORGE_ITERATION_LIMIT, 64);
   assert.equal(
-    buildMissionAgentSpec({ model: "openai/gpt-5.2" }).config.iterationLimit,
+    buildMissionAgentSpec({ model: "openai/gpt-5.4-mini" }).config.iterationLimit,
     DEFAULT_TRUEFORGE_ITERATION_LIMIT,
   );
   assert.equal(
-    buildMissionAgentSpec({ model: "openai/gpt-5.2", iterationLimit: 24 }).config.iterationLimit,
+    buildMissionAgentSpec({ model: "openai/gpt-5.4-mini", iterationLimit: 24 }).config.iterationLimit,
     24,
   );
   assert.throws(
-    () => buildMissionAgentSpec({ model: "openai/gpt-5.2", iterationLimit: MAX_TRUEFORGE_ITERATION_LIMIT + 1 }),
+    () => buildMissionAgentSpec({ model: "openai/gpt-5.4-mini", iterationLimit: MAX_TRUEFORGE_ITERATION_LIMIT + 1 }),
     /between 1 and 1024/,
   );
 });
 
-test("deterministic coordinator policy forces the validated tool for each supported provider", () => {
-  const qwenRepository = buildCoordinatorAgentSpec(
-    { model: "alibaba/qwen3-8-max" },
-    "repository-read",
-  );
-  assert.deepEqual(qwenRepository.model.params, {
-    enable_thinking: false,
-    parallelToolCalls: false,
-    tool_choice: {
-      type: "function",
-      function: { name: "get_commit" },
+test("deterministic coordinator policy supports exactly four models without inert tool forcing", () => {
+  const cases = [
+    {
+      model: "alibaba/qwen3-8-max",
+      params: { enable_thinking: false, parallel_tool_calls: false },
     },
-  });
-
-  const qwenSandbox = buildCoordinatorAgentSpec(
-    { model: "alibaba/qwen3-8-max" },
-    "sandbox-exec",
-  );
-  assert.deepEqual(qwenSandbox.model.params, {
-    enable_thinking: false,
-    parallelToolCalls: false,
-    tool_choice: {
-      type: "function",
-      function: { name: "exec" },
+    {
+      model: "alibaba/qwen3-7-flash",
+      params: { enable_thinking: false, parallel_tool_calls: false },
     },
-  });
-
-  const openAiSandbox = buildCoordinatorAgentSpec(
-    { model: "openai/gpt-5.2" },
-    "sandbox-exec",
-  );
-  assert.deepEqual(openAiSandbox.model.params, {
-    parallelToolCalls: false,
-    tool_choice: {
-      type: "function",
-      function: { name: "exec" },
+    {
+      model: "openai/gpt-5.4-mini",
+      params: { parallel_tool_calls: false },
     },
-  });
+    {
+      model: "openai/gpt-5-6-luna",
+      params: { parallel_tool_calls: false },
+    },
+  ];
+  for (const { model, params } of cases) {
+    for (const surface of ["repository-read", "sandbox-exec"]) {
+      const spec = buildCoordinatorAgentSpec({ model }, surface);
+      assert.deepEqual(spec.model.params, params);
+      assert.equal(spec.model.params.tool_choice, undefined);
+      assert.equal(spec.model.params.toolChoice, undefined);
+    }
+    assert.equal(buildMissionAgentSpec({ model }).model.params, undefined);
+  }
 });
 
 test("unknown deterministic coordinator models fail before mission execution", async () => {
@@ -1290,6 +1313,101 @@ test("unknown deterministic coordinator models fail before mission execution", a
   assert.equal(calls.create.length, 0);
   assert.equal(calls.get.length, 0);
   assert.equal((await missions.getState()).missions.length, 0);
+});
+
+test("repository-read coordinator retries one completed zero-tool turn on the same session and predecessor chain", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client, calls } = fakeClient((turnId) =>
+    turnId === "turn-1" ? zeroToolEvents(turnId) : lockedCommitEvents(turnId),
+  );
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "alibaba/qwen3-7-flash",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-retry-zero-tool-repository-read",
+    objective: "Recover one omitted deterministic repository read",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  const inspection = await runner.inspectRepository({ missionId: mission.id });
+
+  assert.equal(inspection.commitSha, LOCKED_FIXTURE_SHA);
+  assert.equal(calls.turns.length, 2);
+  assert.equal(calls.turns[0].request.previousTurnId, undefined);
+  assert.equal(calls.turns[1].request.previousTurnId, "turn-1");
+  assert.match(calls.turns[1].request.input[0].content, /previous coordinator turn emitted no tool call/i);
+  assert.match(calls.turns[1].request.input[0].content, /full_patch/);
+  assert.equal(calls.updates.length, 2);
+  assert.equal(calls.updates[0].sessionId, "session-created");
+  assert.equal(calls.updates[1].sessionId, "session-created");
+  assert.equal(calls.turns[0].agentSpec, calls.turns[1].agentSpec);
+  assert.equal((await missions.getState()).missions[0].trueforgeTurnId, "turn-2");
+});
+
+test("sandbox proof retries at most twice after completed zero-tool omissions", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client, calls } = fakeClient((turnId) =>
+    turnId === "turn-1" ? zeroToolEvents(turnId) : sandboxEvents(turnId),
+  );
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-6-luna",
+  });
+  const mission = await runner.createMission({
+    id: "mission-retry-zero-tool-sandbox-proof",
+    objective: "Recover one omitted deterministic sandbox proof",
+  });
+
+  const verification = await runner.runSandboxVerification({
+    missionId: mission.id,
+    command: "node --test",
+  });
+
+  assert.equal(verification.exitCode, 0);
+  assert.equal(calls.turns.length, 2);
+  assert.equal(calls.turns[1].request.previousTurnId, "turn-1");
+  assert.match(calls.turns[1].request.input[0].content, /previous coordinator turn emitted no tool call/i);
+  assert.match(calls.turns[1].request.input[0].content, /node --test/);
+  assert.equal(calls.updates.length, 2);
+  assert.equal(calls.turns[0].sessionId, "session-created");
+  assert.equal(calls.turns[1].sessionId, "session-created");
+  assert.equal((await missions.getState()).missions[0].trueforgeSandboxId, "sandbox-1");
+});
+
+test("zero-tool coordinator recovery stops after three completed attempts", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client, calls } = fakeClient((turnId) => zeroToolEvents(turnId));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5.4-mini",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-retry-zero-tool-limit",
+    objective: "Bound repeated omitted deterministic repository reads",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  await assert.rejects(
+    runner.inspectRepository({ missionId: mission.id }),
+    /TrueForge did not record MCP initialization/,
+  );
+
+  assert.equal(calls.turns.length, 3);
+  assert.deepEqual(
+    calls.turns.map((turn) => turn.request.previousTurnId),
+    [undefined, "turn-1", "turn-2"],
+  );
+  assert.match(calls.turns[1].request.input[0].content, /previous coordinator turn emitted no tool call/i);
+  assert.match(calls.turns[2].request.input[0].content, /previous coordinator turn emitted no tool call/i);
+  assert.equal(calls.updates.length, 2);
 });
 
 test("normal implementer and reviewer turns remain agentic for a validated model", async () => {
@@ -1336,7 +1454,7 @@ test("runner performs an independent bounded contract review", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client, calls } = fakeClient(contractReviewEvents);
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-contract-review",
@@ -1396,7 +1514,7 @@ test("runner does not mark a done turn as passed while required actions remain",
     return events;
   });
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-pending-required-action",
@@ -1414,7 +1532,7 @@ test("runner does not mark a done turn as passed while required actions remain",
 test("runner resumes the persisted session after a reconnect", async () => {
   const repository = new InMemoryMissionRepository();
   const { client, calls } = fakeClient();
-  const config = { model: "openai/gpt-5.2" };
+  const config = { model: "openai/gpt-5.4-mini" };
   const firstService = new MissionService(repository);
   const firstRunner = new TrueForgeMissionRunner(firstService, client, config);
   const mission = await firstRunner.createMission({
@@ -1452,7 +1570,7 @@ test("pull request delivery pauses one exact TrueForge tool call and resumes onl
     deliveryApprovalEvents(turnId, target)
   );
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
     mcpServerName: "github",
     deliveryToolName: "create_pull_request",
     mcpServers: [{
@@ -1544,7 +1662,7 @@ test("post-create pull request read-back rejects a missing or mismatched head SH
       deliveryApprovalEvents(turnId, target, readbackOptions)
     );
     const runner = new TrueForgeMissionRunner(missions, client, {
-      model: "openai/gpt-5.2",
+      model: "openai/gpt-5.4-mini",
       mcpServerName: "github",
       deliveryToolName: "create_pull_request",
       mcpServers: [{
@@ -1631,7 +1749,7 @@ test("rejecting or cancelling a TrueForge delivery approval returns no protected
       ];
     });
     const runner = new TrueForgeMissionRunner(missions, client, {
-      model: "openai/gpt-5.2",
+      model: "openai/gpt-5.4-mini",
       mcpServerName: "github",
       mcpServers: [{
         name: "github",
@@ -1714,7 +1832,7 @@ test("a delivery-head race blocks the approval allow before any protected operat
     });
   });
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
     mcpServerName: "github",
     deliveryToolName: "create_pull_request",
     mcpServers: [{
@@ -1747,7 +1865,7 @@ test("runner can attach an existing TrueForge session without creating another",
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client, calls } = fakeClient();
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
   });
 
   const mission = await runner.createMission({
@@ -1765,7 +1883,7 @@ test("repository inspection proves the MCP call and returned file resource", asy
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client, calls } = fakeClient(repositoryEvents);
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_file_contents"] }],
   });
   const mission = await runner.createMission({
@@ -1806,7 +1924,7 @@ test("locked fixture inspection proves direct TrueForge get_commit content and e
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client, calls } = fakeClient(lockedCommitEvents);
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_file_contents", "get_commit"] }],
   });
   const mission = await runner.createMission({
@@ -1852,7 +1970,7 @@ test("locked fixture inspection bounds the first MCP read and restores the norma
   let unboundedRetryAttempted = false;
   const { client, calls } = fakeClient((turnId, agentSpec) => {
     const bounded = agentSpec?.config?.iterationLimit === COORDINATOR_TRUEFORGE_ITERATION_LIMIT &&
-      agentSpec?.model?.params?.parallelToolCalls === false;
+      agentSpec?.model?.params?.parallel_tool_calls === false;
     if (!bounded) {
       unboundedRetryAttempted = true;
       return lockedCommitEvents(turnId, {
@@ -1900,7 +2018,7 @@ test("locked fixture inspection bounds the first MCP read and restores the norma
     });
   }, { passAgentSpec: true });
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
   });
   const mission = await runner.createMission({
@@ -1941,7 +2059,7 @@ test("locked fixture inspection bounds the first MCP read and restores the norma
     calls.updates.map((update) => update.request.agent.spec.config.iterationLimit),
     [COORDINATOR_TRUEFORGE_ITERATION_LIMIT, DEFAULT_TRUEFORGE_ITERATION_LIMIT],
   );
-  assert.equal(calls.updates[0].request.agent.spec.model.params.parallelToolCalls, false);
+  assert.equal(calls.updates[0].request.agent.spec.model.params.parallel_tool_calls, false);
   assert.equal(calls.updates[1].request.agent.spec.model.params, undefined);
   const state = await missions.getState();
   assert.equal(state.missions[0].trueforgeSessionId, "session-created");
@@ -1959,7 +2077,7 @@ test("coordinator tool-surface matrix isolates repository reads, sandbox exec, a
     preloadTools: ["get_commit", "get_file_contents"],
   }];
   const config = {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
     dynamicSubAgents: true,
     iterationLimit: 32,
     mcpServers: normalMcpServers,
@@ -2019,11 +2137,11 @@ test("coordinator tool-surface matrix isolates repository reads, sandbox exec, a
   }]);
   assert.equal(boundedRepositorySpec.config.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
   assert.equal(boundedRepositorySpec.config.dynamicSubAgents.enabled, false);
-  assert.equal(boundedRepositorySpec.model.params.parallelToolCalls, false);
+  assert.equal(boundedRepositorySpec.model.params.parallel_tool_calls, false);
   assert.deepEqual(boundedSandboxSpec.mcpServers, []);
   assert.equal(boundedSandboxSpec.config.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
   assert.equal(boundedSandboxSpec.config.dynamicSubAgents.enabled, false);
-  assert.equal(boundedSandboxSpec.model.params.parallelToolCalls, false);
+  assert.equal(boundedSandboxSpec.model.params.parallel_tool_calls, false);
   assert.deepEqual(restoredAfterRepositorySpec, buildMissionAgentSpec(config));
   assert.deepEqual(restoredAfterSandboxSpec, buildMissionAgentSpec(config));
   assert.equal(restoredAfterRepositorySpec.config.dynamicSubAgents.enabled, true);
@@ -2062,7 +2180,7 @@ test("delivery-head inspection accepts a changed commit with the verified implem
     patches: PRIMARY_VERIFIED_DELIVERY_PATCHES,
   }), { passAgentSpec: true });
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
   });
   const mission = await runner.createMission({
@@ -2081,7 +2199,7 @@ test("delivery-head inspection accepts a changed commit with the verified implem
   assert.deepEqual(inspection.patches, PRIMARY_VERIFIED_DELIVERY_PATCHES);
   assert.match(calls.turns[0].request.input[0].content, /proofboard-verified-delivery/);
   assert.equal(calls.turns[0].agentSpec.config.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
-  assert.equal(calls.turns[0].agentSpec.model.params.parallelToolCalls, false);
+  assert.equal(calls.turns[0].agentSpec.model.params.parallel_tool_calls, false);
   assert.deepEqual(
     calls.updates.map((update) => update.request.agent.spec.config.iterationLimit),
     [COORDINATOR_TRUEFORGE_ITERATION_LIMIT, DEFAULT_TRUEFORGE_ITERATION_LIMIT],
@@ -2134,7 +2252,7 @@ test("delivery-head inspection rejects the unchanged baseline and mismatched con
       patches: fixture.patches,
     }));
     const runner = new TrueForgeMissionRunner(missions, client, {
-      model: "openai/gpt-5.2",
+      model: "openai/gpt-5.4-mini",
       mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
     });
     const mission = await runner.createMission({
@@ -2188,7 +2306,7 @@ test("locked fixture inspection rejects a corrective retry after a non-canonical
     ],
   }));
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
   });
   const mission = await runner.createMission({
@@ -2250,12 +2368,9 @@ test("locked fixture inspection rejects when no canonical get_commit call exists
   );
   assert.deepEqual(calls.turns[0].agentSpec.model.params, {
     enable_thinking: false,
-    parallelToolCalls: false,
-    tool_choice: {
-      type: "function",
-      function: { name: "get_commit" },
-    },
+    parallel_tool_calls: false,
   });
+  assert.equal(calls.turns.length, 1);
   const state = await missions.getState();
   assert.equal(state.missions[0].status, "blocked");
   assert.equal(
@@ -2280,7 +2395,7 @@ test("failed repository inspection preserves its exact verification reason and b
     }],
   }));
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
   });
   const mission = await runner.createMission({
@@ -2342,7 +2457,7 @@ test("locked fixture inspection rejects multiple canonical get_commit calls", as
     ],
   }));
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
   });
   const mission = await runner.createMission({
@@ -2377,7 +2492,7 @@ test("locked fixture inspection rejects a wrong SHA or expected patch", async ()
     },
   }));
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
   });
   const mission = await runner.createMission({
@@ -2430,7 +2545,7 @@ test("locked fixture inspection rejects malformed, error, and uncorrelated respo
     const missions = new MissionService(new InMemoryMissionRepository());
     const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, fixture.options));
     const runner = new TrueForgeMissionRunner(missions, client, {
-      model: "openai/gpt-5.2",
+      model: "openai/gpt-5.4-mini",
       mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
     });
     const mission = await runner.createMission({
@@ -2467,7 +2582,7 @@ test("repository inspection does not double-prefix canonical Git refs", async ()
     canonicalRef,
   ));
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_file_contents"] }],
   });
   const mission = await runner.createMission({
@@ -2496,7 +2611,7 @@ test("repository inspection rejects a text-only MCP response without resource pr
     return events;
   });
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_file_contents"] }],
   });
   const mission = await runner.createMission({
@@ -2521,7 +2636,7 @@ test("failed MCP verification is durable and blocks the mission", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client } = fakeClient();
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_file_contents"] }],
   });
   const mission = await runner.createMission({
@@ -2591,7 +2706,7 @@ test("independent implementation proof measures final facts after normal agentic
   });
   const missions = new MissionService(new InMemoryMissionRepository());
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
     dynamicSubAgents: true,
   });
   const mission = await runner.createMission({
@@ -2681,7 +2796,7 @@ test("independent implementation proof rejects out-of-scope final changes before
   });
   const missions = new MissionService(new InMemoryMissionRepository());
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
     dynamicSubAgents: true,
   });
   const mission = await runner.createMission({
@@ -2723,7 +2838,7 @@ test("sandbox verification persists the command, output summary, and exit status
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client, calls } = fakeClient(sandboxEvents);
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-sandbox-verification",
@@ -2760,7 +2875,7 @@ test("sandbox verification resumes the persisted sandbox without creating anothe
     includeSandboxCreated: false,
   }));
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-sandbox-continuity",
@@ -2787,7 +2902,7 @@ test("sandbox verification fails closed when a persisted sandbox has no predeces
     includeSandboxCreated: false,
   }));
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-sandbox-without-turn",
@@ -2814,7 +2929,7 @@ test("sandbox continuity rejects a replacement sandbox identity", async () => {
     sandboxId: "sandbox-2",
   }));
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-sandbox-replacement",
@@ -2998,7 +3113,7 @@ test("sandbox verification rejects incomplete or unsafe proof", async () => {
       fixture.options,
     ));
     const runner = new TrueForgeMissionRunner(missions, client, {
-      model: "openai/gpt-5.2",
+      model: "openai/gpt-5.4-mini",
     });
     const mission = await runner.createMission({
       id: `mission-sandbox-negative-${index}`,
@@ -3027,7 +3142,7 @@ test("nonzero sandbox execution is recorded as failure and blocks the mission", 
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client } = fakeClient((turnId) => sandboxEvents(turnId, 1));
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-sandbox-failure",
@@ -3065,7 +3180,7 @@ test("sandbox verification rejects a done turn with pending required actions", a
     [{ type: "tool.approval_required" }],
   ));
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-sandbox-pending-action",
@@ -3106,7 +3221,7 @@ test("sandbox verification requires the canonical exec tool", async () => {
     const missions = new MissionService(new InMemoryMissionRepository());
     const { client, calls } = fakeClient(sandboxEvents);
     const runner = new TrueForgeMissionRunner(missions, client, {
-      model: "openai/gpt-5.2",
+      model: "openai/gpt-5.4-mini",
       ...fixture.config,
     });
     const mission = await runner.createMission({

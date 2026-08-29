@@ -675,7 +675,7 @@ test("TrueForge derives a structured handoff only from delegated tool responses"
     },
   };
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "alibaba/qwen3-7-plus",
+    model: "alibaba/qwen3-8-max",
     dynamicSubAgents: true,
   });
   const mission = await runner.createMission({
@@ -758,7 +758,7 @@ test("coordinator-thread checks and diff cannot prove delegated completion", asy
     },
   };
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "alibaba/qwen3-7-plus",
+    model: "alibaba/qwen3-8-max",
     dynamicSubAgents: true,
   });
   const mission = await runner.createMission({

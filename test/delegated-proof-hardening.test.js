@@ -428,7 +428,7 @@ async function lockedRepositoryRunnerFixture({ preparation = {}, setup = {}, fai
     },
   };
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
     dynamicSubAgents: true,
   });
   const mission = await runner.createMission({
@@ -710,7 +710,7 @@ async function runnerFixture({
     },
   };
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
     dynamicSubAgents: true,
   });
   const mission = await runner.createMission({
@@ -1084,10 +1084,10 @@ test("empty locked fixture sandboxes are prepared before the workspace snapshot 
       DEFAULT_TRUEFORGE_ITERATION_LIMIT,
     ],
   );
-  assert.equal(fixture.agentSpecUpdates[0].request.agent.spec.model.params.parallelToolCalls, false);
-  assert.equal(fixture.agentSpecUpdates[2].request.agent.spec.model.params.parallelToolCalls, false);
-  assert.equal(fixture.agentSpecUpdates[4].request.agent.spec.model.params.parallelToolCalls, false);
-  assert.equal(fixture.agentSpecUpdates[6].request.agent.spec.model.params.parallelToolCalls, false);
+  assert.equal(fixture.agentSpecUpdates[0].request.agent.spec.model.params.parallel_tool_calls, false);
+  assert.equal(fixture.agentSpecUpdates[2].request.agent.spec.model.params.parallel_tool_calls, false);
+  assert.equal(fixture.agentSpecUpdates[4].request.agent.spec.model.params.parallel_tool_calls, false);
+  assert.equal(fixture.agentSpecUpdates[6].request.agent.spec.model.params.parallel_tool_calls, false);
   assert.deepEqual(fixture.agentSpecUpdates[0].request.agent.spec.mcpServers, []);
   assert.deepEqual(fixture.agentSpecUpdates[2].request.agent.spec.mcpServers, []);
   assert.deepEqual(fixture.agentSpecUpdates[4].request.agent.spec.mcpServers, []);
@@ -1497,7 +1497,7 @@ async function runSequentialWorkspaceScenario({ forbiddenOnSecond = false } = {}
     },
   };
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.2",
+    model: "openai/gpt-5.4-mini",
     dynamicSubAgents: true,
   });
   const mission = await runner.createMission({

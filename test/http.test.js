@@ -959,11 +959,11 @@ test("integration errors expose bounded public text without upstream secrets", a
 });
 
 test("Mission Control defaults to Alibaba Qwen and accepts an explicit model selector", () => {
-  assert.equal(DEFAULT_TRUEFORGE_MODEL, "alibaba/qwen3-7-plus");
+  assert.equal(DEFAULT_TRUEFORGE_MODEL, "alibaba/qwen3-8-max");
   assert.equal(resolveMissionRuntimeConfig({}).model, DEFAULT_TRUEFORGE_MODEL);
   assert.equal(
-    resolveMissionRuntimeConfig({ TRUEFORGE_MODEL: "custom/provider-model" }).model,
-    "custom/provider-model",
+    resolveMissionRuntimeConfig({ TRUEFORGE_MODEL: "openai/gpt-5.4-mini" }).model,
+    "openai/gpt-5.4-mini",
   );
   assert.equal(
     resolveMissionRuntimeConfig({ TRUEFORGE_MODEL: "  " }).model,

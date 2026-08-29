@@ -243,7 +243,7 @@ async function delegatedFixture({ events = delegatedEvents(), repository = new I
   const missions = new MissionService(repository, fixedClock);
   const { client, calls } = fakeClient(events);
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "alibaba/qwen3-7-plus",
+    model: "alibaba/qwen3-8-max",
     dynamicSubAgents: true,
   });
   const mission = await runner.createMission({
