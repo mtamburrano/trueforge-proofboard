@@ -30,7 +30,7 @@ test("TrueForge smoke dry-run is local and contains the expected evidence contra
     encoding: "utf8",
     env: {
       ...process.env,
-      TRUEFORGE_MODEL: "openai/gpt-5.4-mini",
+      TRUEFORGE_MODEL: "openai/gpt-5-4-mini",
       TRUEFORGE_GITHUB_SERVER: "github-test",
     },
   });
@@ -54,7 +54,7 @@ test("TrueForge smoke agent instructions use the pinned exec argument pair", () 
 function smokeConfig() {
   return {
     baseUrl: "http://localhost:8790",
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
     githubServer: "github",
     githubOwner: "owner",
     githubRepo: "repo",

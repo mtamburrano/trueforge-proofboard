@@ -35,7 +35,7 @@ npm start
 The `prestart` lifecycle step builds `dist/` first, so this works from a clean checkout without generated output. The unauthenticated UI binds only to loopback, and state-changing browser requests must be same-origin. Then open `http://127.0.0.1:8787`. The UI creates or recovers the primary mission from `.trueforge/mission-state.json`. Creating and running the mission uses the configured local TrueForge server; provider and connector credentials remain in that server and are never included in browser payloads.
 
 The demo model defaults to `alibaba/qwen3-8-max`. The supported selectors are
-`alibaba/qwen3-8-max`, `alibaba/qwen3-7-flash`, `openai/gpt-5.4-mini`, and
+`alibaba/qwen3-8-max`, `alibaba/qwen3-7-flash`, `openai/gpt-5-4-mini`, and
 `openai/gpt-5-6-luna`; change only `TRUEFORGE_MODEL` to switch between them.
 Model credentials remain in TrueForge.
 

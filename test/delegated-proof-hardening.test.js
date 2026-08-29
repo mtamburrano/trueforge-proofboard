@@ -428,7 +428,7 @@ async function lockedRepositoryRunnerFixture({ preparation = {}, setup = {}, fai
     },
   };
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
     dynamicSubAgents: true,
   });
   const mission = await runner.createMission({
@@ -710,7 +710,7 @@ async function runnerFixture({
     },
   };
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
     dynamicSubAgents: true,
   });
   const mission = await runner.createMission({
@@ -1497,7 +1497,7 @@ async function runSequentialWorkspaceScenario({ forbiddenOnSecond = false } = {}
     },
   };
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
     dynamicSubAgents: true,
   });
   const mission = await runner.createMission({

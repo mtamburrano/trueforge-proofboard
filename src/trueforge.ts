@@ -89,7 +89,7 @@ export const DETERMINISTIC_COORDINATOR_MODEL_CAPABILITY_POLICIES = [
   },
   {
     provider: "openai",
-    model: "gpt-5.4-mini",
+    model: "gpt-5-4-mini",
     providerParams: {
       parallel_tool_calls: false,
     },

@@ -37,7 +37,7 @@ Official setup references: [TrueForge quickstart](https://trueforge.dev/quicksta
 
 2. In Settings → Models, configure the provider for the selected model. The
    demo supports exactly these `TRUEFORGE_MODEL` values:
-   `alibaba/qwen3-8-max`, `alibaba/qwen3-7-flash`, `openai/gpt-5.4-mini`, and
+   `alibaba/qwen3-8-max`, `alibaba/qwen3-7-flash`, `openai/gpt-5-4-mini`, and
    `openai/gpt-5-6-luna`.
 
 3. In Settings → Connectors, connect the GitHub MCP server and authorize it.

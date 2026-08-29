@@ -822,7 +822,7 @@ test("runner creates a TrueForge session and maps safe runtime evidence", async 
   const missions = new MissionService(repository, () => new Date("2026-08-26T16:00:00.000Z"));
   const { client, calls } = fakeClient();
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_file_contents"] }],
   });
 
@@ -865,7 +865,7 @@ test("runner provisions a missing Debian 12 sandbox toolchain before delegated w
       : sandboxToolchainProofEvents(turnId),
   { passAgentSpec: true });
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-sandbox-preparation",
@@ -931,7 +931,7 @@ test("bounded sandbox setup accepts a paraphrased exec intent before exact proof
     return sandboxToolchainProofEvents(turnId);
   }, { passAgentSpec: true });
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-sandbox-paraphrased-intent",
@@ -973,7 +973,7 @@ test("sandbox proof failure blocks without a corrective repair turn and restores
     return sandboxToolchainProofEvents(turnId, { nodeVersion: "v18.20.4" });
   }, { passAgentSpec: true });
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-sandbox-proof-failure",
@@ -1019,7 +1019,7 @@ test("sandbox setup budget exhaustion fails closed before deterministic proof", 
     });
   }, { passAgentSpec: true });
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-sandbox-setup-budget",
@@ -1062,7 +1062,7 @@ test("bounded setup accepts its four-exec maximum with a separate completion ite
     return sandboxToolchainProofEvents(turnId);
   }, { passAgentSpec: true });
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-sandbox-setup-max-exec-boundary",
@@ -1108,7 +1108,7 @@ test("Debian 12 setup guidance recovers from stock Node 18 before independent pr
       : sandboxToolchainProofEvents(turnId),
   { passAgentSpec: true });
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-sandbox-debian-12-node18-recovery",
@@ -1165,7 +1165,7 @@ test("coordinator sandbox readiness and verification require root main call and 
       : sandboxEvents(turnId, 0, [], fixture.options),
     { passAgentSpec: true });
     const runner = new TrueForgeMissionRunner(missions, client, {
-      model: "openai/gpt-5.4-mini",
+      model: "openai/gpt-5-4-mini",
     });
     const mission = await runner.createMission({
       id: `mission-sandbox-root-thread-${index}`,
@@ -1215,7 +1215,7 @@ test("coordinator sandbox turns are runtime-bounded and stop cleanly after the c
     });
   }, { passAgentSpec: true });
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-runtime-bounded-coordinator",
@@ -1262,15 +1262,15 @@ test("coordinator sandbox turns are runtime-bounded and stop cleanly after the c
 test("mission agent specs use a bounded non-twelve default iteration limit", () => {
   assert.equal(DEFAULT_TRUEFORGE_ITERATION_LIMIT, 64);
   assert.equal(
-    buildMissionAgentSpec({ model: "openai/gpt-5.4-mini" }).config.iterationLimit,
+    buildMissionAgentSpec({ model: "openai/gpt-5-4-mini" }).config.iterationLimit,
     DEFAULT_TRUEFORGE_ITERATION_LIMIT,
   );
   assert.equal(
-    buildMissionAgentSpec({ model: "openai/gpt-5.4-mini", iterationLimit: 24 }).config.iterationLimit,
+    buildMissionAgentSpec({ model: "openai/gpt-5-4-mini", iterationLimit: 24 }).config.iterationLimit,
     24,
   );
   assert.throws(
-    () => buildMissionAgentSpec({ model: "openai/gpt-5.4-mini", iterationLimit: MAX_TRUEFORGE_ITERATION_LIMIT + 1 }),
+    () => buildMissionAgentSpec({ model: "openai/gpt-5-4-mini", iterationLimit: MAX_TRUEFORGE_ITERATION_LIMIT + 1 }),
     /between 1 and 1024/,
   );
 });
@@ -1286,7 +1286,7 @@ test("deterministic coordinator policy supports exactly four models without iner
       params: { enable_thinking: false, parallel_tool_calls: false },
     },
     {
-      model: "openai/gpt-5.4-mini",
+      model: "openai/gpt-5-4-mini",
       params: { parallel_tool_calls: false },
     },
     {
@@ -1305,17 +1305,17 @@ test("deterministic coordinator policy supports exactly four models without iner
   }
 });
 
-test("unknown deterministic coordinator models fail before mission execution", async () => {
+test("the dotted GPT-5.4 Mini FQN fails before mission execution", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client, calls } = fakeClient();
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "example/unvalidated-model",
+    model: "openai/gpt-5.4-mini",
   });
 
   await assert.rejects(
     runner.createMission({
       id: "mission-unvalidated-coordinator-model",
-      objective: "Reject an unvalidated deterministic coordinator model",
+      objective: "Reject the upstream model-id spelling as a TrueForge FQN",
     }),
     (error) => {
       assert.equal(error.code, "invalid_input");
@@ -1426,7 +1426,7 @@ test("zero-tool coordinator recovery stops after three completed attempts", asyn
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client, calls } = fakeClient((turnId) => zeroToolEvents(turnId));
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
   });
   const mission = await runner.createMission({
@@ -1498,7 +1498,7 @@ test("runner performs an independent bounded contract review", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client, calls } = fakeClient(contractReviewEvents);
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-contract-review",
@@ -1558,7 +1558,7 @@ test("runner does not mark a done turn as passed while required actions remain",
     return events;
   });
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-pending-required-action",
@@ -1576,7 +1576,7 @@ test("runner does not mark a done turn as passed while required actions remain",
 test("runner resumes the persisted session after a reconnect", async () => {
   const repository = new InMemoryMissionRepository();
   const { client, calls } = fakeClient();
-  const config = { model: "openai/gpt-5.4-mini" };
+  const config = { model: "openai/gpt-5-4-mini" };
   const firstService = new MissionService(repository);
   const firstRunner = new TrueForgeMissionRunner(firstService, client, config);
   const mission = await firstRunner.createMission({
@@ -1614,7 +1614,7 @@ test("pull request delivery pauses one exact TrueForge tool call and resumes onl
     deliveryApprovalEvents(turnId, target)
   );
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
     mcpServerName: "github",
     deliveryToolName: "create_pull_request",
     mcpServers: [{
@@ -1706,7 +1706,7 @@ test("post-create pull request read-back rejects a missing or mismatched head SH
       deliveryApprovalEvents(turnId, target, readbackOptions)
     );
     const runner = new TrueForgeMissionRunner(missions, client, {
-      model: "openai/gpt-5.4-mini",
+      model: "openai/gpt-5-4-mini",
       mcpServerName: "github",
       deliveryToolName: "create_pull_request",
       mcpServers: [{
@@ -1793,7 +1793,7 @@ test("rejecting or cancelling a TrueForge delivery approval returns no protected
       ];
     });
     const runner = new TrueForgeMissionRunner(missions, client, {
-      model: "openai/gpt-5.4-mini",
+      model: "openai/gpt-5-4-mini",
       mcpServerName: "github",
       mcpServers: [{
         name: "github",
@@ -1876,7 +1876,7 @@ test("a delivery-head race blocks the approval allow before any protected operat
     });
   });
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
     mcpServerName: "github",
     deliveryToolName: "create_pull_request",
     mcpServers: [{
@@ -1909,7 +1909,7 @@ test("runner can attach an existing TrueForge session without creating another",
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client, calls } = fakeClient();
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
   });
 
   const mission = await runner.createMission({
@@ -1927,7 +1927,7 @@ test("repository inspection proves the MCP call and returned file resource", asy
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client, calls } = fakeClient(repositoryEvents);
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_file_contents"] }],
   });
   const mission = await runner.createMission({
@@ -1968,7 +1968,7 @@ test("locked fixture inspection proves direct TrueForge get_commit content and e
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client, calls } = fakeClient(lockedCommitEvents);
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_file_contents", "get_commit"] }],
   });
   const mission = await runner.createMission({
@@ -2062,7 +2062,7 @@ test("locked fixture inspection bounds the first MCP read and restores the norma
     });
   }, { passAgentSpec: true });
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
   });
   const mission = await runner.createMission({
@@ -2121,7 +2121,7 @@ test("coordinator tool-surface matrix isolates repository reads, sandbox exec, a
     preloadTools: ["get_commit", "get_file_contents"],
   }];
   const config = {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
     dynamicSubAgents: true,
     iterationLimit: 32,
     mcpServers: normalMcpServers,
@@ -2224,7 +2224,7 @@ test("delivery-head inspection accepts a changed commit with the verified implem
     patches: PRIMARY_VERIFIED_DELIVERY_PATCHES,
   }), { passAgentSpec: true });
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
   });
   const mission = await runner.createMission({
@@ -2296,7 +2296,7 @@ test("delivery-head inspection rejects the unchanged baseline and mismatched con
       patches: fixture.patches,
     }));
     const runner = new TrueForgeMissionRunner(missions, client, {
-      model: "openai/gpt-5.4-mini",
+      model: "openai/gpt-5-4-mini",
       mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
     });
     const mission = await runner.createMission({
@@ -2350,7 +2350,7 @@ test("locked fixture inspection rejects a corrective retry after a non-canonical
     ],
   }));
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
   });
   const mission = await runner.createMission({
@@ -2439,7 +2439,7 @@ test("failed repository inspection preserves its exact verification reason and b
     }],
   }));
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
   });
   const mission = await runner.createMission({
@@ -2501,7 +2501,7 @@ test("locked fixture inspection rejects multiple canonical get_commit calls", as
     ],
   }));
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
   });
   const mission = await runner.createMission({
@@ -2536,7 +2536,7 @@ test("locked fixture inspection rejects a wrong SHA or expected patch", async ()
     },
   }));
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
   });
   const mission = await runner.createMission({
@@ -2589,7 +2589,7 @@ test("locked fixture inspection rejects malformed, error, and uncorrelated respo
     const missions = new MissionService(new InMemoryMissionRepository());
     const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, fixture.options));
     const runner = new TrueForgeMissionRunner(missions, client, {
-      model: "openai/gpt-5.4-mini",
+      model: "openai/gpt-5-4-mini",
       mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
     });
     const mission = await runner.createMission({
@@ -2626,7 +2626,7 @@ test("repository inspection does not double-prefix canonical Git refs", async ()
     canonicalRef,
   ));
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_file_contents"] }],
   });
   const mission = await runner.createMission({
@@ -2655,7 +2655,7 @@ test("repository inspection rejects a text-only MCP response without resource pr
     return events;
   });
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_file_contents"] }],
   });
   const mission = await runner.createMission({
@@ -2680,7 +2680,7 @@ test("failed MCP verification is durable and blocks the mission", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client } = fakeClient();
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
     mcpServers: [{ name: "github", enableTools: ["get_file_contents"] }],
   });
   const mission = await runner.createMission({
@@ -2750,7 +2750,7 @@ test("independent implementation proof measures final facts after normal agentic
   });
   const missions = new MissionService(new InMemoryMissionRepository());
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
     dynamicSubAgents: true,
   });
   const mission = await runner.createMission({
@@ -2840,7 +2840,7 @@ test("independent implementation proof rejects out-of-scope final changes before
   });
   const missions = new MissionService(new InMemoryMissionRepository());
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
     dynamicSubAgents: true,
   });
   const mission = await runner.createMission({
@@ -2882,7 +2882,7 @@ test("sandbox verification persists the command, output summary, and exit status
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client, calls } = fakeClient(sandboxEvents);
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-sandbox-verification",
@@ -2919,7 +2919,7 @@ test("sandbox verification resumes the persisted sandbox without creating anothe
     includeSandboxCreated: false,
   }));
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-sandbox-continuity",
@@ -2946,7 +2946,7 @@ test("sandbox verification fails closed when a persisted sandbox has no predeces
     includeSandboxCreated: false,
   }));
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-sandbox-without-turn",
@@ -2973,7 +2973,7 @@ test("sandbox continuity rejects a replacement sandbox identity", async () => {
     sandboxId: "sandbox-2",
   }));
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-sandbox-replacement",
@@ -3157,7 +3157,7 @@ test("sandbox verification rejects incomplete or unsafe proof", async () => {
       fixture.options,
     ));
     const runner = new TrueForgeMissionRunner(missions, client, {
-      model: "openai/gpt-5.4-mini",
+      model: "openai/gpt-5-4-mini",
     });
     const mission = await runner.createMission({
       id: `mission-sandbox-negative-${index}`,
@@ -3186,7 +3186,7 @@ test("nonzero sandbox execution is recorded as failure and blocks the mission", 
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client } = fakeClient((turnId) => sandboxEvents(turnId, 1));
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-sandbox-failure",
@@ -3224,7 +3224,7 @@ test("sandbox verification rejects a done turn with pending required actions", a
     [{ type: "tool.approval_required" }],
   ));
   const runner = new TrueForgeMissionRunner(missions, client, {
-    model: "openai/gpt-5.4-mini",
+    model: "openai/gpt-5-4-mini",
   });
   const mission = await runner.createMission({
     id: "mission-sandbox-pending-action",
@@ -3265,7 +3265,7 @@ test("sandbox verification requires the canonical exec tool", async () => {
     const missions = new MissionService(new InMemoryMissionRepository());
     const { client, calls } = fakeClient(sandboxEvents);
     const runner = new TrueForgeMissionRunner(missions, client, {
-      model: "openai/gpt-5.4-mini",
+      model: "openai/gpt-5-4-mini",
       ...fixture.config,
     });
     const mission = await runner.createMission({
