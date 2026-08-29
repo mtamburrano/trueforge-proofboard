@@ -893,6 +893,44 @@ test("safe working-directory prefixes preserve exit-aware check evidence", async
   ]);
 });
 
+test("safe working-directory prefixes preserve independently reviewable diff evidence", async () => {
+  const fixture = await runnerFixture({
+    allowedFiles: ["src/index.ts"],
+    output: diffOutput(["src/index.ts"]),
+    diffCommand: "cd /workspace && git diff -- src/index.ts",
+    workspaceCurrentFiles: ["src/index.ts"],
+    workspaceCumulativeFiles: ["src/index.ts"],
+  });
+  const diffEvidence = (await fixture.missions.getState()).evidence.find((evidence) =>
+    evidence.kind === "diff_summary",
+  );
+  assert.ok(diffEvidence);
+  const details = JSON.parse(diffEvidence.details);
+  assert.equal(details.command, "git diff -- src/index.ts");
+
+  await fixture.missions.recordHandoff(fixture.mission.id, {
+    workItemId: fixture.workItem.id,
+    result: "done",
+    summary: "The delegated implementation is ready for independent review.",
+    filesChanged: fixture.result.implementationHandoff.filesChanged,
+    testsRun: ["npm run typecheck && npm test"],
+    diffSummary: fixture.result.implementationHandoff.diffSummary,
+    checks: fixture.result.implementationHandoff.checks,
+    evidenceIds: fixture.result.implementationHandoff.evidenceIds,
+    executionOrigin: fixture.result.implementationHandoff.executionOrigin,
+  });
+  await fixture.missions.transitionWorkItem(
+    fixture.mission.id,
+    fixture.workItem.id,
+    "ready_for_review",
+  );
+  const context = await fixture.missions.getReviewContext(
+    fixture.mission.id,
+    fixture.workItem.id,
+  );
+  assert.deepEqual(context.actualFilesChanged, ["src/index.ts"]);
+});
+
 test("coordinator workspace proof turns request their exact sandbox exec commands", async () => {
   const missionStartTreeRef = "c".repeat(40);
   const expectedDeltaCommand = buildDelegatedWorkspaceDeltaCommand(
@@ -1676,7 +1714,8 @@ test("legacy primary missions are upgraded without losing their history", async 
   assert.equal(afterRun.workItems.filter((item) => item.status === "complete").length, 3);
   assert.equal(afterRun.evidence.some((evidence) => evidence.id === history.id), true);
   const manifest = afterRun.evidence.find((evidence) => evidence.kind === "file_change");
-  assert.equal(manifest?.executionOrigin?.threadId, "main");
+  assert.equal(manifest?.source, "sandbox");
+  assert.equal(manifest?.executionOrigin?.threadId, undefined);
 });
 
 test("production app wires bounded contract review and fails closed on invalid results", async () => {
@@ -1861,18 +1900,8 @@ class LegacyPrimaryRunner {
   async runTurn(missionId, _instruction, options) {
     this.turn += 1;
     const turnId = `legacy-turn-${this.turn}`;
-    const threadId = `legacy-thread-${this.turn}`;
-    const treeRef = "a".repeat(40);
-    const endTreeRef = "b".repeat(40);
     await this.missions.attachTrueforgeTurn(missionId, turnId);
-    await this.missions.attachTrueforgeWorkspaceBaseline(missionId, treeRef);
-    await this.missions.startWorkItemDelegation(missionId, options.workItemId, {
-      owner: "legacy-implementer",
-      threadId,
-      turnId,
-      startTreeRef: treeRef,
-      missionStartTreeRef: treeRef,
-    });
+    await this.missions.attachTrueforgeSandbox(missionId, "legacy-sandbox");
     await this.missions.addEvidence(missionId, {
       workItemId: options.workItemId,
       kind: "tool_result",
@@ -1880,93 +1909,74 @@ class LegacyPrimaryRunner {
       source: "trueforge",
       summary: "TrueForge turn finished with status done.",
     });
-    const origin = { kind: "trueforge", sessionId: "legacy-session", turnId, threadId };
-    const typecheck = await this.missions.addEvidence(missionId, {
-      workItemId: options.workItemId,
-      kind: "typecheck_result",
-      result: "passed",
-      source: "trueforge",
-      summary: "The delegated typecheck passed.",
-      executionOrigin: { ...origin, toolCallId: `legacy-typecheck-${this.turn}` },
-    });
-    const tests = await this.missions.addEvidence(missionId, {
-      workItemId: options.workItemId,
-      kind: "test_result",
-      result: "passed",
-      source: "trueforge",
-      summary: "The delegated tests passed.",
-      executionOrigin: { ...origin, toolCallId: `legacy-test-${this.turn}` },
-    });
-    const diff = await this.missions.addEvidence(missionId, {
-      workItemId: options.workItemId,
-      kind: "diff_summary",
-      result: "passed",
-      source: "trueforge",
-      summary: "The delegated content diff was captured.",
-      details: JSON.stringify({ command: "git diff", output: [
-        "diff --git a/src/index.ts b/src/index.ts",
-        "@@ -1 +1,2 @@",
-        "+export function getNextDeliveryStage(stage) { return stage === \"Plan\" ? \"Execute\" : null; }",
-        "diff --git a/test/index.test.js b/test/index.test.js",
-        "@@ -1 +1,2 @@",
-        "+assert.equal(getNextDeliveryStage(\"Plan\"), \"Execute\");",
-      ].join("\n") }),
-      executionOrigin: { ...origin, toolCallId: `legacy-diff-${this.turn}` },
-    });
-    const manifest = await this.missions.addEvidence(missionId, {
-      workItemId: options.workItemId,
-      kind: "file_change",
-      result: "passed",
-      source: "trueforge",
-      summary: "The delegated complete changed-file manifest was captured.",
-      details: workspaceDeltaEvidenceDetails({
-        startTreeRef: treeRef,
-        missionStartTreeRef: treeRef,
-        endTreeRef,
-      }),
-      executionOrigin: {
-        kind: "trueforge",
-        sessionId: "legacy-session",
-        turnId: `legacy-proof-turn-${this.turn}`,
-        threadId: "main",
-        toolCallId: `legacy-manifest-${this.turn}`,
-      },
-    });
-    await this.missions.completeWorkItemDelegation(missionId, options.workItemId, {
-      threadId,
-      turnId,
-    });
     return {
       sessionId: "legacy-session",
       turnId,
       events: [],
       mission: await this.missions.getMission(missionId),
-      implementationHandoff: {
-        filesChanged: ["src/index.ts", "test/index.test.js"],
-        diffSummary: "The source and focused test files changed.",
-        checks: [
-          {
-            name: "typecheck",
-            command: "npm run typecheck",
-            result: "passed",
-            required: true,
-            evidenceIds: [typecheck.id],
-            exitCode: 0,
-          },
-          {
-            name: "test",
-            command: "npm test",
-            result: "passed",
-            required: true,
-            evidenceIds: [tests.id],
-            exitCode: 0,
-          },
-        ],
-        decisions: [],
-        openQuestions: [],
-        evidenceIds: [typecheck.id, tests.id, manifest.id, diff.id],
-        executionOrigin: origin,
-      },
+    };
+  }
+
+  async proveImplementation(input) {
+    const origin = { kind: "sandbox", sessionId: "legacy-session" };
+    const diffOutput = [
+      "diff --git a/src/index.ts b/src/index.ts",
+      "@@ -1 +1,2 @@",
+      "+export function getNextDeliveryStage(stage) { return stage === \"Plan\" ? \"Execute\" : null; }",
+      "diff --git a/test/index.test.js b/test/index.test.js",
+      "@@ -1 +1,2 @@",
+      "+assert.equal(getNextDeliveryStage(\"Plan\"), \"Execute\");",
+    ].join("\n");
+    const typecheck = await this.missions.addEvidence(input.missionId, {
+      workItemId: input.workItemId,
+      kind: "typecheck_result",
+      result: "passed",
+      source: "sandbox",
+      summary: "The independent typecheck passed.",
+      executionOrigin: origin,
+    });
+    const tests = await this.missions.addEvidence(input.missionId, {
+      workItemId: input.workItemId,
+      kind: "test_result",
+      result: "passed",
+      source: "sandbox",
+      summary: "The independent tests passed.",
+      executionOrigin: origin,
+    });
+    const diff = await this.missions.addEvidence(input.missionId, {
+      workItemId: input.workItemId,
+      kind: "diff_summary",
+      result: "passed",
+      source: "sandbox",
+      summary: "The independent content diff was captured.",
+      details: JSON.stringify({ command: "git diff", output: diffOutput }),
+      executionOrigin: origin,
+    });
+    const manifest = await this.missions.addEvidence(input.missionId, {
+      workItemId: input.workItemId,
+      kind: "file_change",
+      result: "passed",
+      source: "sandbox",
+      summary: "The independent complete changed-file manifest was captured.",
+      details: JSON.stringify({
+        complete_changed_files: true,
+        command: "git status --porcelain=v1 -z --untracked-files=all",
+        output: " M src/index.ts\u0000 M test/index.test.js\u0000",
+        changed_files: ["src/index.ts", "test/index.test.js"],
+      }),
+      executionOrigin: origin,
+    });
+    return {
+      filesChanged: ["src/index.ts", "test/index.test.js"],
+      diffSummary: diffOutput,
+      checks: [
+        { name: "typecheck", command: "npm run typecheck", result: "passed", required: true, evidenceIds: [typecheck.id], exitCode: 0 },
+        { name: "test", command: "npm test", result: "passed", required: true, evidenceIds: [tests.id], exitCode: 0 },
+      ],
+      decisions: [],
+      openQuestions: [],
+      evidenceIds: [typecheck.id, tests.id, manifest.id, diff.id],
+      executionOrigin: origin,
     };
   }
 

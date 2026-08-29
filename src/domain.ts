@@ -1847,7 +1847,15 @@ function asStructuredHandoff(handoff: Handoff): StructuredHandoffRecord | null {
 }
 
 function isStructuredImplementationWorkItem(workItem: WorkItem): boolean {
-  return workItem.assignedRole === "implementer" && workItem.delegation !== undefined;
+  return workItem.assignedRole === "implementer" && (
+    workItem.delegation !== undefined ||
+    (workItem.requiredChecks !== undefined && workItem.requiredChecks.length > 0 &&
+      workItem.allowedFiles !== undefined && workItem.allowedFiles.length > 0)
+  );
+}
+
+function isDelegatedImplementationWorkItem(workItem: WorkItem): boolean {
+  return isStructuredImplementationWorkItem(workItem) && workItem.delegation !== undefined;
 }
 
 function isCoordinatorWorkspaceDeltaEvidence(evidence: Evidence): boolean {
@@ -1861,7 +1869,7 @@ function isCoordinatorWorkspaceDeltaEvidence(evidence: Evidence): boolean {
 }
 
 function handoffMatchesCurrentDelegation(workItem: WorkItem, handoff: Handoff): boolean {
-  if (!isStructuredImplementationWorkItem(workItem)) {
+  if (!isDelegatedImplementationWorkItem(workItem)) {
     return false;
   }
   const structured = asStructuredHandoff(handoff);
@@ -1941,7 +1949,7 @@ function validateStructuredHandoffCorrelation(
     );
   }
   if (
-    isStructuredImplementationWorkItem(workItem) &&
+    isDelegatedImplementationWorkItem(workItem) &&
     enforceCurrentDelegation &&
     (structured.executionOrigin.threadId === undefined ||
       structured.executionOrigin.threadId !== workItem.delegation?.threadId)
@@ -2005,7 +2013,7 @@ function validateStructuredHandoffCorrelation(
     );
   }
 
-  if (isStructuredImplementationWorkItem(workItem) && enforceCurrentDelegation) {
+  if (isDelegatedImplementationWorkItem(workItem) && enforceCurrentDelegation) {
     const workspaceDeltaEvidence = linkedEvidence
       .map((evidence) => ({
         evidence,
@@ -2103,7 +2111,7 @@ function validateStructuredHandoffCorrelation(
   if (handoff.result !== "done") {
     return;
   }
-  if (isStructuredImplementationWorkItem(workItem)) {
+  if (isDelegatedImplementationWorkItem(workItem)) {
     if (structured.executionOrigin.kind !== "trueforge") {
       return fail(
         "invalid_input",

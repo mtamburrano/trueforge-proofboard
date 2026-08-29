@@ -292,7 +292,10 @@ export function parseDelegatedWorkspaceDeltaEvidence(
 }
 
 export function isContentDiffCommand(command: string): boolean {
-  const normalized = normalizeCommand(command);
+  const normalized = normalizeGitWorkingDirectory(command);
+  if (normalized === null) {
+    return false;
+  }
   return /^git\s+diff(?:\s+[^;&|]+)*$/.test(normalized) &&
     !metadataOnlyDiffFlags.test(normalized);
 }
@@ -306,13 +309,25 @@ export function isContentDiffOutput(output: string): boolean {
 }
 
 export function isCompleteChangedFilesCommand(command: string): boolean {
-  const normalized = normalizeCommand(command);
+  const normalized = normalizeGitWorkingDirectory(command);
+  if (normalized === null) {
+    return false;
+  }
   if (!normalized.startsWith("git status ")) {
     return false;
   }
   const options = normalized.slice("git status ".length).split(" ").sort().join(" ");
   return completeChangedFilesStatusOptions.includes(options) ||
     options === completeChangedFilesStatusOptionsWithNul;
+}
+
+function normalizeGitWorkingDirectory(command: string): string | null {
+  const normalized = normalizeCommand(command);
+  const match = normalized.match(/^git -C (\.\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+) (.+)$/);
+  if (match === null) {
+    return normalized.startsWith("git ") ? normalized : null;
+  }
+  return match[2] === undefined ? null : `git ${match[2]}`;
 }
 
 export function completeChangedFilesFromCommand(

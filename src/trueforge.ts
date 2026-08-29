@@ -23,6 +23,7 @@ import {
 import {
   buildDelegatedWorkspaceDeltaCommand,
   changedFilesFromDiff,
+  completeChangedFilesFromCommand,
   DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
   parseDelegatedWorkspaceDeltaOutput,
   parseDelegatedWorkspaceTreeSnapshotOutput,
@@ -138,6 +139,8 @@ const SANDBOX_NODE_SOURCE_SETUP_URL =
   `https://deb.nodesource.com/setup_${SANDBOX_NODE_SOURCE_MAJOR}.x`;
 export const DELEGATED_COMPLETE_CHANGED_FILES_COMMAND =
   "git status --porcelain=v1 -z --untracked-files=all";
+export const IMPLEMENTATION_REPOSITORY_DISCOVERY_COMMAND =
+  "find . -maxdepth 4 -type d -name .git -print";
 export { DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND } from "./diff.js";
 
 /**
@@ -306,23 +309,19 @@ export class RepositoryWorkGraphPlanner implements WorkGraphPlanner {
       : `${input.mission.repository.owner}/${input.mission.repository.name}@${input.mission.repository.ref}`;
     const inspectionLabel = `${inspection.resourceUri} (${inspection.contentHash})`;
     const fileScope = files.join(", ");
-    const implementationScopes = files.map((file, index) => ({
-        id: implementationWorkItemId(file, index),
-        label: file,
-      }));
-    const implementationItems = implementationScopes.map((scope) => ({
-      id: scope.id,
-      title: `Implement the requested change in ${scope.label}`,
-      purpose: `Apply the bounded mission objective to ${scope.label}: ${objective}`,
+    const implementationItem = {
+      id: PRIMARY_WORK_GRAPH_IDS.implement,
+      title: "Implement the requested change across the verified scope",
+      purpose: `Apply the bounded mission objective to ${fileScope}: ${objective}`,
       acceptanceCriteria: [
-        `The implementation satisfies the mission objective for ${scope.label}: ${objective}`,
-        `Changes for this work item remain limited to ${scope.label}.`,
+        `The implementation satisfies the mission objective: ${objective}`,
+        `Changes remain limited to the verified file scope: ${fileScope}.`,
       ],
       dependsOn: [PRIMARY_WORK_GRAPH_IDS.inspect],
       assignedRole: "implementer" as const,
       requiredChecks: ["typecheck", "test"],
-      allowedFiles: [scope.label],
-    }));
+      allowedFiles: files,
+    };
 
     return validateWorkGraph({
       items: [
@@ -337,7 +336,7 @@ export class RepositoryWorkGraphPlanner implements WorkGraphPlanner {
           dependsOn: [],
           assignedRole: "planner",
         },
-        ...implementationItems,
+        implementationItem,
         {
           id: PRIMARY_WORK_GRAPH_IDS.verify,
           title: "Verify the requested delivery",
@@ -346,7 +345,7 @@ export class RepositoryWorkGraphPlanner implements WorkGraphPlanner {
             `The verification checks every implementation condition for: ${objective}`,
             "The verification result is captured from the configured sandbox or review tools.",
           ],
-          dependsOn: implementationItems.map((item) => item.id),
+          dependsOn: [implementationItem.id],
           assignedRole: "reviewer",
         },
       ],
@@ -477,12 +476,6 @@ function referencedFiles(
     );
   }
   return files;
-}
-
-function implementationWorkItemId(file: string, index: number): string {
-  const slug = file.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "")
-    .slice(0, 80);
-  return `primary-implement-${index + 1}-${slug || "repository"}`;
 }
 
 export interface TrueForgeClientLike {
@@ -627,6 +620,11 @@ export interface SandboxVerificationInput {
   command: string;
   workItemId?: string;
   toolName?: string;
+}
+
+export interface ImplementationProofInput {
+  missionId: string;
+  workItemId: string;
 }
 
 export interface SandboxPreparationInput {
@@ -785,6 +783,12 @@ interface VerifiedSandboxSetup {
   observedExecCount: number;
   commands: string[];
   failedExecCount: number;
+}
+
+interface IndependentSandboxMeasurement {
+  sessionId: string;
+  turnId: string;
+  verified: VerifiedSandboxExecution;
 }
 
 export class TrueForgeIntegrationError extends Error {
@@ -1078,6 +1082,303 @@ export class TrueForgeMissionRunner {
       ...(implementationHandoff === undefined
         ? {}
         : { implementationHandoff }),
+    };
+  }
+
+  async proveImplementation(
+    input: ImplementationProofInput,
+  ): Promise<ImplementationHandoffDraft> {
+    const mission = await this.missions.getMission(input.missionId);
+    const workItem = await this.missions.getWorkItem(input.missionId, input.workItemId);
+    const allowedFiles = workItem.allowedFiles ?? [];
+    const baselineSha = mission.repository?.ref;
+    if (
+      workItem.assignedRole !== "implementer" ||
+      allowedFiles.length === 0 ||
+      mission.repository === undefined ||
+      baselineSha === undefined ||
+      !/^[0-9a-f]{40}$/i.test(baselineSha)
+    ) {
+      throw new TrueForgeIntegrationError(
+        "prove implementation",
+        "Independent implementation proof requires an implementer scope and a pinned repository baseline.",
+      );
+    }
+
+    try {
+      const discovery = await this.measureImplementationState(
+        mission.id,
+        workItem.id,
+        IMPLEMENTATION_REPOSITORY_DISCOVERY_COMMAND,
+        "Locate the completed Git repository in the persisted sandbox.",
+      );
+      const repositoryRoot = implementationRepositoryRoot(discovery.verified.stdout);
+      if (repositoryRoot === null) {
+        throw new TrueForgeIntegrationError(
+          "prove implementation",
+          "Independent proof found no unique completed Git repository within the sandbox workspace.",
+        );
+      }
+
+      const remoteCommand = gitAtRepository(repositoryRoot, "config --get remote.origin.url");
+      const remote = await this.measureImplementationState(
+        mission.id,
+        workItem.id,
+        remoteCommand,
+        "Measure the completed repository origin.",
+      );
+      const repository = repositoryIdentityFromRemoteUrl(remote.verified.stdout.trim());
+      const expectedRepository = `${mission.repository.owner}/${mission.repository.name}`;
+      if (repository !== expectedRepository) {
+        throw new TrueForgeIntegrationError(
+          "prove implementation",
+          `Independent proof measured repository ${sanitizeRuntimeText(repository ?? remote.verified.stdout.trim())}; expected ${expectedRepository}.`,
+        );
+      }
+
+      const ancestryCommand = gitAtRepository(
+        repositoryRoot,
+        `merge-base --is-ancestor ${baselineSha} HEAD`,
+      );
+      const ancestry = await this.measureImplementationState(
+        mission.id,
+        workItem.id,
+        ancestryCommand,
+        "Verify that the pinned baseline is an ancestor of the completed workspace.",
+      );
+      const statusCommand = gitAtRepository(
+        repositoryRoot,
+        "status --porcelain=v1 -z --untracked-files=all",
+      );
+      const status = await this.measureImplementationState(
+        mission.id,
+        workItem.id,
+        statusCommand,
+        "Measure every staged, unstaged, and untracked workspace change.",
+      );
+      const statusFiles = completeChangedFilesFromCommand(
+        status.verified.stdout,
+        statusCommand,
+      );
+      if (statusFiles === null) {
+        throw new TrueForgeIntegrationError(
+          "prove implementation",
+          "Independent proof could not parse the complete changed-file measurement.",
+        );
+      }
+
+      const diffCommand = gitAtRepository(
+        repositoryRoot,
+        `diff --no-ext-diff --binary ${baselineSha} --`,
+      );
+      const diff = await this.measureImplementationState(
+        mission.id,
+        workItem.id,
+        diffCommand,
+        "Capture the actual completed diff from the pinned baseline.",
+      );
+      const diffFiles = changedFilesFromDiff(diff.verified.stdout, diffCommand);
+      if (!isContentDiffOutput(diff.verified.stdout) || diffFiles.length === 0) {
+        throw new TrueForgeIntegrationError(
+          "prove implementation",
+          "Independent proof found no content-bearing diff from the pinned baseline.",
+        );
+      }
+      const filesChanged = uniqueStrings([...diffFiles, ...statusFiles]);
+      const outOfScopeFiles = filesChanged.filter((file) => !allowedFiles.includes(file));
+      if (outOfScopeFiles.length > 0) {
+        throw new TrueForgeIntegrationError(
+          "prove implementation",
+          `Independent proof found changes outside the allowed scope: ${outOfScopeFiles.join(", ")}.`,
+        );
+      }
+
+      const checkMeasurements: Array<{
+        name: string;
+        command: string;
+        measurement: IndependentSandboxMeasurement;
+      }> = [];
+      const checkNames = uniqueStrings(["typecheck", "test", ...(workItem.requiredChecks ?? [])]);
+      for (const name of checkNames) {
+        const command = implementationCheckCommand(repositoryRoot, name);
+        if (command === null) {
+          throw new TrueForgeIntegrationError(
+            "prove implementation",
+            `Independent proof has no authoritative command for required check ${name}.`,
+          );
+        }
+        checkMeasurements.push({
+          name,
+          command,
+          measurement: await this.measureImplementationState(
+            mission.id,
+            workItem.id,
+            command,
+            `Run the authoritative ${name} check against the completed workspace.`,
+          ),
+        });
+      }
+
+      const discoveryEvidence = await this.missions.addEvidence(mission.id, {
+        workItemId: workItem.id,
+        kind: "tool_result",
+        result: "passed",
+        source: "sandbox",
+        summary: `Independent proof located the completed repository at ${repositoryRoot}.`,
+        details: JSON.stringify({
+          command: IMPLEMENTATION_REPOSITORY_DISCOVERY_COMMAND,
+          repository_root: repositoryRoot,
+          observed_exec_count: discovery.verified.observedExecCount,
+        }),
+        executionOrigin: sandboxMeasurementOrigin(discovery),
+      });
+      const identityEvidence = await this.missions.addEvidence(mission.id, {
+        workItemId: workItem.id,
+        kind: "tool_result",
+        result: "passed",
+        source: "sandbox",
+        summary: `Independent proof verified repository ${expectedRepository}.`,
+        details: JSON.stringify({
+          command: remoteCommand,
+          repository: expectedRepository,
+          remote_url: remote.verified.stdout.trim(),
+        }),
+        executionOrigin: sandboxMeasurementOrigin(remote),
+      });
+      const ancestryEvidence = await this.missions.addEvidence(mission.id, {
+        workItemId: workItem.id,
+        kind: "tool_result",
+        result: "passed",
+        source: "sandbox",
+        summary: `Independent proof verified pinned baseline ancestry at ${baselineSha}.`,
+        details: JSON.stringify({
+          command: ancestryCommand,
+          baseline_sha: baselineSha,
+          exit_code: ancestry.verified.exitCode,
+        }),
+        executionOrigin: sandboxMeasurementOrigin(ancestry),
+      });
+      const statusEvidence = await this.missions.addEvidence(mission.id, {
+        workItemId: workItem.id,
+        kind: "file_change",
+        result: "passed",
+        source: "sandbox",
+        summary: "Independent proof measured the complete final workspace status.",
+        details: JSON.stringify({
+          complete_changed_files: true,
+          command: statusCommand,
+          output: status.verified.stdout,
+          changed_files: statusFiles,
+        }),
+        executionOrigin: sandboxMeasurementOrigin(status),
+      });
+      const diffSummary = summarizeOutput(diff.verified.stdout);
+      const diffEvidence = await this.missions.addEvidence(mission.id, {
+        workItemId: workItem.id,
+        kind: "diff_summary",
+        result: "passed",
+        source: "sandbox",
+        summary: "Independent proof captured the actual final diff from the pinned baseline.",
+        details: JSON.stringify({
+          command: diffCommand,
+          output: diffSummary,
+          changed_files: diffFiles,
+          output_truncated: diff.verified.stdout.trim().length > 4_000,
+          baseline_sha: baselineSha,
+        }),
+        executionOrigin: sandboxMeasurementOrigin(diff),
+      });
+      const checks: ImplementationCheck[] = [];
+      const checkEvidenceIds: string[] = [];
+      for (const { name, command, measurement } of checkMeasurements) {
+        const evidence = await this.missions.addEvidence(mission.id, {
+          workItemId: workItem.id,
+          kind: name === "typecheck" ? "typecheck_result" : "test_result",
+          result: "passed",
+          source: "sandbox",
+          summary: `Independent authoritative ${name} check passed.`,
+          details: JSON.stringify({
+            command,
+            exit_code: measurement.verified.exitCode,
+            output: measurement.verified.outputSummary,
+          }),
+          executionOrigin: sandboxMeasurementOrigin(measurement),
+        });
+        checkEvidenceIds.push(evidence.id);
+        checks.push({
+          name,
+          command,
+          result: "passed",
+          required: true,
+          evidenceIds: [evidence.id],
+          exitCode: measurement.verified.exitCode,
+        });
+      }
+
+      return {
+        filesChanged,
+        diffSummary,
+        checks,
+        decisions: [],
+        openQuestions: [],
+        evidenceIds: [
+          discoveryEvidence.id,
+          identityEvidence.id,
+          ancestryEvidence.id,
+          statusEvidence.id,
+          diffEvidence.id,
+          ...checkEvidenceIds,
+        ],
+        executionOrigin: {
+          kind: "sandbox",
+          sessionId: discovery.sessionId,
+        },
+      };
+    } catch (error) {
+      const reason = error instanceof TrueForgeIntegrationError
+        ? error.message
+        : "Independent final-state proof failed.";
+      await this.recordImplementationProofFailure(mission.id, workItem.id, reason);
+      if (error instanceof TrueForgeIntegrationError) {
+        throw error;
+      }
+      throw new TrueForgeIntegrationError("prove implementation", reason);
+    }
+  }
+
+  private async measureImplementationState(
+    missionId: string,
+    workItemId: string,
+    command: string,
+    intent: string,
+  ): Promise<IndependentSandboxMeasurement> {
+    const mission = await this.missions.getMission(missionId);
+    if (mission.trueforgeSandboxId === undefined || mission.trueforgeTurnId === undefined) {
+      throw new TrueForgeIntegrationError(
+        "prove implementation",
+        "Agentic execution did not leave a persisted sandbox and predecessor turn for independent proof.",
+      );
+    }
+    const toolName = canonicalSandboxToolName(undefined, this.config.sandboxToolName);
+    const execution = await this.executeCoordinatorTurn(
+      mission.id,
+      buildSandboxVerificationInstruction(mission, command, toolName, intent),
+      {
+        workItemId,
+        previousTurnId: mission.trueforgeTurnId,
+        coordinatorToolSurface: "sandbox-exec",
+        coordinatorPhase: "deterministic-proof",
+      },
+    );
+    return {
+      sessionId: execution.sessionId,
+      turnId: execution.turnId,
+      verified: verifySandboxExecution(
+        execution.rawEvents,
+        command,
+        toolName,
+        mission.trueforgeSandboxId,
+      ),
     };
   }
 
@@ -2719,7 +3020,7 @@ export class TrueForgeMissionRunner {
       source: "trueforge",
       summary: "The delegated execution returned a changed-file diff summary.",
       details: JSON.stringify({
-        command: diffExecution?.command,
+        command: diffCommand,
         output: diffSummary,
         exit_code: diffObserved?.exitCode,
         changed_files: filesChanged,
@@ -3018,6 +3319,30 @@ export class TrueForgeMissionRunner {
     }
   }
 
+  private async recordImplementationProofFailure(
+    missionId: string,
+    workItemId: string,
+    reason: string,
+  ): Promise<void> {
+    const safeReason = sanitizeRuntimeText(reason);
+    try {
+      await this.missions.addEvidence(missionId, {
+        workItemId,
+        kind: "tool_result",
+        result: "failed",
+        source: "sandbox",
+        summary: `Independent final-state proof failed: ${safeReason}`,
+        details: JSON.stringify({
+          failure_layer: "proof",
+          failure_category: "sandbox",
+          reason: safeReason,
+        }),
+      });
+    } catch {
+      // Preserve the concrete proof failure if durable failure recording is unavailable.
+    }
+  }
+
   private async recordRepositoryPreparationFailure(
     missionId: string,
     workItemId: string,
@@ -3124,6 +3449,55 @@ export class TrueForgeMissionRunner {
       // Preserve the original verification error when the mission is already terminal or unavailable.
     }
   }
+}
+
+function implementationRepositoryRoot(output: string): string | null {
+  const candidates = output.replace(/\r\n/g, "\n").split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  if (candidates.length !== 1) {
+    return null;
+  }
+  const gitDirectory = candidates[0];
+  if (
+    gitDirectory === undefined ||
+    !/^\.\/(?:[A-Za-z0-9._-]+\/)*\.git$/.test(gitDirectory)
+  ) {
+    return null;
+  }
+  return gitDirectory === "./.git" ? "." : gitDirectory.slice(0, -"/.git".length);
+}
+
+function gitAtRepository(repositoryRoot: string, argumentsValue: string): string {
+  if (repositoryRoot !== "." && !/^\.\/(?:[A-Za-z0-9._-]+\/)*[A-Za-z0-9._-]+$/.test(repositoryRoot)) {
+    throw new TrueForgeIntegrationError(
+      "prove implementation",
+      "Independent proof rejected an unsafe repository path.",
+    );
+  }
+  return repositoryRoot === "."
+    ? `git ${argumentsValue}`
+    : `git -C ${repositoryRoot} ${argumentsValue}`;
+}
+
+function implementationCheckCommand(repositoryRoot: string, name: string): string | null {
+  const prefix = repositoryRoot === "." ? "" : ` --prefix ${repositoryRoot}`;
+  if (name === "typecheck") {
+    return `npm${prefix} run typecheck`;
+  }
+  if (name === "test") {
+    return `npm${prefix} test`;
+  }
+  return null;
+}
+
+function sandboxMeasurementOrigin(measurement: IndependentSandboxMeasurement): ExecutionOrigin {
+  return {
+    kind: "sandbox",
+    sessionId: measurement.sessionId,
+    turnId: measurement.turnId,
+    toolCallId: measurement.verified.toolCallId,
+  };
 }
 
 function buildTurnInstruction(

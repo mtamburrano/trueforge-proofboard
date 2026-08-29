@@ -26,10 +26,11 @@ import {
 import {
   buildPreflightWorkGraph,
   DeliveryHeadInspectionInput,
+  ImplementationProofInput,
+  ImplementationHandoffDraft,
   RepositoryInspectionInput,
   RepositoryWorkGraphPlanner,
   PullRequestDeliveryTarget,
-  SandboxPreparationInput,
   SandboxVerificationInput,
   TrueForgeDeliveryApproval,
   TrueForgeIntegrationError,
@@ -63,87 +64,7 @@ export const PRIMARY_DELIVERY_TARGET: PullRequestDeliveryTarget = {
   body: "Adds the backwards-compatible delivery-stage helper and focused transition coverage verified by the Proof Board mission.",
 };
 
-export const PRIMARY_MISSION_VERIFICATION_SCRIPT = [
-  'import assert from "node:assert/strict";',
-  'import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";',
-  'import { spawnSync } from "node:child_process";',
-  'import os from "node:os";',
-  'import path from "node:path";',
-  'const source = await readFile("src/index.ts", "utf8");',
-  'assert.match(source, /(?:export\\s+function|export\\s+const)\\s+getNextDeliveryStage/, "mission stage helper is missing");',
-  'const transitions = [["Plan", "Execute"], ["Execute", "Prove"], ["Prove", "Approve"], ["Approve", null]];',
-  'const { getNextDeliveryStage } = await import("./dist/index.js");',
-  'assert.equal(typeof getNextDeliveryStage, "function", "mission stage helper is not callable");',
-  'for (const [stage, next] of transitions) assert.equal(getNextDeliveryStage(stage), next);',
-  'const directory = await mkdtemp(path.join(os.tmpdir(), "trueforge-mission-verification-"));',
-  'const loaderPath = path.join(directory, "loader.mjs");',
-  'const logPath = path.join(directory, "calls.jsonl");',
-  'const loaderSource = String.raw`',
-  'import { pathToFileURL } from "node:url";',
-  'const targetUrl = pathToFileURL(process.cwd() + "/dist/index.js").href;',
-  'export async function load(url, context, defaultLoad) {',
-  '  const loaded = await defaultLoad(url, context);',
-  '  if (url !== targetUrl) return loaded;',
-  '  let source = String(loaded.source);',
-  '  if (source.includes("__trueforgeVerificationWrapper")) return { ...loaded, source, shortCircuit: true };',
-  '  if (source.includes("export function getNextDeliveryStage")) {',
-  '    source = source.replace("export function getNextDeliveryStage", "function __verifiedGetNextDeliveryStage");',
-  '  } else if (source.includes("export const getNextDeliveryStage")) {',
-  '    source = source.replace("export const getNextDeliveryStage", "const __verifiedGetNextDeliveryStage");',
-  '  } else {',
-  '    throw new Error("mission stage helper is missing");',
-  '  }',
-  '  const newline = String.fromCharCode(10);',
-  '  source = "import { appendFileSync as __trueforgeAppendCall } from " + String.fromCharCode(34) + "node:fs" + String.fromCharCode(34) + ";" + newline + source;',
-  '  source += newline + "const __trueforgeVerificationWrapper = true;" + newline +',
-  '    "const __trueforgeMutationStage = process.env.MISSION_VERIFICATION_MUTATION_STAGE;" + newline +',
-  '    "const __trueforgeMutationResults = { Plan: null, Execute: null, Prove: null, Approve: " + String.fromCharCode(34) + "Plan" + String.fromCharCode(34) + " };" + newline +',
-  '    "export function getNextDeliveryStage(stage) {" + newline +',
-  '    "  const result = __verifiedGetNextDeliveryStage(stage);" + newline +',
-  '    "  const returnedResult = __trueforgeMutationStage === stage ? __trueforgeMutationResults[stage] : result;" + newline +',
-  '    "  __trueforgeAppendCall(process.env.MISSION_VERIFICATION_LOG, JSON.stringify({ stage, result: returnedResult, mutated: __trueforgeMutationStage === stage }) + String.fromCharCode(10));" + newline +',
-  '    "  return returnedResult;" + newline +',
-  '    "}" + newline;',
-  '  return { ...loaded, source, shortCircuit: true };',
-  '}',
-  '`;',
-  'try {',
-  'const testArguments = ["--loader", loaderPath, "--test", "test/index.test.js"];',
-  'const baseEnvironment = { ...process.env, MISSION_VERIFICATION_LOG: logPath };',
-  'delete baseEnvironment.MISSION_VERIFICATION_MUTATION_STAGE;',
-  'const runFocusedTests = (mutationStage, mutationLogPath) => spawnSync(process.execPath, testArguments, {',
-  '  cwd: process.cwd(),',
-  '  encoding: "utf8",',
-  '  env: { ...baseEnvironment, MISSION_VERIFICATION_LOG: mutationLogPath, ...(mutationStage ? { MISSION_VERIFICATION_MUTATION_STAGE: mutationStage } : {}) },',
-  '});',
-  'const readCalls = async (logFile) => (await readFile(logFile, "utf8").catch(() => "")).trim().split(String.fromCharCode(10)).filter(Boolean).map((line) => JSON.parse(line));',
-  'await writeFile(loaderPath, loaderSource, "utf8");',
-  'const testRun = runFocusedTests(null, logPath);',
-  'if (testRun.stdout) process.stdout.write(testRun.stdout);',
-  'if (testRun.status !== 0) {',
-  '  if (testRun.stderr) process.stderr.write(testRun.stderr);',
-  '  throw new Error("focused transition tests failed");',
-  '}',
-  'const observed = new Set((await readCalls(logPath)).map(({ stage, result }) => JSON.stringify([stage, result])));',
-  'for (const transition of transitions) {',
-  '  assert.ok(observed.has(JSON.stringify(transition)), "transition " + transition[0] + " -> " + transition[1] + " was not executed by the focused test");',
-  '  const mutationLogPath = path.join(directory, "mutation-" + transition[0] + ".jsonl");',
-  '  const mutationRun = runFocusedTests(transition[0], mutationLogPath);',
-  '  const mutatedStages = new Set((await readCalls(mutationLogPath)).filter(({ mutated }) => mutated).map(({ stage }) => stage));',
-  '  assert.ok(mutatedStages.has(transition[0]), "transition " + transition[0] + " was not exercised during mutation verification");',
-  '  assert.notEqual(mutationRun.status, 0, "focused test did not enforce transition " + transition[0] + " -> " + transition[1]);',
-  '}',
-  `const expectedDeliveryFiles = ${JSON.stringify(PRIMARY_VERIFIED_DELIVERY_FILES)};`,
-  'assert.equal(source, expectedDeliveryFiles["src/index.ts"], "verified source differs from the delivery-head content contract");',
-  'assert.equal(await readFile("test/index.test.js", "utf8"), expectedDeliveryFiles["test/index.test.js"], "verified tests differ from the delivery-head content contract");',
-  '  console.log("Mission transition verification passed.");',
-  '} finally {',
-  '  await rm(directory, { recursive: true, force: true });',
-  '}',
-].join("\n");
-
-export const PRIMARY_VERIFICATION_COMMAND =
-  `npm test && node --input-type=module -e '${PRIMARY_MISSION_VERIFICATION_SCRIPT}'`;
+export const PRIMARY_VERIFICATION_COMMAND = "npm test";
 
 export interface MissionRunner {
   createMission(input: {
@@ -158,7 +79,7 @@ export interface MissionRunner {
     instruction: string,
     options: { workItemId: string; delegateToSubagent?: boolean },
   ): Promise<TrueForgeTurnResult>;
-  prepareSandbox?(input: SandboxPreparationInput): Promise<unknown>;
+  proveImplementation(input: ImplementationProofInput): Promise<ImplementationHandoffDraft>;
   runSandboxVerification(input: SandboxVerificationInput): Promise<unknown>;
   requestPullRequestApproval(
     missionId: string,
@@ -678,45 +599,48 @@ class MissionController {
       const reviewers = state.workItems.filter((item) =>
         item.missionId === PRIMARY_MISSION_ID && item.assignedRole === "reviewer"
       );
-      if (implementers.length === 0 || reviewers.length === 0) {
+      if (implementers.length !== 1 || reviewers.length !== 1) {
         throw new MissionControlError(
-          "Planning must produce bounded implementation and verification work.",
+          "Planning must produce one bounded implementation and one verification step.",
         );
-      }
-      if (
-        this.runner.prepareSandbox !== undefined &&
-        implementers.some((item) => item.status !== "complete")
-      ) {
-        await this.runner.prepareSandbox({ missionId: PRIMARY_MISSION_ID });
       }
       for (const implementer of implementers) {
         await this.executeWork(implementer.id, async () => {
-          const execution = await this.runner.runTurn(
+          await this.runner.runTurn(
             PRIMARY_MISSION_ID,
             [
-              `Execute only this bounded work item: ${implementer.purpose}`,
+              `Own the implementation for this bounded work item: ${implementer.purpose}`,
               `Acceptance criteria: ${implementer.acceptanceCriteria.join(" ")}`,
               `Allowed files for this work item: ${(implementer.allowedFiles ?? []).join(", ")}`,
-              "Use the configured sandbox and verified pinned source.",
+              `Prepare the sandbox and repository as needed, starting from the pinned repository ${PRIMARY_REPOSITORY.owner}/${PRIMARY_REPOSITORY.name}@${PRIMARY_REPOSITORY.ref}.`,
+              "You may install tools, clone or check out the repository, edit, test, retry failed commands, and optionally use dynamic subagents.",
+              "Proof Board will independently measure the final repository, diff, and checks after this turn; narration is not proof.",
               "Do not push, open a pull request, or perform any other remote mutation.",
             ].join(" "),
-            { workItemId: implementer.id, delegateToSubagent: true },
+            { workItemId: implementer.id },
           );
           await this.requirePassedTurn(implementer.id);
-          if (execution.implementationHandoff !== undefined) {
-            await this.recordImplementationHandoff(execution, implementer.id);
-          }
+          const proof = await this.runner.proveImplementation({
+            missionId: PRIMARY_MISSION_ID,
+            workItemId: implementer.id,
+          });
+          await this.recordImplementationHandoff(proof, implementer.id);
         }, false);
         await this.reviewImplementation(implementer.id);
       }
       for (const reviewer of reviewers) {
         await this.executeWork(reviewer.id, async () => {
-          await this.runner.runSandboxVerification({
-            missionId: PRIMARY_MISSION_ID,
-            workItemId: reviewer.id,
-            command: PRIMARY_VERIFICATION_COMMAND,
-          });
-          await this.requirePassedEvidence(reviewer.id, "sandbox");
+          const reviewState = await this.missions.getState();
+          const acceptedImplementationIds = new Set(reviewState.reviews
+            .filter((review) =>
+              review.missionId === PRIMARY_MISSION_ID && review.outcome === "accepted"
+            )
+            .map((review) => review.workItemId));
+          if (implementers.some((item) => !acceptedImplementationIds.has(item.id))) {
+            throw new MissionControlError(
+              "Verification cannot complete before independent implementation review is accepted.",
+            );
+          }
         });
       }
 
@@ -734,13 +658,9 @@ class MissionController {
   }
 
   private async recordImplementationHandoff(
-    execution: TrueForgeTurnResult,
+    draft: ImplementationHandoffDraft,
     workItemId: string,
   ): Promise<void> {
-    const draft = execution.implementationHandoff;
-    if (draft === undefined) {
-      return;
-    }
     const requiredChecksPassed = draft.checks
       .filter((check) => check.required)
       .every((check) => check.result === "passed");
@@ -748,8 +668,8 @@ class MissionController {
       workItemId,
       result: requiredChecksPassed ? "done" : "partial",
       summary: requiredChecksPassed
-        ? "The delegated implementation returned a structured evidence handoff."
-        : "The delegated implementation returned a partial handoff with unresolved required checks.",
+        ? "Independent final-state proof established a structured implementation handoff."
+        : "Independent final-state proof returned a partial handoff with unresolved required checks.",
       filesChanged: draft.filesChanged,
       testsRun: [...new Set(draft.checks.map((check) => check.command))],
       decisions: draft.decisions,
@@ -784,8 +704,8 @@ class MissionController {
     const plannerIds = new Set(
       workItems.filter((item) => item.assignedRole === "planner").map((item) => item.id),
     );
-    const reviewerIds = new Set(
-      workItems.filter((item) => item.assignedRole === "reviewer").map((item) => item.id),
+    const implementationIds = new Set(
+      workItems.filter((item) => item.assignedRole === "implementer").map((item) => item.id),
     );
     const repositoryProof = state.evidence.filter((evidence) =>
       evidence.missionId === PRIMARY_MISSION_ID &&
@@ -793,11 +713,18 @@ class MissionController {
       plannerIds.has(evidence.workItemId) &&
       evidence.source === "mcp"
     ).at(-1);
+    const implementationProofEvidenceIds = new Set(state.handoffs
+      .filter((handoff) =>
+        handoff.missionId === PRIMARY_MISSION_ID &&
+        implementationIds.has(handoff.workItemId) &&
+        handoff.result === "done"
+      )
+      .flatMap((handoff) => handoff.evidenceIds ?? []));
     const sandboxProof = state.evidence.filter((evidence) =>
       evidence.missionId === PRIMARY_MISSION_ID &&
-      evidence.workItemId !== undefined &&
-      reviewerIds.has(evidence.workItemId) &&
-      evidence.source === "sandbox"
+      evidence.source === "sandbox" &&
+      evidence.result === "passed" &&
+      implementationProofEvidenceIds.has(evidence.id)
     ).at(-1);
     if (repositoryProof?.result !== "passed" || sandboxProof?.result !== "passed") {
       throw new MissionControlError(
@@ -828,12 +755,13 @@ class MissionController {
         review.missionId === PRIMARY_MISSION_ID && review.outcome === "accepted"
       )
       .map((review) => review.findingEvidenceId);
-    const evidenceIds = [
+    const evidenceIds = [...new Set([
       repositoryProof.id,
       deliveryHeadProof.id,
       sandboxProof.id,
+      ...implementationProofEvidenceIds,
       ...acceptedReviewEvidenceIds,
-    ];
+    ])];
     const pending = await this.runner.requestPullRequestApproval(
       PRIMARY_MISSION_ID,
       deliveryTarget,
@@ -992,10 +920,6 @@ class MissionController {
       throw new MissionControlError(
         "Independent verification requires the implementation to be ready for review.",
       );
-    }
-    if (workItem.delegation === undefined) {
-      await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, workItemId, "complete");
-      return;
     }
     const context = await this.missions.getReviewContext(PRIMARY_MISSION_ID, workItemId);
     const decision = await this.verifier.review(context);
@@ -1573,7 +1497,7 @@ export function mapMissionState(state: MissionState, missionId: string): Mission
   const sandboxProof = latestProofResultForRole(
     missionEvidence,
     workItems,
-    "reviewer",
+    ["implementer", "reviewer"],
     "sandbox",
   );
   const currentProofFailed = repositoryProof === "failed" || sandboxProof === "failed";
@@ -1734,11 +1658,14 @@ function lane(id: "plan" | "execute" | "prove" | "approve", label: string, items
 function latestProofResultForRole(
   evidence: Evidence[],
   workItems: WorkItem[],
-  role: "planner" | "implementer" | "reviewer",
+  role: "planner" | "implementer" | "reviewer" | ReadonlyArray<"planner" | "implementer" | "reviewer">,
   source: "mcp" | "sandbox",
 ): Evidence["result"] | undefined {
+  const roles = new Set(Array.isArray(role) ? role : [role]);
   const workItemIds = new Set(
-    workItems.filter((item) => item.assignedRole === role).map((item) => item.id),
+    workItems.filter((item) =>
+      item.assignedRole !== undefined && roles.has(item.assignedRole)
+    ).map((item) => item.id),
   );
   let latest: Evidence["result"] | undefined;
   for (const item of evidence) {

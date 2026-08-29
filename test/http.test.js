@@ -18,17 +18,14 @@ import {
   createMissionHttpApp,
   resolveMissionRuntimeConfig,
 } from "../dist/index.js";
-import { workspaceDeltaEvidenceDetails } from "./delegated-proof-fixture.js";
 
 class TestMissionRunner {
   constructor(
     missions,
     {
       failSandbox = false,
-      sandboxPreparationError = false,
       secretInspectionError = false,
       createGate,
-      structuredHandoff = false,
       inspectionRepository = PRIMARY_DELIVERY_FIXTURE,
       deliveryHeadSha = "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1",
       deliveryHeadPatches = PRIMARY_VERIFIED_DELIVERY_PATCHES,
@@ -36,15 +33,12 @@ class TestMissionRunner {
   ) {
     this.missions = missions;
     this.failSandbox = failSandbox;
-    this.sandboxPreparationError = sandboxPreparationError;
     this.secretInspectionError = secretInspectionError;
     this.createGate = createGate;
-    this.structuredHandoff = structuredHandoff;
     this.inspectionRepository = inspectionRepository;
     this.deliveryHeadSha = deliveryHeadSha;
     this.deliveryHeadPatches = deliveryHeadPatches;
     this.sandboxInputs = [];
-    this.preparationInputs = [];
     this.operationLog = [];
     this.turnInputs = [];
     this.deliveryCalls = { requested: [], resolved: [], protectedOperations: 0 };
@@ -161,24 +155,12 @@ class TestMissionRunner {
   }
 
   async runTurn(missionId, _instruction, options) {
-    this.operationLog.push("delegate");
+    this.operationLog.push("execute");
     this.calls.turn += 1;
     this.turnInputs.push({ instruction: _instruction, options });
     const turnId = `test-turn-${this.calls.turn}`;
-    const threadId = `test-thread-${options.workItemId}`;
-    const treeRef = "a".repeat(40);
-    const endTreeRef = "b".repeat(40);
     await this.missions.attachTrueforgeTurn(missionId, turnId);
-    if (this.structuredHandoff) {
-      await this.missions.attachTrueforgeWorkspaceBaseline(missionId, treeRef);
-      await this.missions.startWorkItemDelegation(missionId, options.workItemId, {
-        owner: "bounded-test-implementer",
-        threadId,
-        turnId,
-        startTreeRef: treeRef,
-        missionStartTreeRef: treeRef,
-      });
-    }
+    await this.missions.attachTrueforgeSandbox(missionId, "test-sandbox-durable");
     await this.missions.addEvidence(missionId, {
       workItemId: options.workItemId,
       kind: "tool_result",
@@ -187,100 +169,74 @@ class TestMissionRunner {
       summary: "TrueForge turn finished with status done.",
       details: JSON.stringify({ event_type: "turn.done", provider_secret: "hidden" }),
     });
-    let implementationHandoff;
-    if (this.structuredHandoff) {
-      const origin = {
-        kind: "trueforge",
-        sessionId: "test-session-durable",
-        turnId,
-        threadId,
-      };
-      const typecheck = await this.missions.addEvidence(missionId, {
-        workItemId: options.workItemId,
-        kind: "typecheck_result",
-        result: "passed",
-        source: "trueforge",
-        summary: "Delegated typecheck passed.",
-        executionOrigin: { ...origin, toolCallId: `call-typecheck-${this.calls.turn}` },
-      });
-      const tests = await this.missions.addEvidence(missionId, {
-        workItemId: options.workItemId,
-        kind: "test_result",
-        result: "passed",
-        source: "trueforge",
-        summary: "Delegated tests passed.",
-        executionOrigin: { ...origin, toolCallId: `call-test-${this.calls.turn}` },
-      });
-      const diff = await this.missions.addEvidence(missionId, {
-        workItemId: options.workItemId,
-        kind: "diff_summary",
-        result: "passed",
-        source: "trueforge",
-        summary: "Delegated content diff captured.",
-        details: JSON.stringify({
-          command: "git diff",
-          output: "diff --git a/src/index.ts b/src/index.ts\n--- a/src/index.ts\n+++ b/src/index.ts\n@@ -1 +1,2 @@\n before\n+after",
-        }),
-        executionOrigin: { ...origin, toolCallId: `call-diff-${this.calls.turn}` },
-      });
-      const manifest = await this.missions.addEvidence(missionId, {
-        workItemId: options.workItemId,
-        kind: "file_change",
-        result: "passed",
-        source: "trueforge",
-        summary: "Delegated complete changed-file manifest captured.",
-        details: workspaceDeltaEvidenceDetails({
-          startTreeRef: treeRef,
-          missionStartTreeRef: treeRef,
-          endTreeRef,
-          currentFiles: ["src/index.ts"],
-          cumulativeFiles: ["src/index.ts"],
-        }),
-        executionOrigin: {
-          kind: "trueforge",
-          sessionId: "test-session-durable",
-          turnId: `test-proof-delta-${this.calls.turn}`,
-          threadId: "main",
-          toolCallId: `call-manifest-${this.calls.turn}`,
-        },
-      });
-      await this.missions.completeWorkItemDelegation(missionId, options.workItemId, {
-        threadId,
-        turnId,
-      });
-      implementationHandoff = {
-        filesChanged: ["src/index.ts"],
-        diffSummary: "src/index.ts changed.",
-        checks: [
-          {
-            name: "typecheck",
-            command: "npm run typecheck",
-            result: "passed",
-            required: true,
-            evidenceIds: [typecheck.id],
-            exitCode: 0,
-          },
-          {
-            name: "test",
-            command: "npm test",
-            result: "passed",
-            required: true,
-            evidenceIds: [tests.id],
-            exitCode: 0,
-          },
-        ],
-        evidenceIds: [typecheck.id, tests.id, manifest.id, diff.id],
-        decisions: [],
-        openQuestions: [],
-        executionOrigin: origin,
-      };
-    }
     return {
       sessionId: "test-session-durable",
       turnId,
       events: [],
       mission: await this.missions.getMission(missionId),
-      ...(implementationHandoff === undefined ? {} : { implementationHandoff }),
+    };
+  }
+
+  async proveImplementation(input) {
+    this.operationLog.push("prove");
+    this.calls.sandbox += 1;
+    this.sandboxInputs.push(input);
+    const origin = { kind: "sandbox", sessionId: "test-session-durable" };
+    if (this.failSandbox) {
+      await this.missions.addEvidence(input.missionId, {
+        workItemId: input.workItemId,
+        kind: "test_result",
+        result: "failed",
+        source: "sandbox",
+        summary: "Independent final-state proof failed.",
+        details: JSON.stringify({ command: PRIMARY_VERIFICATION_COMMAND, exit_code: 1 }),
+      });
+      throw new TrueForgeIntegrationError(
+        "prove implementation",
+        "Independent authoritative test exited with code 1.",
+      );
+    }
+    const workItem = await this.missions.getWorkItem(input.missionId, input.workItemId);
+    const filesChanged = workItem.allowedFiles ?? [];
+    const diffOutput = filesChanged.map((file) =>
+      `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1 +1,2 @@\n before\n+after`
+    ).join("\n");
+    const diff = await this.missions.addEvidence(input.missionId, {
+      workItemId: input.workItemId,
+      kind: "diff_summary",
+      result: "passed",
+      source: "sandbox",
+      summary: "Independent proof captured the actual final diff.",
+      details: JSON.stringify({ command: "git diff", output: diffOutput, changed_files: filesChanged }),
+      executionOrigin: origin,
+    });
+    const typecheck = await this.missions.addEvidence(input.missionId, {
+      workItemId: input.workItemId,
+      kind: "typecheck_result",
+      result: "passed",
+      source: "sandbox",
+      summary: "Independent typecheck passed.",
+      executionOrigin: origin,
+    });
+    const tests = await this.missions.addEvidence(input.missionId, {
+      workItemId: input.workItemId,
+      kind: "test_result",
+      result: "passed",
+      source: "sandbox",
+      summary: "Independent tests passed.",
+      executionOrigin: origin,
+    });
+    return {
+      filesChanged,
+      diffSummary: diffOutput,
+      checks: [
+        { name: "typecheck", command: "npm run typecheck", result: "passed", required: true, evidenceIds: [typecheck.id], exitCode: 0 },
+        { name: "test", command: PRIMARY_VERIFICATION_COMMAND, result: "passed", required: true, evidenceIds: [tests.id], exitCode: 0 },
+      ],
+      evidenceIds: [diff.id, typecheck.id, tests.id],
+      decisions: [],
+      openQuestions: [],
+      executionOrigin: origin,
     };
   }
 
@@ -325,25 +281,13 @@ class TestMissionRunner {
     return { evidenceId: evidence.id };
   }
 
-  async prepareSandbox(input) {
-    this.operationLog.push("prepare-sandbox");
-    this.preparationInputs.push(input);
-    if (this.sandboxPreparationError) {
-      await this.missions.addEvidence(input.missionId, {
-        kind: "tool_result",
-        result: "failed",
-        source: "sandbox",
-        summary: "Sandbox toolchain readiness failed; coding delegation did not start.",
-        details: JSON.stringify({
-          command: "sandbox toolchain readiness",
-          reason: "Node.js >=20 and npm are required before coding delegation.",
-        }),
-      });
-      throw new TrueForgeIntegrationError(
-        "prepare sandbox",
-        "Sandbox toolchain readiness failed: Node.js >=20 and npm are required before coding delegation.",
-      );
-    }
+  async reviewContract() {
+    return {
+      outcome: "accepted",
+      reviewer: "test-independent-reviewer",
+      summary: "Independent review accepted the measured implementation.",
+      finding: "The actual diff and authoritative checks satisfy the bounded contract.",
+    };
   }
 
   async requestPullRequestApproval(missionId, target) {
@@ -650,10 +594,16 @@ test("run mission uses the runtime adapters and exposes passed proof", async () 
   assert.equal(response.status, 200);
   const payload = await json(response);
   assert.equal(payload.mission.mission.status, "awaiting_approval");
-  assert.equal(payload.mission.progress.complete, 4);
+  assert.equal(payload.mission.progress.complete, 3);
   assert.equal(payload.mission.progress.execution, "passed");
   assert.equal(payload.mission.progress.verification, "passed");
-  assert.deepEqual(payload.mission.evidence.map((item) => item.source).sort(), ["mcp", "mcp", "sandbox"]);
+  assert.deepEqual(payload.mission.evidence.map((item) => item.source).sort(), [
+    "mcp",
+    "mcp",
+    "sandbox",
+    "sandbox",
+    "sandbox",
+  ]);
   assert.equal(payload.mission.approvals.length, 1);
   assert.equal(payload.mission.approvals[0].actionType, "create_pull_request");
   assert.equal(
@@ -672,35 +622,33 @@ test("run mission uses the runtime adapters and exposes passed proof", async () 
   );
   assert.equal(runner.deliveryCalls.requested.length, 1);
   assert.equal(runner.deliveryCalls.protectedOperations, 0);
-  assert.deepEqual(runner.preparationInputs, [{ missionId: PRIMARY_MISSION_ID }]);
-  assert.deepEqual(runner.operationLog.slice(0, 4), [
+  assert.deepEqual(runner.operationLog.slice(0, 3), [
     "inspect",
-    "prepare-sandbox",
-    "delegate",
-    "delegate",
+    "execute",
+    "prove",
   ]);
-  assert.deepEqual(runner.calls, { create: 1, inspect: 1, headInspect: 1, turn: 2, sandbox: 1 });
+  assert.deepEqual(runner.calls, { create: 1, inspect: 1, headInspect: 1, turn: 1, sandbox: 1 });
   assert.deepEqual(
     runner.turnInputs.map((input) => input.options.workItemId),
-    ["primary-implement-1-src-index-ts", "primary-implement-2-test-index-test-js"],
+    ["primary-implement"],
   );
   assert.match(runner.turnInputs[0].instruction, /src\/index\.ts/);
   assert.match(
     runner.turnInputs[0].instruction,
-    /Changes for this work item remain limited to src\/index\.ts/,
+    /Changes remain limited to the verified file scope: src\/index\.ts, test\/index\.test\.js/,
   );
-  assert.match(runner.turnInputs[0].instruction, /Allowed files for this work item: src\/index\.ts/);
-  assert.match(runner.turnInputs[1].instruction, /test\/index\.test\.js/);
   assert.match(
-    runner.turnInputs[1].instruction,
-    /Changes for this work item remain limited to test\/index\.test\.js/,
+    runner.turnInputs[0].instruction,
+    /Allowed files for this work item: src\/index\.ts, test\/index\.test\.js/,
   );
-  assert.match(runner.turnInputs[1].instruction, /Allowed files for this work item: test\/index\.test\.js/);
-  assert.equal(runner.sandboxInputs[0].command, PRIMARY_VERIFICATION_COMMAND);
-  assert.match(runner.sandboxInputs[0].command, /node --input-type=module -e/);
-  assert.match(runner.sandboxInputs[0].command, /--loader/);
-  assert.match(runner.sandboxInputs[0].command, /--test\", \"test\/index\.test\.js/);
-  assert.match(runner.sandboxInputs[0].command, /getNextDeliveryStage/);
+  assert.match(runner.turnInputs[0].instruction, /install tools, clone or check out the repository/i);
+  assert.match(runner.turnInputs[0].instruction, /optionally use dynamic subagents/i);
+  assert.equal(runner.turnInputs[0].options.delegateToSubagent, undefined);
+  assert.deepEqual(runner.sandboxInputs[0], {
+    missionId: PRIMARY_MISSION_ID,
+    workItemId: "primary-implement",
+  });
+  assert.equal(PRIMARY_VERIFICATION_COMMAND, "npm test");
 
   const serialized = JSON.stringify(payload);
   assert.doesNotMatch(serialized, /must-not-reach-browser|provider_secret/);
@@ -880,7 +828,7 @@ test("failed sandbox proof remains visibly failed and blocks the mission", async
   assert.equal(response.status, 502);
   const payload = await json(response);
   assert.equal(payload.mission.mission.status, "blocked");
-  assert.equal(payload.mission.progress.execution, "passed");
+  assert.equal(payload.mission.progress.execution, "failed");
   assert.equal(payload.mission.progress.verification, "failed");
   const sandbox = payload.mission.evidence.find((item) => item.source === "sandbox");
   assert.equal(sandbox.result, "failed");
@@ -888,47 +836,6 @@ test("failed sandbox proof remains visibly failed and blocks the mission", async
   assert.equal(payload.mission.evidence.some(
     (item) => item.source === "sandbox" && item.result === "passed",
   ), false);
-});
-
-test("sandbox readiness failure blocks before delegation and stays distinct from verification", async () => {
-  const { app, runner } = testApp(new InMemoryMissionRepository(), {
-    sandboxPreparationError: true,
-  });
-
-  const response = await app.request("/api/mission/run", { method: "POST" });
-  assert.equal(response.status, 502);
-  const payload = await json(response);
-  assert.equal(payload.mission.mission.status, "blocked");
-  assert.equal(payload.mission.progress.execution, "failed");
-  assert.equal(payload.mission.progress.verification, "not_started");
-  assert.match(payload.message, /Node\.js >=20 and npm are required/);
-  assert.equal(runner.turnInputs.length, 0);
-  assert.deepEqual(runner.operationLog, ["inspect", "prepare-sandbox"]);
-  assert.equal(
-    payload.mission.evidence.some((item) =>
-      item.source === "sandbox" && item.result === "failed" &&
-      /toolchain readiness failed/.test(item.summary)
-    ),
-    true,
-  );
-});
-
-test("a readiness retry preserves history and reaches coding without a stale execution failure", async () => {
-  const { app, runner } = testApp(new InMemoryMissionRepository(), {
-    sandboxPreparationError: true,
-  });
-
-  const failed = await app.request("/api/mission/run", { method: "POST" });
-  assert.equal(failed.status, 502);
-  runner.sandboxPreparationError = false;
-
-  const retried = await json(await app.request("/api/mission/run", { method: "POST" }));
-  assert.equal(retried.mission.mission.status, "awaiting_approval");
-  assert.equal(retried.mission.progress.execution, "passed");
-  assert.equal(retried.mission.progress.verification, "passed");
-  assert.equal(retried.mission.progress.failedEvidence, 1);
-  assert.equal(runner.turnInputs.length, 2);
-  assert.equal(runner.preparationInputs.length, 2);
 });
 
 test("a successful retry uses current proof while preserving historical failure", async () => {
@@ -952,7 +859,7 @@ test("a successful retry uses current proof while preserving historical failure"
       .filter((item) => item.source === "sandbox")
       .map((item) => item.result)
       .sort(),
-    ["failed", "passed"],
+    ["failed", "passed", "passed", "passed"],
   );
   assert.deepEqual(runner.calls, { create: 1, inspect: 1, headInspect: 1, turn: 2, sandbox: 2 });
 });

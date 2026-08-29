@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
   DEFAULT_TRUEFORGE_ITERATION_LIMIT,
+  IMPLEMENTATION_REPOSITORY_DISCOVERY_COMMAND,
   InMemoryMissionRepository,
   MAX_TRUEFORGE_ITERATION_LIMIT,
   MissionService,
@@ -2427,6 +2428,183 @@ test("failed MCP verification is durable and blocks the mission", async () => {
     state.evidence.some((item) => item.source === "mcp" && item.result === "failed"),
     true,
   );
+});
+
+test("independent implementation proof measures final facts after normal agentic execution", async () => {
+  const repositoryRoot = "./work/proofboard-demo-fixture";
+  const commands = [
+    IMPLEMENTATION_REPOSITORY_DISCOVERY_COMMAND,
+    `git -C ${repositoryRoot} config --get remote.origin.url`,
+    `git -C ${repositoryRoot} merge-base --is-ancestor ${LOCKED_FIXTURE_SHA} HEAD`,
+    `git -C ${repositoryRoot} status --porcelain=v1 -z --untracked-files=all`,
+    `git -C ${repositoryRoot} diff --no-ext-diff --binary ${LOCKED_FIXTURE_SHA} --`,
+    `npm --prefix ${repositoryRoot} run typecheck`,
+    `npm --prefix ${repositoryRoot} test`,
+  ];
+  const outputs = [
+    `${repositoryRoot}/.git\n`,
+    "https://github.com/mtamburrano/proofboard-demo-fixture.git\n",
+    "",
+    " M src/index.ts\u0000 M test/index.test.js\u0000",
+    [
+      "diff --git a/src/index.ts b/src/index.ts",
+      "--- a/src/index.ts",
+      "+++ b/src/index.ts",
+      "@@ -1 +1,2 @@",
+      " before",
+      "+after",
+      "diff --git a/test/index.test.js b/test/index.test.js",
+      "--- a/test/index.test.js",
+      "+++ b/test/index.test.js",
+      "@@ -1 +1,2 @@",
+      " before",
+      "+after",
+    ].join("\n"),
+    "typecheck passed\n",
+    "tests passed\n",
+  ];
+  const { client, calls } = fakeClient((turnId) => {
+    const index = Number(turnId.slice("turn-".length)) - 1;
+    return sandboxEvents(turnId, 0, [], {
+      includeSandboxCreated: false,
+      sandboxArguments: {
+        intent: "Measure one independent final-state fact.",
+        command: commands[index],
+      },
+      sandboxResult: {
+        success: true,
+        response: { exitCode: 0, result: outputs[index] },
+      },
+    });
+  });
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "google-gemini/test-model",
+    dynamicSubAgents: true,
+  });
+  const mission = await runner.createMission({
+    id: "mission-agentic-final-proof",
+    objective: "Verify a normal agent-owned implementation from final facts.",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_SHA,
+    },
+  });
+  const workItem = await missions.addWorkItem(mission.id, {
+    id: "work-agentic-final-proof",
+    title: "Implement the verified change",
+    purpose: "Let the normal implementer own setup and coding.",
+    acceptanceCriteria: ["The final state is independently proven."],
+    assignedRole: "implementer",
+    requiredChecks: ["typecheck", "test"],
+    allowedFiles: ["src/index.ts", "test/index.test.js"],
+    status: "ready",
+  });
+  await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
+  await missions.attachTrueforgeTurn(mission.id, "turn-agentic-execution");
+  await missions.attachTrueforgeSandbox(mission.id, "sandbox-agentic-execution");
+
+  const proof = await runner.proveImplementation({
+    missionId: mission.id,
+    workItemId: workItem.id,
+  });
+
+  assert.deepEqual(proof.filesChanged, ["src/index.ts", "test/index.test.js"]);
+  assert.deepEqual(proof.checks.map((check) => check.name), ["typecheck", "test"]);
+  assert.equal(proof.executionOrigin.kind, "sandbox");
+  assert.equal(proof.executionOrigin.threadId, undefined);
+  assert.equal(calls.turns.length, commands.length);
+  assert.equal(calls.turns[0].request.previousTurnId, "turn-agentic-execution");
+  assert.equal(calls.turns.every((turn, index) =>
+    sandboxInstructionArguments(turn.request).command === commands[index]
+  ), true);
+  assert.equal(commands.every((command) => !/[;&|]|\n/.test(command)), true);
+  assert.equal(calls.updates.length, commands.length * 2);
+  assert.equal(calls.updates.filter((call) =>
+    call.request.agent.spec.config.dynamicSubAgents.enabled === true
+  ).length, commands.length);
+
+  const handoff = await missions.recordHandoff(mission.id, {
+    workItemId: workItem.id,
+    result: "done",
+    summary: "Independent final-state proof completed.",
+    filesChanged: proof.filesChanged,
+    testsRun: proof.checks.map((check) => check.command),
+    diffSummary: proof.diffSummary,
+    checks: proof.checks,
+    evidenceIds: proof.evidenceIds,
+    executionOrigin: proof.executionOrigin,
+  });
+  await missions.transitionWorkItem(mission.id, workItem.id, "ready_for_review");
+  const context = await missions.getReviewContext(mission.id, workItem.id);
+  assert.equal(handoff.result, "done");
+  assert.deepEqual(context.actualFilesChanged, proof.filesChanged);
+  assert.equal(context.evidence.every((evidence) => evidence.source === "sandbox"), true);
+});
+
+test("independent implementation proof rejects out-of-scope final changes before checks", async () => {
+  const repositoryRoot = "./proofboard-demo-fixture";
+  const commands = [
+    IMPLEMENTATION_REPOSITORY_DISCOVERY_COMMAND,
+    `git -C ${repositoryRoot} config --get remote.origin.url`,
+    `git -C ${repositoryRoot} merge-base --is-ancestor ${LOCKED_FIXTURE_SHA} HEAD`,
+    `git -C ${repositoryRoot} status --porcelain=v1 -z --untracked-files=all`,
+    `git -C ${repositoryRoot} diff --no-ext-diff --binary ${LOCKED_FIXTURE_SHA} --`,
+  ];
+  const outputs = [
+    `${repositoryRoot}/.git\n`,
+    "git@github.com:mtamburrano/proofboard-demo-fixture.git\n",
+    "",
+    " M src/index.ts\u0000?? package.json\u0000",
+    "diff --git a/src/index.ts b/src/index.ts\n--- a/src/index.ts\n+++ b/src/index.ts\n@@ -1 +1,2 @@\n before\n+after",
+  ];
+  const { client, calls } = fakeClient((turnId) => {
+    const index = Number(turnId.slice("turn-".length)) - 1;
+    return sandboxEvents(turnId, 0, [], {
+      includeSandboxCreated: false,
+      sandboxArguments: { intent: "Measure one final-state fact.", command: commands[index] },
+      sandboxResult: { success: true, response: { exitCode: 0, result: outputs[index] } },
+    });
+  });
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "google-gemini/test-model",
+    dynamicSubAgents: true,
+  });
+  const mission = await runner.createMission({
+    id: "mission-agentic-out-of-scope",
+    objective: "Reject final changes outside the verified scope.",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_SHA,
+    },
+  });
+  const workItem = await missions.addWorkItem(mission.id, {
+    id: "work-agentic-out-of-scope",
+    title: "Implement only the source helper",
+    purpose: "Keep the completed change inside source scope.",
+    acceptanceCriteria: ["Only src/index.ts changes."],
+    assignedRole: "implementer",
+    requiredChecks: ["typecheck", "test"],
+    allowedFiles: ["src/index.ts"],
+    status: "ready",
+  });
+  await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
+  await missions.attachTrueforgeTurn(mission.id, "turn-agentic-out-of-scope");
+  await missions.attachTrueforgeSandbox(mission.id, "sandbox-agentic-out-of-scope");
+
+  await assert.rejects(
+    runner.proveImplementation({ missionId: mission.id, workItemId: workItem.id }),
+    /outside the allowed scope: package\.json/,
+  );
+  assert.equal(calls.turns.length, commands.length);
+  const state = await missions.getState();
+  assert.equal(state.evidence.some((evidence) =>
+    evidence.workItemId === workItem.id && evidence.source === "sandbox" &&
+    evidence.result === "failed" && /outside the allowed scope/.test(evidence.summary)
+  ), true);
 });
 
 test("sandbox verification persists the command, output summary, and exit status", async () => {
