@@ -109,10 +109,13 @@ final answer is never used as proof.
 The mission adapter uses distinct fail-closed proofs for the delivery fixture.
 Initial inspection requires a correlated GitHub MCP `get_commit` call for the
 immutable `mtamburrano/proofboard-demo-fixture` baseline
-`590aa8a6d72c580f61fc1b19d33e9876bc0feb9b`. Before delivery approval, a second
-read-only call resolves `proofboard-verified-delivery`. Its commit must differ from
-the baseline and contain exactly the verified `src/index.ts` and
-`test/index.test.js` patches. The observed delivery-head SHA is included in the
+`88e53b07691d5ed3d327f5d47179e99c64e672af`. Before delivery approval, a second
+read-only call resolves `proofboard-verified-delivery`. The pinned baseline's
+`full_patch` response must contain the Todo transition in `src/index.ts`
+(`Todo`, `createTodo`, and `getOpenTodos`) and the two focused Todo tests in
+`test/index.test.js`; the former Proof Board/getNextDeliveryStage shape is not
+accepted. The delivery-head commit must differ from the baseline and contain
+the exact approved artifact patches. Its observed SHA is included in the
 approval target, context, and durable delivery evidence; narration, unchanged
 baseline state, or unrelated content cannot satisfy the check.
 

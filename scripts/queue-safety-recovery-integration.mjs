@@ -11,6 +11,8 @@ import {
   PRIMARY_DELIVERY_FIXTURE,
   PRIMARY_DELIVERY_TARGET,
   PRIMARY_MISSION_ID,
+  PRIMARY_VERIFIED_DELIVERY_ARTIFACT,
+  PRIMARY_VERIFIED_DELIVERY_FILES,
   PRIMARY_VERIFIED_DELIVERY_PATCHES,
   PRIMARY_VERIFICATION_COMMAND,
   TrueForgeIntegrationError,
@@ -25,11 +27,13 @@ const FIXED_NOW = () => new Date("2099-01-01T00:00:00.000Z");
 
 function createSharedHarness({
   proofFailuresRemaining = 0,
+  infrastructureFailuresRemaining = 0,
   deliveryHeadShaSequence = [DELIVERY_HEAD_SHA],
   deliveryResultHeadSha = DELIVERY_HEAD_SHA,
 } = {}) {
   return {
     proofFailuresRemaining,
+    infrastructureFailuresRemaining,
     deliveryHeadShaSequence: [...deliveryHeadShaSequence],
     deliveryResultHeadSha,
     calls: {
@@ -163,6 +167,35 @@ class QueueSafetyRunner {
       threadId: `queue-safety-proof-thread-${proofAttempt}`,
       toolCallId: `queue-safety-proof-call-${proofAttempt}`,
     };
+    if (this.shared.infrastructureFailuresRemaining > 0) {
+      this.shared.infrastructureFailuresRemaining -= 1;
+      await this.missions.addEvidence(input.missionId, {
+        workItemId: input.workItemId,
+        kind: "tool_result",
+        result: "failed",
+        source: "sandbox",
+        summary: "The direct proof provider was temporarily unavailable.",
+        details: JSON.stringify({
+          proof_mode: IMPLEMENTATION_PROOF_MODE,
+          failure_layer: "tool",
+          failure_category: "sandbox",
+          failure_class: "infrastructure",
+          failure_reason_category: "network",
+          retryable: true,
+          reason: "provider connection failed",
+        }),
+        executionOrigin: proofOrigin,
+      });
+      throw new TrueForgeIntegrationError(
+        "prove implementation",
+        "Direct proof provider connection failed.",
+        {
+          failureClass: "infrastructure",
+          failureCategory: "network",
+          retryable: true,
+        },
+      );
+    }
     if (this.shared.proofFailuresRemaining > 0) {
       this.shared.proofFailuresRemaining -= 1;
       await this.missions.addEvidence(input.missionId, {
@@ -187,9 +220,37 @@ class QueueSafetyRunner {
 
     const workItem = await this.missions.getWorkItem(input.missionId, input.workItemId);
     const filesChanged = workItem.allowedFiles ?? [];
-    const diffOutput = filesChanged.map((file) =>
-      `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1 +1,2 @@\n before\n+after`
-    ).join("\n");
+    const isPrimaryArtifact = filesChanged.length === Object.keys(PRIMARY_VERIFIED_DELIVERY_FILES).length &&
+      filesChanged.every((file) => Object.prototype.hasOwnProperty.call(PRIMARY_VERIFIED_DELIVERY_FILES, file));
+    const diffOutput = isPrimaryArtifact
+      ? Object.entries(PRIMARY_VERIFIED_DELIVERY_PATCHES).map(([file, patch]) =>
+          `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n${patch}`
+        ).join("\n")
+      : filesChanged.map((file) =>
+          `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1 +1,2 @@\n before\n+after`
+        ).join("\n");
+    const finalFileContents = isPrimaryArtifact
+      ? PRIMARY_VERIFIED_DELIVERY_FILES
+      : Object.fromEntries(filesChanged.map((file) => [file, "before\nafter\n"]));
+    const parsedPatches = isPrimaryArtifact
+      ? PRIMARY_VERIFIED_DELIVERY_PATCHES
+      : Object.fromEntries(filesChanged.map((file) => [file, "@@ -1 +1,2 @@\n before\n+after"]));
+    const status = await this.missions.addEvidence(input.missionId, {
+      workItemId: input.workItemId,
+      kind: "file_change",
+      result: "passed",
+      source: "sandbox",
+      summary: "The direct sandbox proof measured the complete final workspace status.",
+      details: JSON.stringify({
+        proof_mode: IMPLEMENTATION_PROOF_MODE,
+        complete_changed_files: true,
+        command: "git status --porcelain=v1 -z --untracked-files=all",
+        exit_code: 0,
+        changed_files: filesChanged,
+        sandbox_id: SANDBOX_ID,
+      }),
+      executionOrigin: proofOrigin,
+    });
     const diff = await this.missions.addEvidence(input.missionId, {
       workItemId: input.workItemId,
       kind: "diff_summary",
@@ -201,6 +262,21 @@ class QueueSafetyRunner {
         command: "git diff -- src/index.ts test/index.test.js",
         output: diffOutput,
         changed_files: filesChanged,
+        parsed_patches: parsedPatches,
+        final_file_contents: finalFileContents,
+        final_file_content_commands: filesChanged.slice().sort().map((file) => ({
+          file,
+          command: `cat /tmp/proofboard-workspace/${file}`,
+        })),
+        baseline_sha: PRIMARY_DELIVERY_FIXTURE.baselineSha,
+        sandbox_id: SANDBOX_ID,
+        ...(isPrimaryArtifact
+          ? {
+              provenance_kind: "implementation_artifact",
+              artifact_hash: PRIMARY_VERIFIED_DELIVERY_ARTIFACT.contentHash,
+              delivery_artifact: PRIMARY_VERIFIED_DELIVERY_ARTIFACT,
+            }
+          : {}),
       }),
       executionOrigin: proofOrigin,
     });
@@ -215,6 +291,7 @@ class QueueSafetyRunner {
         command: "npm run typecheck",
         exit_code: 0,
         output: "typecheck passed",
+        sandbox_id: SANDBOX_ID,
       }),
       executionOrigin: proofOrigin,
     });
@@ -229,6 +306,7 @@ class QueueSafetyRunner {
         command: PRIMARY_VERIFICATION_COMMAND,
         exit_code: 0,
         output: "all tests passed",
+        sandbox_id: SANDBOX_ID,
       }),
       executionOrigin: proofOrigin,
     });
@@ -253,9 +331,10 @@ class QueueSafetyRunner {
           exitCode: 0,
         },
       ],
-      evidenceIds: [diff.id, typecheck.id, tests.id],
+      evidenceIds: [status.id, diff.id, typecheck.id, tests.id],
       decisions: [],
       openQuestions: [],
+      ...(isPrimaryArtifact ? { deliveryArtifact: PRIMARY_VERIFIED_DELIVERY_ARTIFACT } : {}),
       executionOrigin: proofOrigin,
     };
   }
@@ -311,13 +390,14 @@ class QueueSafetyRunner {
 
   async requestPullRequestApproval(missionId, target) {
     this.shared.calls.requestedApprovals += 1;
+    const artifactDelivery = target.artifact !== undefined;
     return {
       sessionId: SESSION_ID,
       turnId: "queue-safety-approval-turn",
       threadId: "queue-safety-approval-thread",
-      toolCallId: "queue-safety-create-pr-call",
+      toolCallId: artifactDelivery ? "queue-safety-push-files-call" : "queue-safety-create-pr-call",
       serverName: "github",
-      toolName: "create_pull_request",
+      toolName: artifactDelivery ? "push_files" : "create_pull_request",
       target: { ...target },
     };
   }
@@ -350,6 +430,9 @@ class QueueSafetyRunner {
       threadId: pending.threadId,
       toolCallId: pending.toolCallId,
     };
+    if (pending.target.artifact !== undefined) {
+      await this.recordPublishedArtifactReadback(missionId, pending, workItemId);
+    }
     await this.missions.addEvidence(missionId, {
       workItemId,
       kind: "tool_result",
@@ -376,6 +459,47 @@ class QueueSafetyRunner {
       },
     });
     return result;
+  }
+
+  async recordPublishedArtifactReadback(missionId, pending, workItemId) {
+    const artifact = pending.target.artifact;
+    if (artifact === undefined) {
+      return;
+    }
+    const publishedHeadSha = this.shared.deliveryHeadShaSequence[0] ?? DELIVERY_HEAD_SHA;
+    await this.missions.addEvidence(missionId, {
+      workItemId,
+      kind: "tool_result",
+      result: "passed",
+      source: "mcp",
+      summary: `The published artifact branch was independently read back at ${publishedHeadSha}.`,
+      details: JSON.stringify({
+        server: "github",
+        tool: "get_commit",
+        provenance_kind: "delivery_head",
+        arguments: {
+          owner: pending.target.owner,
+          repo: pending.target.repo,
+          sha: pending.target.head,
+          detail: "full_patch",
+          perPage: 100,
+        },
+        repository_owner: pending.target.owner,
+        repository_name: pending.target.repo,
+        requested_ref: pending.target.head,
+        baseline_sha: artifact.baselineSha,
+        uri: `repo://${pending.target.owner}/${pending.target.repo}/sha/${publishedHeadSha}`,
+        commit_sha: publishedHeadSha,
+        patches: artifact.patches,
+        artifact_hash: artifact.contentHash,
+        content_hash: "queue-safety-published-artifact-content",
+      }),
+      executionOrigin: {
+        kind: "mcp",
+        sessionId: pending.sessionId,
+        turnId: "queue-safety-published-artifact-turn",
+      },
+    });
   }
 }
 
@@ -749,6 +873,67 @@ async function runProofFailureScenario(directory) {
   };
 }
 
+async function runProofInfrastructureRetryScenario(directory) {
+  const statePath = path.join(directory, "proof-infrastructure-retry.json");
+  const shared = createSharedHarness({ infrastructureFailuresRemaining: 1 });
+  const first = testApp(new JsonMissionRepository(statePath), shared);
+  const prepared = await preparePendingApprovalButStopAtProof(first.app);
+  const failed = await runMission(first.app);
+  const failedTicket = ticketFor(failed.mission, "implementer");
+  assert.equal(failedTicket.status, "proving");
+  assert.equal(failedTicket.attempt, 1);
+  assert.equal(failed.mission.approvals.length, 0);
+  assert.equal(failed.mission.handoffs.length, 0);
+  assert.equal(failed.mission.reviews.length, 0);
+  assert.equal(shared.calls.turn, 1);
+  assert.equal(shared.calls.proof, 1);
+
+  const failedState = await first.missions.getState();
+  const retryFinding = failedState.evidence.find((item) =>
+    item.workItemId === failedTicket.id &&
+    item.source === "system" &&
+    item.result === "failed" &&
+    JSON.parse(item.details).retryable === true,
+  );
+  assert.ok(retryFinding, "The provider failure must survive as durable retry evidence.");
+  const failedEvidenceCount = failedState.evidence.length;
+
+  const reconnectMissions = new MissionService(new JsonMissionRepository(statePath), FIXED_NOW);
+  const reconnectApp = createMissionHttpApp({
+    missions: reconnectMissions,
+    runner: new QueueSafetyRunner(reconnectMissions, shared),
+    verifier: acceptedVerifier(),
+  });
+  const reconnected = await missionView(reconnectApp);
+  const reconnectedTicket = ticketFor(reconnected, "implementer");
+  assert.equal(reconnectedTicket.status, "proving");
+  assert.equal(reconnectedTicket.claim.trueforgeSessionId, SESSION_ID);
+  assert.equal(reconnectedTicket.claim.trueforgeSandboxId, SANDBOX_ID);
+
+  const recovered = await runMission(reconnectApp);
+  const recoveredTicket = ticketFor(recovered.mission, "implementer");
+  assert.equal(recoveredTicket.status, "awaiting_approval");
+  assert.equal(recoveredTicket.attempt, 1);
+  assert.equal(shared.calls.turn, 1);
+  assert.equal(shared.calls.proof, 2);
+  assert.equal(recovered.mission.handoffs.length, 1);
+  assert.equal(recovered.mission.reviews.length, 1);
+  assert.equal(recovered.mission.approvals.length, 1);
+  const recoveredState = await reconnectMissions.getState();
+  assert.ok(recoveredState.evidence.length > failedEvidenceCount);
+  assert.equal(recoveredState.evidence.some((item) => item.id === retryFinding.id), true);
+
+  return {
+    flow: "proof infrastructure failure → reconnect → Proving retry without coding",
+    status: recoveredTicket.status,
+    attempts: recoveredTicket.attempt,
+    codingTurns: shared.calls.turn,
+    proofCalls: shared.calls.proof,
+    evidencePreserved: true,
+    preparedStatus: prepared.status,
+  };
+}
+
 async function preparePendingApprovalButStopAtProof(app) {
   await createPrimary(app);
   let current = await missionView(app);
@@ -860,7 +1045,7 @@ async function runReadbackMismatchScenario(directory) {
   const prepared = await preparePendingApproval(fixture.app);
   const result = await decide(fixture.app, prepared.approval, "approved");
   assert.equal(result.response.status, 502);
-  assert.match(result.payload.message, /head does not match|delivery/i);
+  assert.match(result.payload.message, /head does not match|published branch|delivery/i);
   assert.equal(result.payload.mission.mission.status, "blocked");
   assert.equal(ticketFor(result.payload.mission, "implementer").status, "blocked");
   assert.equal(result.payload.mission.delivery.length, 0);
@@ -879,6 +1064,7 @@ export async function runQueueSafetyRecoveryIntegration() {
   try {
     const semanticRework = await runSemanticReworkRecoveryScenario(directory);
     const proofFailure = await runProofFailureScenario(directory);
+    const proofInfrastructureRetry = await runProofInfrastructureRetryScenario(directory);
     const staleCorrelation = await runOlderEvidenceAndCurrentFindingScenarios(directory);
     const rejectedApproval = await runRejectedApprovalScenario(directory);
     const readbackMismatch = await runReadbackMismatchScenario(directory);
@@ -886,12 +1072,14 @@ export async function runQueueSafetyRecoveryIntegration() {
       temporaryState: "isolated temporary JSON repositories; removed after the run",
       semanticRework,
       proofFailure,
+      proofInfrastructureRetry,
       staleCorrelation,
       rejectedApproval,
       readbackMismatch,
       remoteMutations: [
         semanticRework.remoteMutations,
         proofFailure.remoteMutations,
+        proofInfrastructureRetry.remoteMutations ?? 0,
         rejectedApproval.remoteMutations,
         readbackMismatch.remoteMutations,
       ].reduce((total, count) => total + count, 0),

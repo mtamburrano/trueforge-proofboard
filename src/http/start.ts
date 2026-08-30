@@ -12,13 +12,14 @@ import { createMissionHttpApp } from "./server.js";
 const { host, port, statePath, baseUrl, model, githubServer } =
   resolveMissionRuntimeConfig(process.env);
 const daytonaApiKey = process.env.DAYTONA_API_KEY?.trim();
+const daytonaApiUrl = process.env.DAYTONA_API_URL?.trim();
 const sandboxExecutor = daytonaApiKey === undefined || daytonaApiKey.length === 0
   ? undefined
   : createDaytonaSandboxExecutor({
       apiKey: daytonaApiKey,
-      ...(process.env.DAYTONA_TOOLBOX_BASE_URL === undefined
+      ...(daytonaApiUrl === undefined || daytonaApiUrl.length === 0
         ? {}
-        : { toolboxBaseUrl: process.env.DAYTONA_TOOLBOX_BASE_URL }),
+        : { apiUrl: daytonaApiUrl }),
     });
 
 const missions = new MissionService(new JsonMissionRepository(statePath));
@@ -40,9 +41,9 @@ const runner = new TrueForgeMissionRunner(
     ...(sandboxExecutor === undefined ? {} : { sandboxExecutor }),
     mcpServers: [{
       name: githubServer,
-      enableTools: ["get_file_contents", "get_commit", "create_pull_request", "pull_request_read", "search_pull_requests"],
-      preloadTools: ["get_file_contents", "get_commit", "create_pull_request", "pull_request_read", "search_pull_requests"],
-      requireApprovalForTools: ["create_pull_request"],
+      enableTools: ["get_file_contents", "get_commit", "push_files", "create_pull_request", "pull_request_read", "search_pull_requests"],
+      preloadTools: ["get_file_contents", "get_commit", "push_files", "create_pull_request", "pull_request_read", "search_pull_requests"],
+      requireApprovalForTools: ["push_files", "create_pull_request"],
     }],
   },
 );
@@ -50,6 +51,7 @@ const app = createMissionHttpApp({
   missions,
   runner,
   semanticVerifier: runner,
+  model,
 });
 
 const server = createMissionNodeServer(app, { host, port });

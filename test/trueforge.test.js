@@ -4,9 +4,12 @@ import test from "node:test";
 import {
   COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
   DEFAULT_TRUEFORGE_ITERATION_LIMIT,
+  deriveWorkGraph,
   InMemoryMissionRepository,
   MAX_TRUEFORGE_ITERATION_LIMIT,
   MissionService,
+  PRIMARY_VERIFIED_DELIVERY_ARTIFACT,
+  PRIMARY_VERIFIED_DELIVERY_FILES,
   PRIMARY_VERIFIED_DELIVERY_PATCHES,
   PRIMARY_SANDBOX_REPOSITORY_ROOT,
   SANDBOX_SETUP_EXEC_LIMIT,
@@ -14,17 +17,21 @@ import {
   SANDBOX_TOOLCHAIN_PROOF_COMMAND,
   SANDBOX_TOOLCHAIN_READINESS_COMMAND,
   SANDBOX_TOOLCHAIN_READINESS_INTENT,
+  TrueForgeIntegrationError,
   TrueForgeMissionRunner,
   buildCoordinatorAgentSpec,
   buildMissionAgentSpec,
   createDaytonaSandboxExecutor,
+  DaytonaSandboxExecutionError,
+  resolveDaytonaSandboxId,
+  verifiedDeliveryArtifactHash,
 } from "../dist/index.js";
 
-const LOCKED_FIXTURE_SHA = "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b";
+const LOCKED_FIXTURE_SHA = "88e53b07691d5ed3d327f5d47179e99c64e672af";
 const LOCKED_FIXTURE_REF = LOCKED_FIXTURE_SHA;
 const VERIFIED_DELIVERY_HEAD_SHA = "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1";
 const SANDBOX_VERIFICATION_INTENT = "Run the requested verification command in the sandbox.";
-const LOCKED_FIXTURE_PATCHES = {
+const LEGACY_LOCKED_FIXTURE_PATCHES = {
   "src/index.ts": [
     "@@ -0,0 +1,11 @@",
     "+export const productName = \"TrueForge Proof Board\" as const;",
@@ -61,6 +68,95 @@ const LOCKED_FIXTURE_PATCHES = {
     "+  );",
     "+});",
   ].join("\n"),
+};
+
+const LOCKED_FIXTURE_PATCHES = {
+  "src/index.ts": [
+    "@@ -1,11 +1,17 @@",
+    "-export const productName = \"TrueForge Proof Board\" as const;",
+    "-",
+    "-export const productThesis = \"Verified autonomous software delivery\" as const;",
+    "-",
+    "-export const deliveryStages = [\"Plan\", \"Execute\", \"Prove\", \"Approve\"] as const;",
+    "-",
+    "-export type DeliveryStage = (typeof deliveryStages)[number];",
+    "+export interface Todo {",
+    "+  id: number;",
+    "+  title: string;",
+    "+  completed: boolean;",
+    "+}",
+    " ",
+    "-export function getProductSummary(): string {",
+    "-  return `${productName}: ${productThesis} — ${deliveryStages.join(\" → \")}`;",
+    "+export function createTodo(id: number, title: string): Todo {",
+    "+  return {",
+    "+    id,",
+    "+    title,",
+    "+    completed: false,",
+    "+  };",
+    " }",
+    "+",
+    "+export function getOpenTodos(todos: readonly Todo[]): Todo[] {",
+    "+  return todos.filter((todo) => !todo.completed);",
+    "+}",
+    "\\ No newline at end of file",
+  ].join("\n"),
+  "test/index.test.js": [
+    "@@ -1,19 +1,25 @@",
+    " import assert from \"node:assert/strict\";",
+    " import test from \"node:test\";",
+    " ",
+    "-import {",
+    "-  deliveryStages,",
+    "-  getProductSummary,",
+    "-  productName,",
+    "-  productThesis,",
+    "-} from \"../dist/index.js\";",
+    "+import { createTodo, getOpenTodos } from \"../dist/index.js\";",
+    " ",
+    "-test(\"exports the product identity and delivery thesis\", () => {",
+    "-  assert.equal(productName, \"TrueForge Proof Board\");",
+    "-  assert.equal(productThesis, \"Verified autonomous software delivery\");",
+    "-  assert.deepEqual(deliveryStages, [\"Plan\", \"Execute\", \"Prove\", \"Approve\"]);",
+    "-  assert.equal(",
+    "-    getProductSummary(),",
+    "-    \"TrueForge Proof Board: Verified autonomous software delivery — Plan → Execute → Prove → Approve\",",
+    "-  );",
+    "+test(\"createTodo creates an open todo\", () => {",
+    "+  assert.deepEqual(createTodo(1, \"Ship the demo\"), {",
+    "+    id: 1,",
+    "+    title: \"Ship the demo\",",
+    "+    completed: false,",
+    "+  });",
+    " });",
+    "+",
+    "+test(\"getOpenTodos returns only incomplete todos\", () => {",
+    "+  const todos = [",
+    "+    createTodo(1, \"Write tests\"),",
+    "+    { ...createTodo(2, \"Record demo\"), completed: true },",
+    "+    createTodo(3, \"Submit project\"),",
+    "+  ];",
+    "+",
+    "+  assert.deepEqual(",
+    "+    getOpenTodos(todos).map((todo) => todo.id),",
+    "+    [1, 3],",
+    "+  );",
+    "+});",
+    "\\ No newline at end of file",
+  ].join("\n"),
+};
+const LOCKED_FIXTURE_LUNA_PATCHES = {
+  "README.md": [
+    "@@ -1,3 +1,3 @@",
+    " # proofboard-demo-fixture",
+    "-The original fixture description.",
+    "+The Todo fixture description.",
+  ].join("\n"),
+  "src/index.ts": LOCKED_FIXTURE_PATCHES["src/index.ts"],
+  "test/index.test.js": LOCKED_FIXTURE_PATCHES["test/index.test.js"].replace(
+    "\\ No newline at end of file",
+    "\\ No newline at end of fi",
+  ),
 };
 
 function fakeEvents(turnId = "turn-1") {
@@ -245,6 +341,7 @@ function lockedCommitEvents(
     responseContent,
     responseCallId = "call-commit",
     attempts,
+    discoveryCalls = [],
     turnState = { status: "done", requiredActions: [] },
   } = {},
 ) {
@@ -256,6 +353,47 @@ function lockedCommitEvents(
     responseContent,
     responseCallId,
   }];
+  const discoveryEvents = discoveryCalls.flatMap((discovery, index) => {
+    const discoveryArguments = JSON.stringify(discovery.argumentsValue ?? {});
+    const argumentSplit = Math.ceil(discoveryArguments.length / 2);
+    const callId = discovery.callId ?? `call-discovery-${index + 1}`;
+    return [
+      {
+        type: "model.message.delta",
+        id: `event-discovery-${index + 1}`,
+        createdAt: "2026-08-26T16:00:01.500Z",
+        threadId: "thread-1",
+        toolCalls: [{
+          index: index + 100,
+          id: callId,
+          function: {
+            name: discovery.name,
+            arguments: discoveryArguments.slice(0, argumentSplit),
+          },
+        }],
+      },
+      {
+        type: "model.message.delta",
+        id: `event-discovery-${index + 1}-arguments`,
+        createdAt: "2026-08-26T16:00:01.750Z",
+        threadId: "thread-1",
+        toolCalls: [{
+          index: index + 100,
+          function: {
+            arguments: discoveryArguments.slice(argumentSplit),
+          },
+        }],
+      },
+      {
+        type: "tool.response",
+        id: `event-discovery-response-${index + 1}`,
+        createdAt: "2026-08-26T16:00:01.900Z",
+        threadId: "thread-1",
+        toolCallId: discovery.responseCallId ?? callId,
+        content: discovery.responseContent ?? JSON.stringify({ isError: false, structuredContent: {} }),
+      },
+    ];
+  });
   const attemptEvents = commitAttempts.flatMap((attempt, index) => {
     const commitArguments = JSON.stringify(attempt.argumentsValue);
     const argumentSplit = Math.ceil(commitArguments.length / 2);
@@ -318,6 +456,7 @@ function lockedCommitEvents(
       threadId: "thread-1",
       mcpServers: [{ name: "github" }],
     },
+    ...discoveryEvents,
     ...attemptEvents,
     {
       type: "turn.done",
@@ -387,6 +526,7 @@ function pullRequestReadbackEvents(
     head = "proofboard-verified-delivery",
     headSha = VERIFIED_DELIVERY_HEAD_SHA,
     includeHeadSha = true,
+    responseContent,
   } = {},
 ) {
   const readback = {
@@ -442,7 +582,7 @@ function pullRequestReadbackEvents(
       createdAt: "2026-08-28T08:01:06.000Z",
       threadId: "thread-readback",
       toolCallId: "call-readback-pr",
-      content: JSON.stringify({
+      content: responseContent ?? JSON.stringify({
         isError: false,
         structuredContent: readback,
       }),
@@ -610,6 +750,251 @@ function deliveryApprovalEvents(turnId, target, readbackOptions = {}) {
   throw new Error(`Unexpected delivery turn ${turnId}.`);
 }
 
+const ARTIFACT_DELIVERY_MESSAGE = "Publish the verified Proof Board delivery artifact";
+
+function artifactDeliveryTarget({ headSha, artifact = PRIMARY_VERIFIED_DELIVERY_ARTIFACT } = {}) {
+  return {
+    owner: "mtamburrano",
+    repo: "proofboard-demo-fixture",
+    base: "main",
+    head: "proofboard-verified-delivery",
+    ...(headSha === undefined ? {} : { headSha }),
+    artifact,
+    title: "Verified fixture delivery",
+    body: "Verified fixture delivery body.",
+  };
+}
+
+function artifactPublicationArguments(target) {
+  return {
+    owner: target.owner,
+    repo: target.repo,
+    branch: target.head,
+    files: Object.entries(target.artifact.files)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([path, content]) => ({ path, content })),
+    message: ARTIFACT_DELIVERY_MESSAGE,
+  };
+}
+
+function artifactApprovalEvents(
+  turnId,
+  target,
+  {
+    publishedHeadSha = VERIFIED_DELIVERY_HEAD_SHA,
+    deliveryHeadPatches = PRIMARY_VERIFIED_DELIVERY_PATCHES,
+    deliveryHeadResponseContent,
+    publicationResponseContent,
+    pullRequestResponseContent,
+    pullRequestReadbackResponseContent,
+    searchItems = [],
+  } = {},
+) {
+  if (turnId === "turn-1") {
+    const toolArguments = artifactPublicationArguments(target);
+    const approval = {
+      type: "tool.approval_required",
+      id: "approval-artifact-publication",
+      createdAt: "2026-08-29T08:00:02.000Z",
+      threadId: "thread-artifact-delivery",
+      toolCalls: [{ id: "call-push-files", sourceEventId: "message-push-files" }],
+    };
+    return [
+      {
+        type: "turn.created",
+        id: "turn-created-artifact-publication",
+        createdAt: "2026-08-29T08:00:00.000Z",
+        turnId,
+        threadId: null,
+      },
+      {
+        type: "mcp.initialize",
+        id: "mcp-artifact-publication",
+        createdAt: "2026-08-29T08:00:00.500Z",
+        threadId: "thread-artifact-delivery",
+        mcpServers: [{ name: "github" }],
+      },
+      {
+        type: "model.message",
+        id: "message-push-files",
+        createdAt: "2026-08-29T08:00:01.000Z",
+        threadId: "thread-artifact-delivery",
+        toolCalls: [{
+          id: "call-push-files",
+          function: { name: "push_files", arguments: JSON.stringify(toolArguments) },
+        }],
+      },
+      approval,
+      {
+        type: "turn.done",
+        id: "turn-paused-artifact-publication",
+        createdAt: "2026-08-29T08:00:03.000Z",
+        threadId: null,
+        state: { status: "done", requiredActions: [approval] },
+      },
+    ];
+  }
+  if (turnId === "turn-2") {
+    return [
+      {
+        type: "turn.created",
+        id: "turn-created-push-files-result",
+        createdAt: "2026-08-29T08:01:00.000Z",
+        turnId,
+        threadId: null,
+      },
+      {
+        type: "tool.response",
+        id: "response-push-files",
+        createdAt: "2026-08-29T08:01:01.000Z",
+        threadId: "thread-artifact-delivery",
+        toolCallId: "call-push-files",
+        content: publicationResponseContent ?? JSON.stringify({
+          isError: false,
+          structuredContent: { commit: { sha: publishedHeadSha } },
+        }),
+      },
+      {
+        type: "turn.done",
+        id: "turn-done-push-files-result",
+        createdAt: "2026-08-29T08:01:02.000Z",
+        threadId: null,
+        state: { status: "done", requiredActions: [] },
+      },
+    ];
+  }
+  if (turnId === "turn-3") {
+    return lockedCommitEvents(turnId, {
+      argumentsValue: {
+        owner: target.owner,
+        repo: target.repo,
+        sha: target.head,
+        detail: "full_patch",
+        perPage: 100,
+      },
+      sha: publishedHeadSha,
+      patches: deliveryHeadPatches,
+      ...(deliveryHeadResponseContent === undefined ? {} : { responseContent: deliveryHeadResponseContent }),
+    });
+  }
+  if (turnId === "turn-4") {
+    const toolArguments = {
+      owner: target.owner,
+      repo: target.repo,
+      base: target.base,
+      head: target.head,
+      title: target.title,
+      body: target.body,
+    };
+    const approval = {
+      type: "tool.approval_required",
+      id: "approval-artifact-pr",
+      createdAt: "2026-08-29T08:03:02.000Z",
+      threadId: "thread-artifact-pr",
+      toolCalls: [{ id: "call-create-artifact-pr", sourceEventId: "message-create-artifact-pr" }],
+    };
+    return [
+      {
+        type: "turn.created",
+        id: "turn-created-artifact-pr",
+        createdAt: "2026-08-29T08:03:00.000Z",
+        turnId,
+        threadId: null,
+      },
+      {
+        type: "mcp.initialize",
+        id: "mcp-artifact-pr",
+        createdAt: "2026-08-29T08:03:00.500Z",
+        threadId: "thread-artifact-pr",
+        mcpServers: [{ name: "github" }],
+      },
+      {
+        type: "model.message",
+        id: "message-create-artifact-pr",
+        createdAt: "2026-08-29T08:03:01.000Z",
+        threadId: "thread-artifact-pr",
+        toolCalls: [{
+          id: "call-create-artifact-pr",
+          function: {
+            name: "create_pull_request",
+            arguments: JSON.stringify(toolArguments),
+          },
+        }],
+      },
+      approval,
+      {
+        type: "turn.done",
+        id: "turn-paused-artifact-pr",
+        createdAt: "2026-08-29T08:03:03.000Z",
+        threadId: null,
+        state: { status: "done", requiredActions: [approval] },
+      },
+    ];
+  }
+  if (turnId === "turn-5") {
+    return [
+      {
+        type: "turn.created",
+        id: "turn-created-artifact-pr-result",
+        createdAt: "2026-08-29T08:04:00.000Z",
+        turnId,
+        threadId: null,
+      },
+      {
+        type: "tool.response",
+        id: "response-artifact-pr",
+        createdAt: "2026-08-29T08:04:01.000Z",
+        threadId: "thread-artifact-pr",
+        toolCallId: "call-create-artifact-pr",
+        content: pullRequestResponseContent ?? JSON.stringify({
+          isError: false,
+          structuredContent: {
+            id: "PR_kwDOArtifact42",
+            url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/42",
+          },
+        }),
+      },
+      {
+        type: "turn.done",
+        id: "turn-done-artifact-pr-result",
+        createdAt: "2026-08-29T08:04:02.000Z",
+        threadId: null,
+        state: { status: "done", requiredActions: [] },
+      },
+    ];
+  }
+  if (turnId === "turn-6") {
+    return pullRequestReadbackEvents(turnId, {
+      owner: target.owner,
+      repo: target.repo,
+      base: target.base,
+      head: target.head,
+      headSha: publishedHeadSha,
+      ...(pullRequestReadbackResponseContent === undefined
+        ? {}
+        : { responseContent: pullRequestReadbackResponseContent }),
+    });
+  }
+  if (turnId === "turn-7") {
+    return pullRequestSearchEvents(turnId, searchItems);
+  }
+  throw new Error(`Unexpected artifact delivery turn ${turnId}.`);
+}
+
+function artifactDeliveryConfig() {
+  return {
+    model: "openai/gpt-5-4-mini",
+    mcpServerName: "github",
+    deliveryToolName: "create_pull_request",
+    mcpServers: [{
+      name: "github",
+      enableTools: ["push_files", "create_pull_request", "get_commit", "pull_request_read", "search_pull_requests"],
+      preloadTools: ["push_files", "create_pull_request", "get_commit", "pull_request_read", "search_pull_requests"],
+      requireApprovalForTools: ["push_files", "create_pull_request"],
+    }],
+  };
+}
+
 function sandboxEvents(
   turnId = "turn-1",
   exitCode = 0,
@@ -741,7 +1126,7 @@ function fakeClient(eventFactory = fakeEvents, { passAgentSpec = false } = {}) {
         const turnCall = { sessionId, request, agentSpec: activeAgentSpec, events: [] };
         calls.turns.push(turnCall);
         const events = passAgentSpec
-          ? eventFactory(turnId, activeAgentSpec)
+          ? eventFactory(turnId, activeAgentSpec, calls.turns.length)
           : eventFactory(turnId);
         turnCall.events = events;
         return fakeStream(events);
@@ -935,8 +1320,8 @@ test("runner creates a TrueForge session and maps safe runtime evidence", async 
 
 test("runner provisions a missing Debian 12 sandbox toolchain before delegated work", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
-  const { client, calls } = fakeClient((turnId, agentSpec) =>
-    agentSpec?.config?.iterationLimit === SANDBOX_SETUP_ITERATION_LIMIT
+  const { client, calls } = fakeClient((turnId, agentSpec, turnNumber) =>
+    turnNumber === 1
       ? sandboxSetupEvents(turnId)
       : sandboxToolchainProofEvents(turnId),
   { passAgentSpec: true });
@@ -996,8 +1381,8 @@ test("bounded sandbox setup accepts a paraphrased exec intent before exact proof
   const missions = new MissionService(new InMemoryMissionRepository());
   const paraphrasedIntent =
     "Provision the sandbox runtime and confirm it is usable before delegated work.";
-  const { client, calls } = fakeClient((turnId, agentSpec) => {
-    if (agentSpec?.config?.iterationLimit === SANDBOX_SETUP_ITERATION_LIMIT) {
+  const { client, calls } = fakeClient((turnId, agentSpec, turnNumber) => {
+    if (turnNumber === 1) {
       assert.equal(agentSpec?.model?.params?.parallel_tool_calls, false);
       return sandboxSetupEvents(turnId, {
         intents: [paraphrasedIntent, paraphrasedIntent],
@@ -1042,8 +1427,8 @@ test("bounded sandbox setup accepts a paraphrased exec intent before exact proof
 
 test("sandbox proof failure blocks without a corrective repair turn and restores the normal agent", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
-  const { client, calls } = fakeClient((turnId, agentSpec) => {
-    if (agentSpec?.config?.iterationLimit === SANDBOX_SETUP_ITERATION_LIMIT) {
+  const { client, calls } = fakeClient((turnId, agentSpec, turnNumber) => {
+    if (turnNumber === 1) {
       return sandboxSetupEvents(turnId);
     }
     return sandboxToolchainProofEvents(turnId, { nodeVersion: "v18.20.4" });
@@ -1127,8 +1512,8 @@ test("bounded setup accepts its four-exec maximum with a separate completion ite
     { length: SANDBOX_SETUP_EXEC_LIMIT },
     (_, index) => `echo setup-${index + 1}`,
   );
-  const { client, calls } = fakeClient((turnId, agentSpec) => {
-    if (agentSpec?.config?.iterationLimit === SANDBOX_SETUP_ITERATION_LIMIT) {
+  const { client, calls } = fakeClient((turnId, agentSpec, turnNumber) => {
+    if (turnNumber === 1) {
       return sandboxSetupEvents(turnId, {
         commands: setupCommands,
         exitCodes: [1, 0, 0, 0],
@@ -1169,8 +1554,8 @@ test("Debian 12 setup guidance recovers from stock Node 18 before independent pr
     "curl -fsSL https://deb.nodesource.com/setup_22.x | bash -",
     "node --version && npm --version",
   ];
-  const { client, calls } = fakeClient((turnId, agentSpec) =>
-    agentSpec?.config?.iterationLimit === SANDBOX_SETUP_ITERATION_LIMIT
+  const { client, calls } = fakeClient((turnId, agentSpec, turnNumber) =>
+    turnNumber === 1
       ? sandboxSetupEvents(turnId, {
           commands: setupCommands,
           exitCodes: [0, 0, 0, 0],
@@ -1234,8 +1619,8 @@ test("coordinator sandbox readiness and verification require root main call and 
 
   for (const [index, fixture] of cases.entries()) {
     const missions = new MissionService(new InMemoryMissionRepository());
-    const { client } = fakeClient((turnId, agentSpec) => fixture.operation === "readiness"
-      ? agentSpec?.config?.iterationLimit === SANDBOX_SETUP_ITERATION_LIMIT
+    const { client } = fakeClient((turnId, agentSpec, turnNumber) => fixture.operation === "readiness"
+      ? turnNumber === 1
         ? sandboxSetupEvents(turnId, fixture.options)
         : sandboxToolchainProofEvents(turnId)
       : sandboxEvents(turnId, 0, [], fixture.options),
@@ -1329,7 +1714,7 @@ test("coordinator sandbox turns are runtime-bounded and stop cleanly after the c
   assert.equal(state.missions[0].trueforgeSessionId, "session-created");
   assert.equal(state.missions[0].trueforgeSandboxId, "sandbox-1");
   const completionEvidence = state.evidence.find((item) =>
-    item.summary.includes("one-iteration sandbox proof boundary"),
+    item.summary.includes("5-iteration sandbox proof boundary"),
   );
   assert.ok(completionEvidence);
   assert.equal(completionEvidence.result, "informational");
@@ -1349,6 +1734,18 @@ test("mission agent specs use a bounded non-twelve default iteration limit", () 
     () => buildMissionAgentSpec({ model: "openai/gpt-5-4-mini", iterationLimit: MAX_TRUEFORGE_ITERATION_LIMIT + 1 }),
     /between 1 and 1024/,
   );
+});
+
+test("final demo coordinator surfaces share a five-iteration bound", () => {
+  assert.equal(COORDINATOR_TRUEFORGE_ITERATION_LIMIT, 5);
+  const config = { model: "openai/gpt-5-4-mini" };
+  for (const surface of ["repository-read", "sandbox-exec", "review"]) {
+    assert.equal(
+      buildCoordinatorAgentSpec(config, surface).config.iterationLimit,
+      COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
+      surface,
+    );
+  }
 });
 
 test("deterministic coordinator policy supports exactly four models without inert tool forcing", () => {
@@ -1693,7 +2090,7 @@ test("pull request delivery pauses one exact TrueForge tool call and resumes onl
     base: "main",
     head: "proofboard-verified-delivery",
     headSha: VERIFIED_DELIVERY_HEAD_SHA,
-    title: "Add the verified delivery-stage helper",
+    title: "Add todo completion support",
     body: "Verified delivery body.",
   };
   const { client, calls } = fakeClient((turnId) =>
@@ -1771,6 +2168,289 @@ test("pull request delivery pauses one exact TrueForge tool call and resumes onl
   assert.equal(JSON.parse(readbackEvidence.details).base, target.base);
   assert.equal(JSON.parse(readbackEvidence.details).head, target.head);
   assert.equal(calls.turns.length, 4);
+});
+
+test("verified artifact delivery pauses the exact push_files publication call", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const target = artifactDeliveryTarget();
+  const { client, calls } = fakeClient((turnId) => artifactApprovalEvents(turnId, target));
+  const runner = new TrueForgeMissionRunner(missions, client, artifactDeliveryConfig());
+  const mission = await runner.createMission({
+    id: "mission-artifact-delivery-approval",
+    objective: "Publish only the verified sandbox artifact",
+    repository: {
+      owner: target.owner,
+      name: target.repo,
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  const pending = await runner.requestPullRequestApproval(mission.id, target);
+
+  assert.deepEqual(pending, {
+    sessionId: "session-created",
+    turnId: "turn-1",
+    threadId: "thread-artifact-delivery",
+    toolCallId: "call-push-files",
+    serverName: "github",
+    toolName: "push_files",
+    target,
+  });
+  const publicationMessage = calls.turns[0].events.find((event) =>
+    event.type === "model.message"
+  );
+  assert.ok(publicationMessage);
+  assert.deepEqual(
+    JSON.parse(publicationMessage.toolCalls[0].function.arguments),
+    artifactPublicationArguments(target),
+  );
+  assert.equal(
+    calls.turns[0].events.some((event) => event.type === "tool.response"),
+    false,
+  );
+  assert.equal(calls.turns.length, 1);
+});
+
+test("approved artifact delivery publishes, independently reads back, then creates and reads the PR", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const target = artifactDeliveryTarget();
+  const { client, calls } = fakeClient((turnId) => artifactApprovalEvents(turnId, target));
+  const runner = new TrueForgeMissionRunner(missions, client, artifactDeliveryConfig());
+  const mission = await runner.createMission({
+    id: "mission-artifact-delivery-approved",
+    objective: "Publish and review the verified sandbox artifact",
+    repository: {
+      owner: target.owner,
+      name: target.repo,
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+  const pending = await runner.requestPullRequestApproval(mission.id, target);
+
+  const delivered = await runner.resolvePullRequestApproval(mission.id, pending, "approved");
+
+  assert.deepEqual(delivered, {
+    number: 42,
+    url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/42",
+    headSha: VERIFIED_DELIVERY_HEAD_SHA,
+    sessionId: "session-created",
+    turnId: "turn-5",
+    threadId: "thread-artifact-delivery",
+    toolCallId: "call-push-files",
+  });
+  assert.equal(calls.turns.length, 6);
+  assert.deepEqual(
+    calls.turns.map((turn) => turn.request.previousTurnId),
+    [undefined, "turn-1", "turn-2", "turn-3", "turn-4", "turn-5"],
+  );
+  assert.equal(calls.turns[1].request.input[0].approval.status, "allow");
+  assert.match(calls.turns[2].request.input[0].content, /get_commit with this exact JSON object/);
+  assert.match(calls.turns[3].request.input[0].content, /create_pull_request exactly once/);
+  assert.match(calls.turns[5].request.input[0].content, /pull_request_read exactly once/);
+  const toolNames = calls.turns.flatMap((turn) => turn.events)
+    .filter((event) => event.type === "model.message" || event.type === "model.message.delta")
+    .flatMap((event) => event.toolCalls ?? [])
+    .map((call) => call.function?.name)
+    .filter((name) => name !== undefined);
+  assert.deepEqual(toolNames, ["push_files", "get_commit", "create_pull_request", "pull_request_read"]);
+  assert.equal(
+    calls.turns[2].events.some((event) => event.type === "tool.response"),
+    true,
+  );
+  const state = await missions.getState();
+  const branchEvidence = state.evidence.find((item) =>
+    item.summary === `MCP verified changed delivery head ${target.head} at ${VERIFIED_DELIVERY_HEAD_SHA}.`
+  );
+  assert.ok(branchEvidence);
+  assert.equal(JSON.parse(branchEvidence.details).artifact_hash, target.artifact.contentHash);
+});
+
+test("approved artifact delivery accepts realistic wrapped provider responses without weakening identities", async () => {
+  const target = artifactDeliveryTarget();
+  const publishedHeadSha = VERIFIED_DELIVERY_HEAD_SHA;
+  const pullRequestRecord = {
+    number: 42,
+    html_url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/42",
+    base: {
+      ref: target.base,
+      repo: { full_name: `${target.owner}/${target.repo}` },
+    },
+    head: {
+      ref: target.head,
+      sha: publishedHeadSha,
+      repo: { full_name: `${target.owner}/${target.repo}` },
+    },
+  };
+  const options = {
+    publicationResponseContent: JSON.stringify({
+      isError: false,
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          object: { type: "commit", sha: publishedHeadSha },
+        }),
+      }],
+    }),
+    deliveryHeadResponseContent: JSON.stringify({
+      isError: false,
+      structuredContent: {
+        sha: publishedHeadSha,
+        files: ["[bounded]", "[bounded]"],
+      },
+    }),
+    pullRequestResponseContent: JSON.stringify({
+      isError: false,
+      structuredContent: {
+        number: 42,
+        url: "https://api.github.com/repos/mtamburrano/proofboard-demo-fixture/pulls/42",
+      },
+    }),
+    pullRequestReadbackResponseContent: JSON.stringify({
+      isError: false,
+      content: [{ type: "text", text: JSON.stringify(pullRequestRecord) }],
+    }),
+  };
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client } = fakeClient((turnId) => artifactApprovalEvents(turnId, target, options));
+  const runner = new TrueForgeMissionRunner(missions, client, artifactDeliveryConfig());
+  const mission = await runner.createMission({
+    id: "mission-artifact-delivery-wrapped-provider-responses",
+    objective: "Publish and verify the exact proof-bound artifact",
+    repository: {
+      owner: target.owner,
+      name: target.repo,
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+  const pending = await runner.requestPullRequestApproval(mission.id, target);
+
+  const delivered = await runner.resolvePullRequestApproval(mission.id, pending, "approved");
+
+  assert.deepEqual(delivered, {
+    number: 42,
+    url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/42",
+    headSha: publishedHeadSha,
+    sessionId: "session-created",
+    turnId: "turn-5",
+    threadId: "thread-artifact-delivery",
+    toolCallId: "call-push-files",
+  });
+  const branchEvidence = (await missions.getState()).evidence.find((item) =>
+    item.summary === `MCP verified changed delivery head ${target.head} at ${publishedHeadSha}.`
+  );
+  assert.ok(branchEvidence);
+  assert.equal(JSON.parse(branchEvidence.details).patch_verification, "content_addressed");
+});
+
+test("artifact delivery fails closed on a mismatched or missing published branch", async () => {
+  const mismatchedPatches = { ...PRIMARY_VERIFIED_DELIVERY_PATCHES };
+  mismatchedPatches["src/index.ts"] += "\n+// unexpected remote change";
+  for (const [label, options, expected] of [
+    [
+      "mismatch",
+      { deliveryHeadPatches: mismatchedPatches },
+      /approved sandbox artifact|exactly match/i,
+    ],
+    [
+      "missing-ref",
+      {
+        deliveryHeadResponseContent: JSON.stringify({
+          isError: true,
+          content: [{ type: "text", text: "404 Not Found: ref does not exist" }],
+        }),
+      },
+      /branch ref was not found|no delivery mutation was replayed/i,
+    ],
+  ]) {
+    const missions = new MissionService(new InMemoryMissionRepository());
+    const target = artifactDeliveryTarget();
+    const { client, calls } = fakeClient((turnId) =>
+      artifactApprovalEvents(turnId, target, options)
+    );
+    const runner = new TrueForgeMissionRunner(missions, client, artifactDeliveryConfig());
+    const mission = await runner.createMission({
+      id: `mission-artifact-delivery-${label}`,
+      objective: "Reject an unverified published artifact",
+      repository: {
+        owner: target.owner,
+        name: target.repo,
+        ref: LOCKED_FIXTURE_REF,
+      },
+    });
+    const pending = await runner.requestPullRequestApproval(mission.id, target);
+
+    await assert.rejects(
+      runner.resolvePullRequestApproval(mission.id, pending, "approved"),
+      expected,
+      label,
+    );
+    assert.equal(calls.turns.length, 3, label);
+    assert.equal(
+      calls.turns.some((turn) => turn.events.some((event) =>
+        (event.type === "model.message" || event.type === "model.message.delta") &&
+        (event.toolCalls ?? []).some((call) => call.function?.name === "create_pull_request")
+      )),
+      false,
+      label,
+    );
+  }
+});
+
+test("artifact reconnect reconciles read-only before creating a PR and never republishes", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const target = artifactDeliveryTarget();
+  const { client, calls } = fakeClient((turnId) => {
+    if (turnId === "turn-2") {
+      return lockedCommitEvents(turnId, {
+        argumentsValue: {
+          owner: target.owner,
+          repo: target.repo,
+          sha: target.head,
+          detail: "full_patch",
+          perPage: 100,
+        },
+        sha: VERIFIED_DELIVERY_HEAD_SHA,
+        patches: PRIMARY_VERIFIED_DELIVERY_PATCHES,
+      });
+    }
+    if (turnId === "turn-3") {
+      return pullRequestSearchEvents(turnId, []);
+    }
+    return artifactApprovalEvents(turnId, target);
+  });
+  const runner = new TrueForgeMissionRunner(missions, client, artifactDeliveryConfig());
+  const mission = await runner.createMission({
+    id: "mission-artifact-delivery-reconnect",
+    objective: "Reconcile an interrupted exact artifact delivery",
+    repository: {
+      owner: target.owner,
+      name: target.repo,
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+  const pending = await runner.requestPullRequestApproval(mission.id, target);
+
+  const result = await runner.reconcilePullRequestApproval(mission.id, pending);
+
+  assert.deepEqual(result, {
+    number: 42,
+    url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/42",
+    headSha: VERIFIED_DELIVERY_HEAD_SHA,
+    sessionId: "session-created",
+    turnId: "turn-5",
+    threadId: "thread-artifact-delivery",
+    toolCallId: "call-push-files",
+  });
+  assert.equal(calls.turns.length, 6);
+  assert.match(calls.turns[1].request.input[0].content, /get_commit with this exact JSON object/);
+  assert.match(calls.turns[2].request.input[0].content, /search_pull_requests exactly once/);
+  assert.match(calls.turns[3].request.input[0].content, /create_pull_request exactly once/);
+  const republished = calls.turns.slice(1).some((turn) => turn.events.some((event) =>
+    (event.type === "model.message" || event.type === "model.message.delta") &&
+    (event.toolCalls ?? []).some((call) => call.function?.name === "push_files")
+  ));
+  assert.equal(republished, false);
 });
 
 test("reconciliation searches read-only and verifies one exact approved pull request", async () => {
@@ -2157,7 +2837,7 @@ test("repository inspection proves the MCP call and returned file resource", asy
   assert.equal(state.missions[0].status, "draft");
 });
 
-test("locked fixture inspection proves direct TrueForge get_commit content and expected patches", async () => {
+test("locked fixture inspection accepts the pinned Todo baseline commit shape", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client, calls } = fakeClient(lockedCommitEvents);
   const runner = new TrueForgeMissionRunner(missions, client, {
@@ -2197,6 +2877,358 @@ test("locked fixture inspection proves direct TrueForge get_commit content and e
   });
   assert.equal(details.commit_sha, LOCKED_FIXTURE_SHA);
   assert.deepEqual(details.patches, LOCKED_FIXTURE_PATCHES);
+});
+
+test("locked fixture inspection accepts schema discovery before canonical get_commit", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client, calls } = fakeClient((turnId, agentSpec) => {
+    assert.equal(agentSpec?.config?.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
+    return lockedCommitEvents(turnId, {
+      discoveryCalls: [{
+        name: "get_tool_output_schema",
+        argumentsValue: {
+          mcp_server: "github",
+          tool_name: "get_commit",
+        },
+      }],
+    });
+  }, { passAgentSpec: true });
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-6-luna",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-mcp-schema-before-commit",
+    objective: "Inspect the pinned repository after harmless MCP schema discovery",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  const inspection = await runner.inspectRepository({ missionId: mission.id });
+
+  assert.equal(inspection.commitSha, LOCKED_FIXTURE_SHA);
+  assert.deepEqual(inspection.patches, LOCKED_FIXTURE_PATCHES);
+  assert.deepEqual(
+    calls.turns[0].events
+      .filter((event) => event.type === "model.message.delta")
+      .flatMap((event) => event.toolCalls ?? [])
+      .map((call) => call.function?.name)
+      .filter((name) => name !== undefined),
+    ["get_tool_output_schema", "get_commit"],
+  );
+  assert.deepEqual(calls.turns[0].agentSpec.mcpServers, [{
+    name: "github",
+    enableTools: ["get_commit"],
+    preload: true,
+  }]);
+});
+
+test("locked fixture inspection accepts the real three-entry bounded commit file shape", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, {
+    responseContent: JSON.stringify({
+      sha: LOCKED_FIXTURE_SHA,
+      files: ["[bounded]", "[bounded]", "[bounded]"],
+    }),
+  }));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-4-mini",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-mcp-bounded-file-shape",
+    objective: "Accept the pinned repository read with bounded file entries",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  const inspection = await runner.inspectRepository({ missionId: mission.id });
+
+  assert.equal(inspection.commitSha, LOCKED_FIXTURE_SHA);
+  assert.deepEqual(inspection.patches, LOCKED_FIXTURE_PATCHES);
+  const state = await missions.getState();
+  const proof = state.evidence.find((item) => item.id === inspection.evidenceId);
+  assert.ok(proof);
+  assert.deepEqual(JSON.parse(proof.details).patches, LOCKED_FIXTURE_PATCHES);
+  assert.equal(JSON.parse(proof.details).patch_verification, "content_addressed");
+});
+
+test("locked fixture inspection accepts Luna-truncated concrete commit patches", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, {
+    responseContent: JSON.stringify({
+      sha: LOCKED_FIXTURE_SHA,
+      files: Object.entries(LOCKED_FIXTURE_LUNA_PATCHES).map(([filename, patch]) => ({
+        filename,
+        patch,
+      })),
+    }),
+  }));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-6-luna",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-mcp-luna-truncated-concrete-patches",
+    objective: "Inspect the pinned repository through the live Luna transport",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  const inspection = await runner.inspectRepository({ missionId: mission.id });
+
+  assert.equal(inspection.commitSha, LOCKED_FIXTURE_SHA);
+  assert.deepEqual(inspection.patches, LOCKED_FIXTURE_PATCHES);
+  const planned = deriveWorkGraph({ mission, inspection });
+  assert.deepEqual(planned.items[1].allowedFiles, ["src/index.ts", "test/index.test.js"]);
+  assert.equal(planned.items[1].allowedFiles.includes("README.md"), false);
+});
+
+test("locked fixture inspection accepts omitted reviewed patches after exact SHA correlation", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, {
+    responseContent: JSON.stringify({
+      isError: false,
+      structuredContent: {
+        sha: LOCKED_FIXTURE_SHA,
+        files: [
+          { filename: "README.md", patch: "[bounded]" },
+          { filename: "src/index.ts" },
+          "[bounded]",
+        ],
+      },
+    }),
+  }));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-6-luna",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-mcp-omitted-reviewed-patches",
+    objective: "Inspect the exact pinned repository with transport-degraded patch detail",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  const inspection = await runner.inspectRepository({ missionId: mission.id });
+
+  assert.equal(inspection.commitSha, LOCKED_FIXTURE_SHA);
+  assert.deepEqual(inspection.patches, LOCKED_FIXTURE_PATCHES);
+  const proof = (await missions.getState()).evidence.find((item) =>
+    item.id === inspection.evidenceId
+  );
+  assert.ok(proof);
+  assert.equal(JSON.parse(proof.details).patch_verification, "content_addressed");
+  const planned = deriveWorkGraph({ mission, inspection });
+  assert.deepEqual(planned.items[1].allowedFiles, ["src/index.ts", "test/index.test.js"]);
+});
+
+test("locked fixture inspection rejects a contradictory visible concrete patch prefix", async () => {
+  const contradictoryPatches = {
+    ...LOCKED_FIXTURE_LUNA_PATCHES,
+    "test/index.test.js": LOCKED_FIXTURE_LUNA_PATCHES["test/index.test.js"].replace(
+      'import { createTodo, getOpenTodos } from "../dist/index.js";',
+      'import { forgedTodo } from "../dist/index.js";',
+    ),
+  };
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, {
+    responseContent: JSON.stringify({
+      sha: LOCKED_FIXTURE_SHA,
+      files: Object.entries(contradictoryPatches).map(([filename, patch]) => ({
+        filename,
+        patch,
+      })),
+    }),
+  }));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-6-luna",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-mcp-luna-contradictory-concrete-patch",
+    objective: "Reject a contradictory pinned repository patch",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  await assert.rejects(
+    runner.inspectRepository({ missionId: mission.id }),
+    /get_commit MCP response did not contain the pinned SHA and expected file patches/,
+  );
+  assert.equal((await missions.getMission(mission.id)).status, "blocked");
+});
+
+test("locked fixture inspection rejects nested contradictions even when a wrapper exposes the pinned SHA first", async () => {
+  const contradictoryPatch = LOCKED_FIXTURE_PATCHES["src/index.ts"].replace(
+    "+    completed: false,",
+    "+    completed: true,",
+  );
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, {
+    responseContent: JSON.stringify({
+      sha: LOCKED_FIXTURE_SHA,
+      structuredContent: {
+        files: [{ filename: "src/index.ts", patch: contradictoryPatch }],
+      },
+    }),
+  }));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-6-luna",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-mcp-nested-contradictory-patch",
+    objective: "Reject concrete contradictions across provider wrapper levels",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  await assert.rejects(
+    runner.inspectRepository({ missionId: mission.id }),
+    /get_commit MCP response did not contain the pinned SHA and expected file patches/,
+  );
+  assert.equal((await missions.getMission(mission.id)).status, "blocked");
+});
+
+test("bounded locked fixture reads still reject a wrong SHA or uncorrelated response", async () => {
+  const boundedFiles = ["[bounded]", "[bounded]", "[bounded]"];
+  const cases = [
+    {
+      label: "wrong SHA",
+      options: {
+        responseContent: JSON.stringify({
+          sha: "0000000000000000000000000000000000000000",
+          files: boundedFiles,
+        }),
+      },
+      error: /get_commit MCP response did not contain the pinned SHA and expected file patches/,
+    },
+    {
+      label: "uncorrelated response",
+      options: {
+        responseCallId: "different-call",
+        responseContent: JSON.stringify({ sha: LOCKED_FIXTURE_SHA, files: boundedFiles }),
+      },
+      error: /get_commit MCP call has no structured response/,
+    },
+  ];
+
+  for (const fixture of cases) {
+    const missions = new MissionService(new InMemoryMissionRepository());
+    const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, fixture.options));
+    const runner = new TrueForgeMissionRunner(missions, client, {
+      model: "openai/gpt-5-4-mini",
+      mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+    });
+    const mission = await runner.createMission({
+      id: `mission-mcp-bounded-${fixture.label.replaceAll(" ", "-")}`,
+      objective: `Reject a bounded repository read with ${fixture.label}`,
+      repository: {
+        owner: "mtamburrano",
+        name: "proofboard-demo-fixture",
+        ref: LOCKED_FIXTURE_REF,
+      },
+    });
+
+    await assert.rejects(runner.inspectRepository({ missionId: mission.id }), fixture.error, fixture.label);
+    assert.equal((await missions.getMission(mission.id)).status, "blocked", fixture.label);
+  }
+});
+
+test("locked fixture inspection rejects extra MCP servers and cross-thread responses", async () => {
+  const cases = [
+    {
+      label: "extra initialized MCP server",
+      mutate(events) {
+        events.find((event) => event.type === "mcp.initialize").mcpServers.push({
+          name: "untrusted-github",
+        });
+      },
+      error: /Only the configured MCP server github may be initialized/,
+    },
+    {
+      label: "cross-thread response",
+      mutate(events) {
+        events.find((event) => event.type === "tool.response").threadId = "thread-other";
+      },
+      error: /get_commit MCP call has no structured response/,
+    },
+  ];
+
+  for (const fixture of cases) {
+    const missions = new MissionService(new InMemoryMissionRepository());
+    const { client } = fakeClient((turnId) => {
+      const events = lockedCommitEvents(turnId);
+      fixture.mutate(events);
+      return events;
+    });
+    const runner = new TrueForgeMissionRunner(missions, client, {
+      model: "openai/gpt-5-4-mini",
+      mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+    });
+    const mission = await runner.createMission({
+      id: `mission-mcp-correlation-${fixture.label.replaceAll(" ", "-")}`,
+      objective: `Reject ${fixture.label}`,
+      repository: {
+        owner: "mtamburrano",
+        name: "proofboard-demo-fixture",
+        ref: LOCKED_FIXTURE_REF,
+      },
+    });
+
+    await assert.rejects(runner.inspectRepository({ missionId: mission.id }), fixture.error);
+    assert.equal((await missions.getMission(mission.id)).status, "blocked");
+  }
+});
+
+test("locked fixture inspection rejects the old Proof Board fixture shape", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, {
+    patches: LEGACY_LOCKED_FIXTURE_PATCHES,
+  }));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-4-mini",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-mcp-legacy-fixture-rejected",
+    objective: "Reject the old repository fixture shape",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  await assert.rejects(
+    runner.inspectRepository({ missionId: mission.id }),
+    /get_commit MCP response did not contain the pinned SHA and expected file patches/,
+  );
+  const state = await missions.getState();
+  assert.equal(state.missions[0].status, "blocked");
+  assert.equal(
+    state.evidence.some((item) => item.source === "mcp" && item.result === "passed"),
+    false,
+  );
 });
 
 test("locked fixture inspection accepts safe page-one pagination after an iteration-limit stop", async () => {
@@ -2267,6 +3299,37 @@ test("locked fixture inspection accepts safe page-one pagination after an iterat
   assert.deepEqual(JSON.parse(proof.details).patches, LOCKED_FIXTURE_PATCHES);
 });
 
+test("coordinator accepts a top-level iteration-limit completion after the canonical response", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client } = fakeClient((turnId) => {
+    const events = lockedCommitEvents(turnId);
+    const done = events.at(-1);
+    delete done.state;
+    done.status = "error";
+    done.error = "Maximum iteration limit of 1 reached after tool completion";
+    done.required_actions = [];
+    return events;
+  });
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-4-mini",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-mcp-top-level-iteration-completion",
+    objective: "Accept the canonical read despite provider completion flattening",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  const inspection = await runner.inspectRepository({ missionId: mission.id });
+
+  assert.equal(inspection.commitSha, LOCKED_FIXTURE_SHA);
+  assert.equal((await missions.getMission(mission.id)).status, "draft");
+});
+
 test("locked fixture inspection rejects unsafe page pagination and unrelated arguments", async () => {
   const cases = [
     {
@@ -2290,6 +3353,45 @@ test("locked fixture inspection rejects unsafe page pagination and unrelated arg
         page: 1,
         perPage: 100,
         path: "src/index.ts",
+      },
+    },
+    {
+      label: "abbreviated SHA",
+      argumentsValue: {
+        owner: "mtamburrano",
+        repo: "proofboard-demo-fixture",
+        sha: LOCKED_FIXTURE_SHA.slice(0, 12),
+        detail: "full_patch",
+        perPage: 100,
+      },
+    },
+    {
+      label: "ref alias",
+      argumentsValue: {
+        owner: "mtamburrano",
+        repo: "proofboard-demo-fixture",
+        ref: LOCKED_FIXTURE_SHA,
+        detail: "full_patch",
+        perPage: 100,
+      },
+    },
+    {
+      label: "missing full patch detail",
+      argumentsValue: {
+        owner: "mtamburrano",
+        repo: "proofboard-demo-fixture",
+        sha: LOCKED_FIXTURE_SHA,
+        perPage: 100,
+      },
+    },
+    {
+      label: "noncanonical page size",
+      argumentsValue: {
+        owner: "mtamburrano",
+        repo: "proofboard-demo-fixture",
+        sha: LOCKED_FIXTURE_SHA,
+        detail: "full_patch",
+        perPage: 50,
       },
     },
   ];
@@ -2578,6 +3680,162 @@ test("delivery-head inspection accepts a changed commit with the verified implem
   assert.equal(details.commit_sha, headSha);
 });
 
+test("delivery-head inspection accepts schema discovery before canonical get_commit", async () => {
+  const headSha = "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1";
+  const target = {
+    owner: "mtamburrano",
+    repo: "proofboard-demo-fixture",
+    base: "main",
+    head: "proofboard-verified-delivery",
+    title: "Verified fixture delivery",
+    body: "Verified fixture delivery body.",
+  };
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client, calls } = fakeClient((turnId, agentSpec) => {
+    assert.equal(agentSpec?.config?.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
+    return lockedCommitEvents(turnId, {
+      discoveryCalls: [{
+        name: "get_tool_output_schema",
+        argumentsValue: {
+          mcp_server: "github",
+          tool_name: "get_commit",
+        },
+      }],
+      argumentsValue: {
+        owner: target.owner,
+        repo: target.repo,
+        sha: target.head,
+        detail: "full_patch",
+        perPage: 100,
+      },
+      sha: headSha,
+      patches: PRIMARY_VERIFIED_DELIVERY_PATCHES,
+    });
+  }, { passAgentSpec: true });
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-6-luna",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-delivery-head-schema-before-commit",
+    objective: "Verify the delivery head after harmless MCP schema discovery",
+    repository: {
+      owner: target.owner,
+      name: target.repo,
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  const inspection = await runner.inspectDeliveryHead({ missionId: mission.id, target });
+
+  assert.equal(inspection.commitSha, headSha);
+  assert.deepEqual(inspection.patches, PRIMARY_VERIFIED_DELIVERY_PATCHES);
+  assert.deepEqual(
+    calls.turns[0].events
+      .filter((event) => event.type === "model.message.delta")
+      .flatMap((event) => event.toolCalls ?? [])
+      .map((call) => call.function?.name)
+      .filter((name) => name !== undefined),
+    ["get_tool_output_schema", "get_commit"],
+  );
+});
+
+test("delivery-head inspection accepts wrapped truncated patches only for the exact push_files SHA", async () => {
+  const headSha = "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1";
+  const target = artifactDeliveryTarget({ headSha });
+  const wrappedCommit = {
+    sha: headSha,
+    files: [
+      {
+        filename: "src/index.ts",
+        patch: PRIMARY_VERIFIED_DELIVERY_PATCHES["src/index.ts"].slice(0, 180),
+      },
+      { filename: "test/index.test.js" },
+    ],
+  };
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, {
+    argumentsValue: {
+      owner: target.owner,
+      repo: target.repo,
+      sha: target.head,
+      detail: "full_patch",
+      perPage: 100,
+    },
+    responseContent: JSON.stringify({
+      isError: false,
+      content: [{ type: "text", text: JSON.stringify(wrappedCommit) }],
+    }),
+  }));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-6-luna",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-delivery-head-content-addressed",
+    objective: "Verify the exact content-addressed push_files result",
+    repository: {
+      owner: target.owner,
+      name: target.repo,
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  const inspection = await runner.inspectDeliveryHead({ missionId: mission.id, target });
+
+  assert.equal(inspection.commitSha, headSha);
+  assert.deepEqual(inspection.patches, PRIMARY_VERIFIED_DELIVERY_PATCHES);
+  const proof = (await missions.getState()).evidence.find((item) =>
+    item.id === inspection.evidenceId
+  );
+  assert.ok(proof);
+  assert.equal(JSON.parse(proof.details).patch_verification, "content_addressed");
+});
+
+test("delivery-head inspection rejects nested contradictions despite an exact push_files SHA wrapper", async () => {
+  const headSha = "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1";
+  const target = artifactDeliveryTarget({ headSha });
+  const contradictoryPatch = PRIMARY_VERIFIED_DELIVERY_PATCHES["src/index.ts"].replace(
+    "+  return deliveryStages[index + 1] ?? null;",
+    "+  return deliveryStages[index] ?? null;",
+  );
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, {
+    argumentsValue: {
+      owner: target.owner,
+      repo: target.repo,
+      sha: target.head,
+      detail: "full_patch",
+      perPage: 100,
+    },
+    responseContent: JSON.stringify({
+      sha: headSha,
+      structuredContent: {
+        files: [{ filename: "src/index.ts", patch: contradictoryPatch }],
+      },
+    }),
+  }));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-6-luna",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-delivery-head-nested-contradiction",
+    objective: "Reject a contradicted proof-bound published head",
+    repository: {
+      owner: target.owner,
+      name: target.repo,
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  await assert.rejects(
+    runner.inspectDeliveryHead({ missionId: mission.id, target }),
+    /Delivery head must differ from the unchanged baseline and exactly match the approved implementation artifact/,
+  );
+  assert.equal((await missions.getMission(mission.id)).status, "blocked");
+});
+
 test("delivery-head inspection rejects the unchanged baseline and mismatched content", async () => {
   const target = {
     owner: "mtamburrano",
@@ -2632,7 +3890,7 @@ test("delivery-head inspection rejects the unchanged baseline and mismatched con
 
     await assert.rejects(
       runner.inspectDeliveryHead({ missionId: mission.id, target }),
-      /Delivery head must differ from the baseline and exactly match the verified implementation patches/,
+      /Delivery head must differ from the unchanged baseline and exactly match the approved implementation artifact/,
       fixture.label,
     );
     assert.equal((await missions.getMission(mission.id)).status, "blocked");
@@ -2686,7 +3944,7 @@ test("locked fixture inspection rejects a corrective retry after a non-canonical
 
   await assert.rejects(
     runner.inspectRepository({ missionId: mission.id }),
-    /Expected exactly one canonical get_commit MCP call, found 2/,
+    /unsupported non-canonical tool call: get_commit/,
   );
   const state = await missions.getState();
   assert.equal(state.missions[0].status, "blocked");
@@ -3029,6 +4287,8 @@ test("independent implementation proof measures final facts after normal agentic
     `git -C ${repositoryRoot} merge-base --is-ancestor ${LOCKED_FIXTURE_SHA} HEAD`,
     `git -C ${repositoryRoot} status --porcelain=v1 -z --untracked-files=all`,
     `git -C ${repositoryRoot} diff --no-ext-diff --binary ${LOCKED_FIXTURE_SHA} --`,
+    `cat ${repositoryRoot}/src/index.ts`,
+    `cat ${repositoryRoot}/test/index.test.js`,
     `npm --prefix ${repositoryRoot} run typecheck`,
     `npm --prefix ${repositoryRoot} test`,
   ];
@@ -3050,6 +4310,8 @@ test("independent implementation proof measures final facts after normal agentic
       " before",
       "+after",
     ].join("\n"),
+    "before\nafter\n",
+    "before\nafter\n",
     "typecheck passed\n",
     "tests passed\n",
   ];
@@ -3125,6 +4387,305 @@ test("independent implementation proof measures final facts after normal agentic
   assert.equal(context.evidence.every((evidence) => evidence.source === "sandbox"), true);
 });
 
+test("same-sandbox artifact capture builds a content-bearing artifact for a scoped untracked file", async () => {
+  const repositoryRoot = PRIMARY_SANDBOX_REPOSITORY_ROOT;
+  const file = "docs/notes/naïve draft.txt";
+  const content = "A newly captured proof file.\n";
+  const commands = [
+    `git -C ${repositoryRoot} config --get remote.origin.url`,
+    `git -C ${repositoryRoot} status --porcelain=v1 -z --untracked-files=all`,
+    `git -C ${repositoryRoot} diff --no-ext-diff --binary ${LOCKED_FIXTURE_SHA} --`,
+    `cat '${repositoryRoot}/${file}'`,
+  ];
+  const outputs = [
+    "https://github.com/mtamburrano/proofboard-demo-fixture.git\n",
+    `?? ${file}\u0000`,
+    "",
+    content,
+  ];
+  const { client, calls } = fakeClient();
+  const sandboxExecutor = fakeSandboxExecutor(commands, outputs, "sandbox-untracked-proof");
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-4-mini",
+    sandboxExecutor,
+  });
+  const mission = await runner.createMission({
+    id: "mission-untracked-artifact",
+    objective: "Capture a scoped newly created file.",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_SHA,
+    },
+  });
+  const workItem = await missions.addWorkItem(mission.id, {
+    id: "work-untracked-artifact",
+    title: "Capture the new proof file",
+    purpose: "Keep a newly created file inside the approved scope.",
+    acceptanceCriteria: ["The new file is represented by final content and a content-bearing patch."],
+    assignedRole: "implementer",
+    requiredChecks: ["typecheck", "test"],
+    allowedFiles: [file],
+    status: "backlog",
+  });
+  await missions.attachTrueforgeSession(mission.id, "session-untracked-artifact");
+  await missions.attachTrueforgeTurn(mission.id, "turn-untracked-artifact");
+  await missions.attachTrueforgeSandbox(mission.id, "sandbox-untracked-proof");
+  await missions.authorizeWorkItem(mission.id, workItem.id, { actor: "test-operator" });
+  await missions.claimReadyWorkItem(mission.id, workItem.id, {
+    owner: "test-worker",
+    trueforgeSessionId: "session-untracked-artifact",
+    trueforgeSandboxId: "sandbox-untracked-proof",
+  });
+
+  const proof = await runner.captureImplementationArtifact({
+    missionId: mission.id,
+    workItemId: workItem.id,
+  });
+
+  assert.deepEqual(proof.filesChanged, [file]);
+  assert.equal(proof.deliveryArtifact.files[file], content);
+  assert.match(proof.deliveryArtifact.patches[file], /\+A newly captured proof file\./);
+  assert.match(proof.diffSummary, /diff --git "a\/docs\/notes\/naïve draft\.txt"/);
+  assert.equal(sandboxExecutor.calls.length, commands.length);
+  assert.deepEqual(sandboxExecutor.calls.map((call) => call.command), commands);
+  assert.equal(calls.turns.length, 0);
+});
+
+test("independent implementation proof rejects deletion before final-content capture", async () => {
+  const repositoryRoot = PRIMARY_SANDBOX_REPOSITORY_ROOT;
+  const commands = [
+    `git -C ${repositoryRoot} config --get remote.origin.url`,
+    `git -C ${repositoryRoot} merge-base --is-ancestor ${LOCKED_FIXTURE_SHA} HEAD`,
+    `git -C ${repositoryRoot} status --porcelain=v1 -z --untracked-files=all`,
+  ];
+  const outputs = [
+    "https://github.com/mtamburrano/proofboard-demo-fixture.git\n",
+    "",
+    " D src/index.ts\u0000",
+  ];
+  const { client, calls } = fakeClient();
+  const sandboxExecutor = fakeSandboxExecutor(commands, outputs, "sandbox-deletion-proof");
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-4-mini",
+    sandboxExecutor,
+  });
+  const mission = await runner.createMission({
+    id: "mission-deletion-artifact",
+    objective: "Reject an unsupported deleted file.",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_SHA,
+    },
+  });
+  const workItem = await missions.addWorkItem(mission.id, {
+    id: "work-deletion-artifact",
+    title: "Reject deleted publication content",
+    purpose: "Do not represent unsupported deletion as a captured file.",
+    acceptanceCriteria: ["Deletion is rejected before final-content capture."],
+    assignedRole: "implementer",
+    requiredChecks: ["typecheck", "test"],
+    allowedFiles: ["src/index.ts"],
+    status: "ready",
+  });
+  await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
+  await missions.attachTrueforgeTurn(mission.id, "turn-deletion-artifact");
+  await missions.attachTrueforgeSandbox(mission.id, "sandbox-deletion-proof");
+
+  await assert.rejects(
+    runner.proveImplementation({ missionId: mission.id, workItemId: workItem.id }),
+    (error) => error instanceof TrueForgeIntegrationError &&
+      error.retryable === false &&
+      error.failureClass === "implementation" &&
+      error.failureCategory === "verification" &&
+      /unsupported deleted files before final-content capture/.test(error.message),
+  );
+  assert.equal(calls.turns.length, 0);
+  assert.deepEqual(sandboxExecutor.calls.map((call) => call.command), commands);
+  const state = await missions.getState();
+  const failure = state.evidence.find((evidence) => evidence.result === "failed");
+  assert.ok(failure);
+  const details = JSON.parse(failure.details);
+  assert.equal(details.failure_class, "implementation");
+  assert.equal(details.retryable, false);
+  assert.equal(details.measurements.length, commands.length);
+  assert.equal(details.measurements.some((measurement) => measurement.command.startsWith("cat ")), false);
+});
+
+test("independent implementation proof captures a safe space-and-Unicode path", async () => {
+  const repositoryRoot = PRIMARY_SANDBOX_REPOSITORY_ROOT;
+  const file = "docs/notes/café menu.txt";
+  const content = "before\nafter\n";
+  const gitQuotedFile = "docs/notes/caf\\303\\251 menu.txt";
+  const diffOutput = [
+    `diff --git "a/${gitQuotedFile}" "b/${gitQuotedFile}"`,
+    `--- "a/${gitQuotedFile}"`,
+    `+++ "b/${gitQuotedFile}"`,
+    "@@ -1 +1,2 @@",
+    " before",
+    "+after",
+  ].join("\n");
+  const commands = [
+    `git -C ${repositoryRoot} config --get remote.origin.url`,
+    `git -C ${repositoryRoot} merge-base --is-ancestor ${LOCKED_FIXTURE_SHA} HEAD`,
+    `git -C ${repositoryRoot} status --porcelain=v1 -z --untracked-files=all`,
+    `git -C ${repositoryRoot} diff --no-ext-diff --binary ${LOCKED_FIXTURE_SHA} --`,
+    `cat '${repositoryRoot}/${file}'`,
+    `npm --prefix ${repositoryRoot} run typecheck`,
+    `npm --prefix ${repositoryRoot} test`,
+  ];
+  const outputs = [
+    "https://github.com/mtamburrano/proofboard-demo-fixture.git\n",
+    "",
+    ` M ${file}\u0000`,
+    diffOutput,
+    content,
+    "typecheck passed\n",
+    "tests passed\n",
+  ];
+  const { client, calls } = fakeClient();
+  const sandboxExecutor = fakeSandboxExecutor(commands, outputs, "sandbox-safe-path-proof");
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-4-mini",
+    sandboxExecutor,
+  });
+  const mission = await runner.createMission({
+    id: "mission-safe-path-artifact",
+    objective: "Capture a safe repository path with spaces and Unicode.",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_SHA,
+    },
+  });
+  const workItem = await missions.addWorkItem(mission.id, {
+    id: "work-safe-path-artifact",
+    title: "Capture the safe path",
+    purpose: "Keep a valid repository-relative path shell-safe during capture.",
+    acceptanceCriteria: ["The final content command accepts the approved path."],
+    assignedRole: "implementer",
+    requiredChecks: ["typecheck", "test"],
+    allowedFiles: [file],
+    status: "ready",
+  });
+  await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
+  await missions.attachTrueforgeTurn(mission.id, "turn-safe-path-artifact");
+  await missions.attachTrueforgeSandbox(mission.id, "sandbox-safe-path-proof");
+
+  const proof = await runner.proveImplementation({
+    missionId: mission.id,
+    workItemId: workItem.id,
+  });
+
+  assert.deepEqual(proof.filesChanged, [file]);
+  assert.equal(proof.deliveryArtifact.files[file], content);
+  assert.equal(sandboxExecutor.calls[4]?.command, `cat '${repositoryRoot}/${file}'`);
+  assert.equal(proof.deliveryArtifact.patches[file], "@@ -1 +1,2 @@\n before\n+after");
+  assert.equal(calls.turns.length, 0);
+});
+
+test("direct sandbox proof derives distinct artifacts from distinct final file contents", async () => {
+  const repositoryRoot = PRIMARY_SANDBOX_REPOSITORY_ROOT;
+  const fixtureSnapshot = {
+    files: structuredClone(PRIMARY_VERIFIED_DELIVERY_FILES),
+    patches: structuredClone(PRIMARY_VERIFIED_DELIVERY_PATCHES),
+    artifact: structuredClone(PRIMARY_VERIFIED_DELIVERY_ARTIFACT),
+  };
+  const hashes = [];
+
+  for (const [index, variant] of ["alpha", "beta"].entries()) {
+    const files = {
+      "src/index.ts": `export const deliveryVariant = "${variant}";\n`,
+      "test/index.test.js": `assert.equal(deliveryVariant, "${variant}");\n`,
+    };
+    const patches = {
+      "src/index.ts": `@@ -1 +1 @@\n-export const deliveryVariant = "baseline";\n+export const deliveryVariant = "${variant}";`,
+      "test/index.test.js": `@@ -1 +1 @@\n-assert.equal(deliveryVariant, "baseline");\n+assert.equal(deliveryVariant, "${variant}");`,
+    };
+    const diffOutput = Object.entries(patches).map(([file, patch]) =>
+      `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n${patch}`
+    ).join("\n");
+    const commands = [
+      `git -C ${repositoryRoot} config --get remote.origin.url`,
+      `git -C ${repositoryRoot} merge-base --is-ancestor ${LOCKED_FIXTURE_SHA} HEAD`,
+      `git -C ${repositoryRoot} status --porcelain=v1 -z --untracked-files=all`,
+      `git -C ${repositoryRoot} diff --no-ext-diff --binary ${LOCKED_FIXTURE_SHA} --`,
+      `cat ${repositoryRoot}/src/index.ts`,
+      `cat ${repositoryRoot}/test/index.test.js`,
+      `npm --prefix ${repositoryRoot} run typecheck`,
+      `npm --prefix ${repositoryRoot} test`,
+    ];
+    const outputs = [
+      "https://github.com/mtamburrano/proofboard-demo-fixture.git\n",
+      "",
+      " M src/index.ts\u0000 M test/index.test.js\u0000",
+      diffOutput,
+      files["src/index.ts"],
+      files["test/index.test.js"],
+      "typecheck passed\n",
+      "tests passed\n",
+    ];
+    const { client, calls } = fakeClient();
+    const sandboxExecutor = fakeSandboxExecutor(
+      commands,
+      outputs,
+      `sandbox-dynamic-${index}`,
+    );
+    const missions = new MissionService(new InMemoryMissionRepository());
+    const runner = new TrueForgeMissionRunner(missions, client, {
+      model: "openai/gpt-5-4-mini",
+      dynamicSubAgents: true,
+      sandboxExecutor,
+    });
+    const mission = await runner.createMission({
+      id: `mission-dynamic-proof-${variant}`,
+      objective: "Derive a delivery artifact from current sandbox facts.",
+      repository: {
+        owner: "mtamburrano",
+        name: "proofboard-demo-fixture",
+        ref: LOCKED_FIXTURE_SHA,
+      },
+    });
+    const workItem = await missions.addWorkItem(mission.id, {
+      id: `work-dynamic-proof-${variant}`,
+      title: "Measure the current implementation",
+      purpose: "Capture the exact bounded implementation artifact.",
+      acceptanceCriteria: ["The artifact contains the measured files and contents."],
+      assignedRole: "implementer",
+      requiredChecks: ["typecheck", "test"],
+      allowedFiles: ["src/index.ts", "test/index.test.js"],
+      status: "ready",
+    });
+    await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
+    await missions.attachTrueforgeTurn(mission.id, `turn-dynamic-proof-${variant}`);
+    await missions.attachTrueforgeSandbox(mission.id, `sandbox-dynamic-${index}`);
+
+    const proof = await runner.proveImplementation({
+      missionId: mission.id,
+      workItemId: workItem.id,
+    });
+    const expectedHash = verifiedDeliveryArtifactHash(LOCKED_FIXTURE_SHA, files, patches);
+    assert.deepEqual(proof.deliveryArtifact, {
+      baselineSha: LOCKED_FIXTURE_SHA,
+      files,
+      patches,
+      contentHash: expectedHash,
+    });
+    assert.deepEqual(proof.filesChanged, ["src/index.ts", "test/index.test.js"]);
+    assert.equal(calls.turns.length, 0);
+    hashes.push(expectedHash);
+  }
+
+  assert.notEqual(hashes[0], hashes[1]);
+  assert.deepEqual(PRIMARY_VERIFIED_DELIVERY_FILES, fixtureSnapshot.files);
+  assert.deepEqual(PRIMARY_VERIFIED_DELIVERY_PATCHES, fixtureSnapshot.patches);
+  assert.deepEqual(PRIMARY_VERIFIED_DELIVERY_ARTIFACT, fixtureSnapshot.artifact);
+});
+
 test("independent implementation proof rejects out-of-scope final changes before checks", async () => {
   const repositoryRoot = PRIMARY_SANDBOX_REPOSITORY_ROOT;
   const commands = [
@@ -3194,90 +4755,287 @@ test("independent implementation proof rejects out-of-scope final changes before
   ), true);
 });
 
-test("direct Daytona proof execution targets the requested sandbox without a TrueForge turn", async () => {
-  const requests = [];
-  const executor = createDaytonaSandboxExecutor({
-    apiKey: "daytona-test-secret",
-    toolboxBaseUrl: "https://proxy.example/toolbox/",
-    commandTimeoutSeconds: 17,
-    fetch: async (url, init) => {
-      requests.push({ url: String(url), init });
+test("direct Daytona proof execution resolves the exact persisted sandbox through the SDK", async () => {
+  const getRequests = [];
+  const executeRequests = [];
+  const locator = "default.115d7785-8a05-4476-9347-03d08469b69a";
+  const persistedReference = `v1:daytona:${locator}`;
+  const daytona = {
+    async get(sandboxLocator) {
+      getRequests.push(sandboxLocator);
       return {
-        ok: true,
-        status: 200,
-        async json() {
-          return { exitCode: 0, result: "proof output\n" };
+        id: "7c5f11d4-b1aa-46e5-a7e6-2fef4d0c7e4b",
+        name: locator,
+        state: "started",
+        process: {
+          async executeCommand(command, cwd, env, timeout) {
+            executeRequests.push({ command, cwd, env, timeout });
+            return { exitCode: 0, result: "proof output\n" };
+          },
         },
       };
     },
+  };
+  const executor = createDaytonaSandboxExecutor({
+    daytona,
+    commandTimeoutSeconds: 17,
   });
 
   const result = await executor.execute({
-    sandboxId: "sandbox/persisted",
+    sandboxId: persistedReference,
     command: "git status --porcelain=v1",
     cwd: "/proof",
   });
 
-  assert.equal(requests.length, 1);
-  assert.equal(
-    requests[0].url,
-    "https://proxy.example/toolbox/sandbox%2Fpersisted/process/execute",
-  );
-  assert.equal(requests[0].init.method, "POST");
-  assert.equal(requests[0].init.headers.Authorization, "Bearer daytona-test-secret");
-  assert.deepEqual(JSON.parse(requests[0].init.body), {
+  assert.deepEqual(getRequests, [locator]);
+  assert.deepEqual(executeRequests, [{
     command: "git status --porcelain=v1",
     cwd: "/proof",
+    env: undefined,
     timeout: 17,
-  });
+  }]);
   assert.deepEqual(result, {
-    sandboxId: "sandbox/persisted",
+    sandboxId: persistedReference,
     exitCode: 0,
     stdout: "proof output\n",
+    sandboxLifecycle: {
+      initialState: "started",
+      finalState: "started",
+      action: "none",
+      recovered: false,
+    },
   });
 });
 
-test("Daytona rejects bearer-authenticated HTTP endpoints unless loopback development is explicit", async () => {
-  assert.throws(
-    () => createDaytonaSandboxExecutor({
-      apiKey: "daytona-test-secret",
-      toolboxBaseUrl: "http://proxy.example/toolbox",
-      fetch: async () => ({ ok: true, status: 200, async json() { return { exitCode: 0, result: "" }; } }),
-    }),
-    /must use HTTPS/i,
-  );
-  assert.throws(
-    () => createDaytonaSandboxExecutor({
-      apiKey: "daytona-test-secret",
-      toolboxBaseUrl: "http://127.0.0.1:8080/toolbox",
-      fetch: async () => ({ ok: true, status: 200, async json() { return { exitCode: 0, result: "" }; } }),
-    }),
-    /must use HTTPS/i,
-  );
-
-  const requests = [];
+test("direct Daytona proof accepts an exact persisted provider id with a distinct sandbox name", async () => {
+  const locator = "7c5f11d4-b1aa-46e5-a7e6-2fef4d0c7e4b";
+  const persistedReference = `v1:daytona:${locator}`;
+  const getRequests = [];
   const executor = createDaytonaSandboxExecutor({
-    apiKey: "daytona-test-secret",
-    toolboxBaseUrl: "http://127.0.0.1:8080/toolbox",
-    allowInsecureLoopbackForDevelopment: true,
-    fetch: async (url, init) => {
-      requests.push({ url: String(url), init });
-      return {
-        ok: true,
-        status: 200,
-        async json() {
-          return { exitCode: 0, result: "loopback proof\n" };
-        },
-      };
+    daytona: {
+      async get(sandboxLocator) {
+        getRequests.push(sandboxLocator);
+        return {
+          id: locator,
+          name: "trueforge-generated-name",
+          state: "started",
+          process: {
+            async executeCommand() {
+              return { exitCode: 0, result: "proof output\n" };
+            },
+          },
+        };
+      },
     },
   });
+
   const result = await executor.execute({
-    sandboxId: "sandbox-loopback",
-    command: "true",
+    sandboxId: persistedReference,
+    command: "git status --porcelain=v1",
   });
-  assert.equal(requests.length, 1);
-  assert.match(requests[0].url, /^http:\/\/127\.0\.0\.1:8080\/toolbox\//);
-  assert.equal(result.stdout, "loopback proof\n");
+
+  assert.deepEqual(getRequests, [locator]);
+  assert.equal(result.sandboxId, persistedReference);
+  assert.equal(result.exitCode, 0);
+});
+
+test("direct Daytona proof starts the exact archived sandbox in place before execution", async () => {
+  const locator = "default.115d7785-8a05-4476-9347-03d08469b69a";
+  const persistedReference = `v1:daytona:${locator}`;
+  const getRequests = [];
+  const startRequests = [];
+  const executeRequests = [];
+  let state = "archived";
+  const executor = createDaytonaSandboxExecutor({
+    sandboxStartTimeoutSeconds: 23,
+    daytona: {
+      async get(sandboxLocator) {
+        getRequests.push(sandboxLocator);
+        return {
+          id: "7c5f11d4-b1aa-46e5-a7e6-2fef4d0c7e4b",
+          name: locator,
+          get state() {
+            return state;
+          },
+          async start(timeout) {
+            startRequests.push(timeout);
+            state = "started";
+          },
+          process: {
+            async executeCommand(command) {
+              executeRequests.push(command);
+              return { exitCode: 0, result: "archived workspace recovered\n" };
+            },
+          },
+        };
+      },
+    },
+  });
+
+  const result = await executor.execute({
+    sandboxId: persistedReference,
+    command: "git status --porcelain=v1",
+  });
+
+  assert.deepEqual(getRequests, [locator]);
+  assert.deepEqual(startRequests, [23]);
+  assert.deepEqual(executeRequests, ["git status --porcelain=v1"]);
+  assert.deepEqual(result.sandboxLifecycle, {
+    initialState: "archived",
+    finalState: "started",
+    action: "start",
+    recovered: true,
+  });
+});
+
+test("direct Daytona proof fails closed when archived recovery is not ready", async () => {
+  const locator = "default.115d7785-8a05-4476-9347-03d08469b69a";
+  const persistedReference = `v1:daytona:${locator}`;
+  let executeCalls = 0;
+  let startCalls = 0;
+  const executor = createDaytonaSandboxExecutor({
+    daytona: {
+      async get() {
+        return {
+          id: "7c5f11d4-b1aa-46e5-a7e6-2fef4d0c7e4b",
+          name: locator,
+          state: "archived",
+          async start() {
+            startCalls += 1;
+          },
+          process: {
+            async executeCommand() {
+              executeCalls += 1;
+              return { exitCode: 0, result: "must not execute" };
+            },
+          },
+        };
+      },
+    },
+  });
+
+  await assert.rejects(
+    executor.execute({ sandboxId: persistedReference, command: "true" }),
+    (error) => error instanceof DaytonaSandboxExecutionError &&
+      error.retryable === true &&
+      error.failureCategory === "transport" &&
+      /instead of started/.test(error.message),
+  );
+  assert.equal(startCalls, 1);
+  assert.equal(executeCalls, 0);
+});
+
+test("direct Daytona proof rejects a sandbox whose name does not match the persisted locator", async () => {
+  const locator = "default.115d7785-8a05-4476-9347-03d08469b69a";
+  const persistedReference = `v1:daytona:${locator}`;
+  const getRequests = [];
+  let executeCalls = 0;
+  const executor = createDaytonaSandboxExecutor({
+    daytona: {
+      async get(sandboxLocator) {
+        getRequests.push(sandboxLocator);
+        return {
+          id: "7c5f11d4-b1aa-46e5-a7e6-2fef4d0c7e4b",
+          name: "default.attacker-sandbox",
+          process: {
+            async executeCommand() {
+              executeCalls += 1;
+              return { exitCode: 0, result: "must not execute" };
+            },
+          },
+        };
+      },
+    },
+  });
+
+  await assert.rejects(
+    executor.execute({ sandboxId: persistedReference, command: "true" }),
+    (error) => error instanceof DaytonaSandboxExecutionError &&
+      error.failureCategory === "identity" &&
+      /persisted locator/.test(error.message),
+  );
+  assert.deepEqual(getRequests, [locator]);
+  assert.equal(executeCalls, 0);
+});
+
+test("Daytona sandbox references reject an unknown provider namespace and classify auth failures", async () => {
+  assert.throws(
+    () => resolveDaytonaSandboxId("v1:other:raw-persisted-id"),
+    /unsupported provider namespace/i,
+  );
+  const executor = createDaytonaSandboxExecutor({
+    daytona: {
+      async get() {
+        const error = new Error("Authorization: Bearer live-token");
+        error.name = "DaytonaAuthenticationError";
+        error.statusCode = 401;
+        throw error;
+      },
+    },
+  });
+  await assert.rejects(
+    executor.execute({ sandboxId: "v1:daytona:raw-persisted-id", command: "true" }),
+    (error) => error instanceof DaytonaSandboxExecutionError &&
+      error.retryable === true &&
+      error.failureClass === "infrastructure" &&
+      error.failureCategory === "authentication" &&
+      !error.message.includes("live-token"),
+  );
+});
+
+test("direct proof marks sandbox transport failures retryable without changing the proof commands", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client, calls } = fakeClient();
+  const sandboxExecutor = {
+    calls: [],
+    async execute(request) {
+      this.calls.push(request);
+      throw new Error("connection reset by peer");
+    },
+  };
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-4-mini",
+    sandboxExecutor,
+  });
+  const mission = await runner.createMission({
+    id: "mission-retryable-proof-transport",
+    objective: "Classify provider transport failure as retryable proof infrastructure.",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_SHA,
+    },
+  });
+  const workItem = await missions.addWorkItem(mission.id, {
+    id: "work-retryable-proof-transport",
+    title: "Measure the verified implementation",
+    purpose: "Prove the implementation from the persisted sandbox.",
+    acceptanceCriteria: ["Provider transport failures remain retryable."],
+    assignedRole: "implementer",
+    requiredChecks: ["typecheck", "test"],
+    allowedFiles: ["src/index.ts"],
+    status: "ready",
+  });
+  await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
+  await missions.attachTrueforgeTurn(mission.id, "turn-retryable-proof-transport");
+  await missions.attachTrueforgeSandbox(mission.id, "v1:daytona:raw-proof-sandbox");
+
+  await assert.rejects(
+    runner.proveImplementation({ missionId: mission.id, workItemId: workItem.id }),
+    (error) => error instanceof TrueForgeIntegrationError &&
+      error.retryable === true &&
+      error.failureClass === "infrastructure" &&
+      error.failureCategory === "transport",
+  );
+  assert.equal(calls.turns.length, 0);
+  assert.equal(sandboxExecutor.calls.length, 1);
+  const state = await missions.getState();
+  const failure = state.evidence.find((item) => item.result === "failed");
+  assert.ok(failure);
+  const details = JSON.parse(failure.details);
+  assert.equal(details.retryable, true);
+  assert.equal(details.failure_class, "infrastructure");
+  assert.equal(details.failure_reason_category, "transport");
 });
 
 test("sandbox verification persists the command, output summary, and exit status", async () => {
@@ -3313,6 +5071,36 @@ test("sandbox verification persists the command, output summary, and exit status
   assert.match(proof.details, /"intent":"Run the requested verification command in the sandbox\."/);
   assert.match(proof.details, /"exit_code":0/);
   assert.match(proof.details, /all tests passed/);
+});
+
+test("sandbox verification parses wrapped snake-case execution results", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client } = fakeClient((turnId) => sandboxEvents(turnId, 0, [], {
+    responseContent: JSON.stringify({
+      content: [{
+        type: "text",
+        text: JSON.stringify({
+          success: true,
+          response: { exit_code: 0, stdout: "wrapped proof passed\n" },
+        }),
+      }],
+    }),
+  }));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-4-mini",
+  });
+  const mission = await runner.createMission({
+    id: "mission-sandbox-wrapped-response",
+    objective: "Verify a provider-wrapped sandbox result",
+  });
+
+  const verification = await runner.runSandboxVerification({
+    missionId: mission.id,
+    command: "node --test",
+  });
+
+  assert.equal(verification.exitCode, 0);
+  assert.equal(verification.stdout, "wrapped proof passed\n");
 });
 
 test("sandbox verification resumes the persisted sandbox without creating another one", async () => {
@@ -3516,7 +5304,7 @@ test("sandbox verification rejects incomplete or unsafe proof", async () => {
     {
       label: "malformed response",
       options: { responseContent: "not-json" },
-      error: /exec sandbox response was not a JSON object/,
+      error: /exec sandbox response did not include a structured execution result/,
     },
     {
       label: "success is not true",
@@ -3526,14 +5314,14 @@ test("sandbox verification rejects incomplete or unsafe proof", async () => {
           response: { exitCode: 0, result: "all tests passed\n" },
         },
       },
-      error: /exec sandbox execution did not return success: true/,
+      error: /exec sandbox response did not include a structured execution result/,
     },
     {
       label: "missing response object",
       options: {
         sandboxResult: { success: true, response: "all tests passed\n" },
       },
-      error: /exec sandbox response did not include a response object/,
+      error: /exec sandbox response did not include a structured execution result/,
     },
     {
       label: "invalid exit code",
@@ -3543,7 +5331,7 @@ test("sandbox verification rejects incomplete or unsafe proof", async () => {
           response: { exitCode: "0", result: "all tests passed\n" },
         },
       },
-      error: /non-numeric exit code/,
+      error: /exec sandbox response did not include a structured execution result/,
     },
     {
       label: "non-zero exit code",
@@ -3563,7 +5351,7 @@ test("sandbox verification rejects incomplete or unsafe proof", async () => {
           response: { exitCode: 0, result: { output: "all tests passed" } },
         },
       },
-      error: /exec sandbox response did not include string output/,
+      error: /exec sandbox response did not include a structured execution result/,
     },
     {
       label: "missing terminal turn",

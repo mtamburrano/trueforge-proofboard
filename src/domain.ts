@@ -454,6 +454,7 @@ export interface ApprovalExecutionContext {
   base: string;
   head: string;
   headSha?: string;
+  artifactHash?: string;
   title: string;
   body: string;
 }
@@ -491,9 +492,18 @@ export interface DeliveryAttemptTarget {
   repositoryName: string;
   base: string;
   head: string;
-  headSha: string;
+  headSha?: string;
+  artifact?: DeliveryArtifact;
   title: string;
   body: string;
+}
+
+/** Exact sandbox artifact bound to a pending delivery approval. */
+export interface DeliveryArtifact {
+  baselineSha: string;
+  files: Readonly<Record<string, string>>;
+  patches: Readonly<Record<string, string>>;
+  contentHash: string;
 }
 
 /** Durable intent and, once available, result for one approved remote mutation. */
@@ -785,27 +795,39 @@ function optionalStringArray(
   return value === undefined ? undefined : stringArray(value, label, maxItems);
 }
 
+function boundedString(value: unknown, label: string, maxLength: number): string {
+  if (typeof value !== "string") {
+    return fail("invalid_input", `${label} must be a string.`);
+  }
+  if (value.length > maxLength) {
+    return fail("invalid_input", `${label} must be ${maxLength} characters or fewer.`);
+  }
+  return value;
+}
+
+export function isSafeRepositoryRelativeFilePath(file: string): boolean {
+  return file.length > 0 &&
+    !file.startsWith("/") &&
+    !file.startsWith("\\") &&
+    !/^[A-Za-z]:[\\/]/.test(file) &&
+    !file.includes("\\") &&
+    file.length <= 500 &&
+    !/[\u0000-\u001f\u007f]/.test(file) &&
+    !file.includes("*") &&
+    !file.includes("?") &&
+    !file.includes("[") &&
+    !file.includes("]") &&
+    !/[;|&$`(){}<>"']/.test(file) &&
+    file.split("/").every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
+}
+
 function filePathArray(
   value: unknown,
   label: string,
 ): string[] {
   const files = stringArray(value, label, MAX_WORK_ITEM_ALLOWED_FILES);
   for (const file of files) {
-    if (
-      file.startsWith("/") ||
-      file.startsWith("\\") ||
-      /^[A-Za-z]:[\\/]/.test(file) ||
-      file.includes("\\") ||
-      file.length > 500 ||
-      file.includes("\u0000") ||
-      /[\u0000-\u001f\u007f]/.test(file) ||
-      file.includes("*") ||
-      file.includes("?") ||
-      file.includes("[") ||
-      file.includes("]") ||
-      /[;|&$`(){}<>"']/.test(file) ||
-      file.split("/").some((segment) => segment.length === 0 || segment === "." || segment === "..")
-    ) {
+    if (!isSafeRepositoryRelativeFilePath(file)) {
       return fail(
         "invalid_input",
         `${label} must contain safe repository-relative file paths without traversal or shell wildcards.`,
@@ -1394,10 +1416,10 @@ function validateStructuredHandoffFields(
     return fail("invalid_input", `${label}.filesChanged must identify changed files.`);
   }
   const rawChecks = arrayValue(value.checks, `${label}.checks`);
-  if (rawChecks.length === 0 || rawChecks.length > MAX_WORK_ITEM_REQUIRED_CHECKS) {
+  if (rawChecks.length > MAX_WORK_ITEM_REQUIRED_CHECKS) {
     return fail(
       "invalid_input",
-      `${label}.checks must contain between 1 and ${MAX_WORK_ITEM_REQUIRED_CHECKS} checks.`,
+      `${label}.checks must contain at most ${MAX_WORK_ITEM_REQUIRED_CHECKS} checks.`,
     );
   }
   const checks = rawChecks.map((check, index) =>
@@ -1406,7 +1428,7 @@ function validateStructuredHandoffFields(
   if (new Set(checks.map((check) => check.name)).size !== checks.length) {
     return fail("invalid_input", `${label}.checks must not contain duplicate names.`);
   }
-  if (!checks.some((check) => check.required)) {
+  if (checks.length > 0 && !checks.some((check) => check.required)) {
     return fail("invalid_input", `${label}.checks must include at least one required check.`);
   }
   if (
@@ -1505,10 +1527,10 @@ function validateReview(value: unknown, label: string): Review {
     return fail("invalid_input", `${label}.filesChanged must identify changed files.`);
   }
   const rawChecks = arrayValue(review.checks, `${label}.checks`);
-  if (rawChecks.length === 0 || rawChecks.length > MAX_WORK_ITEM_REQUIRED_CHECKS) {
+  if (rawChecks.length > MAX_WORK_ITEM_REQUIRED_CHECKS) {
     return fail(
       "invalid_input",
-      `${label}.checks must contain between 1 and ${MAX_WORK_ITEM_REQUIRED_CHECKS} checks.`,
+      `${label}.checks must contain at most ${MAX_WORK_ITEM_REQUIRED_CHECKS} checks.`,
     );
   }
   const checks = rawChecks.map((check, index) =>
@@ -1659,6 +1681,9 @@ function validateApprovalExecutionContext(
   if (context.headSha !== undefined) {
     result.headSha = requiredString(context.headSha, `${label}.headSha`, 500);
   }
+  if (context.artifactHash !== undefined) {
+    result.artifactHash = requiredString(context.artifactHash, `${label}.artifactHash`, 200);
+  }
   return result;
 }
 
@@ -1775,18 +1800,64 @@ function validateDeliveryAttemptTarget(
   label: string,
 ): DeliveryAttemptTarget {
   const target = objectValue(value, label);
-  const headSha = requiredString(target.headSha, `${label}.headSha`, 500);
-  if (!/^[0-9a-f]{40}$/i.test(headSha)) {
+  const headSha = target.headSha === undefined
+    ? undefined
+    : requiredString(target.headSha, `${label}.headSha`, 500);
+  if (headSha !== undefined && !/^[0-9a-f]{40}$/i.test(headSha)) {
     return fail("invalid_input", `${label}.headSha must be a 40-character hexadecimal SHA.`);
   }
-  return {
+  const artifact = target.artifact === undefined
+    ? undefined
+    : validateDeliveryArtifact(target.artifact, `${label}.artifact`);
+  if (headSha === undefined && artifact === undefined) {
+    return fail(
+      "invalid_input",
+      `${label} must identify either a verified remote head SHA or a proof-bound delivery artifact.`,
+    );
+  }
+  const result: DeliveryAttemptTarget = {
     repositoryOwner: requiredString(target.repositoryOwner, `${label}.repositoryOwner`, 200),
     repositoryName: requiredString(target.repositoryName, `${label}.repositoryName`, 200),
     base: requiredString(target.base, `${label}.base`, 500),
     head: requiredString(target.head, `${label}.head`, 500),
-    headSha,
     title: requiredString(target.title, `${label}.title`, 500),
     body: requiredString(target.body, `${label}.body`, 4_000),
+  };
+  if (headSha !== undefined) {
+    result.headSha = headSha;
+  }
+  if (artifact !== undefined) {
+    result.artifact = artifact;
+  }
+  return result;
+}
+
+function validateDeliveryArtifact(value: unknown, label: string): DeliveryArtifact {
+  const artifact = objectValue(value, label);
+  const rawFiles = objectValue(artifact.files, `${label}.files`);
+  const rawPatches = objectValue(artifact.patches, `${label}.patches`);
+  const fileNames = filePathArray(Object.keys(rawFiles), `${label}.files`);
+  const patchNames = filePathArray(Object.keys(rawPatches), `${label}.patches`);
+  if (fileNames.length === 0 || fileNames.length !== patchNames.length ||
+      fileNames.some((file) => !patchNames.includes(file))) {
+    return fail(
+      "invalid_input",
+      `${label}.files and ${label}.patches must identify the same non-empty files.`,
+    );
+  }
+  const files: Record<string, string> = {};
+  for (const file of [...fileNames].sort()) {
+    files[file] = boundedString(rawFiles[file], `${label}.files.${file}`, 20_000);
+  }
+  const patches: Record<string, string> = {};
+  for (const file of [...patchNames].sort()) {
+    patches[file] = boundedString(rawPatches[file], `${label}.patches.${file}`, 20_000);
+  }
+  return {
+    baselineSha: requiredString(artifact.baselineSha, `${label}.baselineSha`, 500),
+    files,
+    patches,
+    contentHash: requiredString(artifact.contentHash, `${label}.contentHash`, 200),
   };
 }
 
@@ -2189,13 +2260,15 @@ export function validateMissionState(value: unknown): MissionState {
       }
       if (delivery.pullRequest !== undefined && delivery.executionOrigin !== undefined) {
         const context = approval.executionContext;
+        const artifactApproval = context?.artifactHash !== undefined;
         if (
           context === undefined ||
+          context.toolName !== (artifactApproval ? "push_files" : PRIMARY_CONSEQUENTIAL_ACTION) ||
           context.repositoryOwner !== delivery.pullRequest.repositoryOwner ||
           context.repositoryName !== delivery.pullRequest.repositoryName ||
           context.base !== delivery.pullRequest.base ||
           context.head !== delivery.pullRequest.head ||
-          context.headSha !== delivery.pullRequest.headSha ||
+          (context.headSha !== undefined && context.headSha !== delivery.pullRequest.headSha) ||
           context.sessionId !== delivery.executionOrigin.sessionId ||
           context.threadId !== delivery.executionOrigin.threadId ||
           context.toolCallId !== delivery.executionOrigin.toolCallId
@@ -2248,12 +2321,14 @@ export function validateMissionState(value: unknown): MissionState {
     const context = approval.executionContext;
     if (
       context === undefined ||
-      context.headSha === undefined ||
+      (context.headSha === undefined && context.artifactHash === undefined) ||
       context.repositoryOwner !== deliveryAttempt.target.repositoryOwner ||
       context.repositoryName !== deliveryAttempt.target.repositoryName ||
       context.base !== deliveryAttempt.target.base ||
       context.head !== deliveryAttempt.target.head ||
-      context.headSha !== deliveryAttempt.target.headSha ||
+      (context.headSha !== undefined && context.headSha !== deliveryAttempt.target.headSha) ||
+      (context.artifactHash !== undefined &&
+        context.artifactHash !== deliveryAttempt.target.artifact?.contentHash) ||
       context.title !== deliveryAttempt.target.title ||
       context.body !== deliveryAttempt.target.body
     ) {
@@ -2267,7 +2342,8 @@ export function validateMissionState(value: unknown): MissionState {
         pullRequest.repositoryName !== deliveryAttempt.target.repositoryName ||
         pullRequest.base !== deliveryAttempt.target.base ||
         pullRequest.head !== deliveryAttempt.target.head ||
-        pullRequest.headSha !== deliveryAttempt.target.headSha ||
+        (deliveryAttempt.target.headSha !== undefined &&
+          pullRequest.headSha !== deliveryAttempt.target.headSha) ||
         executionOrigin?.kind !== "mcp" ||
         executionOrigin.sessionId !== approval.executionContext?.sessionId ||
         executionOrigin.threadId !== approval.executionContext?.threadId ||
@@ -2477,7 +2553,7 @@ function workItemFinding(
   const latestFailure = [...state.evidence].reverse().find((evidence) =>
     evidence.workItemId === workItem.id && evidence.result === "failed",
   );
-  return latestFailure?.summary ?? "The current proof did not establish the ticket contract.";
+  return latestFailure?.summary ?? "The current captured artifact and review did not establish the ticket contract.";
 }
 
 function ensureAllWorkComplete(state: MissionState, missionId: string): void {
@@ -2742,7 +2818,6 @@ function ensureDeliveryAttemptMatchesApproval(
   const context = approval.executionContext;
   if (
     context === undefined ||
-    context.headSha === undefined ||
     approval.actionType !== PRIMARY_CONSEQUENTIAL_ACTION ||
     actionType !== approval.actionType ||
     expectedEffect !== approval.expectedEffect ||
@@ -2750,13 +2825,14 @@ function ensureDeliveryAttemptMatchesApproval(
     context.repositoryName !== target.repositoryName ||
     context.base !== target.base ||
     context.head !== target.head ||
-    context.headSha !== target.headSha ||
+    (context.headSha !== undefined && context.headSha !== target.headSha) ||
+    (context.artifactHash !== undefined && target.artifact?.contentHash !== context.artifactHash) ||
     context.title !== target.title ||
     context.body !== target.body
   ) {
     fail(
       "approval_blocked",
-      "The durable delivery attempt does not match the exact approved repository, base, head, SHA, or effect.",
+      "The durable delivery attempt does not match the exact approved repository, base, head, artifact, SHA, or effect.",
     );
   }
 }
@@ -2772,7 +2848,8 @@ function ensureDeliveryAttemptResultMatchesTarget(
     pullRequest.repositoryName !== deliveryAttempt.target.repositoryName ||
     pullRequest.base !== deliveryAttempt.target.base ||
     pullRequest.head !== deliveryAttempt.target.head ||
-    pullRequest.headSha !== deliveryAttempt.target.headSha ||
+    (deliveryAttempt.target.headSha !== undefined &&
+      pullRequest.headSha !== deliveryAttempt.target.headSha) ||
     executionOrigin.kind !== "mcp"
   ) {
     fail(
@@ -2888,6 +2965,13 @@ function validateStructuredHandoffCorrelation(
     }
     return evidence;
   });
+  const hasSameSandboxArtifactCapture = linkedEvidence.some(isSameSandboxArtifactCaptureEvidence);
+  if (structured.checks.length === 0 && !hasSameSandboxArtifactCapture) {
+    return fail(
+      "invalid_input",
+      `Handoff ${handoff.id} has neither executed checks nor a same-sandbox delivery artifact capture.`,
+    );
+  }
 
   if (
     structured.executionOrigin.threadId !== undefined &&
@@ -3093,14 +3177,16 @@ function validateStructuredHandoffCorrelation(
       );
     }
   }
-  const requiredChecks = workItem.requiredChecks ?? [];
-  for (const requiredCheck of requiredChecks) {
-    const check = structured.checks.find((candidate) => candidate.name === requiredCheck);
-    if (check === undefined || !check.required || check.result !== "passed") {
-      return fail(
-        "invalid_input",
-        `Handoff ${handoff.id} is missing a passed required check: ${requiredCheck}.`,
-      );
+  if (!hasSameSandboxArtifactCapture) {
+    const requiredChecks = workItem.requiredChecks ?? [];
+    for (const requiredCheck of requiredChecks) {
+      const check = structured.checks.find((candidate) => candidate.name === requiredCheck);
+      if (check === undefined || !check.required || check.result !== "passed") {
+        return fail(
+          "invalid_input",
+          `Handoff ${handoff.id} is missing a passed required check: ${requiredCheck}.`,
+        );
+      }
     }
   }
 }
@@ -3166,6 +3252,19 @@ function changedFilesFromContentBearingEvidence(evidence: Evidence): string[] | 
   return parseContentDiffEvidence(evidence)?.filesChanged ?? null;
 }
 
+function isSameSandboxArtifactCaptureEvidence(evidence: Evidence): boolean {
+  if (evidence.source !== "sandbox" || evidence.result !== "passed" || evidence.details === undefined) {
+    return false;
+  }
+  try {
+    const details = JSON.parse(evidence.details) as unknown;
+    return typeof details === "object" && details !== null && !Array.isArray(details) &&
+      (details as Record<string, unknown>).artifact_capture_mode === "same_sandbox_delivery_artifact";
+  } catch {
+    return false;
+  }
+}
+
 function isContentBearingChangedStateEvidence(evidence: Evidence): boolean {
   return changedFilesFromContentBearingEvidence(evidence) !== null;
 }
@@ -3214,13 +3313,15 @@ function buildReviewContext(
     .map((item) => parseContentDiffEvidence(item)?.output)
     .filter((output): output is string => output !== undefined)
     .at(-1) ?? "";
-  for (const requiredCheck of workItem.requiredChecks ?? []) {
-    const check = structured.checks.find((candidate) => candidate.name === requiredCheck);
-    if (check === undefined || check.result !== "passed" || !check.required) {
-      return fail(
-        "invalid_transition",
-        `Work item ${workItem.id} has insufficient proof for required check ${requiredCheck}.`,
-      );
+  if (!evidence.some(isSameSandboxArtifactCaptureEvidence)) {
+    for (const requiredCheck of workItem.requiredChecks ?? []) {
+      const check = structured.checks.find((candidate) => candidate.name === requiredCheck);
+      if (check === undefined || check.result !== "passed" || !check.required) {
+        return fail(
+          "invalid_transition",
+          `Work item ${workItem.id} has insufficient proof for required check ${requiredCheck}.`,
+        );
+      }
     }
   }
   return {
@@ -4248,7 +4349,7 @@ export class MissionService {
         kind: "reviewer_finding",
         result: outcome === "accepted" ? "passed" : "failed",
         source: "reviewer",
-        summary: `Independent verifier ${outcome}: ${finding}`,
+        summary: `${reviewer} ${outcome}: ${finding}`,
         createdAt: now,
         details: JSON.stringify({
           reviewer,
@@ -4908,14 +5009,15 @@ export class MissionService {
           fail("invalid_input", "Delivered pull request URL must match the delivery reference.");
         }
         const context = approvedDelivery.executionContext;
+        const artifactApproval = context?.artifactHash !== undefined;
         if (
           context === undefined ||
-          context.toolName !== PRIMARY_CONSEQUENTIAL_ACTION ||
+          context.toolName !== (artifactApproval ? "push_files" : PRIMARY_CONSEQUENTIAL_ACTION) ||
           context.repositoryOwner !== pullRequest.repositoryOwner ||
           context.repositoryName !== pullRequest.repositoryName ||
           context.base !== pullRequest.base ||
           context.head !== pullRequest.head ||
-          context.headSha !== pullRequest.headSha ||
+          (context.headSha !== undefined && context.headSha !== pullRequest.headSha) ||
           executionOrigin.kind !== "mcp" ||
           context.sessionId !== executionOrigin.sessionId ||
           context.threadId !== executionOrigin.threadId ||

@@ -1134,7 +1134,7 @@ test("empty locked fixture sandboxes are prepared before the workspace snapshot 
   );
   assert.ok(preparation);
   assert.equal(preparation.result, "passed");
-  assert.match(preparation.details, /"baseline_sha":"590aa8a6d72c580f61fc1b19d33e9876bc0feb9b"/);
+  assert.match(preparation.details, /"baseline_sha":"88e53b07691d5ed3d327f5d47179e99c64e672af"/);
   assert.match(preparation.details, new RegExp(`"workspace_root":"${PRIMARY_SANDBOX_REPOSITORY_ROOT.replaceAll("/", "\\/")}"`));
   assert.equal(LOCKED_REPOSITORY_PREPARATION_COMMAND, LOCKED_REPOSITORY_PROOF_COMMAND);
   assert.match(LOCKED_REPOSITORY_PROOF_COMMAND, /git -C .* config --get remote\.origin\.url/);
@@ -1336,7 +1336,7 @@ test("wrong locked repository identity or baseline blocks before delegation", as
     },
     {
       sha: "b".repeat(40),
-      error: /expected 590aa8a6d72c580f61fc1b19d33e9876bc0feb9b/i,
+      error: /expected 88e53b07691d5ed3d327f5d47179e99c64e672af/i,
     },
     {
       clean: "false",

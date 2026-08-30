@@ -1,6 +1,67 @@
 (function (global) {
   "use strict";
 
+  function viewTickets(view) {
+    if (Array.isArray(view?.tickets)) return view.tickets;
+    return (view?.lanes ?? []).flatMap((lane) => lane.items ?? []);
+  }
+
+  function primaryTicket(view) {
+    const tickets = viewTickets(view);
+    return tickets.find((ticket) => ticket.assignedRole === "implementer") ??
+      tickets.find((ticket) => ticket.allowedFiles?.length > 0) ?? tickets[0];
+  }
+
+  function normalizedTicketStatus(ticket) {
+    if (ticket?.status === "ready_for_review") return "proving";
+    if (ticket?.status === "complete") return "done";
+    return ticket?.status;
+  }
+
+  function describeRunOutcome(view) {
+    const status = normalizedTicketStatus(primaryTicket(view));
+    if (status === "proving" && view?.progress?.verification === "failed") {
+      return {
+        kind: "warning",
+        message: "TrueForge recorded a retryable sandbox-capture failure. The ticket remains in Review; inspect the durable evidence and retry the review flow.",
+      };
+    }
+    if (status === "proving") {
+      return {
+        kind: "success",
+        message: "TrueForge completed implementation; independent review is in progress or ready to resume.",
+      };
+    }
+    if (status === "awaiting_approval") {
+      return {
+        kind: "success",
+        message: "Independent TrueForge review accepted the captured sandbox artifact; approve the exact delivery.",
+      };
+    }
+    if (status === "delivering") {
+      return {
+        kind: "success",
+        message: "Delivery approval is recorded; protected read-back is in progress.",
+      };
+    }
+    if (status === "done") {
+      return {
+        kind: "success",
+        message: "Delivery is verified with durable pull request evidence.",
+      };
+    }
+    if (status === "in_progress") {
+      return {
+        kind: "success",
+        message: "TrueForge claimed the authorized ticket; execution is in progress.",
+      };
+    }
+    return {
+      kind: "success",
+      message: "TrueForge advanced the durable queue state.",
+    };
+  }
+
   function createRunCoordinator(options) {
     const intervalMs = options.intervalMs ?? 750;
     const schedule = options.schedule ?? ((callback, delay) => global.setTimeout(callback, delay));
@@ -89,5 +150,5 @@
     });
   }
 
-  global.MissionRunState = Object.freeze({ createRunCoordinator });
+  global.MissionRunState = Object.freeze({ createRunCoordinator, describeRunOutcome });
 })(globalThis);

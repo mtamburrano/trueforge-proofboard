@@ -11,11 +11,15 @@ import {
   JsonMissionRepository,
   MissionService,
   PRIMARY_DELIVERY_FIXTURE,
+  PRIMARY_VERIFIED_DELIVERY_ARTIFACT,
+  PRIMARY_VERIFIED_DELIVERY_FILES,
   PRIMARY_VERIFIED_DELIVERY_PATCHES,
+  verifiedDeliveryArtifactHash,
   PRIMARY_MISSION_ID,
   PRIMARY_MISSION_OBJECTIVE,
   PRIMARY_SANDBOX_REPOSITORY_ROOT,
   PRIMARY_VERIFICATION_COMMAND,
+  IMPLEMENTATION_ARTIFACT_CAPTURE_MODE,
   IMPLEMENTATION_PROOF_MODE,
   TrueForgeIntegrationError,
   createMissionHttpApp,
@@ -28,27 +32,35 @@ class TestMissionRunner {
     missions,
     {
       failSandbox = false,
+      sandboxInfrastructureFailure = false,
       secretInspectionError = false,
       createGate,
       reconciliationResult = "found",
       inspectionRepository = PRIMARY_DELIVERY_FIXTURE,
       deliveryHeadSha = "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1",
-      deliveryHeadPatches = PRIMARY_VERIFIED_DELIVERY_PATCHES,
+      deliveryHeadPatches,
+      proofArtifact,
       proofMode = IMPLEMENTATION_PROOF_MODE,
     } = {},
   ) {
     this.missions = missions;
     this.failSandbox = failSandbox;
+    this.sandboxInfrastructureFailure = sandboxInfrastructureFailure;
     this.secretInspectionError = secretInspectionError;
     this.createGate = createGate;
     this.reconciliationResult = reconciliationResult;
     this.inspectionRepository = inspectionRepository;
     this.deliveryHeadSha = deliveryHeadSha;
-    this.deliveryHeadPatches = deliveryHeadPatches;
+    this.proofArtifact = proofArtifact;
+    this.deliveryHeadPatches = deliveryHeadPatches ?? proofArtifact?.patches ?? PRIMARY_VERIFIED_DELIVERY_PATCHES;
     this.proofMode = proofMode;
+    this.captureMode = proofMode === IMPLEMENTATION_PROOF_MODE
+      ? IMPLEMENTATION_ARTIFACT_CAPTURE_MODE
+      : proofMode;
     this.sandboxInputs = [];
     this.operationLog = [];
     this.turnInputs = [];
+    this.reviewInputs = [];
     this.deliveryCalls = { requested: [], resolved: [], reconciled: [], protectedOperations: 0, lifecycle: [] };
     this.calls = { create: 0, inspect: 0, headInspect: 0, turn: 0, sandbox: 0 };
   }
@@ -193,30 +205,217 @@ class TestMissionRunner {
     };
   }
 
+  async captureImplementationArtifact(input) {
+    this.operationLog.push("capture");
+    this.calls.sandbox += 1;
+    this.sandboxInputs.push(input);
+    const origin = { kind: "sandbox", sessionId: "test-session-durable" };
+    if (this.failSandbox || this.sandboxInfrastructureFailure) {
+      await this.missions.addEvidence(input.missionId, {
+        workItemId: input.workItemId,
+        kind: "tool_result",
+        result: "failed",
+        source: "sandbox",
+        summary: "Same-sandbox artifact capture failed.",
+        details: JSON.stringify({
+          artifact_capture_mode: this.captureMode,
+          phase: "artifact-capture",
+          failure_class: this.sandboxInfrastructureFailure ? "infrastructure" : "implementation",
+          failure_reason_category: this.sandboxInfrastructureFailure ? "network" : "verification",
+          retryable: this.sandboxInfrastructureFailure,
+        }),
+      });
+      throw new TrueForgeIntegrationError(
+        "capture implementation artifact",
+        "Sandbox artifact capture command exited with code 1.",
+        this.sandboxInfrastructureFailure
+          ? { failureClass: "infrastructure", failureCategory: "network", retryable: true }
+          : undefined,
+      );
+    }
+    const workItem = await this.missions.getWorkItem(input.missionId, input.workItemId);
+    const allowedFiles = workItem.allowedFiles ?? [];
+    const isPrimaryFixture = allowedFiles.length === Object.keys(PRIMARY_VERIFIED_DELIVERY_FILES).length &&
+      allowedFiles.every((file) => Object.prototype.hasOwnProperty.call(PRIMARY_VERIFIED_DELIVERY_FILES, file));
+    let deliveryArtifact = this.proofArtifact ?? (isPrimaryFixture
+      ? PRIMARY_VERIFIED_DELIVERY_ARTIFACT
+      : undefined);
+    if (deliveryArtifact === undefined) {
+      const files = Object.fromEntries(allowedFiles.map((file) => [file, "before\nafter\n"]));
+      const patches = Object.fromEntries(
+        allowedFiles.map((file) => [file, "@@ -1 +1,2 @@\n before\n+after"]),
+      );
+      deliveryArtifact = {
+        baselineSha: PRIMARY_DELIVERY_FIXTURE.baselineSha,
+        files,
+        patches,
+        contentHash: verifiedDeliveryArtifactHash(
+          PRIMARY_DELIVERY_FIXTURE.baselineSha,
+          files,
+          patches,
+        ),
+      };
+    }
+    const filesChanged = deliveryArtifact === undefined ? allowedFiles : Object.keys(deliveryArtifact.files);
+    const diffOutput = deliveryArtifact === undefined
+      ? filesChanged.map((file) =>
+          `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1 +1,2 @@\n before\n+after`
+        ).join("\n")
+      : Object.entries(deliveryArtifact.patches).map(([file, patch]) =>
+          `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n${patch}`
+        ).join("\n");
+    const finalFileContents = deliveryArtifact?.files ?? Object.fromEntries(
+      filesChanged.map((file) => [file, "before\nafter\n"]),
+    );
+    const parsedPatches = deliveryArtifact?.patches ?? Object.fromEntries(
+      filesChanged.map((file) => [file, "@@ -1 +1,2 @@\n before\n+after"]),
+    );
+    const identity = await this.missions.addEvidence(input.missionId, {
+      workItemId: input.workItemId,
+      kind: "tool_result",
+      result: "passed",
+      source: "sandbox",
+      summary: "Captured repository identity from the persisted sandbox.",
+      details: JSON.stringify({
+        artifact_capture_mode: this.captureMode,
+        command: `git -C ${PRIMARY_SANDBOX_REPOSITORY_ROOT} config --get remote.origin.url`,
+        exit_code: 0,
+        sandbox_id: "test-sandbox-durable",
+      }),
+      executionOrigin: origin,
+    });
+    const status = await this.missions.addEvidence(input.missionId, {
+      workItemId: input.workItemId,
+      kind: "file_change",
+      result: "passed",
+      source: "sandbox",
+      summary: "Captured the complete changed-file status from the persisted sandbox.",
+      details: JSON.stringify({
+        artifact_capture_mode: this.captureMode,
+        complete_changed_files: true,
+        command: `git -C ${PRIMARY_SANDBOX_REPOSITORY_ROOT} status --porcelain=v1 -z --untracked-files=all`,
+        exit_code: 0,
+        changed_files: filesChanged,
+        sandbox_id: "test-sandbox-durable",
+      }),
+      executionOrigin: origin,
+    });
+    const diff = await this.missions.addEvidence(input.missionId, {
+      workItemId: input.workItemId,
+      kind: "diff_summary",
+      result: "passed",
+      source: "sandbox",
+      summary: "Captured the actual bounded diff and final file contents for independent review.",
+      details: JSON.stringify({
+        artifact_capture_mode: this.captureMode,
+        command: `git -C ${PRIMARY_SANDBOX_REPOSITORY_ROOT} diff --no-ext-diff --binary ${PRIMARY_DELIVERY_FIXTURE.baselineSha} --`,
+        exit_code: 0,
+        output: diffOutput,
+        changed_files: filesChanged,
+        parsed_patches: parsedPatches,
+        final_file_contents: finalFileContents,
+        final_file_content_commands: filesChanged.map((file) => ({
+          file,
+          command: `cat ${PRIMARY_SANDBOX_REPOSITORY_ROOT}/${file}`,
+        })),
+        output_truncated: false,
+        baseline_sha: PRIMARY_DELIVERY_FIXTURE.baselineSha,
+        sandbox_id: "test-sandbox-durable",
+        provenance_kind: "implementation_artifact",
+        artifact_hash: deliveryArtifact?.contentHash,
+        delivery_artifact: deliveryArtifact,
+      }),
+      executionOrigin: origin,
+    });
+    return {
+      filesChanged,
+      diffSummary: diffOutput,
+      checks: [],
+      evidenceIds: [identity.id, status.id, diff.id],
+      decisions: [],
+      openQuestions: [],
+      executionOrigin: origin,
+      ...(deliveryArtifact === undefined ? {} : { deliveryArtifact }),
+    };
+  }
+
   async proveImplementation(input) {
     this.operationLog.push("prove");
     this.calls.sandbox += 1;
     this.sandboxInputs.push(input);
     const origin = { kind: "sandbox", sessionId: "test-session-durable" };
-    if (this.failSandbox) {
+    if (this.failSandbox || this.sandboxInfrastructureFailure) {
       await this.missions.addEvidence(input.missionId, {
         workItemId: input.workItemId,
         kind: "test_result",
         result: "failed",
         source: "sandbox",
         summary: "Independent final-state proof failed.",
-        details: JSON.stringify({ command: PRIMARY_VERIFICATION_COMMAND, exit_code: 1 }),
+        details: JSON.stringify({
+          command: PRIMARY_VERIFICATION_COMMAND,
+          exit_code: 1,
+          ...(this.sandboxInfrastructureFailure
+            ? {
+                proof_mode: IMPLEMENTATION_PROOF_MODE,
+                phase: "deterministic-proof",
+                failure_class: "infrastructure",
+                failure_reason_category: "network",
+                retryable: true,
+              }
+            : {}),
+        }),
       });
       throw new TrueForgeIntegrationError(
         "prove implementation",
         "Independent authoritative test exited with code 1.",
+        this.sandboxInfrastructureFailure
+          ? {
+              failureClass: "infrastructure",
+              failureCategory: "network",
+              retryable: true,
+            }
+          : undefined,
       );
     }
     const workItem = await this.missions.getWorkItem(input.missionId, input.workItemId);
-    const filesChanged = workItem.allowedFiles ?? [];
-    const diffOutput = filesChanged.map((file) =>
-      `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1 +1,2 @@\n before\n+after`
-    ).join("\n");
+    const allowedFiles = workItem.allowedFiles ?? [];
+    const isPrimaryFixture = allowedFiles.length === Object.keys(PRIMARY_VERIFIED_DELIVERY_FILES).length &&
+      allowedFiles.every((file) => Object.prototype.hasOwnProperty.call(PRIMARY_VERIFIED_DELIVERY_FILES, file));
+    const deliveryArtifact = this.proofArtifact ?? (isPrimaryFixture
+      ? PRIMARY_VERIFIED_DELIVERY_ARTIFACT
+      : undefined);
+    const filesChanged = deliveryArtifact === undefined
+      ? allowedFiles
+      : Object.keys(deliveryArtifact.files);
+    const diffOutput = deliveryArtifact === undefined
+      ? filesChanged.map((file) =>
+          `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1 +1,2 @@\n before\n+after`
+        ).join("\n")
+      : Object.entries(deliveryArtifact.patches).map(([file, patch]) =>
+          `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n${patch}`
+        ).join("\n");
+    const finalFileContents = deliveryArtifact?.files ?? Object.fromEntries(
+      filesChanged.map((file) => [file, "before\nafter\n"]),
+    );
+    const parsedPatches = deliveryArtifact?.patches ?? Object.fromEntries(
+      filesChanged.map((file) => [file, "@@ -1 +1,2 @@\n before\n+after"]),
+    );
+    const status = await this.missions.addEvidence(input.missionId, {
+      workItemId: input.workItemId,
+      kind: "file_change",
+      result: "passed",
+      source: "sandbox",
+      summary: "Independent proof measured the complete final workspace status.",
+      details: JSON.stringify({
+        proof_mode: this.proofMode,
+        complete_changed_files: true,
+        command: "git status --porcelain=v1 -z --untracked-files=all",
+        exit_code: 0,
+        changed_files: filesChanged,
+        sandbox_id: "test-sandbox-durable",
+      }),
+      executionOrigin: origin,
+    });
     const diff = await this.missions.addEvidence(input.missionId, {
       workItemId: input.workItemId,
       kind: "diff_summary",
@@ -228,6 +427,21 @@ class TestMissionRunner {
         command: "git diff",
         output: diffOutput,
         changed_files: filesChanged,
+        parsed_patches: parsedPatches,
+        final_file_contents: finalFileContents,
+        final_file_content_commands: Object.keys(finalFileContents).sort().map((file) => ({
+          file,
+          command: `cat ${PRIMARY_SANDBOX_REPOSITORY_ROOT}/${file}`,
+        })),
+        baseline_sha: deliveryArtifact?.baselineSha,
+        sandbox_id: "test-sandbox-durable",
+        ...(deliveryArtifact !== undefined
+          ? {
+              provenance_kind: "implementation_artifact",
+              artifact_hash: deliveryArtifact.contentHash,
+              delivery_artifact: deliveryArtifact,
+            }
+          : {}),
       }),
       executionOrigin: origin,
     });
@@ -242,6 +456,7 @@ class TestMissionRunner {
         command: "npm run typecheck",
         exit_code: 0,
         output: "typecheck passed",
+        sandbox_id: "test-sandbox-durable",
       }),
       executionOrigin: origin,
     });
@@ -256,6 +471,7 @@ class TestMissionRunner {
         command: PRIMARY_VERIFICATION_COMMAND,
         exit_code: 0,
         output: "all tests passed",
+        sandbox_id: "test-sandbox-durable",
       }),
       executionOrigin: origin,
     });
@@ -266,10 +482,11 @@ class TestMissionRunner {
         { name: "typecheck", command: "npm run typecheck", result: "passed", required: true, evidenceIds: [typecheck.id], exitCode: 0 },
         { name: "test", command: PRIMARY_VERIFICATION_COMMAND, result: "passed", required: true, evidenceIds: [tests.id], exitCode: 0 },
       ],
-      evidenceIds: [diff.id, typecheck.id, tests.id],
+      evidenceIds: [status.id, diff.id, typecheck.id, tests.id],
       decisions: [],
       openQuestions: [],
       executionOrigin: origin,
+      ...(deliveryArtifact === undefined ? {} : { deliveryArtifact }),
     };
   }
 
@@ -314,7 +531,8 @@ class TestMissionRunner {
     return { evidenceId: evidence.id };
   }
 
-  async reviewContract() {
+  async reviewContract(context) {
+    this.reviewInputs.push(context);
     return {
       outcome: "accepted",
       reviewer: "test-independent-reviewer",
@@ -325,13 +543,14 @@ class TestMissionRunner {
 
   async requestPullRequestApproval(missionId, target) {
     this.deliveryCalls.requested.push({ missionId, target });
+    const artifactDelivery = target.artifact !== undefined;
     return {
       sessionId: "test-session-durable",
       turnId: "test-delivery-approval-turn",
       threadId: "test-delivery-thread",
-      toolCallId: "test-create-pull-request-call",
+      toolCallId: artifactDelivery ? "test-push-files-call" : "test-create-pull-request-call",
       serverName: "github",
-      toolName: "create_pull_request",
+      toolName: artifactDelivery ? "push_files" : "create_pull_request",
       target: { ...target },
     };
   }
@@ -351,12 +570,17 @@ class TestMissionRunner {
     const result = {
       number: 73,
       url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/73",
-      headSha: pending.target.headSha,
+      headSha: pending.target.artifact === undefined
+        ? pending.target.headSha
+        : this.deliveryHeadSha,
       sessionId: pending.sessionId,
       turnId: "test-delivery-result-turn",
       threadId: pending.threadId,
       toolCallId: pending.toolCallId,
     };
+    if (pending.target.artifact !== undefined) {
+      await this.recordPublishedArtifactReadback(missionId, pending, workItemId);
+    }
     await this.missions.addEvidence(missionId, {
       ...(workItemId === undefined ? {} : { workItemId }),
       kind: "tool_result",
@@ -390,15 +614,60 @@ class TestMissionRunner {
     if (this.reconciliationResult === null) {
       return null;
     }
+    if (pending.target.artifact !== undefined) {
+      await this.recordPublishedArtifactReadback(missionId, pending, workItemId);
+    }
     return {
       number: 73,
       url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/73",
-      headSha: pending.target.headSha,
+      headSha: pending.target.artifact === undefined
+        ? pending.target.headSha
+        : this.deliveryHeadSha,
       sessionId: pending.sessionId,
       turnId: "test-reconciliation-turn",
       threadId: pending.threadId,
       toolCallId: pending.toolCallId,
     };
+  }
+
+  async recordPublishedArtifactReadback(missionId, pending, workItemId) {
+    const artifact = pending.target.artifact;
+    if (artifact === undefined) {
+      return;
+    }
+    await this.missions.addEvidence(missionId, {
+      ...(workItemId === undefined ? {} : { workItemId }),
+      kind: "tool_result",
+      result: "passed",
+      source: "mcp",
+      summary: `MCP verified published artifact at ${this.deliveryHeadSha}.`,
+      details: JSON.stringify({
+        server: "github",
+        tool: "get_commit",
+        provenance_kind: "delivery_head",
+        arguments: {
+          owner: pending.target.owner,
+          repo: pending.target.repo,
+          sha: pending.target.head,
+          detail: "full_patch",
+          perPage: 100,
+        },
+        repository_owner: pending.target.owner,
+        repository_name: pending.target.repo,
+        requested_ref: pending.target.head,
+        baseline_sha: artifact.baselineSha,
+        uri: `repo://${pending.target.owner}/${pending.target.repo}/sha/${this.deliveryHeadSha}`,
+        commit_sha: this.deliveryHeadSha,
+        patches: artifact.patches,
+        artifact_hash: artifact.contentHash,
+        content_hash: "verified-published-artifact-content-hash",
+      }),
+      executionOrigin: {
+        kind: "mcp",
+        sessionId: pending.sessionId,
+        turnId: "test-delivery-head-turn",
+      },
+    });
   }
 }
 
@@ -410,6 +679,27 @@ function testApp(repository = new InMemoryMissionRepository(), options = {}) {
     missions,
     runner,
     app: createMissionHttpApp({ missions, runner, planner, verifier }),
+  };
+}
+
+function dynamicProofArtifact(variant) {
+  const files = {
+    "src/index.ts": `export const deliveryVariant = "${variant}";\n`,
+    "test/index.test.js": `assert.equal(deliveryVariant, "${variant}");\n`,
+  };
+  const patches = {
+    "src/index.ts": `@@ -1 +1 @@\n-export const deliveryVariant = "baseline";\n+${files["src/index.ts"].trimEnd()}`,
+    "test/index.test.js": `@@ -1 +1 @@\n-assert.equal(deliveryVariant, "baseline");\n+${files["test/index.test.js"].trimEnd()}`,
+  };
+  return {
+    baselineSha: PRIMARY_VERIFIED_DELIVERY_ARTIFACT.baselineSha,
+    files,
+    patches,
+    contentHash: verifiedDeliveryArtifactHash(
+      PRIMARY_VERIFIED_DELIVERY_ARTIFACT.baselineSha,
+      files,
+      patches,
+    ),
   };
 }
 
@@ -499,7 +789,9 @@ async function reachDeliveryApproval(app) {
   await authorizeTicket(app, implementTicket.id);
   await app.request("/api/mission/run", { method: "POST" });
   const provedResponse = await app.request("/api/mission/run", { method: "POST" });
-  assert.equal(provedResponse.status, 200);
+  if (provedResponse.status !== 200) {
+    throw new Error(`Proof response ${provedResponse.status}: ${await provedResponse.text()}`);
+  }
   const proved = await json(provedResponse);
   const approval = proved.mission.approvals.find((item) => item.decision === "pending");
   assert.ok(approval, "A passed current attempt should create a pending delivery approval.");
@@ -527,14 +819,17 @@ test("initial mission route and static application assets load", async () => {
   assert.equal(page.status, 200);
   assert.match(page.headers.get("content-type"), /text\/html/);
   const pageBody = await page.text();
-  assert.match(pageBody, /MISSION CONTROL/);
+  assert.match(pageBody, /PROOF BOARD/);
   assert.match(pageBody, /run-state\.js[\s\S]+app\.js/);
   assert.match(page.headers.get("content-security-policy"), /default-src 'self'/);
 
   const script = await app.request("/public/app.js");
   assert.equal(script.status, 200);
   const scriptBody = await script.text();
-  assert.match(scriptBody, /Create primary mission/);
+  assert.match(scriptBody, /Create tickets/);
+  assert.match(scriptBody, /Use demo mission/);
+  assert.match(scriptBody, /Mission objective/);
+  assert.match(scriptBody, /Start TrueForge execution/);
   assert.match(scriptBody, /data-source=/);
   assert.match(scriptBody, /data-result=/);
   assert.match(scriptBody, /Runtime narration never appears in this panel/);
@@ -557,6 +852,7 @@ test("initial mission route and static application assets load", async () => {
   assert.match(styleBody, /approval-actions/);
   assert.match(styleBody, /delivery-card/);
   assert.match(styleBody, /diagnostics-panel/);
+  assert.match(styleBody, /\.mission-intake\s*\{/);
 
   const runState = await app.request("/public/run-state.js");
   assert.equal(runState.status, 200);
@@ -568,6 +864,12 @@ test("create or open is idempotent and returns durable structured mission state"
 
   const empty = await json(await app.request("/api/mission"));
   assert.equal(empty.mission, null);
+  assert.equal(empty.intake.demoObjective, "Add support for marking a todo as completed.");
+  assert.deepEqual(empty.intake.repository, {
+    owner: PRIMARY_DELIVERY_FIXTURE.owner,
+    name: PRIMARY_DELIVERY_FIXTURE.repository,
+    ref: PRIMARY_DELIVERY_FIXTURE.baselineRef,
+  });
 
   const createdResponse = await app.request("/api/mission", { method: "POST" });
   assert.equal(createdResponse.status, 201);
@@ -587,6 +889,58 @@ test("create or open is idempotent and returns durable structured mission state"
   assert.equal(opened.mission.mission.id, created.mission.mission.id);
   assert.equal(opened.mission.revision, created.mission.revision);
   assert.equal(runner.calls.create, 1);
+});
+
+test("mission intake persists the submitted objective after read-only planning and gates execution", async () => {
+  const { app, runner, missions } = testApp();
+  const objective = "Track completion state for each todo.";
+
+  const createdResponse = await app.request("/api/mission", {
+    method: "POST",
+    body: JSON.stringify({ objective }),
+  });
+  assert.equal(createdResponse.status, 201);
+  const created = await json(createdResponse);
+  assert.equal(created.mission.mission.objective, objective);
+  assert.equal(created.mission.mission.status, "planning");
+  assert.equal(created.mission.mission.repository.ref, PRIMARY_DELIVERY_FIXTURE.baselineSha);
+  assert.equal(created.mission.tickets.length, 1);
+  assert.equal(created.mission.tickets[0].assignedRole, "implementer");
+  assert.equal(created.mission.tickets[0].status, "backlog");
+  assert.deepEqual(created.mission.tickets[0].dependsOn, []);
+  assert.equal(runner.calls.create, 1);
+  assert.equal(runner.calls.inspect, 1);
+  assert.equal(runner.calls.turn, 0);
+  assert.deepEqual(runner.operationLog, ["inspect"]);
+
+  const stateAfterPlanning = await missions.getState();
+  assert.equal(stateAfterPlanning.workItems.length, 1);
+  assert.equal(stateAfterPlanning.workItems[0].assignedRole, "implementer");
+  assert.equal(stateAfterPlanning.evidence.some((item) =>
+    item.source === "mcp" && item.workItemId === undefined
+  ), true);
+  assert.equal(stateAfterPlanning.evidence.some((item) =>
+    item.source === "system" && /read-only planning/i.test(item.summary)
+  ), true);
+
+  const repeated = await json(await app.request("/api/mission", {
+    method: "POST",
+    body: JSON.stringify({ objective }),
+  }));
+  assert.equal(repeated.mission.revision, created.mission.revision);
+  assert.equal(runner.calls.create, 1);
+  assert.equal(runner.calls.inspect, 1);
+
+  await authorizeTicket(app, created.mission.tickets[0].id);
+  const executed = await json(await app.request("/api/mission/run", { method: "POST" }));
+  assert.equal(executed.mission.mission.objective, objective);
+  assert.equal(executed.mission.tickets[0].status, "awaiting_approval");
+  assert.equal(runner.calls.turn, 1);
+  assert.equal(runner.calls.inspect, 1);
+  assert.equal(runner.calls.sandbox, 1);
+  assert.equal(runner.reviewInputs.length, 1);
+  assert.equal(runner.deliveryCalls.protectedOperations, 0);
+  assert.match(runner.turnInputs[0].instruction, new RegExp(objective.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
 
 test("cross-origin browser state changes are rejected while same-origin changes remain valid", async () => {
@@ -799,6 +1153,8 @@ test("API maps persisted proof separately from runtime narration and redacts sec
   assert.equal(payload.mission.evidence.find((item) => item.source === "mcp").metadata.commitSha, "durable-commit");
   assert.equal(payload.mission.evidence.find((item) => item.source === "sandbox").metadata.exitCode, 1);
   assert.equal(payload.mission.activity.some((item) => item.category === "narration"), true);
+  assert.equal(payload.mission.activity.find((item) => item.category === "repository").actor, "GitHub MCP read");
+  assert.equal(payload.mission.activity.find((item) => item.category === "sandbox").actor, "Proof Board verification · Daytona sandbox");
   assert.equal(payload.mission.evidence.some((item) => item.summary.includes("Free-form")), false);
   assert.equal(payload.mission.progress.verification, "failed");
 
@@ -895,14 +1251,14 @@ test("run mission executes only the human-authorized queue ticket and preserves 
   assert.equal(implementationResponse.status, 200);
   const implemented = await json(implementationResponse);
   const implementedTicket = implemented.mission.tickets.find((item) => item.id === implementTicket.id);
-  assert.equal(implementedTicket.status, "proving");
+  assert.equal(implementedTicket.status, "awaiting_approval");
   assert.equal(implementedTicket.claim.owner, "trueforge-worker");
   assert.equal(implementedTicket.claim.trueforgeSessionId, "test-session-durable");
   assert.equal(implementedTicket.executionAuthorization.authorizedBy, "test-operator");
   assert.equal(implemented.mission.mission.execution.sandboxId, "test-sandbox-durable");
-  assert.equal(implemented.mission.approvals.length, 0);
-  assert.deepEqual(runner.operationLog, ["inspect", "execute"]);
-  assert.deepEqual(runner.calls, { create: 1, inspect: 1, headInspect: 0, turn: 1, sandbox: 0 });
+  assert.equal(implemented.mission.approvals.length, 1);
+  assert.deepEqual(runner.operationLog, ["inspect", "execute", "capture"]);
+  assert.deepEqual(runner.calls, { create: 1, inspect: 1, headInspect: 0, turn: 1, sandbox: 1 });
   assert.deepEqual(runner.turnInputs.map((input) => input.options.workItemId), [implementTicket.id]);
   assert.equal(runner.turnInputs[0].options.previousTurnId, "test-inspection-turn");
   assert.match(runner.turnInputs[0].instruction, /Verified repository facts: mtamburrano\/proofboard-demo-fixture at full commit/);
@@ -914,7 +1270,7 @@ test("run mission executes only the human-authorized queue ticket and preserves 
   assert.doesNotMatch(serialized, /must-not-reach-browser|provider_secret/);
 });
 
-test("run mission performs deterministic proof and independent review after coding", async () => {
+test("implementation automatically captures the same sandbox and enters independent review", async () => {
   const { app, runner, missions } = testApp();
 
   await app.request("/api/mission", { method: "POST" });
@@ -926,11 +1282,9 @@ test("run mission performs deterministic proof and independent review after codi
   current = await json(await app.request("/api/mission"));
   const implementTicket = current.mission.tickets.find((item) => item.assignedRole === "implementer");
   await authorizeTicket(app, implementTicket.id);
-  await app.request("/api/mission/run", { method: "POST" });
-
-  const proofResponse = await app.request("/api/mission/run", { method: "POST" });
-  assert.equal(proofResponse.status, 200);
-  const proved = await json(proofResponse);
+  const reviewResponse = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(reviewResponse.status, 200);
+  const proved = await json(reviewResponse);
   const provedTicket = proved.mission.tickets.find((item) => item.id === implementTicket.id);
   assert.equal(provedTicket.status, "awaiting_approval");
   assert.equal(provedTicket.attempts[0].status, "awaiting_approval");
@@ -940,22 +1294,187 @@ test("run mission performs deterministic proof and independent review after codi
   assert.equal(proved.mission.approvals.length, 1);
   assert.equal(proved.mission.approvals[0].workItemId, implementTicket.id);
   assert.equal(proved.mission.approvals[0].attempt, 1);
-  assert.deepEqual(runner.operationLog, ["inspect", "execute", "prove", "head-inspect"]);
+  assert.deepEqual(runner.operationLog, ["inspect", "execute", "capture"]);
+  assert.equal(runner.operationLog.includes("prove"), false);
   assert.equal(runner.calls.sandbox, 1);
-  assert.equal(runner.calls.headInspect, 1);
+  assert.equal(runner.calls.headInspect, 0);
+  assert.equal(runner.reviewInputs.length, 1);
+  assert.deepEqual(runner.reviewInputs[0].actualFilesChanged.sort(), ["src/index.ts", "test/index.test.js"]);
+  assert.equal(runner.deliveryCalls.protectedOperations, 0);
+  assert.equal(runner.deliveryCalls.resolved.length, 0);
 
   const state = await missions.getState();
   assert.equal(state.handoffs.length, 1);
   assert.equal(state.handoffs[0].attempt, 1);
+  assert.deepEqual(state.handoffs[0].checks, []);
+  assert.deepEqual(state.handoffs[0].testsRun, []);
   assert.equal(state.reviews.length, 1);
   assert.equal(state.reviews[0].outcome, "accepted");
   assert.equal(state.reviews[0].attempt, 1);
   assert.equal(state.evidence.some((item) =>
     item.workItemId === implementTicket.id && item.source === "sandbox" && item.attempt === 1
   ), true);
+  assert.equal(state.evidence.some((item) =>
+    /npm|typecheck|test/.test(JSON.parse(item.details ?? "{}").command ?? "")
+  ), false);
 });
 
-test("delivery approval refuses a green handoff without the direct proof marker", async () => {
+test("independent review findings require human-authorized same-sandbox rework", async () => {
+  let reviewCalls = 0;
+  const finding = "Return the completed todo instead of dropping it from the result.";
+  const verifier = {
+    review(context) {
+      reviewCalls += 1;
+      return reviewCalls === 1
+        ? {
+            outcome: "changes_requested",
+            reviewer: "test-independent-reviewer",
+            summary: "The actual diff has one concrete contract issue.",
+            finding,
+          }
+        : {
+            outcome: "accepted",
+            reviewer: "test-independent-reviewer",
+            summary: "The rework satisfies the bounded ticket.",
+            finding: "The requested behavior is present and remains in scope.",
+          };
+    },
+  };
+  const { app, runner, missions } = testApp(new InMemoryMissionRepository(), { verifier });
+
+  await app.request("/api/mission", { method: "POST" });
+  let current = await json(await app.request("/api/mission"));
+  const inspectTicket = current.mission.tickets.find((item) => item.assignedRole === "planner");
+  await authorizeTicket(app, inspectTicket.id);
+  const inspected = await json(await app.request("/api/mission/run", { method: "POST" }));
+  const implementTicket = inspected.mission.tickets.find((item) => item.assignedRole === "implementer");
+  await authorizeTicket(app, implementTicket.id);
+
+  const firstRun = await json(await app.request("/api/mission/run", { method: "POST" }));
+  const requested = firstRun.mission.tickets.find((item) => item.id === implementTicket.id);
+  assert.equal(requested.status, "changes_requested");
+  assert.deepEqual(requested.requestedChanges, [finding]);
+  assert.equal(firstRun.mission.approvals.length, 0);
+  assert.equal(runner.calls.turn, 1);
+  assert.equal(runner.calls.sandbox, 1);
+  assert.equal(runner.deliveryCalls.protectedOperations, 0);
+
+  const unauthorizedRetry = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(unauthorizedRetry.status, 400);
+  assert.equal(runner.calls.turn, 1);
+
+  await authorizeTicket(app, implementTicket.id, "rework-operator");
+  const reworked = await json(await app.request("/api/mission/run", { method: "POST" }));
+  const accepted = reworked.mission.tickets.find((item) => item.id === implementTicket.id);
+  assert.equal(accepted.status, "awaiting_approval");
+  assert.equal(accepted.attempt, 2);
+  assert.equal(accepted.attempts[0].retiredBy, "rework-operator");
+  assert.deepEqual(accepted.attempts[1].requestedChanges, [finding]);
+  assert.equal(accepted.attempts[1].claim.trueforgeSandboxId, "test-sandbox-durable");
+  assert.match(runner.turnInputs[1].instruction, new RegExp(finding.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.equal(reworked.mission.approvals.length, 1);
+  assert.equal(runner.deliveryCalls.protectedOperations, 0);
+
+  const state = await missions.getState();
+  assert.equal(state.reviews.length, 2);
+  assert.equal(state.reviews[0].outcome, "changes_requested");
+  assert.equal(state.reviews[1].outcome, "accepted");
+  assert.equal(state.handoffs[1].attempt, 2);
+});
+
+test("two different proof artifacts independently reach approval and delivery", async () => {
+  const fixtureSnapshot = {
+    files: structuredClone(PRIMARY_VERIFIED_DELIVERY_FILES),
+    patches: structuredClone(PRIMARY_VERIFIED_DELIVERY_PATCHES),
+    artifact: structuredClone(PRIMARY_VERIFIED_DELIVERY_ARTIFACT),
+  };
+  const artifacts = [dynamicProofArtifact("alpha"), dynamicProofArtifact("beta")];
+  const deliveredHashes = [];
+
+  for (const [index, artifact] of artifacts.entries()) {
+    const headSha = index === 0
+      ? "91aa2a62b3714f699204cb0d5c440fcb7f0a09e1"
+      : "92bb2a62b3714f699204cb0d5c440fcb7f0a09e1";
+    const { app, runner, missions } = testApp(new InMemoryMissionRepository(), {
+      proofArtifact: artifact,
+      deliveryHeadPatches: artifact.patches,
+      deliveryHeadSha: headSha,
+    });
+    const { approval } = await reachDeliveryApproval(app);
+    assert.equal(approval.executionContext.artifactHash, artifact.contentHash);
+    assert.deepEqual(runner.deliveryCalls.requested[0].target.artifact, artifact);
+
+    const delivered = await decideDelivery(app, approval, "approved");
+    assert.equal(delivered.mission.mission.status, "delivered");
+    assert.equal(runner.deliveryCalls.protectedOperations, 1);
+    const state = await missions.getState();
+    const publishedEvidence = state.evidence.find((item) =>
+      JSON.parse(item.details ?? "{}").provenance_kind === "delivery_head"
+    );
+    assert.equal(JSON.parse(publishedEvidence.details).artifact_hash, artifact.contentHash);
+    deliveredHashes.push(artifact.contentHash);
+  }
+
+  assert.notEqual(deliveredHashes[0], deliveredHashes[1]);
+  assert.deepEqual(PRIMARY_VERIFIED_DELIVERY_FILES, fixtureSnapshot.files);
+  assert.deepEqual(PRIMARY_VERIFIED_DELIVERY_PATCHES, fixtureSnapshot.patches);
+  assert.deepEqual(PRIMARY_VERIFIED_DELIVERY_ARTIFACT, fixtureSnapshot.artifact);
+});
+
+test("artifact capture infrastructure failure retries Review without another coding turn", async () => {
+  const { app, runner, missions } = testApp(new InMemoryMissionRepository(), {
+    sandboxInfrastructureFailure: true,
+  });
+
+  await app.request("/api/mission", { method: "POST" });
+  let current = await json(await app.request("/api/mission"));
+  const inspectTicket = current.mission.tickets.find((item) => item.assignedRole === "planner");
+  await authorizeTicket(app, inspectTicket.id);
+  await app.request("/api/mission/run", { method: "POST" });
+
+  current = await json(await app.request("/api/mission"));
+  const implementTicket = current.mission.tickets.find((item) => item.assignedRole === "implementer");
+  await authorizeTicket(app, implementTicket.id);
+  const failedProof = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(failedProof.status, 200);
+  const proving = await json(failedProof);
+  const provingTicket = proving.mission.tickets.find((item) => item.id === implementTicket.id);
+  assert.equal(provingTicket.status, "proving");
+  assert.equal(provingTicket.attempt, 1);
+  assert.equal(proving.mission.approvals.length, 0);
+  assert.equal(proving.mission.handoffs.length, 0);
+  assert.equal(proving.mission.reviews.length, 0);
+  assert.equal(runner.calls.turn, 1);
+  assert.equal(runner.calls.sandbox, 1);
+
+  const failedState = await missions.getState();
+  const retryEvidence = failedState.evidence.find((item) =>
+    item.workItemId === implementTicket.id &&
+    item.source === "system" &&
+    item.result === "failed" &&
+    JSON.parse(item.details).retryable === true,
+  );
+  assert.ok(retryEvidence, "A retryable capture failure must be durably recorded.");
+  assert.equal(JSON.parse(retryEvidence.details).failure_class, "infrastructure");
+
+  runner.sandboxInfrastructureFailure = false;
+  const recoveredProof = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(recoveredProof.status, 200);
+  const recovered = await json(recoveredProof);
+  const recoveredTicket = recovered.mission.tickets.find((item) => item.id === implementTicket.id);
+  assert.equal(recoveredTicket.status, "awaiting_approval");
+  assert.equal(recoveredTicket.attempt, 1);
+  assert.equal(recoveredTicket.claim.trueforgeSessionId, "test-session-durable");
+  assert.equal(recoveredTicket.claim.trueforgeSandboxId, "test-sandbox-durable");
+  assert.equal(runner.calls.turn, 1);
+  assert.equal(runner.calls.sandbox, 2);
+  assert.equal(recovered.mission.handoffs.length, 1);
+  assert.equal(recovered.mission.reviews.length, 1);
+  assert.equal(recovered.mission.approvals.length, 1);
+  assert.equal((await missions.getState()).evidence.some((item) => item.id === retryEvidence.id), true);
+});
+
+test("delivery approval refuses a handoff without the same-sandbox capture marker", async () => {
   const { app, runner, missions } = testApp(new InMemoryMissionRepository(), {
     proofMode: "coordinator_turn",
   });
@@ -967,20 +1486,18 @@ test("delivery approval refuses a green handoff without the direct proof marker"
   const inspected = await json(await app.request("/api/mission/run", { method: "POST" }));
   const implementTicket = inspected.mission.tickets.find((item) => item.assignedRole === "implementer");
   await authorizeTicket(app, implementTicket.id);
-  await app.request("/api/mission/run", { method: "POST" });
-
   const proofResponse = await app.request("/api/mission/run", { method: "POST" });
-  assert.equal(proofResponse.status, 502);
+  assert.equal(proofResponse.status, 200);
   const failed = await json(proofResponse);
   const failedTicket = failed.mission.tickets.find((item) => item.id === implementTicket.id);
-  assert.equal(failedTicket.status, "blocked");
+  assert.equal(failedTicket.status, "changes_requested");
   assert.equal(failed.mission.approvals.length, 0);
   assert.equal(runner.calls.sandbox, 1);
   assert.equal(runner.calls.headInspect, 0);
-  assert.equal((await missions.getState()).missions[0].status, "blocked");
+  assert.equal((await missions.getState()).missions[0].status, "executing");
 });
 
-test("proof findings require human reauthorization and reuse the same execution binding", async () => {
+test("artifact capture findings require human reauthorization and reuse the same execution binding", async () => {
   const { app, runner, missions } = testApp(new InMemoryMissionRepository(), { failSandbox: true });
 
   await app.request("/api/mission", { method: "POST" });
@@ -992,8 +1509,6 @@ test("proof findings require human reauthorization and reuse the same execution 
   current = await json(await app.request("/api/mission"));
   const implementTicket = current.mission.tickets.find((item) => item.assignedRole === "implementer");
   await authorizeTicket(app, implementTicket.id);
-  await app.request("/api/mission/run", { method: "POST" });
-
   const failedProof = await app.request("/api/mission/run", { method: "POST" });
   assert.equal(failedProof.status, 200);
   const changesRequested = await json(failedProof);
@@ -1014,18 +1529,15 @@ test("proof findings require human reauthorization and reuse the same execution 
   runner.failSandbox = false;
   const reworkExecution = await app.request("/api/mission/run", { method: "POST" });
   assert.equal(reworkExecution.status, 200);
-  const reworkProving = await json(reworkExecution);
-  const reworkTicket = reworkProving.mission.tickets.find((item) => item.id === implementTicket.id);
-  assert.equal(reworkTicket.status, "proving");
+  const reworkComplete = await json(reworkExecution);
+  const reworkTicket = reworkComplete.mission.tickets.find((item) => item.id === implementTicket.id);
+  assert.equal(reworkTicket.status, "awaiting_approval");
   assert.equal(reworkTicket.attempt, 2);
   assert.equal(reworkTicket.attempts[0].retiredBy, "repair-operator");
   assert.equal(reworkTicket.attempts[1].claim.trueforgeSessionId, "test-session-durable");
   assert.equal(reworkTicket.attempts[1].claim.trueforgeSandboxId, "test-sandbox-durable");
   assert.match(runner.turnInputs[1].instruction, /Requested rework findings:.*exited with code 1/i);
 
-  const reworkProof = await app.request("/api/mission/run", { method: "POST" });
-  assert.equal(reworkProof.status, 200);
-  const reworkComplete = await json(reworkProof);
   const reworked = reworkComplete.mission.tickets.find((item) => item.id === implementTicket.id);
   assert.equal(reworked.status, "awaiting_approval");
   assert.equal(reworked.attempts[1].status, "awaiting_approval");
@@ -1033,7 +1545,7 @@ test("proof findings require human reauthorization and reuse the same execution 
   assert.equal(reworkComplete.mission.approvals.length, 1);
   assert.equal(reworkComplete.mission.approvals[0].attempt, 2);
   assert.equal(runner.calls.sandbox, 2);
-  assert.equal(runner.calls.headInspect, 1);
+  assert.equal(runner.calls.headInspect, 0);
 
   const state = await missions.getState();
   assert.equal(state.handoffs.length, 1);
@@ -1077,8 +1589,6 @@ test("Changes Requested stays inert across JSON reconnect before a new authorize
     const inspected = await json(await first.app.request("/api/mission/run", { method: "POST" }));
     const implementTicket = inspected.mission.tickets.find((item) => item.assignedRole === "implementer");
     await authorizeTicket(first.app, implementTicket.id);
-    await first.app.request("/api/mission/run", { method: "POST" });
-
     const requested = await json(await first.app.request("/api/mission/run", { method: "POST" }));
     const requestedTicket = requested.mission.tickets.find((item) => item.id === implementTicket.id);
     assert.equal(requestedTicket.status, "changes_requested");
@@ -1114,20 +1624,19 @@ test("Changes Requested stays inert across JSON reconnect before a new authorize
 
     const reworkExecution = await json(await restoredApp.request("/api/mission/run", { method: "POST" }));
     const reworkTicket = reworkExecution.mission.tickets.find((item) => item.id === implementTicket.id);
-    assert.equal(reworkTicket.status, "proving");
+    assert.equal(reworkTicket.status, "awaiting_approval");
     assert.equal(reworkTicket.attempt, 2);
     assert.equal(reworkTicket.attempts[0].retiredBy, "reconnect-operator");
     assert.equal(reworkTicket.attempts[1].claim.trueforgeSessionId, "test-session-durable");
     assert.equal(reworkTicket.attempts[1].claim.trueforgeSandboxId, "test-sandbox-durable");
     assert.equal(restoredRunner.turnInputs[0].options.previousTurnId, "test-turn-1");
 
-    const reworkProof = await json(await restoredApp.request("/api/mission/run", { method: "POST" }));
-    const completedTicket = reworkProof.mission.tickets.find((item) => item.id === implementTicket.id);
+    const completedTicket = reworkExecution.mission.tickets.find((item) => item.id === implementTicket.id);
     assert.equal(completedTicket.status, "awaiting_approval");
     assert.equal(completedTicket.attempts[1].status, "awaiting_approval");
-    assert.equal(reworkProof.mission.approvals.at(-1).attempt, 2);
-    assert.equal(reworkProof.mission.reviews.length, 2);
-    assert.equal(reworkProof.mission.reviews.at(-1).outcome, "accepted");
+    assert.equal(reworkExecution.mission.approvals.at(-1).attempt, 2);
+    assert.equal(reworkExecution.mission.reviews.length, 2);
+    assert.equal(reworkExecution.mission.reviews.at(-1).outcome, "accepted");
     assert.equal(restoredRunner.calls.turn, 1);
     assert.equal(restoredRunner.calls.sandbox, 1);
   } finally {
@@ -1175,9 +1684,16 @@ test("a reconnect resumes a durably completed implementation turn without replay
   assert.equal(executed.status, 200);
 
   const snapshot = await repository.load();
+  snapshot.missions[0].status = "executing";
   const persistedTicket = snapshot.workItems.find((item) => item.id === implementTicket.id);
   persistedTicket.status = "in_progress";
   persistedTicket.attempts.at(-1).status = "in_progress";
+  snapshot.handoffs = [];
+  snapshot.reviews = [];
+  snapshot.approvals = [];
+  snapshot.evidence = snapshot.evidence.filter((item) =>
+    item.workItemId !== implementTicket.id || item.source === "trueforge"
+  );
   await repository.save(snapshot);
 
   const restoredMissions = new MissionService(repository);
@@ -1187,9 +1703,10 @@ test("a reconnect resumes a durably completed implementation turn without replay
   assert.equal(resumed.status, 200);
   const payload = await json(resumed);
   const resumedTicket = payload.mission.tickets.find((item) => item.id === implementTicket.id);
-  assert.equal(resumedTicket.status, "proving");
+  assert.equal(resumedTicket.status, "awaiting_approval");
   assert.equal(resumedTicket.attempts.length, 1);
   assert.equal(restoredRunner.calls.turn, 0);
+  assert.equal(restoredRunner.calls.sandbox, 1);
 });
 
 test("approved delivery advances the same attempt through read-back before Done", async () => {
@@ -1259,7 +1776,7 @@ test("a reconnect reconciles a durable delivery intent without replaying create_
       repositoryName: context.repositoryName,
       base: context.base,
       head: context.head,
-      headSha: context.headSha,
+      artifact: PRIMARY_VERIFIED_DELIVERY_ARTIFACT,
       title: context.title,
       body: context.body,
     },
@@ -1306,7 +1823,7 @@ test("a missing reconciled pull request fails closed without replaying the prote
       repositoryName: context.repositoryName,
       base: context.base,
       head: context.head,
-      headSha: context.headSha,
+      artifact: PRIMARY_VERIFIED_DELIVERY_ARTIFACT,
       title: context.title,
       body: context.body,
     },
@@ -1429,6 +1946,38 @@ test("a restart resumes from persisted pull-request read-back without repeating 
     kind: "tool_result",
     result: "passed",
     source: "mcp",
+    summary: "MCP verified the published artifact before the controller restarted.",
+    details: JSON.stringify({
+      server: "github",
+      tool: "get_commit",
+      provenance_kind: "delivery_head",
+      arguments: {
+        owner: context.repositoryOwner,
+        repo: context.repositoryName,
+        sha: context.head,
+        detail: "full_patch",
+        perPage: 100,
+      },
+      repository_owner: context.repositoryOwner,
+      repository_name: context.repositoryName,
+      requested_ref: context.head,
+      baseline_sha: PRIMARY_VERIFIED_DELIVERY_ARTIFACT.baselineSha,
+      uri: `repo://${context.repositoryOwner}/${context.repositoryName}/sha/8bb22a62b3714f699204cb0d5c440fcb7f0a09e1`,
+      commit_sha: "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1",
+      patches: PRIMARY_VERIFIED_DELIVERY_ARTIFACT.patches,
+      artifact_hash: PRIMARY_VERIFIED_DELIVERY_ARTIFACT.contentHash,
+    }),
+    executionOrigin: {
+      kind: "mcp",
+      sessionId: context.sessionId,
+      turnId: "restart-delivery-head-turn",
+    },
+  });
+  await first.missions.addEvidence(PRIMARY_MISSION_ID, {
+    workItemId: implementTicket.id,
+    kind: "tool_result",
+    result: "passed",
+    source: "mcp",
     summary: "MCP verified the pull request before the controller restarted.",
     details: JSON.stringify({
       server: "github",
@@ -1437,7 +1986,7 @@ test("a restart resumes from persisted pull-request read-back without repeating 
       repository_name: context.repositoryName,
       base: context.base,
       head: context.head,
-      head_sha: context.headSha,
+      head_sha: "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1",
       pull_request_number: 73,
       pull_request_url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/73",
     }),
@@ -1486,8 +2035,6 @@ test("a semantic changes-requested review stops the queue without automatic repa
   current = await json(await app.request("/api/mission"));
   const implementTicket = current.mission.tickets.find((item) => item.assignedRole === "implementer");
   await authorizeTicket(app, implementTicket.id);
-  await app.request("/api/mission/run", { method: "POST" });
-
   const reviewResponse = await app.request("/api/mission/run", { method: "POST" });
   assert.equal(reviewResponse.status, 200);
   const changesRequested = await json(reviewResponse);
@@ -1554,7 +2101,7 @@ test("a blocked queue does not silently retry or resurrect the failed execution"
   assert.equal(runner.calls.inspect, 1);
 });
 
-test("the primary controller leaves review and remote delivery for later authorized queue stages", async () => {
+test("the primary controller reviews automatically but leaves remote delivery human-gated", async () => {
   const reviewed = [];
   const verifier = {
     review(context) {
@@ -1580,12 +2127,13 @@ test("the primary controller leaves review and remote delivery for later authori
   const response = await app.request("/api/mission/run", { method: "POST" });
   assert.equal(response.status, 200);
   const state = await missions.getState();
-  assert.equal(state.workItems.find((item) => item.id === implementTicket.id).status, "proving");
-  assert.equal(reviewed.length, 0);
-  assert.equal(state.handoffs.length, 0);
-  assert.equal(state.reviews.length, 0);
-  assert.equal(state.approvals.length, 0);
-  assert.equal(runner.deliveryCalls.requested.length, 0);
+  assert.equal(state.workItems.find((item) => item.id === implementTicket.id).status, "awaiting_approval");
+  assert.equal(reviewed.length, 1);
+  assert.equal(state.handoffs.length, 1);
+  assert.equal(state.reviews.length, 1);
+  assert.equal(state.approvals.length, 1);
+  assert.equal(runner.deliveryCalls.requested.length, 1);
+  assert.equal(runner.deliveryCalls.protectedOperations, 0);
 });
 
 test("Mission Control defaults to Alibaba Qwen and accepts an explicit model selector", () => {

@@ -1,35 +1,170 @@
+import { randomUUID } from "node:crypto";
+
+import { Daytona } from "@daytona/sdk";
+
 import type {
   SandboxCommandExecutionRequest,
   SandboxCommandExecutor,
+  SandboxLifecycleObservation,
 } from "./trueforge.js";
 
-export const DEFAULT_DAYTONA_TOOLBOX_BASE_URL = "https://proxy.app.daytona.io/toolbox";
+export const DAYTONA_SANDBOX_REFERENCE_PREFIX = "v1:daytona:";
 export const DEFAULT_DAYTONA_COMMAND_TIMEOUT_SECONDS = 600;
+export const DEFAULT_DAYTONA_SANDBOX_START_TIMEOUT_SECONDS = 60;
 const DEFAULT_DAYTONA_REQUEST_TIMEOUT_BUFFER_SECONDS = 30;
 const MAX_DAYTONA_RESULT_LENGTH = 2_000_000;
 
+export type DaytonaSandboxFailureCategory =
+  | "configuration"
+  | "authentication"
+  | "network"
+  | "transport"
+  | "identity";
+
+export interface DaytonaSandboxProcess {
+  executeCommand(
+    command: string,
+    cwd?: string,
+    env?: Record<string, string>,
+    timeout?: number,
+  ): Promise<{ exitCode: number; result: string }>;
+}
+
+export interface DaytonaSandboxClient {
+  get(sandboxIdOrName: string): Promise<{
+    id: string;
+    name: string;
+    state?: string;
+    start?: (timeout?: number) => Promise<void>;
+    waitUntilStarted?: (timeout?: number) => Promise<void>;
+    refreshData?: () => Promise<void>;
+    process: DaytonaSandboxProcess;
+  }>;
+}
+
+export interface DaytonaReadinessClient {
+  get(sandboxIdOrName: string): Promise<unknown>;
+}
+
+export interface DaytonaReadinessProbeOptions {
+  /** Required when a Daytona client is not injected for an isolated test. */
+  apiKey?: string;
+  apiUrl?: string;
+  requestTimeoutMs?: number;
+  /** Injectable supported-client surface used by tests; production uses Daytona. */
+  daytona?: DaytonaReadinessClient;
+}
+
+export interface DaytonaReadinessProbe {
+  checkReadiness(): Promise<string>;
+}
+
 export interface DaytonaSandboxExecutorOptions {
-  apiKey: string;
-  toolboxBaseUrl?: string;
-  /** Explicit opt-in for HTTP only when the toolbox endpoint is loopback. */
-  allowInsecureLoopbackForDevelopment?: boolean;
+  /** Required when a Daytona client is not injected for an isolated test. */
+  apiKey?: string;
+  apiUrl?: string;
   commandTimeoutSeconds?: number;
   requestTimeoutMs?: number;
-  fetch?: typeof fetch;
+  sandboxStartTimeoutSeconds?: number;
+  /** Injectable supported-client surface used by tests; production uses Daytona. */
+  daytona?: DaytonaSandboxClient;
 }
 
 /**
- * Execute a command through Daytona's sandbox toolbox API without creating a
- * TrueForge turn or allowing a model to choose the target, command, or args.
+ * A provider-boundary failure is retryable by the Proof Board. It must never
+ * be interpreted as a request to launch another implementation turn.
+ */
+export class DaytonaSandboxExecutionError extends Error {
+  readonly retryable = true as const;
+  readonly failureClass = "infrastructure" as const;
+  readonly failureCategory: DaytonaSandboxFailureCategory;
+
+  constructor(message: string, failureCategory: DaytonaSandboxFailureCategory) {
+    super(message);
+    this.name = "DaytonaSandboxExecutionError";
+    this.failureCategory = failureCategory;
+  }
+}
+
+/**
+ * Validate the direct Daytona credential and endpoint without creating a
+ * sandbox or executing a command. The random lookup intentionally expects a
+ * 404; a valid API key must reach the authenticated resource boundary first.
+ */
+export function createDaytonaReadinessProbe(
+  options: DaytonaReadinessProbeOptions,
+): DaytonaReadinessProbe {
+  const requestTimeoutMs = positiveInteger(
+    options.requestTimeoutMs ?? 5_000,
+    "Daytona readiness request timeout",
+  );
+  let daytona = options.daytona;
+
+  return {
+    async checkReadiness() {
+      if (daytona === undefined) {
+        const clientOptions: DaytonaSandboxExecutorOptions = {
+          ...(options.apiKey === undefined ? {} : { apiKey: options.apiKey }),
+          ...(options.apiUrl === undefined ? {} : { apiUrl: options.apiUrl }),
+        };
+        daytona = createDaytonaClient(
+          clientOptions,
+          requestTimeoutMs,
+          true,
+        );
+      }
+
+      const probeId = `trueforge-proofboard-preflight-${randomUUID()}`;
+      try {
+        await daytona.get(probeId);
+      } catch (error) {
+        if (isDaytonaNotFoundError(error)) {
+          return "Daytona API authenticated and reachable; the read-only probe target is absent";
+        }
+        const reason = error instanceof Error
+          ? sanitizeDaytonaError(error.message)
+          : "provider request failed";
+        throw new Error(`Daytona readiness probe failed: ${reason}`);
+      }
+      return "Daytona API accepted an authenticated read-only sandbox lookup";
+    },
+  };
+}
+
+/**
+ * Resolve the persisted Proof Board reference to the exact provider locator
+ * accepted by Daytona's supported SDK. Resolution is deliberately pure: it
+ * never creates, starts, forks, or substitutes a sandbox.
+ */
+export function resolveDaytonaSandboxId(reference: string): string {
+  const normalized = requiredTrimmedText(reference, "Daytona sandbox reference");
+  if (!normalized.startsWith("v1:")) {
+    return normalized;
+  }
+  if (!normalized.startsWith(DAYTONA_SANDBOX_REFERENCE_PREFIX)) {
+    throw new DaytonaSandboxExecutionError(
+      "The persisted sandbox reference uses an unsupported provider namespace.",
+      "identity",
+    );
+  }
+  const locator = normalized.slice(DAYTONA_SANDBOX_REFERENCE_PREFIX.length);
+  if (locator.length === 0) {
+    throw new DaytonaSandboxExecutionError(
+      "The persisted Daytona sandbox reference does not include a provider id.",
+      "identity",
+    );
+  }
+  return locator;
+}
+
+/**
+ * Execute deterministic proof commands through the official Daytona SDK.
+ * The adapter retrieves only the exact persisted sandbox locator and returns
+ * the persisted reference so downstream proof evidence keeps stable identity.
  */
 export function createDaytonaSandboxExecutor(
   options: DaytonaSandboxExecutorOptions,
 ): SandboxCommandExecutor {
-  const apiKey = requiredTrimmedText(options.apiKey, "Daytona API key");
-  const toolboxBaseUrl = normalizeToolboxBaseUrl(
-    options.toolboxBaseUrl,
-    options.allowInsecureLoopbackForDevelopment === true,
-  );
   const commandTimeoutSeconds = positiveInteger(
     options.commandTimeoutSeconds ?? DEFAULT_DAYTONA_COMMAND_TIMEOUT_SECONDS,
     "Daytona command timeout",
@@ -39,123 +174,255 @@ export function createDaytonaSandboxExecutor(
       (commandTimeoutSeconds + DEFAULT_DAYTONA_REQUEST_TIMEOUT_BUFFER_SECONDS) * 1_000,
     "Daytona request timeout",
   );
-  const fetchImpl = options.fetch ?? globalThis.fetch;
-  if (typeof fetchImpl !== "function") {
-    throw new Error("A fetch implementation is required for direct Daytona sandbox execution.");
-  }
+  const sandboxStartTimeoutSeconds = positiveInteger(
+    options.sandboxStartTimeoutSeconds ?? DEFAULT_DAYTONA_SANDBOX_START_TIMEOUT_SECONDS,
+    "Daytona sandbox start timeout",
+  );
+  const daytona = options.daytona ?? createDaytonaClient(options, requestTimeoutMs);
 
   return {
     async execute(request: SandboxCommandExecutionRequest) {
-      const sandboxId = requiredTrimmedText(request.sandboxId, "Daytona sandbox id");
+      const persistedReference = requiredTrimmedText(
+        request.sandboxId,
+        "Daytona sandbox reference",
+      );
+      const locator = resolveDaytonaSandboxId(persistedReference);
       const command = requiredValue(request.command, "Daytona sandbox command");
       const timeoutSeconds = positiveInteger(
         request.timeoutSeconds ?? commandTimeoutSeconds,
         "Daytona command timeout",
       );
-      const body: Record<string, unknown> = {
-        command,
-        timeout: timeoutSeconds,
-      };
-      if (request.cwd !== undefined) {
-        body.cwd = request.cwd;
-      }
 
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
-      const url = `${toolboxBaseUrl}/${encodeURIComponent(sandboxId)}/process/execute`;
-      let response: Response;
+      let sandbox: Awaited<ReturnType<DaytonaSandboxClient["get"]>>;
       try {
-        response = await fetchImpl(url, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${apiKey}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(body),
-          signal: controller.signal,
-        });
+        sandbox = await daytona.get(locator);
       } catch (error) {
-        const reason = error instanceof Error ? error.message : "request failed";
-        throw new Error(
-          controller.signal.aborted
-            ? `Daytona sandbox execution timed out after ${requestTimeoutMs}ms.`
-            : `Daytona sandbox execution request failed: ${sanitizeDaytonaError(reason)}`,
+        throw daytonaExecutionError(
+          "Daytona could not retrieve the persisted sandbox",
+          error,
         );
-      } finally {
-        clearTimeout(timeout);
+      }
+      if (
+        !isRecord(sandbox) ||
+        typeof sandbox.id !== "string" ||
+        sandbox.id.trim().length === 0 ||
+        typeof sandbox.name !== "string" ||
+        (sandbox.id !== locator && sandbox.name !== locator) ||
+        !isRecord(sandbox.process) ||
+        typeof sandbox.process.executeCommand !== "function"
+      ) {
+        throw new DaytonaSandboxExecutionError(
+          "Daytona returned a sandbox that does not match the persisted locator.",
+          "identity",
+        );
       }
 
-      if (!response.ok) {
-        throw new Error(`Daytona sandbox execution returned HTTP ${response.status}.`);
-      }
+      const sandboxLifecycle = await ensureDaytonaSandboxReady(
+        sandbox,
+        sandboxStartTimeoutSeconds,
+      );
 
-      let payload: unknown;
+      let response: unknown;
       try {
-        payload = await response.json();
-      } catch {
-        throw new Error("Daytona sandbox execution returned invalid JSON.");
-      }
-      const exitCode = isRecord(payload) ? payload.exitCode : undefined;
-      const result = isRecord(payload) ? payload.result : undefined;
-      if (typeof exitCode !== "number" || !Number.isInteger(exitCode) || typeof result !== "string") {
-        throw new Error("Daytona sandbox execution returned an invalid result.");
-      }
-      if (result.length > MAX_DAYTONA_RESULT_LENGTH) {
-        throw new Error(
-          `Daytona sandbox execution exceeded the ${MAX_DAYTONA_RESULT_LENGTH}-character output bound.`,
+        response = await sandbox.process.executeCommand(
+          command,
+          request.cwd,
+          undefined,
+          timeoutSeconds,
+        );
+      } catch (error) {
+        throw daytonaExecutionError(
+          "Daytona could not execute the deterministic proof command",
+          error,
         );
       }
+
+      if (
+        !isRecord(response) ||
+        typeof response.exitCode !== "number" ||
+        !Number.isInteger(response.exitCode) ||
+        typeof response.result !== "string"
+      ) {
+        throw new DaytonaSandboxExecutionError(
+          "Daytona returned an invalid deterministic proof result.",
+          "transport",
+        );
+      }
+      if (response.result.length > MAX_DAYTONA_RESULT_LENGTH) {
+        throw new DaytonaSandboxExecutionError(
+          `Daytona sandbox execution exceeded the ${MAX_DAYTONA_RESULT_LENGTH}-character output bound.`,
+          "transport",
+        );
+      }
+
       return {
-        sandboxId,
-        exitCode,
-        stdout: result,
+        sandboxId: persistedReference,
+        exitCode: response.exitCode,
+        stdout: response.result,
+        sandboxLifecycle,
       };
     },
   };
 }
 
-function normalizeToolboxBaseUrl(
-  value: string | undefined,
-  allowInsecureLoopbackForDevelopment: boolean,
-): string {
-  const raw = value?.trim() || DEFAULT_DAYTONA_TOOLBOX_BASE_URL;
+async function ensureDaytonaSandboxReady(
+  sandbox: {
+    state?: string;
+    start?: (timeout?: number) => Promise<void>;
+    waitUntilStarted?: (timeout?: number) => Promise<void>;
+    refreshData?: () => Promise<void>;
+  },
+  timeoutSeconds: number,
+): Promise<SandboxLifecycleObservation> {
+  const initialState = sandboxState(sandbox.state);
+  if (initialState === "started") {
+    return {
+      initialState,
+      finalState: initialState,
+      action: "none",
+      recovered: false,
+    };
+  }
+
+  const action = initialState === "starting" ||
+      initialState === "restoring" ||
+      initialState === "resuming"
+    ? "wait_until_started"
+    : "start";
+  try {
+    if (action === "wait_until_started") {
+      if (sandbox.waitUntilStarted === undefined) {
+        throw new DaytonaSandboxExecutionError(
+          `Daytona sandbox is ${initialState} but does not expose a supported readiness wait.`,
+          "configuration",
+        );
+      }
+      await sandbox.waitUntilStarted(timeoutSeconds);
+    } else {
+      if (!isStartableDaytonaState(initialState) || sandbox.start === undefined) {
+        throw new DaytonaSandboxExecutionError(
+          `Daytona sandbox is ${initialState} and cannot be resumed through the supported lifecycle API.`,
+          "configuration",
+        );
+      }
+      await sandbox.start(timeoutSeconds);
+    }
+    if (sandbox.refreshData !== undefined) {
+      await sandbox.refreshData();
+    }
+  } catch (error) {
+    if (error instanceof DaytonaSandboxExecutionError) {
+      throw error;
+    }
+    throw daytonaExecutionError(
+      `Daytona could not restore the persisted sandbox from ${initialState} state`,
+      error,
+    );
+  }
+
+  const finalState = sandboxState(sandbox.state);
+  if (finalState !== "started") {
+    throw new DaytonaSandboxExecutionError(
+      `Daytona sandbox lifecycle recovery returned ${finalState} instead of started.`,
+      "transport",
+    );
+  }
+  return {
+    initialState,
+    finalState,
+    action,
+    recovered: true,
+  };
+}
+
+function isStartableDaytonaState(state: string): boolean {
+  return state === "stopped" || state === "archived" || state === "paused";
+}
+
+function sandboxState(value: unknown): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new DaytonaSandboxExecutionError(
+      "Daytona returned no authoritative lifecycle state for the persisted sandbox.",
+      "transport",
+    );
+  }
+  return value.trim().toLowerCase();
+}
+
+function createDaytonaClient(
+  options: DaytonaSandboxExecutorOptions,
+  requestTimeoutMs: number,
+  useDeprecatedPolling = false,
+): DaytonaSandboxClient {
+  const apiKey = requiredTrimmedText(options.apiKey ?? "", "Daytona API key");
+  const config: ConstructorParameters<typeof Daytona>[0] = {
+    apiKey,
+    requestTimeoutMs,
+    useDeprecatedPolling,
+  };
+  if (options.apiUrl !== undefined) {
+    config.apiUrl = normalizeDaytonaApiUrl(options.apiUrl);
+  }
+  return new Daytona(config);
+}
+
+function isDaytonaNotFoundError(error: unknown): boolean {
+  const record = isRecord(error) ? error : undefined;
+  const name = typeof record?.name === "string" ? record.name.toLowerCase() : "";
+  const code = typeof record?.code === "string" ? record.code.toLowerCase() : "";
+  return record?.statusCode === 404 ||
+    name.includes("notfound") ||
+    name.includes("not_found") ||
+    code === "not_found" ||
+    code === "not-found";
+}
+
+function normalizeDaytonaApiUrl(value: string): string {
+  const raw = requiredTrimmedText(value, "Daytona API URL");
   let url: URL;
   try {
     url = new URL(raw);
   } catch {
-    throw new Error("Daytona toolbox base URL must be a valid URL.");
+    throw new Error("Daytona API URL must be a valid URL.");
   }
-  if (
-    url.username ||
-    url.password ||
-    url.protocol !== "https:" &&
-      !(url.protocol === "http:" &&
-        allowInsecureLoopbackForDevelopment &&
-        isLoopbackHostname(url.hostname))
-  ) {
-    throw new Error(
-      "Daytona toolbox base URL must use HTTPS; HTTP is allowed only for explicit loopback development or test use.",
-    );
+  if (url.username || url.password || url.protocol !== "https:") {
+    throw new Error("Daytona API URL must use HTTPS and must not contain credentials.");
   }
   url.search = "";
   url.hash = "";
-  url.pathname = url.pathname.replace(/\/+$/, "");
   return url.toString().replace(/\/$/, "");
 }
 
-function isLoopbackHostname(hostname: string): boolean {
-  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
-  if (normalized === "localhost" || normalized === "::1") {
-    return true;
+function daytonaExecutionError(prefix: string, error: unknown): DaytonaSandboxExecutionError {
+  const category = daytonaFailureCategory(error);
+  const reason = error instanceof Error ? sanitizeDaytonaError(error.message) : "provider request failed";
+  return new DaytonaSandboxExecutionError(`${prefix}: ${reason}`, category);
+}
+
+function daytonaFailureCategory(error: unknown): DaytonaSandboxFailureCategory {
+  if (error instanceof DaytonaSandboxExecutionError) {
+    return error.failureCategory;
   }
-  const octets = normalized.split(".");
-  return (
-    octets.length === 4 &&
-    octets[0] === "127" &&
-    octets.every((octet) =>
-      /^\d+$/.test(octet) && Number(octet) >= 0 && Number(octet) <= 255
-    )
-  );
+  const record = isRecord(error) ? error : undefined;
+  const statusCode = record?.statusCode;
+  const name = typeof record?.name === "string" ? record.name : "";
+  const code = typeof record?.code === "string" ? record.code : "";
+  const text = `${name} ${code} ${error instanceof Error ? error.message : ""}`.toLowerCase();
+  if (
+    statusCode === 401 ||
+    statusCode === 403 ||
+    /auth|credential|forbidden|unauthorized/.test(text)
+  ) {
+    return "authentication";
+  }
+  if (
+    (typeof statusCode === "number" &&
+      (statusCode === 408 || statusCode === 429 || statusCode >= 500)) ||
+    /connection|network|timeout|timed out|socket|fetch|gateway|service unavailable/.test(text)
+  ) {
+    return "network";
+  }
+  return "transport";
 }
 
 function requiredValue(value: string, label: string): string {
@@ -182,7 +449,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function sanitizeDaytonaError(value: string): string {
   return value
-    .replace(/authorization\s*[:=]\s*bearer\s+[^\s,;]+/gi, "[redacted]")
-    .replace(/\bBearer\s+[^\s,;]+/gi, "[redacted]")
+    .replace(/authorization\s*[:=]\s*bearer\s+[^\s,;]+/gi, "authorization: Bearer [redacted]")
+    .replace(/\bBearer\s+[^\s,;]+/gi, "Bearer [redacted]")
+    .replace(/\b(api[_-]?key|token|password|secret|credential|cookie)\s*[:=]\s*[^\s,;]+/gi, "$1=[redacted]")
     .slice(0, 600);
 }

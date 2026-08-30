@@ -20,3 +20,4 @@ export * from "./daytona.js";
 export * from "./http/server.js";
 export * from "./http/config.js";
 export * from "./http/node.js";
+export * from "./demo.js";

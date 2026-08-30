@@ -14,10 +14,15 @@
     "prestart": "npm run build",
     "start": "node --env-file-if-exists=.env dist/http/start.js",
     "smoke:trueforge": "node --env-file-if-exists=.env scripts/trueforge-smoke.mjs",
+    "demo:reset": "npm run build && node --env-file-if-exists=.env scripts/demo-control.mjs reset",
+    "demo:preflight": "npm run build && node --env-file-if-exists=.env scripts/demo-control.mjs preflight",
     "test:proof-loop": "npm run build && node scripts/delegated-delivery-integration.mjs && node scripts/queue-safety-recovery-integration.mjs"
   },
   "devDependencies": {
     "@truefoundry/trueforge-sdk": "0.1.3",
     "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "@daytona/sdk": "^0.207.0"
   }
 }

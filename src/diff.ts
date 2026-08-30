@@ -25,6 +25,11 @@ export interface ParsedCompleteChangedFilesEvidence {
   filesChanged: string[];
 }
 
+export interface CompleteChangedFileStatus {
+  file: string;
+  status: string;
+}
+
 export interface ParsedDelegatedWorkspaceTreeSnapshot {
   command: string;
   output: string;
@@ -352,6 +357,14 @@ export function completeChangedFilesFromCommand(
   output: string,
   command: string,
 ): string[] | null {
+  const entries = completeChangedFileStatusesFromCommand(output, command);
+  return entries === null ? null : entries.map(({ file }) => file);
+}
+
+export function completeChangedFileStatusesFromCommand(
+  output: string,
+  command: string,
+): CompleteChangedFileStatus[] | null {
   const normalized = normalizeCommand(command);
   if (!isCompleteChangedFilesCommand(normalized) || output.length > 12_000) {
     return null;
@@ -360,7 +373,7 @@ export function completeChangedFilesFromCommand(
   const records = usesNul
     ? output.split("\u0000")
     : output.replace(/\r\n/g, "\n").split("\n");
-  const files: string[] = [];
+  const files: CompleteChangedFileStatus[] = [];
   for (let index = 0; index < records.length; index += 1) {
     const record = records[index];
     if (record === undefined || record.length === 0) {
@@ -388,9 +401,16 @@ export function completeChangedFilesFromCommand(
       }
       file = file.slice(separator + 4);
     }
-    files.push(file);
+    files.push({ file, status });
   }
-  return uniqueStrings(files);
+  const seen = new Set<string>();
+  return files.filter(({ file }) => {
+    if (seen.has(file)) {
+      return false;
+    }
+    seen.add(file);
+    return true;
+  });
 }
 
 export function parseCompleteChangedFilesEvidence(
@@ -516,7 +536,7 @@ export function parseContentDiffEvidence(
   };
 }
 
-function parseDiffHeader(
+export function parseDiffHeader(
   line: string,
 ): { before: string; after: string } | null {
   const prefix = "diff --git ";
@@ -585,7 +605,48 @@ function decodeGitPath(value: string): string {
   try {
     return JSON.parse(`"${value}"`) as string;
   } catch {
-    return value.replace(/\\(.)/g, "$1");
+    let decoded = "";
+    let bytes: number[] = [];
+    const flushBytes = (): void => {
+      if (bytes.length > 0) {
+        decoded += new TextDecoder().decode(Uint8Array.from(bytes));
+        bytes = [];
+      }
+    };
+    for (let index = 0; index < value.length; index += 1) {
+      const character = value[index];
+      if (character !== "\\") {
+        flushBytes();
+        decoded += character ?? "";
+        continue;
+      }
+      const octal = value.slice(index + 1).match(/^[0-7]{1,3}/)?.[0];
+      if (octal !== undefined) {
+        bytes.push(Number.parseInt(octal, 8));
+        index += octal.length;
+        continue;
+      }
+      flushBytes();
+      const escaped = value[index + 1];
+      if (escaped === undefined) {
+        decoded += "\\";
+        continue;
+      }
+      decoded += ({
+        a: "\u0007",
+        b: "\b",
+        f: "\f",
+        n: "\n",
+        r: "\r",
+        t: "\t",
+        v: "\u000b",
+        "\\": "\\",
+        '"': '"',
+      } as Record<string, string>)[escaped] ?? escaped;
+      index += 1;
+    }
+    flushBytes();
+    return decoded;
   }
 }
 
