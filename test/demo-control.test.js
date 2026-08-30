@@ -10,10 +10,14 @@ import {
   DEFAULT_TRUEFORGE_MODEL,
   JsonMissionRepository,
   PRIMARY_DELIVERY_FIXTURE,
+  createDaytonaReadinessProbe,
   resetDemoState,
   runDemoPreflight,
 } from "../dist/index.js";
-import { createReadOnlyGitHubAdapter } from "../scripts/demo-control.mjs";
+import {
+  createLivePreflightAdapters,
+  createReadOnlyGitHubAdapter,
+} from "../scripts/demo-control.mjs";
 
 function fixedClock() {
   return new Date("2026-08-30T12:00:00.000Z");
@@ -79,6 +83,12 @@ function passingAdapters({ calls = [], branch = { exists: false }, pullRequests 
       listDeliveryPullRequests: async () => {
         calls.push("github.pull-requests");
         return pullRequests;
+      },
+    },
+    daytona: {
+      checkReadiness: async () => {
+        calls.push("daytona.readiness");
+        return "Daytona API authenticated and reachable";
       },
     },
   };
@@ -166,10 +176,11 @@ test("bounded preflight passes with deterministic read-only adapters and perform
     assert.equal(report.mode, "bounded-read-only");
     assert.equal(report.externalMutations, 0);
     assert.equal(report.manualQueueRunRequired, true);
-    assert.equal(report.maxReadCalls, 8);
-    assert.deepEqual(report.checks.map((check) => check.status), Array(13).fill("passed"));
-    assert.equal(new Set(calls).size, 8);
+    assert.equal(report.maxReadCalls, 9);
+    assert.deepEqual(report.checks.map((check) => check.status), Array(14).fill("passed"));
+    assert.equal(new Set(calls).size, 9);
     assert.deepEqual(calls.sort(), [
+      "daytona.readiness",
       "github.branch",
       "github.commit",
       "github.pull-requests",
@@ -182,6 +193,42 @@ test("bounded preflight passes with deterministic read-only adapters and perform
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("direct Daytona readiness probe accepts an authenticated 404 without creating a sandbox", async () => {
+  const calls = [];
+  const probe = createDaytonaReadinessProbe({
+    apiKey: "test-only-key",
+    daytona: {
+      get: async (sandboxId) => {
+        calls.push(sandboxId);
+        const error = new Error("sandbox not found");
+        error.statusCode = 404;
+        throw error;
+      },
+    },
+  });
+
+  const summary = await probe.checkReadiness();
+
+  assert.match(summary, /authenticated and reachable/);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0], /^trueforge-proofboard-preflight-/);
+});
+
+test("direct Daytona readiness probe fails closed on unauthorized credentials", async () => {
+  const probe = createDaytonaReadinessProbe({
+    apiKey: "test-only-key",
+    daytona: {
+      get: async () => {
+        const error = new Error("Unauthorized");
+        error.statusCode = 401;
+        throw error;
+      },
+    },
+  });
+
+  await assert.rejects(probe.checkReadiness(), /Daytona readiness probe failed: Unauthorized/);
 });
 
 test("baseline preflight accepts the real GitHub REST commit shape and exact requested target", async () => {
@@ -312,6 +359,35 @@ test("live GitHub collision lookup requests open pull requests only", async () =
   }
 });
 
+test("live GitHub adapter rejects a credential-bearing endpoint outside GitHub.com", () => {
+  assert.throws(
+    () => createReadOnlyGitHubAdapter({ GITHUB_API_URL: "https://collector.example.test" }),
+    /GITHUB_API_URL must be exactly https:\/\/api\.github\.com/,
+  );
+});
+
+test("live TrueForge preflight metadata reads disable SDK retries", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestCount = 0;
+  globalThis.fetch = async () => {
+    requestCount += 1;
+    return new Response(JSON.stringify({ error: "unavailable" }), {
+      status: 503,
+      headers: { "content-type": "application/json" },
+    });
+  };
+
+  try {
+    const adapters = createLivePreflightAdapters(config("/tmp/trueforge-proofboard-preflight-retry-test"), {
+      DAYTONA_API_KEY: "test-only-key",
+    });
+    await assert.rejects(adapters.trueforge.getCapabilities());
+    assert.equal(requestCount, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("preflight does not invoke MCP tools after a missing or unauthorized configured server", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "trueforge-proofboard-demo-preflight-mcp-"));
   try {
@@ -349,6 +425,7 @@ test("preflight fails closed when direct Daytona proof credentials are not confi
     assert.equal(report.ok, false);
     assert.equal(check.status, "failed");
     assert.match(check.summary, /DAYTONA_API_KEY/);
+    assert.equal(report.checks.find((item) => item.id === "daytona-direct-readiness").status, "failed");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

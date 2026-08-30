@@ -48,7 +48,8 @@ does not create a TrueForge session or turn, run a model, authorize an MCP
 server, create a Daytona sandbox, execute a sandbox command, create a branch,
 open a pull request, or mutate any remote resource. Every reported check is
 marked `mutating: false`; the report declares `externalMutations: 0` and the
-read budget is eight calls maximum.
+read budget is nine calls maximum. TrueForge metadata requests use zero SDK
+retries so transient failures cannot silently expand that budget.
 
 It checks:
 
@@ -62,7 +63,9 @@ It checks:
 - the TrueForge sandbox settings projection, requiring a `daytona` provider in
   `ready` status without provisioning or executing anything, plus the
   server-side `DAYTONA_API_KEY` required by the direct deterministic proof
-  adapter;
+  adapter. A separate official-Daytona-SDK lookup against a fresh, absent
+  sandbox ID verifies that the direct credential reaches the authenticated API
+  boundary; a 404 is the expected non-mutating response and a 401 fails closed;
 - the exact fixture `mtamburrano/proofboard-demo-fixture` at pinned baseline
   `590aa8a6d72c580f61fc1b19d33e9876bc0feb9b`;
 - the absence of the owned delivery branch
@@ -71,7 +74,12 @@ It checks:
   Closed historical pull requests are ignored after their delivery branch has
   been removed; an existing branch still remains a collision.
 
-The connector and model checks use TrueForge metadata endpoints. The exact
+The connector and model checks use TrueForge metadata endpoints. The direct
+Daytona probe uses the same server-only key and API URL as deterministic proof,
+but does not create, start, execute, stop, or delete a sandbox. GitHub API
+requests are pinned to `https://api.github.com` because this demo's fixture is
+hosted on GitHub.com; a configured alternate host is rejected before a token is
+sent. The exact
 baseline and stale branch/pull-request checks use bounded, read-only GitHub
 API requests so the collision check can inspect remote repository state without
 starting an agent turn. Set a read-capable `GITHUB_TOKEN` in the environment
@@ -79,6 +87,20 @@ when anonymous GitHub API access is unavailable; never commit it. A failed
 request, incomplete response, missing tool, pending authorization, mismatched
 SHA, or stale artifact is a preflight failure that must be resolved before a
 recorded run.
+
+### External nondeterminism and retry plan
+
+The earlier live rehearsal exposed a direct-Daytona `401` even while the
+TrueForge settings projection reported a ready Daytona provider. Treat that as
+an external credential or endpoint mismatch, not as a coding result. The
+direct SDK probe above now catches that boundary before a queue run starts. If
+it fails, preserve the report, correct the server-only key or API URL, run
+`npm run demo:reset`, and repeat the complete preflight; the preflight itself
+does not retry or mutate remote state. If a provider fails after a passing
+preflight, preserve the durable failure evidence, reconnect or retry only
+through the visible queue recovery path, and record the reason before repeating
+the non-mutating rehearsal. Never clean up a branch or pull request unless it
+was created by the explicitly authorized rehearsal described below.
 
 ## Manual validation after review
 

@@ -82,8 +82,12 @@ npm run demo:preflight
 The actual preflight checks TrueForge capabilities/model settings, GitHub MCP
 configuration and tools, Daytona readiness, the exact pinned fixture baseline,
 and stale owned delivery branch/pull-request state; it also checks the
-server-only `DAYTONA_API_KEY` needed by direct deterministic proof. It does not
-create a session, sandbox, branch, pull request, or other remote mutation.
+server-only `DAYTONA_API_KEY` by making one authenticated, read-only lookup
+through the same official Daytona SDK boundary used by deterministic proof.
+GitHub API reads are pinned to `https://api.github.com` for the fixed public
+fixture, and TrueForge metadata reads disable SDK retries so the nine-call
+preflight budget is real. It does not create a session, sandbox, branch, pull
+request, or other remote mutation.
 Automated tests remain provider-free; real queue runs are intentionally manual.
 
 ## Repository safety

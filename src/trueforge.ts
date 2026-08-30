@@ -41,6 +41,7 @@ export interface TrueForgeClientOptions {
   baseUrl: string;
   token?: string;
   timeoutInSeconds?: number;
+  maxRetries?: number;
 }
 
 export interface SandboxCommandExecutionRequest {
@@ -967,6 +968,7 @@ export function createTrueForgeClient(options: TrueForgeClientOptions): TrueForg
   const client = new TrueForge({
     baseUrl: options.baseUrl,
     timeoutInSeconds: options.timeoutInSeconds ?? 600,
+    ...(options.maxRetries === undefined ? {} : { maxRetries: options.maxRetries }),
     ...(options.token === undefined ? {} : { token: options.token }),
   });
   return client as unknown as TrueForgeClientLike;

@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import { Daytona } from "@daytona/sdk";
 
 import type {
@@ -33,6 +35,23 @@ export interface DaytonaSandboxClient {
   }>;
 }
 
+export interface DaytonaReadinessClient {
+  get(sandboxIdOrName: string): Promise<unknown>;
+}
+
+export interface DaytonaReadinessProbeOptions {
+  /** Required when a Daytona client is not injected for an isolated test. */
+  apiKey?: string;
+  apiUrl?: string;
+  requestTimeoutMs?: number;
+  /** Injectable supported-client surface used by tests; production uses Daytona. */
+  daytona?: DaytonaReadinessClient;
+}
+
+export interface DaytonaReadinessProbe {
+  checkReadiness(): Promise<string>;
+}
+
 export interface DaytonaSandboxExecutorOptions {
   /** Required when a Daytona client is not injected for an isolated test. */
   apiKey?: string;
@@ -57,6 +76,51 @@ export class DaytonaSandboxExecutionError extends Error {
     this.name = "DaytonaSandboxExecutionError";
     this.failureCategory = failureCategory;
   }
+}
+
+/**
+ * Validate the direct Daytona credential and endpoint without creating a
+ * sandbox or executing a command. The random lookup intentionally expects a
+ * 404; a valid API key must reach the authenticated resource boundary first.
+ */
+export function createDaytonaReadinessProbe(
+  options: DaytonaReadinessProbeOptions,
+): DaytonaReadinessProbe {
+  const requestTimeoutMs = positiveInteger(
+    options.requestTimeoutMs ?? 5_000,
+    "Daytona readiness request timeout",
+  );
+  let daytona = options.daytona;
+
+  return {
+    async checkReadiness() {
+      if (daytona === undefined) {
+        const clientOptions: DaytonaSandboxExecutorOptions = {
+          ...(options.apiKey === undefined ? {} : { apiKey: options.apiKey }),
+          ...(options.apiUrl === undefined ? {} : { apiUrl: options.apiUrl }),
+        };
+        daytona = createDaytonaClient(
+          clientOptions,
+          requestTimeoutMs,
+          true,
+        );
+      }
+
+      const probeId = `trueforge-proofboard-preflight-${randomUUID()}`;
+      try {
+        await daytona.get(probeId);
+      } catch (error) {
+        if (isDaytonaNotFoundError(error)) {
+          return "Daytona API authenticated and reachable; the read-only probe target is absent";
+        }
+        const reason = error instanceof Error
+          ? sanitizeDaytonaError(error.message)
+          : "provider request failed";
+        throw new Error(`Daytona readiness probe failed: ${reason}`);
+      }
+      return "Daytona API accepted an authenticated read-only sandbox lookup";
+    },
+  };
 }
 
 /**
@@ -184,16 +248,29 @@ export function createDaytonaSandboxExecutor(
 function createDaytonaClient(
   options: DaytonaSandboxExecutorOptions,
   requestTimeoutMs: number,
+  useDeprecatedPolling = false,
 ): DaytonaSandboxClient {
   const apiKey = requiredTrimmedText(options.apiKey ?? "", "Daytona API key");
   const config: ConstructorParameters<typeof Daytona>[0] = {
     apiKey,
     requestTimeoutMs,
+    useDeprecatedPolling,
   };
   if (options.apiUrl !== undefined) {
     config.apiUrl = normalizeDaytonaApiUrl(options.apiUrl);
   }
   return new Daytona(config);
+}
+
+function isDaytonaNotFoundError(error: unknown): boolean {
+  const record = isRecord(error) ? error : undefined;
+  const name = typeof record?.name === "string" ? record.name.toLowerCase() : "";
+  const code = typeof record?.code === "string" ? record.code.toLowerCase() : "";
+  return record?.statusCode === 404 ||
+    name.includes("notfound") ||
+    name.includes("not_found") ||
+    code === "not_found" ||
+    code === "not-found";
 }
 
 function normalizeDaytonaApiUrl(value: string): string {

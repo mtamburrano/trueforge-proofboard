@@ -1,11 +1,15 @@
 import { pathToFileURL } from "node:url";
 
 import {
+  DEMO_PREFLIGHT_MAX_READ_CALLS,
   resetDemoState,
   resolveDemoPreflightConfig,
   runDemoPreflight,
   createTrueForgeClient,
+  createDaytonaReadinessProbe,
 } from "../dist/index.js";
+
+const GITHUB_API_ORIGIN = "https://api.github.com";
 
 function printUsage() {
   console.log("Usage: npm run demo:reset");
@@ -27,8 +31,9 @@ function preflightDryRun(config) {
     delivery_collision_checks: ["owned branch", "owned pull request"],
     daytona: {
       direct_credential_configured: config.daytonaApiKeyConfigured,
-      readiness: "metadata only",
+      readiness: "authenticated read-only SDK lookup",
     },
+    max_read_calls: DEMO_PREFLIGHT_MAX_READ_CALLS,
     note: "Use npm run demo:preflight without --dry-run for bounded read-only checks.",
   }, null, 2));
 }
@@ -38,6 +43,7 @@ function createLivePreflightAdapters(config, environment) {
   const client = createTrueForgeClient({
     baseUrl: config.baseUrl,
     timeoutInSeconds: 5,
+    maxRetries: 0,
     ...(token === undefined || token.length === 0 ? {} : { token }),
   });
 
@@ -50,12 +56,18 @@ function createLivePreflightAdapters(config, environment) {
       getSandboxProvider: () => client.settings.sandboxProviders.get(),
     },
     github: createReadOnlyGitHubAdapter(environment),
+    daytona: createDaytonaReadinessProbe({
+      apiKey: environment.DAYTONA_API_KEY,
+      requestTimeoutMs: 5_000,
+      ...(environment.DAYTONA_API_URL?.trim() === undefined || environment.DAYTONA_API_URL.trim().length === 0
+        ? {}
+        : { apiUrl: environment.DAYTONA_API_URL }),
+    }),
   };
 }
 
 function createReadOnlyGitHubAdapter(environment) {
-  const apiBase = (environment.GITHUB_API_URL?.trim() || "https://api.github.com")
-    .replace(/\/+$/, "");
+  const apiBase = normalizeGitHubApiBase(environment.GITHUB_API_URL);
   const token = environment.GITHUB_TOKEN?.trim();
 
   async function readJson(apiPath, { allowNotFound = false } = {}) {
@@ -94,6 +106,27 @@ function createReadOnlyGitHubAdapter(environment) {
         `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/pulls?state=open&head=${encodeURIComponent(`${owner}:${head}`)}&base=${encodeURIComponent(base)}&per_page=10`,
       ),
   };
+}
+
+function normalizeGitHubApiBase(value) {
+  const raw = value?.trim() || GITHUB_API_ORIGIN;
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(`GITHUB_API_URL must be exactly ${GITHUB_API_ORIGIN} for the fixed demo fixture.`);
+  }
+  if (
+    url.origin !== GITHUB_API_ORIGIN ||
+    url.pathname !== "/" ||
+    url.search.length > 0 ||
+    url.hash.length > 0 ||
+    url.username.length > 0 ||
+    url.password.length > 0
+  ) {
+    throw new Error(`GITHUB_API_URL must be exactly ${GITHUB_API_ORIGIN} for the fixed demo fixture.`);
+  }
+  return GITHUB_API_ORIGIN;
 }
 
 async function run() {

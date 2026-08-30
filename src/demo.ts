@@ -29,7 +29,7 @@ import {
 
 export const DEMO_PREFLIGHT_VERSION = 1 as const;
 export const DEMO_PREFLIGHT_TIMEOUT_MS = 5_000;
-export const DEMO_PREFLIGHT_MAX_READ_CALLS = 8;
+export const DEMO_PREFLIGHT_MAX_READ_CALLS = 9;
 
 export const DEMO_PREFLIGHT_REQUIRED_MCP_TOOLS = [
   "get_file_contents",
@@ -75,9 +75,14 @@ export interface DemoPreflightGitHubAdapter {
   }): Promise<unknown>;
 }
 
+export interface DemoPreflightDaytonaAdapter {
+  checkReadiness(): Promise<string>;
+}
+
 export interface DemoPreflightAdapters {
   trueforge: DemoPreflightTrueForgeAdapter;
   github: DemoPreflightGitHubAdapter;
+  daytona?: DemoPreflightDaytonaAdapter;
 }
 
 export interface DemoPreflightCheck {
@@ -278,6 +283,7 @@ export async function runDemoPreflight(
     checks.push(...missingAdapterChecks());
     return finishPreflight(options.config, fixture, checks);
   }
+  const directDaytonaAdapter = adapters.daytona;
 
   const mcpServerCheck = await checked(
     "trueforge-mcp-server",
@@ -347,6 +353,19 @@ export async function runDemoPreflight(
       },
       timeoutMs,
     ),
+    options.config.daytonaApiKeyConfigured && directDaytonaAdapter !== undefined
+      ? checked(
+          "daytona-direct-readiness",
+          "The direct Daytona proof adapter authenticates through a non-mutating SDK read.",
+          () => directDaytonaAdapter.checkReadiness(),
+          timeoutMs,
+        )
+      : Promise.resolve(failedCheck(
+          "daytona-direct-readiness",
+          directDaytonaAdapter === undefined
+            ? "The direct Daytona readiness adapter was not supplied."
+            : "The direct Daytona readiness probe was skipped because DAYTONA_API_KEY is not configured.",
+        )),
     checked(
       "github-baseline",
       "The exact fixture repository resolves the pinned baseline commit.",
@@ -474,6 +493,7 @@ function missingAdapterChecks(): DemoPreflightCheck[] {
     "trueforge-reachable",
     "trueforge-model",
     "trueforge-daytona",
+    "daytona-direct-readiness",
     "github-baseline",
     "delivery-branch-clean",
     "delivery-pr-clean",
