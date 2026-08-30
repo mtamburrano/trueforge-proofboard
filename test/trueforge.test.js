@@ -3200,11 +3200,14 @@ test("independent implementation proof rejects out-of-scope final changes before
 test("direct Daytona proof execution resolves the exact persisted sandbox through the SDK", async () => {
   const getRequests = [];
   const executeRequests = [];
+  const locator = "default.115d7785-8a05-4476-9347-03d08469b69a";
+  const persistedReference = `v1:daytona:${locator}`;
   const daytona = {
-    async get(sandboxId) {
-      getRequests.push(sandboxId);
+    async get(sandboxLocator) {
+      getRequests.push(sandboxLocator);
       return {
-        id: sandboxId,
+        id: "7c5f11d4-b1aa-46e5-a7e6-2fef4d0c7e4b",
+        name: locator,
         process: {
           async executeCommand(command, cwd, env, timeout) {
             executeRequests.push({ command, cwd, env, timeout });
@@ -3220,12 +3223,12 @@ test("direct Daytona proof execution resolves the exact persisted sandbox throug
   });
 
   const result = await executor.execute({
-    sandboxId: "v1:daytona:raw-persisted-id",
+    sandboxId: persistedReference,
     command: "git status --porcelain=v1",
     cwd: "/proof",
   });
 
-  assert.deepEqual(getRequests, ["raw-persisted-id"]);
+  assert.deepEqual(getRequests, [locator]);
   assert.deepEqual(executeRequests, [{
     command: "git status --porcelain=v1",
     cwd: "/proof",
@@ -3233,10 +3236,43 @@ test("direct Daytona proof execution resolves the exact persisted sandbox throug
     timeout: 17,
   }]);
   assert.deepEqual(result, {
-    sandboxId: "v1:daytona:raw-persisted-id",
+    sandboxId: persistedReference,
     exitCode: 0,
     stdout: "proof output\n",
   });
+});
+
+test("direct Daytona proof rejects a sandbox whose name does not match the persisted locator", async () => {
+  const locator = "default.115d7785-8a05-4476-9347-03d08469b69a";
+  const persistedReference = `v1:daytona:${locator}`;
+  const getRequests = [];
+  let executeCalls = 0;
+  const executor = createDaytonaSandboxExecutor({
+    daytona: {
+      async get(sandboxLocator) {
+        getRequests.push(sandboxLocator);
+        return {
+          id: "7c5f11d4-b1aa-46e5-a7e6-2fef4d0c7e4b",
+          name: "default.attacker-sandbox",
+          process: {
+            async executeCommand() {
+              executeCalls += 1;
+              return { exitCode: 0, result: "must not execute" };
+            },
+          },
+        };
+      },
+    },
+  });
+
+  await assert.rejects(
+    executor.execute({ sandboxId: persistedReference, command: "true" }),
+    (error) => error instanceof DaytonaSandboxExecutionError &&
+      error.failureCategory === "identity" &&
+      /persisted locator/.test(error.message),
+  );
+  assert.deepEqual(getRequests, [locator]);
+  assert.equal(executeCalls, 0);
 });
 
 test("Daytona sandbox references reject an unknown provider namespace and classify auth failures", async () => {

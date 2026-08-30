@@ -31,6 +31,7 @@ export interface DaytonaSandboxProcess {
 export interface DaytonaSandboxClient {
   get(sandboxIdOrName: string): Promise<{
     id: string;
+    name: string;
     process: DaytonaSandboxProcess;
   }>;
 }
@@ -124,9 +125,9 @@ export function createDaytonaReadinessProbe(
 }
 
 /**
- * Resolve the persisted Proof Board reference to the raw provider ID used by
- * Daytona's supported SDK. Resolution is deliberately pure: it never creates,
- * starts, forks, or substitutes a sandbox.
+ * Resolve the persisted Proof Board reference to the exact provider locator
+ * accepted by Daytona's supported SDK. Resolution is deliberately pure: it
+ * never creates, starts, forks, or substitutes a sandbox.
  */
 export function resolveDaytonaSandboxId(reference: string): string {
   const normalized = requiredTrimmedText(reference, "Daytona sandbox reference");
@@ -139,20 +140,20 @@ export function resolveDaytonaSandboxId(reference: string): string {
       "identity",
     );
   }
-  const rawId = normalized.slice(DAYTONA_SANDBOX_REFERENCE_PREFIX.length);
-  if (rawId.length === 0) {
+  const locator = normalized.slice(DAYTONA_SANDBOX_REFERENCE_PREFIX.length);
+  if (locator.length === 0) {
     throw new DaytonaSandboxExecutionError(
       "The persisted Daytona sandbox reference does not include a provider id.",
       "identity",
     );
   }
-  return rawId;
+  return locator;
 }
 
 /**
  * Execute deterministic proof commands through the official Daytona SDK.
- * The adapter retrieves only the exact persisted sandbox and returns the
- * persisted reference so downstream proof evidence keeps stable identity.
+ * The adapter retrieves only the exact persisted sandbox locator and returns
+ * the persisted reference so downstream proof evidence keeps stable identity.
  */
 export function createDaytonaSandboxExecutor(
   options: DaytonaSandboxExecutorOptions,
@@ -174,7 +175,7 @@ export function createDaytonaSandboxExecutor(
         request.sandboxId,
         "Daytona sandbox reference",
       );
-      const rawId = resolveDaytonaSandboxId(persistedReference);
+      const locator = resolveDaytonaSandboxId(persistedReference);
       const command = requiredValue(request.command, "Daytona sandbox command");
       const timeoutSeconds = positiveInteger(
         request.timeoutSeconds ?? commandTimeoutSeconds,
@@ -183,7 +184,7 @@ export function createDaytonaSandboxExecutor(
 
       let sandbox: Awaited<ReturnType<DaytonaSandboxClient["get"]>>;
       try {
-        sandbox = await daytona.get(rawId);
+        sandbox = await daytona.get(locator);
       } catch (error) {
         throw daytonaExecutionError(
           "Daytona could not retrieve the persisted sandbox",
@@ -193,12 +194,14 @@ export function createDaytonaSandboxExecutor(
       if (
         !isRecord(sandbox) ||
         typeof sandbox.id !== "string" ||
-        sandbox.id !== rawId ||
+        sandbox.id.trim().length === 0 ||
+        typeof sandbox.name !== "string" ||
+        sandbox.name !== locator ||
         !isRecord(sandbox.process) ||
         typeof sandbox.process.executeCommand !== "function"
       ) {
         throw new DaytonaSandboxExecutionError(
-          "Daytona returned a sandbox that does not match the persisted provider id.",
+          "Daytona returned a sandbox that does not match the persisted locator.",
           "identity",
         );
       }
