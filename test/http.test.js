@@ -686,7 +686,10 @@ test("initial mission route and static application assets load", async () => {
   const script = await app.request("/public/app.js");
   assert.equal(script.status, 200);
   const scriptBody = await script.text();
-  assert.match(scriptBody, /Create primary mission/);
+  assert.match(scriptBody, /Create tickets/);
+  assert.match(scriptBody, /Use demo mission/);
+  assert.match(scriptBody, /Mission objective/);
+  assert.match(scriptBody, /Start TrueForge execution/);
   assert.match(scriptBody, /data-source=/);
   assert.match(scriptBody, /data-result=/);
   assert.match(scriptBody, /Runtime narration never appears in this panel/);
@@ -709,6 +712,7 @@ test("initial mission route and static application assets load", async () => {
   assert.match(styleBody, /approval-actions/);
   assert.match(styleBody, /delivery-card/);
   assert.match(styleBody, /diagnostics-panel/);
+  assert.match(styleBody, /\.mission-intake\s*\{/);
 
   const runState = await app.request("/public/run-state.js");
   assert.equal(runState.status, 200);
@@ -720,6 +724,12 @@ test("create or open is idempotent and returns durable structured mission state"
 
   const empty = await json(await app.request("/api/mission"));
   assert.equal(empty.mission, null);
+  assert.equal(empty.intake.demoObjective, "Add support for marking a todo as completed.");
+  assert.deepEqual(empty.intake.repository, {
+    owner: PRIMARY_DELIVERY_FIXTURE.owner,
+    name: PRIMARY_DELIVERY_FIXTURE.repository,
+    ref: PRIMARY_DELIVERY_FIXTURE.baselineRef,
+  });
 
   const createdResponse = await app.request("/api/mission", { method: "POST" });
   assert.equal(createdResponse.status, 201);
@@ -739,6 +749,56 @@ test("create or open is idempotent and returns durable structured mission state"
   assert.equal(opened.mission.mission.id, created.mission.mission.id);
   assert.equal(opened.mission.revision, created.mission.revision);
   assert.equal(runner.calls.create, 1);
+});
+
+test("mission intake persists the submitted objective after read-only planning and gates execution", async () => {
+  const { app, runner, missions } = testApp();
+  const objective = "Track completion state for each todo.";
+
+  const createdResponse = await app.request("/api/mission", {
+    method: "POST",
+    body: JSON.stringify({ objective }),
+  });
+  assert.equal(createdResponse.status, 201);
+  const created = await json(createdResponse);
+  assert.equal(created.mission.mission.objective, objective);
+  assert.equal(created.mission.mission.status, "planning");
+  assert.equal(created.mission.mission.repository.ref, PRIMARY_DELIVERY_FIXTURE.baselineSha);
+  assert.equal(created.mission.tickets.length, 1);
+  assert.equal(created.mission.tickets[0].assignedRole, "implementer");
+  assert.equal(created.mission.tickets[0].status, "backlog");
+  assert.deepEqual(created.mission.tickets[0].dependsOn, []);
+  assert.equal(runner.calls.create, 1);
+  assert.equal(runner.calls.inspect, 1);
+  assert.equal(runner.calls.turn, 0);
+  assert.deepEqual(runner.operationLog, ["inspect"]);
+
+  const stateAfterPlanning = await missions.getState();
+  assert.equal(stateAfterPlanning.workItems.length, 1);
+  assert.equal(stateAfterPlanning.workItems[0].assignedRole, "implementer");
+  assert.equal(stateAfterPlanning.evidence.some((item) =>
+    item.source === "mcp" && item.workItemId === undefined
+  ), true);
+  assert.equal(stateAfterPlanning.evidence.some((item) =>
+    item.source === "system" && /read-only planning/i.test(item.summary)
+  ), true);
+
+  const repeated = await json(await app.request("/api/mission", {
+    method: "POST",
+    body: JSON.stringify({ objective }),
+  }));
+  assert.equal(repeated.mission.revision, created.mission.revision);
+  assert.equal(runner.calls.create, 1);
+  assert.equal(runner.calls.inspect, 1);
+
+  await authorizeTicket(app, created.mission.tickets[0].id);
+  const executed = await json(await app.request("/api/mission/run", { method: "POST" }));
+  assert.equal(executed.mission.mission.objective, objective);
+  assert.equal(executed.mission.tickets[0].status, "proving");
+  assert.equal(runner.calls.turn, 1);
+  assert.equal(runner.calls.inspect, 1);
+  assert.equal(runner.deliveryCalls.protectedOperations, 0);
+  assert.match(runner.turnInputs[0].instruction, new RegExp(objective.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
 
 test("cross-origin browser state changes are rejected while same-origin changes remain valid", async () => {

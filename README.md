@@ -32,7 +32,7 @@ Start the local Mission Control server with:
 npm start
 ```
 
-The `prestart` lifecycle step builds `dist/` first, so this works from a clean checkout without generated output. The unauthenticated UI binds only to loopback, and state-changing browser requests must be same-origin. Then open `http://127.0.0.1:8787`. The UI creates or recovers the primary mission from `.trueforge/mission-state.json`. Creating and running the mission uses the configured local TrueForge server; provider and connector credentials remain server-side and are never included in browser payloads. The optional direct proof adapter also keeps its Daytona key server-only.
+The `prestart` lifecycle step builds `dist/` first, so this works from a clean checkout without generated output. The unauthenticated UI binds only to loopback, and state-changing browser requests must be same-origin. Then open `http://127.0.0.1:8787`. The UI starts with human mission intake, persists the submitted objective, and recovers the planned queue from `.trueforge/mission-state.json`. Creating tickets performs only read-only planning; execution and delivery remain behind their existing human gates. Provider and connector credentials remain server-side and are never included in browser payloads. The optional direct proof adapter also keeps its Daytona key server-only.
 
 The demo model defaults to `alibaba/qwen3-8-max`. The supported selectors are
 `alibaba/qwen3-8-max`, `alibaba/qwen3-7-flash`, `openai/gpt-5-4-mini`, and
@@ -146,7 +146,7 @@ record remains available across those outcomes.
 
 For the deterministic delivery fixture, `inspectRepository` first proves the
 immutable `mtamburrano/proofboard-demo-fixture` baseline at commit
-`590aa8a6d72c580f61fc1b19d33e9876bc0feb9b`. After implementation, deterministic
+`acdbbde12203edeee099313a4636ff8c25a83e24`. After implementation, deterministic
 sandbox proof and accepted semantic review bind approval to the exact current
 artifact: its baseline, two files, contents, and patches. No delivery-branch
 read or remote mutation occurs before the human gate. After approval, the

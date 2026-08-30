@@ -35,6 +35,19 @@ test("Proof Board UI declares the queue columns and system-owned boundary", () =
   assert.match(appScript, /system-owned/);
 });
 
+test("Proof Board UI starts with human mission intake and a planning-only gate", () => {
+  assert.match(appScript, /id="mission-intake-form"/);
+  assert.match(appScript, /id="mission-objective"/);
+  assert.match(appScript, /Use demo mission/);
+  assert.match(appScript, /Add support for marking a todo as completed\./);
+  assert.match(appScript, /id="create-tickets"/);
+  assert.match(appScript, /id="start-execution"[^>]+disabled/);
+  assert.match(appScript, /body: JSON\.stringify\(\{ objective \}\)/);
+  assert.match(appScript, /Read-only planning complete/);
+  assert.match(styleSheet, /\.mission-intake-form\s*\{/);
+  assert.match(styleSheet, /\.intake-repository\s*\{/);
+});
+
 test("Proof Board UI explains the queue mental model and elevates the primary contract", () => {
   assert.match(appScript, /const QUEUE_FLOW = Object\.freeze/);
   assert.match(appScript, /One queue\. Two human gates\./);

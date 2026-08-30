@@ -26,7 +26,7 @@ import {
   verifiedDeliveryArtifactHash,
 } from "../dist/index.js";
 
-const LOCKED_FIXTURE_SHA = "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b";
+const LOCKED_FIXTURE_SHA = "acdbbde12203edeee099313a4636ff8c25a83e24";
 const LOCKED_FIXTURE_REF = LOCKED_FIXTURE_SHA;
 const VERIFIED_DELIVERY_HEAD_SHA = "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1";
 const SANDBOX_VERIFICATION_INTENT = "Run the requested verification command in the sandbox.";
@@ -1938,7 +1938,7 @@ test("pull request delivery pauses one exact TrueForge tool call and resumes onl
     base: "main",
     head: "proofboard-verified-delivery",
     headSha: VERIFIED_DELIVERY_HEAD_SHA,
-    title: "Add the verified delivery-stage helper",
+    title: "Add todo completion support",
     body: "Verified delivery body.",
   };
   const { client, calls } = fakeClient((turnId) =>

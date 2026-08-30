@@ -94,7 +94,7 @@ function passingAdapters({ calls = [], branch = { exists: false }, pullRequests 
   };
 }
 
-test("local demo reset atomically restores the exact queue baseline and preserves unrelated files", async () => {
+test("local demo reset atomically restores empty mission intake and preserves unrelated files", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "trueforge-proofboard-demo-reset-"));
   const statePath = path.join(directory, ".trueforge", "mission-state.json");
   const unrelatedPath = path.join(directory, "unrelated.txt");
@@ -111,29 +111,9 @@ test("local demo reset atomically restores the exact queue baseline and preserve
     const persisted = await new JsonMissionRepository(statePath).load();
 
     assert.deepEqual(persisted, result.state);
-    assert.equal(result.state.revision, 3);
-    assert.deepEqual(result.state.missions.map((mission) => ({
-      id: mission.id,
-      status: mission.status,
-      repository: mission.repository,
-      hasSession: mission.trueforgeSessionId !== undefined,
-      hasTurn: mission.trueforgeTurnId !== undefined,
-      hasSandbox: mission.trueforgeSandboxId !== undefined,
-    })), [{
-      id: "primary-mission",
-      status: "draft",
-      repository: {
-        owner: PRIMARY_DELIVERY_FIXTURE.owner,
-        name: PRIMARY_DELIVERY_FIXTURE.repository,
-        ref: PRIMARY_DELIVERY_FIXTURE.baselineSha,
-      },
-      hasSession: false,
-      hasTurn: false,
-      hasSandbox: false,
-    }]);
-    assert.deepEqual(result.state.workItems.map((item) => ({ id: item.id, status: item.status })), [
-      { id: "primary-inspect", status: "backlog" },
-    ]);
+    assert.equal(result.state.revision, 0);
+    assert.deepEqual(result.state.missions, []);
+    assert.deepEqual(result.state.workItems, []);
     assert.equal(result.state.evidence.length, 0);
     assert.equal(result.state.handoffs.length, 0);
     assert.equal(result.state.reviews.length, 0);

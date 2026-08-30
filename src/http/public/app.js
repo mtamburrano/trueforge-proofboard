@@ -62,6 +62,9 @@ let pollHandle = null;
 let pollInFlight = false;
 let missionLoadSequence = 0;
 let boardDragInProgress = false;
+let intakeConfig = null;
+
+const DEFAULT_DEMO_OBJECTIVE = "Add support for marking a todo as completed.";
 
 const labels = {
   draft: "Draft", planning: "Planning", executing: "Executing",
@@ -152,11 +155,25 @@ function clearMessage() {
   messageRegion.replaceChildren();
 }
 
-function renderEmpty() {
+function renderEmpty(intake) {
   currentView = null;
   selectedTicketId = null;
-  app.innerHTML = `<section class="empty-state panel"><p class="eyebrow">Proof Board</p><h1>Queue one bounded delivery mission.</h1><p>Start with a durable work contract, authorize it in Ready, and let TrueForge carry the work through proof and human-approved delivery.</p><button id="create-mission" class="primary-action" type="button">Create primary mission</button></section>`;
-  document.querySelector("#create-mission")?.addEventListener("click", createMission);
+  if (intake !== undefined) intakeConfig = intake;
+  const configured = intakeConfig ?? {
+    demoObjective: DEFAULT_DEMO_OBJECTIVE,
+    repository: { owner: "Configured", name: "repository", ref: "provided by server" },
+  };
+  const repository = configured.repository ?? {};
+  const demoObjective = configured.demoObjective ?? DEFAULT_DEMO_OBJECTIVE;
+  app.innerHTML = `<section class="mission-intake panel" aria-labelledby="mission-intake-title"><div class="mission-intake-copy"><p class="eyebrow">Proof Board · mission intake</p><h1 id="mission-intake-title">Describe the delivery mission.</h1><p>Start with a human objective. Create tickets runs the read-only repository inspection and planning phase; implementation stays in Backlog until you authorize it.</p><div class="intake-repository"><p class="section-kicker">Configured repository</p><strong>${escapeHtml(repository.owner)}/${escapeHtml(repository.name)}</strong><span>Pinned baseline</span><code>${escapeHtml(repository.ref)}</code></div></div><form id="mission-intake-form" class="mission-intake-form"><label for="mission-objective">Mission objective</label><textarea id="mission-objective" name="objective" rows="4" required placeholder="Describe the bounded change you want TrueForge to implement."></textarea><div class="intake-actions"><button id="use-demo-mission" class="compact-action" type="button">Use demo mission</button><button id="create-tickets" class="primary-action" type="submit">Create tickets</button><button id="start-execution" class="compact-action" type="button" disabled>Start TrueForge execution</button></div><p class="intake-hint">Create tickets uses only read-only planning. Start execution stays disabled until the implementation ticket is moved from Backlog to Ready.</p></form></section>`;
+  document.querySelector("#mission-intake-form")?.addEventListener("submit", createMission);
+  document.querySelector("#use-demo-mission")?.addEventListener("click", () => {
+    const input = document.querySelector("#mission-objective");
+    if (input) {
+      input.value = demoObjective;
+      input.focus();
+    }
+  });
 }
 
 function ticketsForView(view) {
@@ -909,12 +926,22 @@ async function copyDiagnostics(snapshot) {
 }
 
 async function createMission(event) {
-  await withBusy(event.currentTarget, async () => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const objective = form.querySelector("#mission-objective")?.value.trim() ?? "";
+  if (objective.length === 0) {
+    showMessage("error", "Enter a mission objective before creating tickets.");
+    return;
+  }
+  await withBusy(form.querySelector("#create-tickets"), async () => {
     try {
-      const payload = await api("/api/mission", { method: "POST" });
+      const payload = await api("/api/mission", {
+        method: "POST",
+        body: JSON.stringify({ objective }),
+      });
       runCoordinator.accept(payload.mission, { force: true, authoritative: true });
       setConnection("connected", "Durable queue ready");
-      showMessage("success", "Primary ticket created in Backlog.");
+      showMessage("success", "Read-only planning complete; the implementation ticket is in Backlog.");
     } catch (error) {
       setConnection("failed", "Operation failed");
       showMessage("error", error.message);
@@ -983,7 +1010,7 @@ async function withBusy(button, operation) {
 async function refreshMission({ force = false } = {}) {
   const payload = await api("/api/mission");
   if (payload.mission === null) {
-    renderEmpty();
+    renderEmpty(payload.intake);
     return payload;
   }
   runCoordinator.accept(payload.mission, { force, authoritative: force });
@@ -998,7 +1025,7 @@ async function pollMission() {
     if (payload.mission === null) {
       // A delayed empty response must not erase a mission recovered or
       // created by a newer request.
-      if (currentView === null) renderEmpty();
+      if (currentView === null) renderEmpty(payload.intake);
       return;
     }
     const accepted = runCoordinator.accept(payload.mission);
@@ -1020,7 +1047,7 @@ async function loadMission() {
   try {
     const payload = await api("/api/mission");
     if (loadSequence !== missionLoadSequence) return;
-    if (payload.mission === null) renderEmpty();
+    if (payload.mission === null) renderEmpty(payload.intake);
     else runCoordinator.accept(payload.mission, { force: true, authoritative: true });
     setConnection("connected", payload.mission ? "State recovered" : "Ready");
     startMissionPolling();

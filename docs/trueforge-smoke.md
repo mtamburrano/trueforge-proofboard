@@ -109,7 +109,7 @@ final answer is never used as proof.
 The mission adapter uses distinct fail-closed proofs for the delivery fixture.
 Initial inspection requires a correlated GitHub MCP `get_commit` call for the
 immutable `mtamburrano/proofboard-demo-fixture` baseline
-`590aa8a6d72c580f61fc1b19d33e9876bc0feb9b`. Before delivery approval, a second
+`acdbbde12203edeee099313a4636ff8c25a83e24`. Before delivery approval, a second
 read-only call resolves `proofboard-verified-delivery`. Its commit must differ from
 the baseline and contain exactly the verified `src/index.ts` and
 `test/index.test.js` patches. The observed delivery-head SHA is included in the

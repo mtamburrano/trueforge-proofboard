@@ -9,7 +9,7 @@ import {
 } from "../dist/index.js";
 
 const NOW = () => new Date("2026-08-29T16:00:00.000Z");
-const BASELINE_SHA = "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b";
+const BASELINE_SHA = "acdbbde12203edeee099313a4636ff8c25a83e24";
 
 function fakeStream(events) {
   return {

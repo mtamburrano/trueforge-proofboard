@@ -6,22 +6,11 @@ import {
   resolve,
 } from "node:path";
 
-import {
-  InMemoryMissionRepository,
-  MissionService,
-} from "./domain.js";
+import { createEmptyMissionState } from "./domain.js";
 import type { MissionState } from "./domain.js";
 import { JsonMissionRepository } from "./persistence.js";
-import {
-  buildPreflightWorkGraph,
-  resolveDeterministicCoordinatorModelPolicy,
-} from "./trueforge.js";
+import { resolveDeterministicCoordinatorModelPolicy } from "./trueforge.js";
 import { PRIMARY_DELIVERY_FIXTURE } from "./fixture.js";
-import {
-  PRIMARY_MISSION_ID,
-  PRIMARY_MISSION_OBJECTIVE,
-  PRIMARY_REPOSITORY,
-} from "./http/server.js";
 import {
   MissionRuntimeConfig,
   resolveMissionRuntimeConfig,
@@ -174,9 +163,9 @@ export function resolveDemoStatePath(statePath: string, rootDirectory: string): 
 }
 
 /**
- * Rebuild the primary mission and its visible queue root in memory, then
- * replace only the guarded local state file. No provider, session, sandbox,
- * connector, or remote repository operation is involved.
+ * Restore the empty mission-intake state, then replace only the guarded local
+ * state file. No provider, session, sandbox, connector, or remote repository
+ * operation is involved.
  */
 export async function resetDemoState(
   options: ResetDemoStateOptions,
@@ -186,24 +175,7 @@ export async function resetDemoState(
   await rejectSymlink(statePath, "the demo state file");
   await rejectSymlink(dirname(statePath), "the demo state directory");
 
-  const memoryRepository = new InMemoryMissionRepository();
-  const missions = options.clock === undefined
-    ? new MissionService(memoryRepository)
-    : new MissionService(memoryRepository, options.clock);
-  const mission = await missions.createMission({
-    id: PRIMARY_MISSION_ID,
-    objective: PRIMARY_MISSION_OBJECTIVE,
-    repository: PRIMARY_REPOSITORY,
-  });
-  const graph = buildPreflightWorkGraph(mission);
-  const created = await missions.persistWorkGraph(PRIMARY_MISSION_ID, graph);
-  for (const item of created) {
-    if (item.status === "ready") {
-      await missions.transitionWorkItem(PRIMARY_MISSION_ID, item.id, "backlog");
-    }
-  }
-
-  const state = await missions.getState();
+  const state = createEmptyMissionState();
   const stateRepository = new JsonMissionRepository(statePath);
   await stateRepository.save(state);
   return { statePath, state };

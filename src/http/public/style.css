@@ -179,6 +179,31 @@ button[aria-busy="true"]::after {
 .boot-state h1, .empty-state h1 { max-width: 680px; margin: 0; font-size: 26px; }
 .empty-state p:not(.eyebrow) { max-width: 560px; color: var(--color-muted); }
 .empty-state .primary-action { justify-self: center; margin-top: var(--space-3); }
+.mission-intake {
+  display: grid;
+  max-width: 1040px;
+  min-height: 360px;
+  grid-template-columns: minmax(0, 1.05fr) minmax(320px, .95fr);
+  gap: var(--space-6);
+  margin: 0 auto;
+  padding: clamp(var(--space-5), 5vw, 64px);
+  align-items: center;
+}
+.mission-intake-copy, .mission-intake-form { min-width: 0; }
+.mission-intake-copy h1 { max-width: 520px; margin: var(--space-2) 0 var(--space-3); font-size: clamp(27px, 4vw, 42px); line-height: 1.05; }
+.mission-intake-copy > p:not(.eyebrow) { max-width: 500px; margin: 0; color: var(--color-muted); font-size: 15px; }
+.intake-repository { display: grid; gap: 4px; margin-top: var(--space-5); padding: var(--space-3); border-left: 2px solid var(--color-primary); background: var(--color-surface-container); }
+.intake-repository p { margin: 0; }
+.intake-repository strong { color: var(--color-ink); font: 700 14px/1.3 var(--font-mono); overflow-wrap: anywhere; }
+.intake-repository span { margin-top: 3px; color: var(--color-muted-dim); font: 9px/1.2 var(--font-mono); letter-spacing: .06em; text-transform: uppercase; }
+.intake-repository code { color: var(--color-secondary); font: 10px/1.35 var(--font-mono); overflow-wrap: anywhere; }
+.mission-intake-form { display: grid; gap: var(--space-2); padding: var(--space-5); border: 1px solid var(--color-border-strong); border-radius: var(--radius-md); background: var(--color-surface-muted); }
+.mission-intake-form label { color: var(--color-ink); font-weight: 700; }
+.mission-intake-form textarea { width: 100%; min-height: 120px; resize: vertical; padding: var(--space-3); border: 1px solid var(--color-border-strong); border-radius: var(--radius-md); background: var(--color-surface-lowest); color: var(--color-ink); font: 13px/1.45 var(--font-ui); }
+.mission-intake-form textarea::placeholder { color: var(--color-muted-dim); }
+.mission-intake-form textarea:focus { outline: 2px solid var(--color-focus); outline-offset: 1px; }
+.intake-actions { display: flex; flex-wrap: wrap; gap: var(--space-2); align-items: center; margin-top: var(--space-2); }
+.intake-hint { margin: var(--space-2) 0 0; color: var(--color-muted-dim); font-size: 10px; }
 
 .eyebrow, .section-kicker, .lane-kicker {
   margin: 0;
@@ -811,6 +836,9 @@ button[aria-busy="true"]::after {
 }
 
 @media (max-width: 700px) {
+  .mission-intake { grid-template-columns: 1fr; gap: var(--space-4); padding: var(--space-4); }
+  .mission-intake-copy h1 { font-size: 30px; }
+  .mission-intake-form { padding: var(--space-4); }
   .queue-hero { grid-template-columns: 1fr; gap: var(--space-3); padding: var(--space-4); }
   .queue-hero .mission-actions { align-items: stretch; }
   .run-hint { text-align: left; }

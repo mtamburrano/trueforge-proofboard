@@ -15,9 +15,9 @@ From the repository root, run:
 npm run demo:reset
 ```
 
-The reset is local and deterministic. It rebuilds the primary mission in
-memory, creates the one inspect ticket in `Backlog`, and atomically writes only
-`.trueforge/mission-state.json`. It clears prior session, turn, sandbox,
+The reset is local and deterministic. It restores empty mission intake and
+atomically writes only `.trueforge/mission-state.json`; the next `Create
+tickets` action performs the read-only inspection and planning phase. It clears prior session, turn, sandbox,
 evidence, handoff, review, approval, delivery, and delivery-attempt records.
 It does not call a provider, create a sandbox, inspect GitHub, delete a branch,
 close a pull request, or touch other files. The reset refuses a state-file or
@@ -67,7 +67,7 @@ It checks:
   sandbox ID verifies that the direct credential reaches the authenticated API
   boundary; a 404 is the expected non-mutating response and a 401 fails closed;
 - the exact fixture `mtamburrano/proofboard-demo-fixture` at pinned baseline
-  `590aa8a6d72c580f61fc1b19d33e9876bc0feb9b`;
+  `acdbbde12203edeee099313a4636ff8c25a83e24`;
 - the absence of the owned delivery branch
   `proofboard-verified-delivery`; and
 - the absence of an open owned pull request from that branch into `main`.
@@ -111,8 +111,9 @@ run with the smoke dry-run or with fixture text.
    GitHub MCP connector, and Daytona provider.
 2. Run `npm run demo:reset`, then `npm run demo:preflight`. Do not continue on
    a failed check.
-3. Open Mission Control, authorize only the intended ticket by moving it from
-   `Backlog` to `Ready`, and drive the real queue through repository
+3. Open Mission Control, enter the mission objective (or use the exact Todo
+   demo mission), choose `Create tickets`, then authorize only the resulting
+   implementation ticket by moving it from `Backlog` to `Ready`, and drive the real queue through repository
    inspection, implementation, independent proof, and review. Stop at
    `Awaiting Approval`; do not approve delivery for the rehearsal.
 4. Repeat the reset, preflight, and clean pre-approval queue run once more.

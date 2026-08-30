@@ -54,8 +54,8 @@ import {
 } from "../fixture.js";
 
 export const PRIMARY_MISSION_ID = "primary-mission";
-export const PRIMARY_MISSION_OBJECTIVE =
-  "Add a backwards-compatible getNextDeliveryStage(stage) helper to src/index.ts. It returns the next stage for Plan, Execute, and Prove, returns null for terminal Approve, preserves the existing identity exports, and includes focused tests for every transition.";
+export const DEMO_MISSION_OBJECTIVE = "Add support for marking a todo as completed.";
+export const PRIMARY_MISSION_OBJECTIVE = DEMO_MISSION_OBJECTIVE;
 export const PRIMARY_REPOSITORY = {
   owner: PRIMARY_DELIVERY_FIXTURE.owner,
   name: PRIMARY_DELIVERY_FIXTURE.repository,
@@ -67,8 +67,8 @@ export const PRIMARY_DELIVERY_TARGET: PullRequestDeliveryTarget = {
   repo: PRIMARY_DELIVERY_FIXTURE.repository,
   base: PRIMARY_DELIVERY_FIXTURE.base,
   head: PRIMARY_DELIVERY_FIXTURE.head,
-  title: "Add the verified delivery-stage helper",
-  body: "Adds the backwards-compatible delivery-stage helper and focused transition coverage verified by the Proof Board mission.",
+  title: "Add todo completion support",
+  body: "Adds support for marking a todo as completed in the verified Todo fixture.",
 };
 
 export const PRIMARY_VERIFICATION_COMMAND = "npm test";
@@ -385,6 +385,11 @@ export interface MissionView {
   }>;
 }
 
+export interface MissionIntakeView {
+  demoObjective: string;
+  repository: { owner: string; name: string; ref: string };
+}
+
 class MissionControlError extends Error {
   constructor(message: string) {
     super(message);
@@ -522,6 +527,19 @@ function compactPrimaryWorkGraph(graph: WorkGraphDefinition): WorkGraphDefinitio
   return validateWorkGraph(compacted);
 }
 
+function implementationOnlyWorkGraph(graph: WorkGraphDefinition): WorkGraphDefinition {
+  const implementers = graph.items.filter((item) => item.assignedRole === "implementer");
+  if (implementers.length !== 1 || implementers[0] === undefined) {
+    throw new MissionDomainError(
+      "invalid_input",
+      "Mission intake requires exactly one bounded implementation ticket.",
+    );
+  }
+  return validateWorkGraph({
+    items: [{ ...implementers[0], dependsOn: [] }],
+  });
+}
+
 class MissionController {
   private operation: Promise<MissionView> | null = null;
   private createOperation: Promise<MissionView> | null = null;
@@ -541,6 +559,13 @@ class MissionController {
       : null;
   }
 
+  getPrimaryIntake(): MissionIntakeView {
+    return {
+      demoObjective: DEMO_MISSION_OBJECTIVE,
+      repository: { ...PRIMARY_REPOSITORY },
+    };
+  }
+
   async getPrimaryDiagnostics(): Promise<DiagnosticSnapshot | null> {
     const state = await this.missions.getState();
     return state.missions.some((mission) => mission.id === PRIMARY_MISSION_ID)
@@ -553,6 +578,16 @@ class MissionController {
       return this.createOperation;
     }
     this.createOperation = this.createOrOpenPrimaryMissionOnce().finally(() => {
+      this.createOperation = null;
+    });
+    return this.createOperation;
+  }
+
+  createOrPlanPrimaryMission(objective: string): Promise<MissionView> {
+    if (this.createOperation !== null) {
+      return this.createOperation;
+    }
+    this.createOperation = this.createOrPlanPrimaryMissionOnce(objective).finally(() => {
       this.createOperation = null;
     });
     return this.createOperation;
@@ -571,6 +606,39 @@ class MissionController {
       repository: PRIMARY_REPOSITORY,
     });
     await this.ensureWorkItems();
+    return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID, this.model);
+  }
+
+  private async createOrPlanPrimaryMissionOnce(objective: string): Promise<MissionView> {
+    const state = await this.missions.getState();
+    const existing = state.missions.find((mission) => mission.id === PRIMARY_MISSION_ID);
+    if (existing !== undefined) {
+      if (existing.objective !== objective) {
+        throw new MissionDomainError(
+          "conflict",
+          "The primary mission already exists with a different objective.",
+        );
+      }
+      const workItems = state.workItems.filter((item) => item.missionId === PRIMARY_MISSION_ID);
+      if (workItems.length > 0) {
+        return mapMissionState(state, PRIMARY_MISSION_ID, this.model);
+      }
+    } else {
+      await this.runner.createMission({
+        id: PRIMARY_MISSION_ID,
+        objective,
+        repository: PRIMARY_REPOSITORY,
+      });
+    }
+
+    const inspectionResult = await this.runner.inspectRepository({
+      missionId: PRIMARY_MISSION_ID,
+    });
+    await this.persistIntakeWorkGraph(inspectionResult);
+    const planned = await this.missions.getMission(PRIMARY_MISSION_ID);
+    if (planned.status === "draft") {
+      await this.missions.transitionMission(PRIMARY_MISSION_ID, "planning");
+    }
     return mapMissionState(await this.missions.getState(), PRIMARY_MISSION_ID, this.model);
   }
 
@@ -1640,6 +1708,54 @@ class MissionController {
     }
   }
 
+  private async persistIntakeWorkGraph(inspectionResult: unknown): Promise<void> {
+    const state = await this.missions.getState();
+    const mission = state.missions.find((item) => item.id === PRIMARY_MISSION_ID);
+    if (mission === undefined) {
+      throw new MissionControlError("Planning could not find the primary mission.");
+    }
+    const inspection = verifiedInspectionFromResult(
+      inspectionResult,
+      state,
+      mission,
+      undefined,
+    );
+    try {
+      const plannedGraph = validateWorkGraph(await this.planner.plan({ mission, inspection }));
+      const graph = implementationOnlyWorkGraph(plannedGraph);
+      const created = await this.missions.persistWorkGraph(PRIMARY_MISSION_ID, graph);
+      for (const item of created) {
+        if (item.status === "ready") {
+          await this.missions.transitionWorkItem(PRIMARY_MISSION_ID, item.id, "backlog");
+        }
+      }
+      const implementation = graph.items[0];
+      if (implementation === undefined) {
+        throw new MissionControlError("Planning failed closed; no implementation ticket was produced.");
+      }
+      await this.missions.addEvidence(PRIMARY_MISSION_ID, {
+        kind: "tool_result",
+        result: "passed",
+        source: "system",
+        summary: "Read-only planning completed; planner and reviewer remain internal provenance.",
+        details: JSON.stringify({
+          phase: "mission-intake",
+          planning: "read-only",
+          implementation_work_item_id: implementation.id,
+          implementation_scope: implementation.allowedFiles,
+          hidden_roles: ["planner", "reviewer"],
+        }),
+      });
+    } catch (error) {
+      if (error instanceof MissionDomainError || error instanceof MissionControlError) {
+        throw error;
+      }
+      throw new MissionControlError(
+        "Planning failed closed; no executable work graph was persisted.",
+      );
+    }
+  }
+
   private async prepareMissionForExecution(): Promise<void> {
     let mission = await this.missions.getMission(PRIMARY_MISSION_ID);
     if (mission.status === "draft") {
@@ -2581,7 +2697,7 @@ function verifiedInspectionFromResult(
   result: unknown,
   state: MissionState,
   mission: Mission,
-  workItemId: string,
+  workItemId?: string,
 ): VerifiedRepositoryInspection {
   if (isRecord(result) &&
       typeof result.resourceUri === "string" &&
@@ -2619,14 +2735,14 @@ function verifiedInspectionFromResult(
         .reverse()
         .find((item) =>
           item.missionId === mission.id &&
-          item.workItemId === workItemId &&
+          (workItemId === undefined ? item.workItemId === undefined : item.workItemId === workItemId) &&
           item.source === "mcp",
         )
     : state.evidence.find((item) => item.id === evidenceId);
   if (
     evidence === undefined ||
     evidence.missionId !== mission.id ||
-    evidence.workItemId !== workItemId ||
+    (workItemId === undefined ? evidence.workItemId !== undefined : evidence.workItemId !== workItemId) ||
     evidence.source !== "mcp" ||
     evidence.result !== "passed"
   ) {
@@ -3206,7 +3322,10 @@ export function createMissionHttpApp(options: MissionHttpOptions) {
         return assetResponse("run-state.js", "text/javascript; charset=utf-8");
       }
       if (request.method === "GET" && url.pathname === "/api/mission") {
-        return jsonResponse({ mission: await controller.getPrimaryMission() });
+        return jsonResponse({
+          mission: await controller.getPrimaryMission(),
+          intake: controller.getPrimaryIntake(),
+        });
       }
       if (request.method === "GET" && url.pathname === "/api/mission/tickets") {
         return jsonResponse(await primaryTicketsResponse(options.missions));
@@ -3218,7 +3337,15 @@ export function createMissionHttpApp(options: MissionHttpOptions) {
         return jsonResponse({ diagnostics: await controller.getPrimaryDiagnostics() });
       }
       if (request.method === "POST" && url.pathname === "/api/mission") {
-        return jsonResponse({ mission: await controller.createOrOpenPrimaryMission() }, 201);
+        const body = await requestRecordIfPresent(request, "Mission intake body");
+        const objective = body.objective === undefined
+          ? undefined
+          : requiredRequestString(body.objective, "objective");
+        return jsonResponse({
+          mission: objective === undefined
+            ? await controller.createOrOpenPrimaryMission()
+            : await controller.createOrPlanPrimaryMission(objective),
+        }, 201);
       }
       if (request.method === "POST" && url.pathname === "/api/mission/run") {
         return jsonResponse({ mission: await controller.runPrimaryMission() });
@@ -3326,6 +3453,13 @@ async function requestRecord(
     throw new MissionDomainError("invalid_input", `${label} must be an object.`);
   }
   return value as Record<string, unknown>;
+}
+
+async function requestRecordIfPresent(
+  request: Request,
+  label: string,
+): Promise<Record<string, unknown>> {
+  return request.body === null ? {} : requestRecord(request, label);
 }
 
 function requiredRequestString(value: unknown, label: string): string {
