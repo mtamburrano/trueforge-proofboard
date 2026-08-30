@@ -129,6 +129,23 @@ test("Agent activity excludes deterministic proof and control-plane activity", (
   assert.match(appScript, /renderDeliveryBody\(delivery\)/);
 });
 
+test("the ticket drawer keeps runtime activity, proof, and delivery control surfaces separate", () => {
+  const drawerSource = appScript.slice(
+    appScript.indexOf("function renderTicketDrawer"),
+    appScript.indexOf("function renderReworkContext"),
+  );
+  const runtimeSection = drawerSource.slice(
+    drawerSource.indexOf("drawer-runtime"),
+    drawerSource.indexOf("drawer-proof"),
+  );
+
+  assert.match(drawerSource, /const activity = ticketRuntimeActivity\(ticket, view\)/);
+  assert.match(runtimeSection, /data-provenance-surface="runtime"/);
+  assert.match(runtimeSection, /renderTicketActivity\(activity\)/);
+  assert.doesNotMatch(runtimeSection, /renderApprovalBody|renderDeliveryBody|renderTicketEvidence/);
+  assert.match(drawerSource, /drawer-proof[\s\S]*data-provenance-surface="proof"[\s\S]*renderTicketEvidence\(evidence\)/);
+});
+
 test("ticket cards open a non-blocking drawer while queue transitions stay in the drawer", () => {
   const cardSource = appScript.slice(
     appScript.indexOf("function renderTicketCard"),

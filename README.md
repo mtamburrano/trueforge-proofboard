@@ -58,6 +58,34 @@ and Daytona sandbox are configured:
 npm run smoke:trueforge
 ```
 
+## Deterministic demo controls
+
+The live queue demo has a local reset and a bounded, read-only preflight. The
+full operator sequence—including the two non-mutating rehearsal runs and one
+explicitly approved PR-producing rehearsal—is in
+[`docs/demo-runbook.md`](docs/demo-runbook.md).
+
+Reset only the guarded local mission state:
+
+```sh
+npm run demo:reset
+```
+
+Preview the preflight topology without contacting providers, then run the
+actual read-only checks manually after external setup:
+
+```sh
+npm run demo:preflight -- --dry-run
+npm run demo:preflight
+```
+
+The actual preflight checks TrueForge capabilities/model settings, GitHub MCP
+configuration and tools, Daytona readiness, the exact pinned fixture baseline,
+and stale owned delivery branch/pull-request state; it also checks the
+server-only `DAYTONA_API_KEY` needed by direct deterministic proof. It does not
+create a session, sandbox, branch, pull request, or other remote mutation.
+Automated tests remain provider-free; real queue runs are intentionally manual.
+
 ## Repository safety
 
 Local credentials, environment files, MCP configuration, dependencies, and generated output are ignored by default. Do not commit secrets or machine-specific configuration.
