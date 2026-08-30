@@ -19,6 +19,7 @@ import {
   PRIMARY_MISSION_OBJECTIVE,
   PRIMARY_SANDBOX_REPOSITORY_ROOT,
   PRIMARY_VERIFICATION_COMMAND,
+  IMPLEMENTATION_ARTIFACT_CAPTURE_MODE,
   IMPLEMENTATION_PROOF_MODE,
   TrueForgeIntegrationError,
   createMissionHttpApp,
@@ -53,9 +54,13 @@ class TestMissionRunner {
     this.proofArtifact = proofArtifact;
     this.deliveryHeadPatches = deliveryHeadPatches ?? proofArtifact?.patches ?? PRIMARY_VERIFIED_DELIVERY_PATCHES;
     this.proofMode = proofMode;
+    this.captureMode = proofMode === IMPLEMENTATION_PROOF_MODE
+      ? IMPLEMENTATION_ARTIFACT_CAPTURE_MODE
+      : proofMode;
     this.sandboxInputs = [];
     this.operationLog = [];
     this.turnInputs = [];
+    this.reviewInputs = [];
     this.deliveryCalls = { requested: [], resolved: [], reconciled: [], protectedOperations: 0, lifecycle: [] };
     this.calls = { create: 0, inspect: 0, headInspect: 0, turn: 0, sandbox: 0 };
   }
@@ -197,6 +202,140 @@ class TestMissionRunner {
       turnId,
       events: [],
       mission: await this.missions.getMission(missionId),
+    };
+  }
+
+  async captureImplementationArtifact(input) {
+    this.operationLog.push("capture");
+    this.calls.sandbox += 1;
+    this.sandboxInputs.push(input);
+    const origin = { kind: "sandbox", sessionId: "test-session-durable" };
+    if (this.failSandbox || this.sandboxInfrastructureFailure) {
+      await this.missions.addEvidence(input.missionId, {
+        workItemId: input.workItemId,
+        kind: "tool_result",
+        result: "failed",
+        source: "sandbox",
+        summary: "Same-sandbox artifact capture failed.",
+        details: JSON.stringify({
+          artifact_capture_mode: this.captureMode,
+          phase: "artifact-capture",
+          failure_class: this.sandboxInfrastructureFailure ? "infrastructure" : "implementation",
+          failure_reason_category: this.sandboxInfrastructureFailure ? "network" : "verification",
+          retryable: this.sandboxInfrastructureFailure,
+        }),
+      });
+      throw new TrueForgeIntegrationError(
+        "capture implementation artifact",
+        "Sandbox artifact capture command exited with code 1.",
+        this.sandboxInfrastructureFailure
+          ? { failureClass: "infrastructure", failureCategory: "network", retryable: true }
+          : undefined,
+      );
+    }
+    const workItem = await this.missions.getWorkItem(input.missionId, input.workItemId);
+    const allowedFiles = workItem.allowedFiles ?? [];
+    const isPrimaryFixture = allowedFiles.length === Object.keys(PRIMARY_VERIFIED_DELIVERY_FILES).length &&
+      allowedFiles.every((file) => Object.prototype.hasOwnProperty.call(PRIMARY_VERIFIED_DELIVERY_FILES, file));
+    let deliveryArtifact = this.proofArtifact ?? (isPrimaryFixture
+      ? PRIMARY_VERIFIED_DELIVERY_ARTIFACT
+      : undefined);
+    if (deliveryArtifact === undefined) {
+      const files = Object.fromEntries(allowedFiles.map((file) => [file, "before\nafter\n"]));
+      const patches = Object.fromEntries(
+        allowedFiles.map((file) => [file, "@@ -1 +1,2 @@\n before\n+after"]),
+      );
+      deliveryArtifact = {
+        baselineSha: PRIMARY_DELIVERY_FIXTURE.baselineSha,
+        files,
+        patches,
+        contentHash: verifiedDeliveryArtifactHash(
+          PRIMARY_DELIVERY_FIXTURE.baselineSha,
+          files,
+          patches,
+        ),
+      };
+    }
+    const filesChanged = deliveryArtifact === undefined ? allowedFiles : Object.keys(deliveryArtifact.files);
+    const diffOutput = deliveryArtifact === undefined
+      ? filesChanged.map((file) =>
+          `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1 +1,2 @@\n before\n+after`
+        ).join("\n")
+      : Object.entries(deliveryArtifact.patches).map(([file, patch]) =>
+          `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n${patch}`
+        ).join("\n");
+    const finalFileContents = deliveryArtifact?.files ?? Object.fromEntries(
+      filesChanged.map((file) => [file, "before\nafter\n"]),
+    );
+    const parsedPatches = deliveryArtifact?.patches ?? Object.fromEntries(
+      filesChanged.map((file) => [file, "@@ -1 +1,2 @@\n before\n+after"]),
+    );
+    const identity = await this.missions.addEvidence(input.missionId, {
+      workItemId: input.workItemId,
+      kind: "tool_result",
+      result: "passed",
+      source: "sandbox",
+      summary: "Captured repository identity from the persisted sandbox.",
+      details: JSON.stringify({
+        artifact_capture_mode: this.captureMode,
+        command: `git -C ${PRIMARY_SANDBOX_REPOSITORY_ROOT} config --get remote.origin.url`,
+        exit_code: 0,
+        sandbox_id: "test-sandbox-durable",
+      }),
+      executionOrigin: origin,
+    });
+    const status = await this.missions.addEvidence(input.missionId, {
+      workItemId: input.workItemId,
+      kind: "file_change",
+      result: "passed",
+      source: "sandbox",
+      summary: "Captured the complete changed-file status from the persisted sandbox.",
+      details: JSON.stringify({
+        artifact_capture_mode: this.captureMode,
+        complete_changed_files: true,
+        command: `git -C ${PRIMARY_SANDBOX_REPOSITORY_ROOT} status --porcelain=v1 -z --untracked-files=all`,
+        exit_code: 0,
+        changed_files: filesChanged,
+        sandbox_id: "test-sandbox-durable",
+      }),
+      executionOrigin: origin,
+    });
+    const diff = await this.missions.addEvidence(input.missionId, {
+      workItemId: input.workItemId,
+      kind: "diff_summary",
+      result: "passed",
+      source: "sandbox",
+      summary: "Captured the actual bounded diff and final file contents for independent review.",
+      details: JSON.stringify({
+        artifact_capture_mode: this.captureMode,
+        command: `git -C ${PRIMARY_SANDBOX_REPOSITORY_ROOT} diff --no-ext-diff --binary ${PRIMARY_DELIVERY_FIXTURE.baselineSha} --`,
+        exit_code: 0,
+        output: diffOutput,
+        changed_files: filesChanged,
+        parsed_patches: parsedPatches,
+        final_file_contents: finalFileContents,
+        final_file_content_commands: filesChanged.map((file) => ({
+          file,
+          command: `cat ${PRIMARY_SANDBOX_REPOSITORY_ROOT}/${file}`,
+        })),
+        output_truncated: false,
+        baseline_sha: PRIMARY_DELIVERY_FIXTURE.baselineSha,
+        sandbox_id: "test-sandbox-durable",
+        provenance_kind: "implementation_artifact",
+        artifact_hash: deliveryArtifact?.contentHash,
+        delivery_artifact: deliveryArtifact,
+      }),
+      executionOrigin: origin,
+    });
+    return {
+      filesChanged,
+      diffSummary: diffOutput,
+      checks: [],
+      evidenceIds: [identity.id, status.id, diff.id],
+      decisions: [],
+      openQuestions: [],
+      executionOrigin: origin,
+      ...(deliveryArtifact === undefined ? {} : { deliveryArtifact }),
     };
   }
 
@@ -392,7 +531,8 @@ class TestMissionRunner {
     return { evidenceId: evidence.id };
   }
 
-  async reviewContract() {
+  async reviewContract(context) {
+    this.reviewInputs.push(context);
     return {
       outcome: "accepted",
       reviewer: "test-independent-reviewer",
@@ -794,9 +934,11 @@ test("mission intake persists the submitted objective after read-only planning a
   await authorizeTicket(app, created.mission.tickets[0].id);
   const executed = await json(await app.request("/api/mission/run", { method: "POST" }));
   assert.equal(executed.mission.mission.objective, objective);
-  assert.equal(executed.mission.tickets[0].status, "proving");
+  assert.equal(executed.mission.tickets[0].status, "awaiting_approval");
   assert.equal(runner.calls.turn, 1);
   assert.equal(runner.calls.inspect, 1);
+  assert.equal(runner.calls.sandbox, 1);
+  assert.equal(runner.reviewInputs.length, 1);
   assert.equal(runner.deliveryCalls.protectedOperations, 0);
   assert.match(runner.turnInputs[0].instruction, new RegExp(objective.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
@@ -1109,14 +1251,14 @@ test("run mission executes only the human-authorized queue ticket and preserves 
   assert.equal(implementationResponse.status, 200);
   const implemented = await json(implementationResponse);
   const implementedTicket = implemented.mission.tickets.find((item) => item.id === implementTicket.id);
-  assert.equal(implementedTicket.status, "proving");
+  assert.equal(implementedTicket.status, "awaiting_approval");
   assert.equal(implementedTicket.claim.owner, "trueforge-worker");
   assert.equal(implementedTicket.claim.trueforgeSessionId, "test-session-durable");
   assert.equal(implementedTicket.executionAuthorization.authorizedBy, "test-operator");
   assert.equal(implemented.mission.mission.execution.sandboxId, "test-sandbox-durable");
-  assert.equal(implemented.mission.approvals.length, 0);
-  assert.deepEqual(runner.operationLog, ["inspect", "execute"]);
-  assert.deepEqual(runner.calls, { create: 1, inspect: 1, headInspect: 0, turn: 1, sandbox: 0 });
+  assert.equal(implemented.mission.approvals.length, 1);
+  assert.deepEqual(runner.operationLog, ["inspect", "execute", "capture"]);
+  assert.deepEqual(runner.calls, { create: 1, inspect: 1, headInspect: 0, turn: 1, sandbox: 1 });
   assert.deepEqual(runner.turnInputs.map((input) => input.options.workItemId), [implementTicket.id]);
   assert.equal(runner.turnInputs[0].options.previousTurnId, "test-inspection-turn");
   assert.match(runner.turnInputs[0].instruction, /Verified repository facts: mtamburrano\/proofboard-demo-fixture at full commit/);
@@ -1128,7 +1270,7 @@ test("run mission executes only the human-authorized queue ticket and preserves 
   assert.doesNotMatch(serialized, /must-not-reach-browser|provider_secret/);
 });
 
-test("run mission performs deterministic proof and independent review after coding", async () => {
+test("implementation automatically captures the same sandbox and enters independent review", async () => {
   const { app, runner, missions } = testApp();
 
   await app.request("/api/mission", { method: "POST" });
@@ -1140,11 +1282,9 @@ test("run mission performs deterministic proof and independent review after codi
   current = await json(await app.request("/api/mission"));
   const implementTicket = current.mission.tickets.find((item) => item.assignedRole === "implementer");
   await authorizeTicket(app, implementTicket.id);
-  await app.request("/api/mission/run", { method: "POST" });
-
-  const proofResponse = await app.request("/api/mission/run", { method: "POST" });
-  assert.equal(proofResponse.status, 200);
-  const proved = await json(proofResponse);
+  const reviewResponse = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(reviewResponse.status, 200);
+  const proved = await json(reviewResponse);
   const provedTicket = proved.mission.tickets.find((item) => item.id === implementTicket.id);
   assert.equal(provedTicket.status, "awaiting_approval");
   assert.equal(provedTicket.attempts[0].status, "awaiting_approval");
@@ -1154,19 +1294,92 @@ test("run mission performs deterministic proof and independent review after codi
   assert.equal(proved.mission.approvals.length, 1);
   assert.equal(proved.mission.approvals[0].workItemId, implementTicket.id);
   assert.equal(proved.mission.approvals[0].attempt, 1);
-  assert.deepEqual(runner.operationLog, ["inspect", "execute", "prove"]);
+  assert.deepEqual(runner.operationLog, ["inspect", "execute", "capture"]);
+  assert.equal(runner.operationLog.includes("prove"), false);
   assert.equal(runner.calls.sandbox, 1);
   assert.equal(runner.calls.headInspect, 0);
+  assert.equal(runner.reviewInputs.length, 1);
+  assert.deepEqual(runner.reviewInputs[0].actualFilesChanged.sort(), ["src/index.ts", "test/index.test.js"]);
+  assert.equal(runner.deliveryCalls.protectedOperations, 0);
+  assert.equal(runner.deliveryCalls.resolved.length, 0);
 
   const state = await missions.getState();
   assert.equal(state.handoffs.length, 1);
   assert.equal(state.handoffs[0].attempt, 1);
+  assert.deepEqual(state.handoffs[0].checks, []);
+  assert.deepEqual(state.handoffs[0].testsRun, []);
   assert.equal(state.reviews.length, 1);
   assert.equal(state.reviews[0].outcome, "accepted");
   assert.equal(state.reviews[0].attempt, 1);
   assert.equal(state.evidence.some((item) =>
     item.workItemId === implementTicket.id && item.source === "sandbox" && item.attempt === 1
   ), true);
+  assert.equal(state.evidence.some((item) =>
+    /npm|typecheck|test/.test(JSON.parse(item.details ?? "{}").command ?? "")
+  ), false);
+});
+
+test("independent review findings require human-authorized same-sandbox rework", async () => {
+  let reviewCalls = 0;
+  const finding = "Return the completed todo instead of dropping it from the result.";
+  const verifier = {
+    review(context) {
+      reviewCalls += 1;
+      return reviewCalls === 1
+        ? {
+            outcome: "changes_requested",
+            reviewer: "test-independent-reviewer",
+            summary: "The actual diff has one concrete contract issue.",
+            finding,
+          }
+        : {
+            outcome: "accepted",
+            reviewer: "test-independent-reviewer",
+            summary: "The rework satisfies the bounded ticket.",
+            finding: "The requested behavior is present and remains in scope.",
+          };
+    },
+  };
+  const { app, runner, missions } = testApp(new InMemoryMissionRepository(), { verifier });
+
+  await app.request("/api/mission", { method: "POST" });
+  let current = await json(await app.request("/api/mission"));
+  const inspectTicket = current.mission.tickets.find((item) => item.assignedRole === "planner");
+  await authorizeTicket(app, inspectTicket.id);
+  const inspected = await json(await app.request("/api/mission/run", { method: "POST" }));
+  const implementTicket = inspected.mission.tickets.find((item) => item.assignedRole === "implementer");
+  await authorizeTicket(app, implementTicket.id);
+
+  const firstRun = await json(await app.request("/api/mission/run", { method: "POST" }));
+  const requested = firstRun.mission.tickets.find((item) => item.id === implementTicket.id);
+  assert.equal(requested.status, "changes_requested");
+  assert.deepEqual(requested.requestedChanges, [finding]);
+  assert.equal(firstRun.mission.approvals.length, 0);
+  assert.equal(runner.calls.turn, 1);
+  assert.equal(runner.calls.sandbox, 1);
+  assert.equal(runner.deliveryCalls.protectedOperations, 0);
+
+  const unauthorizedRetry = await app.request("/api/mission/run", { method: "POST" });
+  assert.equal(unauthorizedRetry.status, 400);
+  assert.equal(runner.calls.turn, 1);
+
+  await authorizeTicket(app, implementTicket.id, "rework-operator");
+  const reworked = await json(await app.request("/api/mission/run", { method: "POST" }));
+  const accepted = reworked.mission.tickets.find((item) => item.id === implementTicket.id);
+  assert.equal(accepted.status, "awaiting_approval");
+  assert.equal(accepted.attempt, 2);
+  assert.equal(accepted.attempts[0].retiredBy, "rework-operator");
+  assert.deepEqual(accepted.attempts[1].requestedChanges, [finding]);
+  assert.equal(accepted.attempts[1].claim.trueforgeSandboxId, "test-sandbox-durable");
+  assert.match(runner.turnInputs[1].instruction, new RegExp(finding.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.equal(reworked.mission.approvals.length, 1);
+  assert.equal(runner.deliveryCalls.protectedOperations, 0);
+
+  const state = await missions.getState();
+  assert.equal(state.reviews.length, 2);
+  assert.equal(state.reviews[0].outcome, "changes_requested");
+  assert.equal(state.reviews[1].outcome, "accepted");
+  assert.equal(state.handoffs[1].attempt, 2);
 });
 
 test("two different proof artifacts independently reach approval and delivery", async () => {
@@ -1208,7 +1421,7 @@ test("two different proof artifacts independently reach approval and delivery", 
   assert.deepEqual(PRIMARY_VERIFIED_DELIVERY_ARTIFACT, fixtureSnapshot.artifact);
 });
 
-test("proof infrastructure failure retries Proving without another coding turn", async () => {
+test("artifact capture infrastructure failure retries Review without another coding turn", async () => {
   const { app, runner, missions } = testApp(new InMemoryMissionRepository(), {
     sandboxInfrastructureFailure: true,
   });
@@ -1222,8 +1435,6 @@ test("proof infrastructure failure retries Proving without another coding turn",
   current = await json(await app.request("/api/mission"));
   const implementTicket = current.mission.tickets.find((item) => item.assignedRole === "implementer");
   await authorizeTicket(app, implementTicket.id);
-  await app.request("/api/mission/run", { method: "POST" });
-
   const failedProof = await app.request("/api/mission/run", { method: "POST" });
   assert.equal(failedProof.status, 200);
   const proving = await json(failedProof);
@@ -1243,7 +1454,7 @@ test("proof infrastructure failure retries Proving without another coding turn",
     item.result === "failed" &&
     JSON.parse(item.details).retryable === true,
   );
-  assert.ok(retryEvidence, "A retryable proof failure must be durably recorded.");
+  assert.ok(retryEvidence, "A retryable capture failure must be durably recorded.");
   assert.equal(JSON.parse(retryEvidence.details).failure_class, "infrastructure");
 
   runner.sandboxInfrastructureFailure = false;
@@ -1263,7 +1474,7 @@ test("proof infrastructure failure retries Proving without another coding turn",
   assert.equal((await missions.getState()).evidence.some((item) => item.id === retryEvidence.id), true);
 });
 
-test("delivery approval refuses a green handoff without the direct proof marker", async () => {
+test("delivery approval refuses a handoff without the same-sandbox capture marker", async () => {
   const { app, runner, missions } = testApp(new InMemoryMissionRepository(), {
     proofMode: "coordinator_turn",
   });
@@ -1275,20 +1486,18 @@ test("delivery approval refuses a green handoff without the direct proof marker"
   const inspected = await json(await app.request("/api/mission/run", { method: "POST" }));
   const implementTicket = inspected.mission.tickets.find((item) => item.assignedRole === "implementer");
   await authorizeTicket(app, implementTicket.id);
-  await app.request("/api/mission/run", { method: "POST" });
-
   const proofResponse = await app.request("/api/mission/run", { method: "POST" });
-  assert.equal(proofResponse.status, 502);
+  assert.equal(proofResponse.status, 200);
   const failed = await json(proofResponse);
   const failedTicket = failed.mission.tickets.find((item) => item.id === implementTicket.id);
-  assert.equal(failedTicket.status, "blocked");
+  assert.equal(failedTicket.status, "changes_requested");
   assert.equal(failed.mission.approvals.length, 0);
   assert.equal(runner.calls.sandbox, 1);
   assert.equal(runner.calls.headInspect, 0);
-  assert.equal((await missions.getState()).missions[0].status, "blocked");
+  assert.equal((await missions.getState()).missions[0].status, "executing");
 });
 
-test("proof findings require human reauthorization and reuse the same execution binding", async () => {
+test("artifact capture findings require human reauthorization and reuse the same execution binding", async () => {
   const { app, runner, missions } = testApp(new InMemoryMissionRepository(), { failSandbox: true });
 
   await app.request("/api/mission", { method: "POST" });
@@ -1300,8 +1509,6 @@ test("proof findings require human reauthorization and reuse the same execution 
   current = await json(await app.request("/api/mission"));
   const implementTicket = current.mission.tickets.find((item) => item.assignedRole === "implementer");
   await authorizeTicket(app, implementTicket.id);
-  await app.request("/api/mission/run", { method: "POST" });
-
   const failedProof = await app.request("/api/mission/run", { method: "POST" });
   assert.equal(failedProof.status, 200);
   const changesRequested = await json(failedProof);
@@ -1322,18 +1529,15 @@ test("proof findings require human reauthorization and reuse the same execution 
   runner.failSandbox = false;
   const reworkExecution = await app.request("/api/mission/run", { method: "POST" });
   assert.equal(reworkExecution.status, 200);
-  const reworkProving = await json(reworkExecution);
-  const reworkTicket = reworkProving.mission.tickets.find((item) => item.id === implementTicket.id);
-  assert.equal(reworkTicket.status, "proving");
+  const reworkComplete = await json(reworkExecution);
+  const reworkTicket = reworkComplete.mission.tickets.find((item) => item.id === implementTicket.id);
+  assert.equal(reworkTicket.status, "awaiting_approval");
   assert.equal(reworkTicket.attempt, 2);
   assert.equal(reworkTicket.attempts[0].retiredBy, "repair-operator");
   assert.equal(reworkTicket.attempts[1].claim.trueforgeSessionId, "test-session-durable");
   assert.equal(reworkTicket.attempts[1].claim.trueforgeSandboxId, "test-sandbox-durable");
   assert.match(runner.turnInputs[1].instruction, /Requested rework findings:.*exited with code 1/i);
 
-  const reworkProof = await app.request("/api/mission/run", { method: "POST" });
-  assert.equal(reworkProof.status, 200);
-  const reworkComplete = await json(reworkProof);
   const reworked = reworkComplete.mission.tickets.find((item) => item.id === implementTicket.id);
   assert.equal(reworked.status, "awaiting_approval");
   assert.equal(reworked.attempts[1].status, "awaiting_approval");
@@ -1385,8 +1589,6 @@ test("Changes Requested stays inert across JSON reconnect before a new authorize
     const inspected = await json(await first.app.request("/api/mission/run", { method: "POST" }));
     const implementTicket = inspected.mission.tickets.find((item) => item.assignedRole === "implementer");
     await authorizeTicket(first.app, implementTicket.id);
-    await first.app.request("/api/mission/run", { method: "POST" });
-
     const requested = await json(await first.app.request("/api/mission/run", { method: "POST" }));
     const requestedTicket = requested.mission.tickets.find((item) => item.id === implementTicket.id);
     assert.equal(requestedTicket.status, "changes_requested");
@@ -1422,20 +1624,19 @@ test("Changes Requested stays inert across JSON reconnect before a new authorize
 
     const reworkExecution = await json(await restoredApp.request("/api/mission/run", { method: "POST" }));
     const reworkTicket = reworkExecution.mission.tickets.find((item) => item.id === implementTicket.id);
-    assert.equal(reworkTicket.status, "proving");
+    assert.equal(reworkTicket.status, "awaiting_approval");
     assert.equal(reworkTicket.attempt, 2);
     assert.equal(reworkTicket.attempts[0].retiredBy, "reconnect-operator");
     assert.equal(reworkTicket.attempts[1].claim.trueforgeSessionId, "test-session-durable");
     assert.equal(reworkTicket.attempts[1].claim.trueforgeSandboxId, "test-sandbox-durable");
     assert.equal(restoredRunner.turnInputs[0].options.previousTurnId, "test-turn-1");
 
-    const reworkProof = await json(await restoredApp.request("/api/mission/run", { method: "POST" }));
-    const completedTicket = reworkProof.mission.tickets.find((item) => item.id === implementTicket.id);
+    const completedTicket = reworkExecution.mission.tickets.find((item) => item.id === implementTicket.id);
     assert.equal(completedTicket.status, "awaiting_approval");
     assert.equal(completedTicket.attempts[1].status, "awaiting_approval");
-    assert.equal(reworkProof.mission.approvals.at(-1).attempt, 2);
-    assert.equal(reworkProof.mission.reviews.length, 2);
-    assert.equal(reworkProof.mission.reviews.at(-1).outcome, "accepted");
+    assert.equal(reworkExecution.mission.approvals.at(-1).attempt, 2);
+    assert.equal(reworkExecution.mission.reviews.length, 2);
+    assert.equal(reworkExecution.mission.reviews.at(-1).outcome, "accepted");
     assert.equal(restoredRunner.calls.turn, 1);
     assert.equal(restoredRunner.calls.sandbox, 1);
   } finally {
@@ -1483,9 +1684,16 @@ test("a reconnect resumes a durably completed implementation turn without replay
   assert.equal(executed.status, 200);
 
   const snapshot = await repository.load();
+  snapshot.missions[0].status = "executing";
   const persistedTicket = snapshot.workItems.find((item) => item.id === implementTicket.id);
   persistedTicket.status = "in_progress";
   persistedTicket.attempts.at(-1).status = "in_progress";
+  snapshot.handoffs = [];
+  snapshot.reviews = [];
+  snapshot.approvals = [];
+  snapshot.evidence = snapshot.evidence.filter((item) =>
+    item.workItemId !== implementTicket.id || item.source === "trueforge"
+  );
   await repository.save(snapshot);
 
   const restoredMissions = new MissionService(repository);
@@ -1495,9 +1703,10 @@ test("a reconnect resumes a durably completed implementation turn without replay
   assert.equal(resumed.status, 200);
   const payload = await json(resumed);
   const resumedTicket = payload.mission.tickets.find((item) => item.id === implementTicket.id);
-  assert.equal(resumedTicket.status, "proving");
+  assert.equal(resumedTicket.status, "awaiting_approval");
   assert.equal(resumedTicket.attempts.length, 1);
   assert.equal(restoredRunner.calls.turn, 0);
+  assert.equal(restoredRunner.calls.sandbox, 1);
 });
 
 test("approved delivery advances the same attempt through read-back before Done", async () => {
@@ -1826,8 +2035,6 @@ test("a semantic changes-requested review stops the queue without automatic repa
   current = await json(await app.request("/api/mission"));
   const implementTicket = current.mission.tickets.find((item) => item.assignedRole === "implementer");
   await authorizeTicket(app, implementTicket.id);
-  await app.request("/api/mission/run", { method: "POST" });
-
   const reviewResponse = await app.request("/api/mission/run", { method: "POST" });
   assert.equal(reviewResponse.status, 200);
   const changesRequested = await json(reviewResponse);
@@ -1894,7 +2101,7 @@ test("a blocked queue does not silently retry or resurrect the failed execution"
   assert.equal(runner.calls.inspect, 1);
 });
 
-test("the primary controller leaves review and remote delivery for later authorized queue stages", async () => {
+test("the primary controller reviews automatically but leaves remote delivery human-gated", async () => {
   const reviewed = [];
   const verifier = {
     review(context) {
@@ -1920,12 +2127,13 @@ test("the primary controller leaves review and remote delivery for later authori
   const response = await app.request("/api/mission/run", { method: "POST" });
   assert.equal(response.status, 200);
   const state = await missions.getState();
-  assert.equal(state.workItems.find((item) => item.id === implementTicket.id).status, "proving");
-  assert.equal(reviewed.length, 0);
-  assert.equal(state.handoffs.length, 0);
-  assert.equal(state.reviews.length, 0);
-  assert.equal(state.approvals.length, 0);
-  assert.equal(runner.deliveryCalls.requested.length, 0);
+  assert.equal(state.workItems.find((item) => item.id === implementTicket.id).status, "awaiting_approval");
+  assert.equal(reviewed.length, 1);
+  assert.equal(state.handoffs.length, 1);
+  assert.equal(state.reviews.length, 1);
+  assert.equal(state.approvals.length, 1);
+  assert.equal(runner.deliveryCalls.requested.length, 1);
+  assert.equal(runner.deliveryCalls.protectedOperations, 0);
 });
 
 test("Mission Control defaults to Alibaba Qwen and accepts an explicit model selector", () => {

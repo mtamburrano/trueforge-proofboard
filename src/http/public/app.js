@@ -7,7 +7,7 @@ const BOARD_COLUMNS = Object.freeze([
   { id: "backlog", label: "Backlog", note: "Awaiting authorization", canDrop: true, gate: true },
   { id: "ready", label: "Ready", note: "Execution authorized", canDrop: true, gate: true },
   { id: "in_progress", label: "In Progress", note: "TrueForge working", canDrop: false },
-  { id: "proving", label: "Proving", note: "Deterministic proof", canDrop: false },
+  { id: "proving", label: "Review", note: "Independent TrueForge review", canDrop: false },
   { id: "changes_requested", label: "Changes Requested", note: "Rework required", canDrop: false, humanSource: true, gate: true },
   { id: "awaiting_approval", label: "Awaiting Approval", note: "Approve exact delivery", canDrop: false, gate: true },
   { id: "delivering", label: "Delivering", note: "Read-back in progress", canDrop: false },
@@ -25,11 +25,11 @@ const QUEUE_FLOW = Object.freeze([
     className: "human-flow",
   },
   {
-    id: "execution-proof",
+    id: "execution-review",
     index: "02",
-    label: "In Progress → Proving",
+    label: "In Progress → Review",
     ownership: "System-owned",
-    description: "TrueForge executes and proves",
+    description: "TrueForge implements and independently reviews",
     statuses: ["in_progress", "proving"],
     className: "system-flow",
   },
@@ -70,9 +70,9 @@ const labels = {
   draft: "Draft", planning: "Planning", executing: "Executing",
   awaiting_approval: "Awaiting approval", verifying: "Verifying",
   delivered: "Delivered", failed: "Failed", backlog: "Backlog",
-  ready: "Ready", in_progress: "In progress", proving: "Proving",
+  ready: "Ready", in_progress: "In progress", proving: "Review",
   changes_requested: "Changes requested", delivering: "Delivering",
-  done: "Done", blocked: "Blocked / error", ready_for_review: "Proof pending",
+  done: "Done", blocked: "Blocked / error", ready_for_review: "Review pending",
   complete: "Done", not_started: "Not started", not_run: "Pending", running: "Running",
   passed: "Passed", active: "Active", pending: "Pending approval",
   approved: "Approved execution", rejected: "Rejected delivery",
@@ -294,7 +294,7 @@ function proofChecks(ticket, view) {
   if (ticket.requiredChecks?.length) {
     return ticket.requiredChecks.map((name) => ({
       name,
-      command: "Awaiting deterministic proof",
+      command: "Not run in the independent-review demo flow",
       result: "not_run",
       required: true,
       evidenceIds: [],
@@ -358,9 +358,9 @@ function renderProofFacts(ticket, view) {
   const evidence = ticketEvidence(ticket, view);
   const binding = runtimeBinding(ticket, view);
   const checkList = checks.length === 0
-    ? `<p class="drawer-empty">No deterministic checks have been registered yet.</p>`
+    ? `<p class="drawer-empty">No captured review inputs have been registered yet.</p>`
     : `<ul class="proof-check-list">${checks.map((check) => `<li data-result="${escapeHtml(check.result)}"><span class="proof-check-name">${escapeHtml(check.name)}</span><code>${escapeHtml(check.command)}</code>${chip(check.result, "result")}</li>`).join("")}</ul>`;
-  return `<p class="proof-ownership">Proof Board verification owns deterministic status; TrueForge activity is shown separately.</p><div class="proof-fact-grid"><div><dt>Checks</dt><dd><strong>${counts.passed} passed</strong> · ${counts.failed} failed · ${counts.pending} pending</dd></div><div><dt>Measured repository</dt><dd>${escapeHtml(repositoryMeasurement(view))}</dd></div><div><dt>Measured sandbox</dt><dd><code>${escapeHtml(binding.sandbox)}</code></dd></div><div><dt>Evidence records</dt><dd>${evidence.length} repository / sandbox record${evidence.length === 1 ? "" : "s"}</dd></div></div><div class="proof-checks"><p class="proof-subheading">Deterministic checks</p>${checkList}</div>`;
+  return `<p class="proof-ownership">Independent TrueForge review uses the actual captured sandbox state; implementation activity is shown separately.</p><div class="proof-fact-grid"><div><dt>Checks</dt><dd><strong>${counts.passed} passed</strong> · ${counts.failed} failed · ${counts.pending} pending</dd></div><div><dt>Measured repository</dt><dd>${escapeHtml(repositoryMeasurement(view))}</dd></div><div><dt>Measured sandbox</dt><dd><code>${escapeHtml(binding.sandbox)}</code></dd></div><div><dt>Evidence records</dt><dd>${evidence.length} repository / sandbox record${evidence.length === 1 ? "" : "s"}</dd></div></div><div class="proof-checks"><p class="proof-subheading">Review inputs</p>${checkList}</div>`;
 }
 
 function activityLabel(item) {
@@ -477,7 +477,7 @@ function renderMission(view) {
     <section class="queue-hero panel" aria-labelledby="mission-objective"><div class="queue-hero-copy"><div class="mission-title-row"><p class="eyebrow">Proof Board · primary delivery contract</p>${chip(view.mission.status)}</div><h1 id="mission-objective" class="mission-objective">${escapeHtml(view.mission.objective)}</h1><p class="queue-thesis">Queue work. Prove facts. Approve the exact delivery.</p><p class="mission-meta">${renderRepositoryFacts(view)}<span class="fact"><span>TrueForge</span> <strong>${view.mission.execution.connected ? "Session connected" : "Waiting"}</strong></span><span class="fact"><span>State revision</span> <strong>${escapeHtml(view.revision)}</strong></span></p></div><div class="mission-actions"><p class="action-kicker">Primary queue action</p><button id="run-mission" class="primary-action" type="button" ${runDisabled ? "disabled" : ""} ${running ? 'aria-busy="true"' : ""}>${escapeHtml(running ? "TrueForge is working…" : canRun ? "Start TrueForge execution" : "Authorize execution first")}</button><p class="run-hint">${escapeHtml(runHint)}</p></div></section>
     <section class="metrics-strip queue-metrics" aria-label="Proof Board summary"><div class="metric"><span class="metric-label">Tickets</span><span class="metric-value">${tickets.length}</span></div><div class="metric"><span class="metric-label">Ready / authorized</span><span class="metric-value good">${counts.ready} / ${authorized}</span></div><div class="metric"><span class="metric-label">Verified done</span><span class="metric-value good">${counts.done}</span></div><div class="metric"><span class="metric-label">Blocked / repair</span><span class="metric-value ${blocked + repair ? "bad" : ""}">${blocked + repair}</span></div><div class="metric"><span class="metric-label">Evidence records</span><span class="metric-value">${view.evidence.length}</span></div></section>
     ${renderQueueFlow(view)}
-    <section class="board-section" aria-labelledby="board-title"><header class="board-heading"><div><p class="section-kicker">Durable work queue</p><h2 id="board-title">Queue → pipeline → delivery</h2><p id="board-description" class="section-note">Backlog ↔ Ready authorizes work. Changes Requested → Ready authorizes bounded rework. In Progress → Proving → Awaiting Approval → Delivering → Done is system-owned progression.</p></div><div class="board-legend"><span class="legend-item"><span class="legend-dot legend-dot-human"></span>Human decision</span><span class="legend-item"><span class="legend-dot legend-dot-system"></span>System-owned</span><span class="revision-label">Revision ${escapeHtml(view.revision)}</span></div></header>${renderBlockedSummary(view)}<div class="ticket-board-wrap"><section class="ticket-board" data-revision="${escapeHtml(view.revision)}" aria-describedby="board-description" aria-label="Work queue statuses">${BOARD_COLUMNS.map((column) => renderBoardColumn(column, view, counts[column.id])).join("")}</section></div></section>
+    <section class="board-section" aria-labelledby="board-title"><header class="board-heading"><div><p class="section-kicker">Durable work queue</p><h2 id="board-title">Queue → pipeline → delivery</h2><p id="board-description" class="section-note">Backlog ↔ Ready authorizes work. Changes Requested → Ready authorizes bounded rework. In Progress → Review → Awaiting Approval → Delivering → Done is system-owned progression.</p></div><div class="board-legend"><span class="legend-item"><span class="legend-dot legend-dot-human"></span>Human decision</span><span class="legend-item"><span class="legend-dot legend-dot-system"></span>System-owned</span><span class="revision-label">Revision ${escapeHtml(view.revision)}</span></div></header>${renderBlockedSummary(view)}<div class="ticket-board-wrap"><section class="ticket-board" data-revision="${escapeHtml(view.revision)}" aria-describedby="board-description" aria-label="Work queue statuses">${BOARD_COLUMNS.map((column) => renderBoardColumn(column, view, counts[column.id])).join("")}</section></div></section>
     ${renderDeliveryApprovalContext(view)}
     <section class="section-heading operations-heading"><div><p class="section-kicker">Durable operational record</p><h2>Activity and proof</h2></div><p class="section-note"><span class="proof-boundary">Runtime activity · Proof Board verification</span></p></section><section class="operations-grid"><article class="operations-panel panel" aria-labelledby="activity-heading"><header class="operations-panel-header"><div><p class="section-kicker">Runtime provenance</p><h2 id="activity-heading">Activity</h2></div><span class="badge">${view.activity.length}</span></header>${renderActivity(view.activity)}</article><article class="operations-panel panel" aria-labelledby="evidence-heading"><header class="operations-panel-header"><div><p class="section-kicker">Proof Board verification</p><h2 id="evidence-heading">Measured evidence</h2></div><span class="badge">Repository + sandbox</span></header>${renderEvidence(view.evidence)}</article></section>${renderDiagnostics(view)}${selectedTicketId === null ? "" : renderTicketDrawer(ticketById(view, selectedTicketId), view)}
     `;
@@ -697,7 +697,7 @@ function renderDrawerAuthorization(ticket, view) {
   const status = effectiveStatus(ticket);
   const approval = isDeliveryTicket(ticket, view) ? deliveryApproval(view) : undefined;
   if (status === "changes_requested") return `<p><strong>Human rework required.</strong> This hard stop cannot be retried by refresh, reconnect, or the pipeline. Moving it to Ready authorizes the next bounded pass.</p>${canHumanMove(ticket, "ready", view) ? `<button class="primary-action compact-action ticket-transition" type="button" data-ticket-transition="${escapeHtml(ticket.id)}" data-target-status="ready">Authorize bounded rework</button>` : `<p class="drawer-empty">A running delegation must finish before rework can be authorized.</p>`}`;
-  if (status === "awaiting_approval") return `<p><strong>Second human gate: protected delivery approval.</strong> Deterministic proof and independent review are complete for attempt ${escapeHtml(ticket.attempt || "—")}. Review the exact target and approve it below; refresh and reconnect cannot authorize delivery.</p>`;
+  if (status === "awaiting_approval") return `<p><strong>Second human gate: protected delivery approval.</strong> Independent TrueForge review accepted the captured same-sandbox artifact for attempt ${escapeHtml(ticket.attempt || "—")}. Review the exact target and approve it below; refresh and reconnect cannot authorize delivery.</p>`;
   if (status === "delivering") return `<p><strong>Delivery authorized.</strong> ${approval?.decidedBy ? `Approved by ${escapeHtml(approval.decidedBy)} at ${escapeHtml(formatTime(approval.decidedAt))}. ` : ""}The protected action and read-back are in progress. The ticket becomes Done only after the repository, base, head, and full head SHA match the approved artifact.</p>`;
   if (status === "done") return `<p><strong>Delivery verified.</strong> The ticket is Done because the protected result was read back and correlated to the approved attempt.</p>`;
   if (status === "blocked") return `<p><strong>Pipeline blocked.</strong> This ticket stopped on an infrastructure or pipeline failure. Inspect the diagnostic record; no code-rework authorization is available from this state.</p>`;

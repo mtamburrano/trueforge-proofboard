@@ -23,19 +23,19 @@
     if (status === "proving" && view?.progress?.verification === "failed") {
       return {
         kind: "warning",
-        message: "TrueForge recorded a retryable proof infrastructure failure. The ticket remains in Proving; inspect the durable failed evidence and retry proof.",
+        message: "TrueForge recorded a retryable sandbox-capture failure. The ticket remains in Review; inspect the durable evidence and retry the review flow.",
       };
     }
     if (status === "proving") {
       return {
         kind: "success",
-        message: "TrueForge completed the implementation step; deterministic proof is next.",
+        message: "TrueForge completed implementation; independent review is in progress or ready to resume.",
       };
     }
     if (status === "awaiting_approval") {
       return {
         kind: "success",
-        message: "Deterministic proof and independent review passed; approve the exact delivery.",
+        message: "Independent TrueForge review accepted the captured sandbox artifact; approve the exact delivery.",
       };
     }
     if (status === "delivering") {

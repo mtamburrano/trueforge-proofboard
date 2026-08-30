@@ -1414,10 +1414,10 @@ function validateStructuredHandoffFields(
     return fail("invalid_input", `${label}.filesChanged must identify changed files.`);
   }
   const rawChecks = arrayValue(value.checks, `${label}.checks`);
-  if (rawChecks.length === 0 || rawChecks.length > MAX_WORK_ITEM_REQUIRED_CHECKS) {
+  if (rawChecks.length > MAX_WORK_ITEM_REQUIRED_CHECKS) {
     return fail(
       "invalid_input",
-      `${label}.checks must contain between 1 and ${MAX_WORK_ITEM_REQUIRED_CHECKS} checks.`,
+      `${label}.checks must contain at most ${MAX_WORK_ITEM_REQUIRED_CHECKS} checks.`,
     );
   }
   const checks = rawChecks.map((check, index) =>
@@ -1426,7 +1426,7 @@ function validateStructuredHandoffFields(
   if (new Set(checks.map((check) => check.name)).size !== checks.length) {
     return fail("invalid_input", `${label}.checks must not contain duplicate names.`);
   }
-  if (!checks.some((check) => check.required)) {
+  if (checks.length > 0 && !checks.some((check) => check.required)) {
     return fail("invalid_input", `${label}.checks must include at least one required check.`);
   }
   if (
@@ -1525,10 +1525,10 @@ function validateReview(value: unknown, label: string): Review {
     return fail("invalid_input", `${label}.filesChanged must identify changed files.`);
   }
   const rawChecks = arrayValue(review.checks, `${label}.checks`);
-  if (rawChecks.length === 0 || rawChecks.length > MAX_WORK_ITEM_REQUIRED_CHECKS) {
+  if (rawChecks.length > MAX_WORK_ITEM_REQUIRED_CHECKS) {
     return fail(
       "invalid_input",
-      `${label}.checks must contain between 1 and ${MAX_WORK_ITEM_REQUIRED_CHECKS} checks.`,
+      `${label}.checks must contain at most ${MAX_WORK_ITEM_REQUIRED_CHECKS} checks.`,
     );
   }
   const checks = rawChecks.map((check, index) =>
@@ -2551,7 +2551,7 @@ function workItemFinding(
   const latestFailure = [...state.evidence].reverse().find((evidence) =>
     evidence.workItemId === workItem.id && evidence.result === "failed",
   );
-  return latestFailure?.summary ?? "The current proof did not establish the ticket contract.";
+  return latestFailure?.summary ?? "The current captured artifact and review did not establish the ticket contract.";
 }
 
 function ensureAllWorkComplete(state: MissionState, missionId: string): void {
@@ -2963,6 +2963,13 @@ function validateStructuredHandoffCorrelation(
     }
     return evidence;
   });
+  const hasSameSandboxArtifactCapture = linkedEvidence.some(isSameSandboxArtifactCaptureEvidence);
+  if (structured.checks.length === 0 && !hasSameSandboxArtifactCapture) {
+    return fail(
+      "invalid_input",
+      `Handoff ${handoff.id} has neither executed checks nor a same-sandbox delivery artifact capture.`,
+    );
+  }
 
   if (
     structured.executionOrigin.threadId !== undefined &&
@@ -3168,14 +3175,16 @@ function validateStructuredHandoffCorrelation(
       );
     }
   }
-  const requiredChecks = workItem.requiredChecks ?? [];
-  for (const requiredCheck of requiredChecks) {
-    const check = structured.checks.find((candidate) => candidate.name === requiredCheck);
-    if (check === undefined || !check.required || check.result !== "passed") {
-      return fail(
-        "invalid_input",
-        `Handoff ${handoff.id} is missing a passed required check: ${requiredCheck}.`,
-      );
+  if (!hasSameSandboxArtifactCapture) {
+    const requiredChecks = workItem.requiredChecks ?? [];
+    for (const requiredCheck of requiredChecks) {
+      const check = structured.checks.find((candidate) => candidate.name === requiredCheck);
+      if (check === undefined || !check.required || check.result !== "passed") {
+        return fail(
+          "invalid_input",
+          `Handoff ${handoff.id} is missing a passed required check: ${requiredCheck}.`,
+        );
+      }
     }
   }
 }
@@ -3241,6 +3250,19 @@ function changedFilesFromContentBearingEvidence(evidence: Evidence): string[] | 
   return parseContentDiffEvidence(evidence)?.filesChanged ?? null;
 }
 
+function isSameSandboxArtifactCaptureEvidence(evidence: Evidence): boolean {
+  if (evidence.source !== "sandbox" || evidence.result !== "passed" || evidence.details === undefined) {
+    return false;
+  }
+  try {
+    const details = JSON.parse(evidence.details) as unknown;
+    return typeof details === "object" && details !== null && !Array.isArray(details) &&
+      (details as Record<string, unknown>).artifact_capture_mode === "same_sandbox_delivery_artifact";
+  } catch {
+    return false;
+  }
+}
+
 function isContentBearingChangedStateEvidence(evidence: Evidence): boolean {
   return changedFilesFromContentBearingEvidence(evidence) !== null;
 }
@@ -3289,13 +3311,15 @@ function buildReviewContext(
     .map((item) => parseContentDiffEvidence(item)?.output)
     .filter((output): output is string => output !== undefined)
     .at(-1) ?? "";
-  for (const requiredCheck of workItem.requiredChecks ?? []) {
-    const check = structured.checks.find((candidate) => candidate.name === requiredCheck);
-    if (check === undefined || check.result !== "passed" || !check.required) {
-      return fail(
-        "invalid_transition",
-        `Work item ${workItem.id} has insufficient proof for required check ${requiredCheck}.`,
-      );
+  if (!evidence.some(isSameSandboxArtifactCaptureEvidence)) {
+    for (const requiredCheck of workItem.requiredChecks ?? []) {
+      const check = structured.checks.find((candidate) => candidate.name === requiredCheck);
+      if (check === undefined || check.result !== "passed" || !check.required) {
+        return fail(
+          "invalid_transition",
+          `Work item ${workItem.id} has insufficient proof for required check ${requiredCheck}.`,
+        );
+      }
     }
   }
   return {

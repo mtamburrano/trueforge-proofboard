@@ -43,6 +43,7 @@ import {
   TrueForgeTurnResult,
   VerifiedRepositoryInspection,
   WorkGraphPlanner,
+  IMPLEMENTATION_ARTIFACT_CAPTURE_MODE,
   IMPLEMENTATION_PROOF_MODE,
 } from "../trueforge.js";
 import { parseContentDiffEvidence } from "../diff.js";
@@ -94,6 +95,7 @@ export interface MissionRunner {
     expectedRevision?: number,
   ): Promise<WorkItem>;
   prepareSandbox?(input: SandboxPreparationInput): Promise<unknown>;
+  captureImplementationArtifact(input: ImplementationProofInput): Promise<ImplementationHandoffDraft>;
   proveImplementation(input: ImplementationProofInput): Promise<ImplementationHandoffDraft>;
   runSandboxVerification(input: SandboxVerificationInput): Promise<unknown>;
   requestPullRequestApproval(
@@ -730,6 +732,10 @@ class MissionController {
           await this.executeRepositoryInspection(workItem);
         } else if (workItem.assignedRole === "implementer") {
           await this.executeImplementation(workItem);
+          const reviewItem = await this.missions.getWorkItem(PRIMARY_MISSION_ID, workItem.id);
+          if (reviewItem.status === "proving") {
+            await this.executeProofAndReview(reviewItem);
+          }
         } else {
           throw new MissionControlError(
             `Ready ticket ${workItem.id} has no executable implementation role.`,
@@ -767,11 +773,11 @@ class MissionController {
   private async executeProofAndReview(workItem: WorkItem): Promise<void> {
     if (workItem.assignedRole !== "implementer" || workItem.claim === undefined) {
       throw new MissionControlError(
-        `Ticket ${workItem.id} cannot enter independent proof without an implementer claim.`,
+        `Ticket ${workItem.id} cannot enter independent review without an implementer claim.`,
       );
     }
 
-    // A process can restart after proof or review has already been persisted
+    // A process can restart after capture or review has already been persisted
     // but before the enclosing request returned. Continue from the durable
     // checkpoint instead of measuring the same sandbox a second time.
     const recoveredState = await this.missions.getState();
@@ -805,10 +811,7 @@ class MissionController {
 
     let handoff: ImplementationHandoffDraft;
     try {
-      if (this.runner.prepareSandbox !== undefined) {
-        await this.runner.prepareSandbox({ missionId: PRIMARY_MISSION_ID });
-      }
-      handoff = await this.runner.proveImplementation({
+      handoff = await this.runner.captureImplementationArtifact({
         missionId: PRIMARY_MISSION_ID,
         workItemId: workItem.id,
       });
@@ -846,11 +849,11 @@ class MissionController {
       kind: "reviewer_finding",
       result: "failed",
       source: "reviewer",
-      summary: "Independent deterministic proof requested changes before review.",
+      summary: "Same-sandbox artifact capture requested changes before independent review.",
       details: JSON.stringify({
         failure_layer: "proof_board",
         failure_category: "verification",
-        phase: "deterministic-proof",
+        phase: "artifact-capture",
         reason,
       }),
     });
@@ -870,7 +873,7 @@ class MissionController {
       kind: "tool_result",
       result: "failed",
       source: "system",
-      summary: "Independent proof infrastructure failed; the current implementation remains in Proving for retry.",
+      summary: "Same-sandbox capture infrastructure failed; the current implementation remains in Review for retry.",
       details: JSON.stringify({
         failure_layer: "tool",
         failure_category: "sandbox",
@@ -879,7 +882,7 @@ class MissionController {
           ? error.failureCategory
           : "transport",
         retryable: true,
-        phase: "deterministic-proof",
+        phase: "artifact-capture",
         reason,
         ...(error instanceof TrueForgeIntegrationError
           ? { operation: error.operation }
@@ -1030,8 +1033,8 @@ class MissionController {
             : [`Requested rework findings: ${workItem.requestedChanges.join(" ")}`]),
           `Verified repository facts: ${repository.owner}/${repository.name} at full commit ${verifiedSha}.`,
           `Use ${PRIMARY_SANDBOX_REPOSITORY_ROOT} as the one canonical absolute sandbox checkout root. Ensure the pinned repository is present there before edits; never use /workspace, a guessed cwd, or a nested checkout.`,
-          "Use the real persistent sandbox and configured tools. You may inspect, edit, install, test, recover from structured command failures, and optionally delegate through TrueForge; keep the turn agentic instead of following a shell micro-script.",
-          "Proof Board will independently measure the final persisted sandbox; narration is not proof.",
+          "Use the real persistent sandbox and configured tools to inspect and edit the bounded files. Do not install packages, provision toolchains, or run npm, typecheck, or test commands.",
+          "After implementation, Proof Board will capture the actual diff and final file contents from the persisted sandbox for an independent TrueForge review; narration is not review input.",
           "Do not push, open a pull request, or perform any other remote mutation.",
         ].join(" "),
         {
@@ -1068,15 +1071,10 @@ class MissionController {
     draft: ImplementationHandoffDraft,
     workItemId: string,
   ): Promise<void> {
-    const requiredChecksPassed = draft.checks
-      .filter((check) => check.required)
-      .every((check) => check.result === "passed");
     await this.missions.recordHandoff(PRIMARY_MISSION_ID, {
       workItemId,
-      result: requiredChecksPassed ? "done" : "partial",
-      summary: requiredChecksPassed
-        ? "Independent final-state proof established a structured implementation handoff."
-        : "Independent final-state proof returned a partial handoff with unresolved required checks.",
+      result: "done",
+      summary: "Same-sandbox capture established the implementation handoff and exact delivery artifact.",
       filesChanged: draft.filesChanged,
       testsRun: [...new Set(draft.checks.map((check) => check.command))],
       decisions: draft.decisions,
@@ -1123,7 +1121,7 @@ class MissionController {
       review.handoffId !== handoff.id
     ) {
       throw new MissionControlError(
-        "Delivery approval requires the current attempt's completed proof and accepted independent review.",
+        "Delivery approval requires the current attempt's completed handoff and accepted independent review.",
       );
     }
     const proofEvidenceIds = handoff.evidenceIds ?? [];
@@ -1150,7 +1148,7 @@ class MissionController {
       )
     ) {
       throw new MissionControlError(
-        "Delivery approval requires current passed direct deterministic proof for the approved attempt.",
+        "Delivery approval requires the current attempt's passed same-sandbox artifact capture.",
       );
     }
     const reviewEvidence = state.evidence.find((evidence) =>
@@ -1192,8 +1190,7 @@ class MissionController {
     );
     const repositoryProof = state.evidence.filter((evidence) =>
       evidence.missionId === PRIMARY_MISSION_ID &&
-      evidence.workItemId !== undefined &&
-      plannerIds.has(evidence.workItemId) &&
+      (evidence.workItemId === undefined || plannerIds.has(evidence.workItemId)) &&
       evidence.source === "mcp" &&
       evidence.result === "passed"
     ).at(-1);
@@ -1238,7 +1235,7 @@ class MissionController {
       pending.toolName !== "push_files"
     ) {
       throw new MissionControlError(
-        "TrueForge returned a delivery approval for an artifact different from the verified sandbox proof.",
+        "TrueForge returned a delivery approval for an artifact different from the reviewed sandbox capture.",
       );
     }
     const target = pullRequestApprovalTarget(deliveryTarget);
@@ -1427,7 +1424,7 @@ class MissionController {
       .at(-1);
     if (implementation === undefined || handoff === undefined || review === undefined) {
       throw new MissionControlError(
-        "The delivering ticket has no current proof and review correlation to resume.",
+        "The delivering ticket has no current captured artifact and accepted-review correlation to resume.",
       );
     }
     requireCurrentDeliveryApprovalCorrelation(
@@ -1931,7 +1928,9 @@ function isRetryableProofInfrastructureEvidence(evidence: Evidence): boolean {
     details?.retryable === true &&
     details.failure_class === "infrastructure" &&
     (details.phase === "deterministic-proof" ||
-      details.proof_mode === IMPLEMENTATION_PROOF_MODE);
+      details.proof_mode === IMPLEMENTATION_PROOF_MODE ||
+      details.phase === "artifact-capture" ||
+      details.artifact_capture_mode === IMPLEMENTATION_ARTIFACT_CAPTURE_MODE);
 }
 
 function latestEvidenceForAttempt(
@@ -2047,14 +2046,15 @@ function primaryDeliveryArtifactFromProof(
     .find((item) =>
       item?.evidence.source === "sandbox" &&
       item.evidence.result === "passed" &&
-      item.details?.proof_mode === IMPLEMENTATION_PROOF_MODE &&
+      (item.details?.proof_mode === IMPLEMENTATION_PROOF_MODE ||
+        item.details?.artifact_capture_mode === IMPLEMENTATION_ARTIFACT_CAPTURE_MODE) &&
       item.details.provenance_kind === "implementation_artifact"
     );
   const details = candidate?.details;
   const artifactValue = details?.delivery_artifact;
   if (!isRecord(artifactValue)) {
     throw new MissionControlError(
-      "Delivery approval requires the exact artifact established by deterministic sandbox proof.",
+      "Delivery approval requires the exact artifact captured from the reviewed sandbox.",
     );
   }
   const files = boundedStringRecord(artifactValue.files);
@@ -2082,7 +2082,8 @@ function primaryDeliveryArtifactFromProof(
   const requiredCheckNames = context.workItem === undefined
     ? []
     : uniqueStrings(["typecheck", "test", ...(context.workItem.requiredChecks ?? [])]);
-  const checkEvidenceComplete = requiredCheckNames.every((name) =>
+  const artifactCapture = details?.artifact_capture_mode === IMPLEMENTATION_ARTIFACT_CAPTURE_MODE;
+  const checkEvidenceComplete = artifactCapture || requiredCheckNames.every((name) =>
     proofEvidence.some((evidence) => {
       if (evidence === undefined || evidence.source !== "sandbox" || evidence.result !== "passed") {
         return false;
@@ -2162,7 +2163,7 @@ function primaryDeliveryArtifactFromProof(
     !handoffCorrelated
   ) {
     throw new MissionControlError(
-      "Delivery approval rejected an artifact that does not match the current deterministic sandbox proof, scope, checks, attempt, or accepted review.",
+      "Delivery approval rejected an artifact that does not match the current same-sandbox capture, scope, attempt, or accepted review.",
     );
   }
   return artifact;
@@ -2351,7 +2352,7 @@ function requireApprovalRepositoryProof(
     );
     if (artifact.contentHash !== context.artifactHash) {
       throw new MissionControlError(
-        "Delivery approval is not bound to the exact deterministic sandbox artifact.",
+        "Delivery approval is not bound to the exact reviewed sandbox artifact.",
       );
     }
     return;
@@ -2416,7 +2417,7 @@ function requireCurrentDeliveryApprovalCorrelation(
     );
     if (artifact.contentHash !== approval.executionContext.artifactHash) {
       throw new MissionControlError(
-        "The delivery approval is stale or does not match the current proven implementation artifact.",
+        "The delivery approval is stale or does not match the current captured implementation artifact.",
       );
     }
   }
@@ -2451,15 +2452,17 @@ function requireCurrentDeliveryApprovalCorrelation(
     })
   ) {
     throw new MissionControlError(
-      "The delivery approval is stale or does not match the current proven implementation attempt.",
+      "The delivery approval is stale or does not match the current reviewed implementation attempt.",
     );
   }
 }
 
 function isDirectImplementationProofEvidence(evidence: Evidence | undefined): boolean {
+  const details = evidence === undefined ? null : evidenceDetails(evidence);
   return evidence?.source === "sandbox" &&
     evidence.result === "passed" &&
-    evidenceDetails(evidence)?.proof_mode === IMPLEMENTATION_PROOF_MODE;
+    (details?.proof_mode === IMPLEMENTATION_PROOF_MODE ||
+      details?.artifact_capture_mode === IMPLEMENTATION_ARTIFACT_CAPTURE_MODE);
 }
 
 function persistedPullRequestReadback(
@@ -2595,7 +2598,7 @@ function deliveryApprovalFromState(
       );
   if (artifact !== undefined && artifact.contentHash !== context.artifactHash) {
     throw new MissionControlError(
-      "The persisted approval is not correlated to the exact deterministic sandbox artifact.",
+      "The persisted approval is not correlated to the exact reviewed sandbox artifact.",
     );
   }
   const target: PullRequestDeliveryTarget = {
@@ -2619,7 +2622,7 @@ function deliveryAttemptTarget(
 ): DeliveryAttemptTarget {
   if (target.headSha === undefined && target.artifact === undefined) {
     throw new MissionControlError(
-      "The durable delivery attempt requires a verified remote head SHA or proof-bound artifact.",
+      "The durable delivery attempt requires a verified remote head SHA or approval-bound artifact.",
     );
   }
   const result: DeliveryAttemptTarget = {
@@ -3246,7 +3249,7 @@ function unavailableSemanticReviewDecision(): ImplementationReviewDecision {
     outcome: "changes_requested",
     reviewer: "independent-verifier",
     summary: "Independent verification could not establish the work-item contract.",
-    finding: "The contract-aware verifier returned no valid semantic review; structural proof cannot establish that the changed state satisfies the work item's purpose and acceptance criteria.",
+    finding: "The contract-aware verifier returned no valid semantic review; the captured diff alone cannot establish that the changed state satisfies the work item's purpose and acceptance criteria.",
   };
 }
 
@@ -3637,6 +3640,7 @@ function isRecoverableImplementationProofFailure(error: unknown): boolean {
   if (error instanceof TrueForgeIntegrationError) {
     return !error.retryable &&
       (error.operation === "prove implementation" ||
+        error.operation === "capture implementation artifact" ||
         error.operation === "run sandbox verification");
   }
   return error instanceof MissionDomainError &&
@@ -3647,6 +3651,7 @@ function isRetryableProofInfrastructureFailure(error: unknown): boolean {
   return error instanceof TrueForgeIntegrationError &&
     (error.retryable || error.operation === "prepare sandbox") &&
     (error.operation === "prove implementation" ||
+      error.operation === "capture implementation artifact" ||
       error.operation === "run sandbox verification" ||
       error.operation === "prepare sandbox");
 }

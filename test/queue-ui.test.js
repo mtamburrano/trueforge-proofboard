@@ -52,7 +52,7 @@ test("Proof Board UI explains the queue mental model and elevates the primary co
   assert.match(appScript, /const QUEUE_FLOW = Object\.freeze/);
   assert.match(appScript, /One queue\. Two human gates\./);
   assert.match(appScript, /Backlog → Ready/);
-  assert.match(appScript, /In Progress → Proving/);
+  assert.match(appScript, /In Progress → Review/);
   assert.match(appScript, /Changes Requested → Ready/);
   assert.match(appScript, /Awaiting Approval → Delivering → Done/);
   assert.match(appScript, /data-primary-ticket="\$\{isPrimary\}"/);
@@ -78,7 +78,7 @@ test("Proof Board UI keeps durable polling, drawer, activity, proof, and approva
   assert.match(appScript, /requestedChanges/);
   assert.match(appScript, /Retired by/);
   assert.match(appScript, /item\.workItemId === ticket\.id/);
-  assert.match(appScript, /Deterministic proof/);
+  assert.match(appScript, /Independent TrueForge review/);
   assert.match(appScript, /Agent activity/);
   assert.match(appScript, /Measured proof/);
   assert.match(appScript, /Model/);
@@ -86,7 +86,7 @@ test("Proof Board UI keeps durable polling, drawer, activity, proof, and approva
   assert.doesNotMatch(appScript, /Real execution trail/);
   assert.doesNotMatch(appScript, /renderProvenanceTrail/);
   assert.match(appScript, /Show execution provenance/);
-  assert.match(appScript, /Proof Board verification owns deterministic status/);
+  assert.match(appScript, /Independent TrueForge review uses the actual captured sandbox state/);
   assert.match(appScript, /verified head SHA/);
   assert.match(appScript, /Diff context/);
   assert.match(appScript, /Approve exact action/);

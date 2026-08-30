@@ -234,17 +234,17 @@ test("run outcome feedback follows the authoritative queue state", async () => {
     progress: { verification: "not_started" },
   });
   assert.equal(execution.kind, "success");
-  assert.match(execution.message, /implementation step/);
-  assert.match(execution.message, /deterministic proof is next/);
+  assert.match(execution.message, /completed implementation/);
+  assert.match(execution.message, /independent review/);
 
   const retryableProof = describeRunOutcome({
     tickets: [ticket("proving")],
     progress: { verification: "failed" },
   });
   assert.equal(retryableProof.kind, "warning");
-  assert.match(retryableProof.message, /retryable proof infrastructure failure/);
-  assert.match(retryableProof.message, /durable failed evidence/);
-  assert.match(retryableProof.message, /remains in Proving/);
+  assert.match(retryableProof.message, /retryable sandbox-capture failure/);
+  assert.match(retryableProof.message, /durable evidence/);
+  assert.match(retryableProof.message, /remains in Review/);
   assert.doesNotMatch(retryableProof.message, /Changes Requested|implementation failed/i);
 
   const verifiedProof = describeRunOutcome({
@@ -252,6 +252,6 @@ test("run outcome feedback follows the authoritative queue state", async () => {
     progress: { verification: "passed" },
   });
   assert.equal(verifiedProof.kind, "success");
-  assert.match(verifiedProof.message, /independent review passed/);
+  assert.match(verifiedProof.message, /Independent TrueForge review accepted/);
   assert.match(verifiedProof.message, /approve the exact delivery/);
 });
