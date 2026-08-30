@@ -4347,7 +4347,7 @@ export class MissionService {
         kind: "reviewer_finding",
         result: outcome === "accepted" ? "passed" : "failed",
         source: "reviewer",
-        summary: `Independent verifier ${outcome}: ${finding}`,
+        summary: `${reviewer} ${outcome}: ${finding}`,
         createdAt: now,
         details: JSON.stringify({
           reviewer,

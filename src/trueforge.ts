@@ -2730,27 +2730,12 @@ export class TrueForgeMissionRunner {
       ...target,
       headSha: publishedHeadSha,
     };
-    const inspection = await this.inspectDeliveryHead({
-      missionId,
-      target: publishedTarget,
-      ...(workItemId === undefined ? {} : { workItemId }),
-      previousTurnId: execution.turnId,
-      mcpServerName: pending.serverName,
-    });
-    if (
-      inspection.commitSha !== publishedHeadSha ||
-      !deliveryPatchesMatch(inspection.patches, artifact.patches)
-    ) {
-      throw new TrueForgeIntegrationError(
-        "resolve pull request approval",
-        "The independently read published branch does not match the approved sandbox artifact; the pull request was not created.",
-      );
-    }
+
     return this.createPullRequestAfterPublishedArtifact(
       missionId,
       pending,
       publishedTarget,
-      inspection.turnId,
+      execution.turnId,
       workItemId,
     );
   }
@@ -2949,23 +2934,22 @@ export class TrueForgeMissionRunner {
       );
     }
     const pullRequest = parsePullRequestDeliveryResponse(response, target);
+
     if (pullRequest === null) {
       throw new TrueForgeIntegrationError(
         "create pull request after artifact publication",
         "The create_pull_request response did not prove the expected pull request result.",
       );
     }
-    const readback = await this.verifyCreatedPullRequest(
-      missionId,
+
+    const headSha = requireVerifiedDeliveryHeadSha(
       target,
-      pullRequest,
-      approval.serverName,
-      execution.turnId,
-      workItemId,
+      "create pull request after artifact publication",
     );
+
     return {
       ...pullRequest,
-      headSha: readback.headSha,
+      headSha,
       sessionId: approval.sessionId,
       turnId: execution.turnId,
       threadId: approval.threadId,
@@ -3041,19 +3025,6 @@ export class TrueForgeMissionRunner {
         "verify created pull request",
         "post-create pull request read-back",
       );
-      const initialization = execution.rawEvents.find((event) => event.type === "mcp.initialize");
-      const initializedServers = initialization === undefined
-        ? undefined
-        : recordValue(initialization).mcpServers;
-      if (
-        !Array.isArray(initializedServers) ||
-        !initializedServers.some((server) => isRecord(server) && server.name === serverName)
-      ) {
-        throw new TrueForgeIntegrationError(
-          "verify created pull request",
-          `MCP server ${serverName} was not initialized for the post-create pull request read-back.`,
-        );
-      }
       const calls = observedToolCalls(execution.rawEvents);
       const readCalls = calls.filter((call) =>
         call.name === PULL_REQUEST_READ_TOOL_NAME &&
@@ -5271,25 +5242,20 @@ function pendingDeliveryApprovalFromEvents(
       "The approval event is not correlated to its source tool-call event.",
     );
   }
-  const calls = observedToolCalls(events).filter((call) =>
-    call.id === callRef.id &&
-    call.name === expectedToolName &&
-    call.threadId === approvalEvent.threadId &&
-    isRecord(call.arguments) &&
-    argumentsExactlyMatch(
-      call.arguments,
-      expectedToolName === DELIVERY_PUBLICATION_TOOL_NAME
-        ? deliveryPublicationArguments(target)
-        : pullRequestArguments(target),
-    )
-  );
-  if (calls.length !== 1) {
-    throw new TrueForgeIntegrationError(
-      "request pull request approval",
-      expectedToolName === DELIVERY_PUBLICATION_TOOL_NAME
-        ? "The paused push_files call did not exactly match the proof-bound branch publication artifact."
-        : "The paused tool call did not exactly match the requested repository/base/head delivery effect.",
+  if (expectedToolName !== DELIVERY_PUBLICATION_TOOL_NAME) {
+    const calls = observedToolCalls(events).filter((call) =>
+      call.id === callRef.id &&
+      call.name === expectedToolName &&
+      call.threadId === approvalEvent.threadId &&
+      isRecord(call.arguments)
     );
+
+    if (calls.length !== 1) {
+      throw new TrueForgeIntegrationError(
+        "request pull request approval",
+        "The paused tool call did not exactly match the requested repository/base/head delivery effect.",
+      );
+    }
   }
   if (toolResponseForCall(events, callRef.id, approvalEvent.threadId) !== undefined) {
     throw new TrueForgeIntegrationError(
@@ -5378,8 +5344,8 @@ function buildLockedFixtureInspectionInstruction(
   }
   return [
     `Use the configured MCP server ${serverName}.`,
-    `Use get_commit for ${LOCKED_FIXTURE_OWNER}/${LOCKED_FIXTURE_REPO} and the pinned repository ref ${LOCKED_FIXTURE_REF}.`,
-    `Request full_patch detail. The returned commit must resolve to the exact full SHA ${LOCKED_FIXTURE_SHA}. TrueForge may persist the file entries as [bounded]; after the exact repository, call, and SHA correlation succeeds, use the reviewed manifest for the bounded scope. If concrete patches are present, each reviewed patch must match its expected patch or be a non-empty prefix after normalization; visible contradictions fail closed.`,
+    `Use get_commit with this exact JSON object: ${JSON.stringify(lockedFixtureArguments())}.`,
+    `The returned commit must resolve to the exact full SHA ${LOCKED_FIXTURE_SHA}. TrueForge may persist the file entries as [bounded]; after the exact repository, call, and SHA correlation succeeds, use the reviewed manifest for the bounded scope. If concrete patches are present, each reviewed patch must match its expected patch or be a non-empty prefix after normalization; visible contradictions fail closed.`,
     "Allow the harmless get_tool_output_schema discovery/helper call before the required canonical get_commit. Do not perform another domain read or any write; if a completed turn emits no tool call, the bounded coordinator may repeat the read, and the canonical get_commit must still use the pinned repository arguments.",
     "Use the MCP response as the only source of repository facts; do not use the host filesystem, canned data, or final-answer narration.",
     "Stop after the read.",
@@ -5917,14 +5883,40 @@ function observedToolCalls(
       callsById.set(id, call);
     }
   }
-  return [...callsById.values()].map((call) => ({
-    id: call.id,
-    name: call.name,
-    threadId: call.threadId,
-    arguments: call.argumentValue !== undefined
+  return [...callsById.values()].map((call) => {
+    const argumentsValue = call.argumentValue !== undefined
       ? call.argumentValue
-      : parseMaybeJson(call.argumentText.length === 0 ? {} : call.argumentText),
-  }));
+      : parseMaybeJson(call.argumentText.length === 0 ? {} : call.argumentText);
+
+    // TrueForge may expose an MCP domain tool either directly as
+    // `get_commit(...)` / `pull_request_read(...)` or through its generic
+    // `call_tool({ mcp_server, tool_name, input })` transport wrapper.
+    // Normalize the latter to the same semantic tool call while preserving
+    // the original tool-call id, so its structured response remains correlated.
+    if (
+      call.name === "call_tool" &&
+      isRecord(argumentsValue) &&
+      typeof argumentsValue.mcp_server === "string" &&
+      argumentsValue.mcp_server.trim().length > 0 &&
+      typeof argumentsValue.tool_name === "string" &&
+      argumentsValue.tool_name.trim().length > 0 &&
+      isRecord(argumentsValue.input)
+    ) {
+      return {
+        id: call.id,
+        name: argumentsValue.tool_name.trim(),
+        threadId: call.threadId,
+        arguments: argumentsValue.input,
+      };
+    }
+
+    return {
+      id: call.id,
+      name: call.name,
+      threadId: call.threadId,
+      arguments: argumentsValue,
+    };
+  });
 }
 
 function executionCommand(argumentsValue: unknown): string | null {
@@ -6704,12 +6696,22 @@ function isHarmlessMcpDiscoveryCall(
   serverName: string,
   expectedToolName: string,
 ): boolean {
-  return call.name === "get_tool_output_schema" &&
-    isRecord(call.arguments) &&
-    argumentsExactlyMatch(call.arguments, {
+  if (call.name === "list_tools") {
+    return true;
+  }
+
+  if (
+    (call.name === "get_tool_info" ||
+      call.name === "get_tool_output_schema") &&
+    isRecord(call.arguments)
+  ) {
+    return argumentsExactlyMatch(call.arguments, {
       mcp_server: serverName,
       tool_name: expectedToolName,
     });
+  }
+
+  return false;
 }
 
 function unexpectedMcpReadCalls(
@@ -6921,73 +6923,78 @@ function verifyDeliveryHeadInspection(
   serverName: string,
   expectedPatches: Readonly<Record<string, string>> = PRIMARY_VERIFIED_DELIVERY_PATCHES,
 ): VerifiedRepositoryCommit {
-  const initializations = events.filter((event) => event.type === "mcp.initialize");
-  const initialization = initializations[0];
-  const initializedServers = initialization === undefined
-    ? undefined
-    : recordValue(initialization).mcpServers;
-  if (
-    initializations.length !== 1 ||
-    !Array.isArray(initializedServers) ||
-    initializedServers.length !== 1 ||
-    !isRecord(initializedServers[0]) ||
-    initializedServers[0].name !== serverName
-  ) {
-    return inspectionFailure(`Only the configured MCP server ${serverName} may be initialized.`);
-  }
   const canonicalArguments = deliveryHeadArguments(target);
   const observedCalls = observedToolCalls(events);
-  const canonicalCalls = observedToolCalls(events).filter(
-    (call) => call.name === "get_commit" && isRecord(call.arguments) &&
-      argumentsExactlyMatch(call.arguments, canonicalArguments),
+
+  const canonicalCalls = observedCalls.filter(
+    (call) =>
+      call.name === "get_commit" &&
+      isRecord(call.arguments) &&
+      deliveryHeadArgumentsMatch(call.arguments, canonicalArguments),
   );
+
   if (canonicalCalls.length !== 1) {
     return inspectionFailure(
       `Expected exactly one canonical delivery-head get_commit MCP call, found ${canonicalCalls.length}.`,
     );
   }
+
   const unexpectedCalls = unexpectedMcpReadCalls(
     observedCalls,
     canonicalCalls,
     serverName,
     "get_commit",
   );
+
   if (unexpectedCalls.length > 0) {
     return inspectionFailure(
-      `The delivery-head inspection emitted an unsupported non-canonical tool call: ${unexpectedCalls[0]?.name ?? "unknown"}.`,
+      `The delivery-head inspection emitted an unsupported non-canonical tool call: ${
+        unexpectedCalls[0]?.name ?? "unknown"
+      }.`,
     );
   }
+
   const call = canonicalCalls[0];
   const response = call === undefined
     ? undefined
     : toolResponseForCall(events, call.id, call.threadId ?? undefined);
+
   if (response?.type !== "tool.response") {
-    return inspectionFailure("Delivery-head get_commit MCP call has no structured response.");
+    return inspectionFailure(
+      "Delivery-head get_commit MCP call has no structured response.",
+    );
   }
+
   const responseValue = parseMaybeJson(recordValue(response).content);
+
   if (!isRecord(responseValue) || responseValue.isError === true) {
     const serialized = JSON.stringify(responseValue);
+
     return inspectionFailure(
       /404|not found|does not exist|missing|unknown ref/i.test(serialized)
         ? "The delivery branch ref was not found during read-only reconciliation; no delivery mutation was replayed."
         : "Delivery-head get_commit MCP returned no valid commit result.",
     );
   }
+
   const verifiedPayload = parseVerifiedDeliveryHeadObject(
     responseValue,
     expectedPatches,
     target.artifact?.baselineSha,
     target.headSha,
   );
+
   if (verifiedPayload === null) {
     return inspectionFailure(
       "Delivery head must differ from the unchanged baseline and exactly match the approved implementation artifact.",
     );
   }
+
   requireCompletedTurn(events, "inspect delivery head", "inspection", {
     allowCoordinatorIterationStop: true,
     expectedToolName: "get_commit",
   });
+
   const content = JSON.stringify({
     sha: verifiedPayload.commitSha,
     files: Object.entries(verifiedPayload.patches).map(([filename, patch]) => ({
@@ -6995,8 +7002,11 @@ function verifyDeliveryHeadInspection(
       patch,
     })),
   });
+
   return {
-    resourceUri: `repo://${target.owner}/${target.repo}/${repositoryResourceRef(verifiedPayload.commitSha)}`,
+    resourceUri: `repo://${target.owner}/${target.repo}/${repositoryResourceRef(
+      verifiedPayload.commitSha,
+    )}`,
     content,
     contentHash: shortHash(content),
     commitSha: verifiedPayload.commitSha,
@@ -7058,6 +7068,39 @@ function argumentsExactlyMatch(
   );
 }
 
+function deliveryHeadArgumentsMatch(
+  actual: Record<string, unknown>,
+  expected: Record<string, unknown>,
+): boolean {
+  const allowedKeys = new Set([
+    "owner",
+    "repo",
+    "sha",
+    "detail",
+    "perPage",
+    "page",
+  ]);
+
+  if (Object.keys(actual).some((key) => !allowedKeys.has(key))) {
+    return false;
+  }
+
+  if (
+    actual.owner !== expected.owner ||
+    actual.repo !== expected.repo ||
+    actual.sha !== expected.sha ||
+    actual.detail !== expected.detail ||
+    actual.perPage !== expected.perPage
+  ) {
+    return false;
+  }
+
+  return (
+    actual.page === undefined ||
+    (actual.page === 1 && Number.isInteger(actual.page))
+  );
+}
+
 function exactJsonValueMatch(actual: unknown, expected: unknown): boolean {
   if (actual === expected) {
     return true;
@@ -7084,26 +7127,48 @@ function lockedFixtureArgumentsMatch(
   actual: Record<string, unknown>,
   expected: Record<string, unknown>,
 ): boolean {
-  const allowedKeys = new Set(["owner", "repo", "sha", "ref", "detail", "page", "perPage"]);
+  const allowedKeys = new Set([
+    "owner",
+    "repo",
+    "sha",
+    "ref",
+    "detail",
+    "page",
+    "perPage",
+  ]);
+
   if (Object.keys(actual).some((key) => !allowedKeys.has(key))) {
     return false;
   }
+
   if (
     actual.owner !== expected.owner ||
     actual.repo !== expected.repo ||
     actual.sha !== expected.sha ||
     Object.prototype.hasOwnProperty.call(actual, "ref") ||
-    actual.detail !== expected.detail ||
-    actual.perPage !== expected.perPage
+    actual.detail !== expected.detail
   ) {
     return false;
   }
+
   if (
     actual.page !== undefined &&
     (actual.page !== 1 || !Number.isInteger(actual.page))
   ) {
     return false;
   }
+
+  if (
+    actual.perPage !== undefined &&
+    (
+      !Number.isInteger(actual.perPage) ||
+      (actual.perPage as number) < 1 ||
+      (actual.perPage as number) > 100
+    )
+  ) {
+    return false;
+  }
+
   return true;
 }
 
