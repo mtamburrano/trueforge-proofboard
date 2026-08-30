@@ -229,6 +229,28 @@ class QueueSafetyRunner {
       : filesChanged.map((file) =>
           `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1 +1,2 @@\n before\n+after`
         ).join("\n");
+    const finalFileContents = isPrimaryArtifact
+      ? PRIMARY_VERIFIED_DELIVERY_FILES
+      : Object.fromEntries(filesChanged.map((file) => [file, "before\nafter\n"]));
+    const parsedPatches = isPrimaryArtifact
+      ? PRIMARY_VERIFIED_DELIVERY_PATCHES
+      : Object.fromEntries(filesChanged.map((file) => [file, "@@ -1 +1,2 @@\n before\n+after"]));
+    const status = await this.missions.addEvidence(input.missionId, {
+      workItemId: input.workItemId,
+      kind: "file_change",
+      result: "passed",
+      source: "sandbox",
+      summary: "The direct sandbox proof measured the complete final workspace status.",
+      details: JSON.stringify({
+        proof_mode: IMPLEMENTATION_PROOF_MODE,
+        complete_changed_files: true,
+        command: "git status --porcelain=v1 -z --untracked-files=all",
+        exit_code: 0,
+        changed_files: filesChanged,
+        sandbox_id: SANDBOX_ID,
+      }),
+      executionOrigin: proofOrigin,
+    });
     const diff = await this.missions.addEvidence(input.missionId, {
       workItemId: input.workItemId,
       kind: "diff_summary",
@@ -240,6 +262,14 @@ class QueueSafetyRunner {
         command: "git diff -- src/index.ts test/index.test.js",
         output: diffOutput,
         changed_files: filesChanged,
+        parsed_patches: parsedPatches,
+        final_file_contents: finalFileContents,
+        final_file_content_commands: filesChanged.slice().sort().map((file) => ({
+          file,
+          command: `cat /tmp/proofboard-workspace/${file}`,
+        })),
+        baseline_sha: PRIMARY_DELIVERY_FIXTURE.baselineSha,
+        sandbox_id: SANDBOX_ID,
         ...(isPrimaryArtifact
           ? {
               provenance_kind: "implementation_artifact",
@@ -261,6 +291,7 @@ class QueueSafetyRunner {
         command: "npm run typecheck",
         exit_code: 0,
         output: "typecheck passed",
+        sandbox_id: SANDBOX_ID,
       }),
       executionOrigin: proofOrigin,
     });
@@ -275,6 +306,7 @@ class QueueSafetyRunner {
         command: PRIMARY_VERIFICATION_COMMAND,
         exit_code: 0,
         output: "all tests passed",
+        sandbox_id: SANDBOX_ID,
       }),
       executionOrigin: proofOrigin,
     });
@@ -299,7 +331,7 @@ class QueueSafetyRunner {
           exitCode: 0,
         },
       ],
-      evidenceIds: [diff.id, typecheck.id, tests.id],
+      evidenceIds: [status.id, diff.id, typecheck.id, tests.id],
       decisions: [],
       openQuestions: [],
       ...(isPrimaryArtifact ? { deliveryArtifact: PRIMARY_VERIFIED_DELIVERY_ARTIFACT } : {}),

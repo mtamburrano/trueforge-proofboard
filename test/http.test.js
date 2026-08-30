@@ -14,6 +14,7 @@ import {
   PRIMARY_VERIFIED_DELIVERY_ARTIFACT,
   PRIMARY_VERIFIED_DELIVERY_FILES,
   PRIMARY_VERIFIED_DELIVERY_PATCHES,
+  verifiedDeliveryArtifactHash,
   PRIMARY_MISSION_ID,
   PRIMARY_MISSION_OBJECTIVE,
   PRIMARY_SANDBOX_REPOSITORY_ROOT,
@@ -36,7 +37,8 @@ class TestMissionRunner {
       reconciliationResult = "found",
       inspectionRepository = PRIMARY_DELIVERY_FIXTURE,
       deliveryHeadSha = "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1",
-      deliveryHeadPatches = PRIMARY_VERIFIED_DELIVERY_PATCHES,
+      deliveryHeadPatches,
+      proofArtifact,
       proofMode = IMPLEMENTATION_PROOF_MODE,
     } = {},
   ) {
@@ -48,7 +50,8 @@ class TestMissionRunner {
     this.reconciliationResult = reconciliationResult;
     this.inspectionRepository = inspectionRepository;
     this.deliveryHeadSha = deliveryHeadSha;
-    this.deliveryHeadPatches = deliveryHeadPatches;
+    this.proofArtifact = proofArtifact;
+    this.deliveryHeadPatches = deliveryHeadPatches ?? proofArtifact?.patches ?? PRIMARY_VERIFIED_DELIVERY_PATCHES;
     this.proofMode = proofMode;
     this.sandboxInputs = [];
     this.operationLog = [];
@@ -236,16 +239,44 @@ class TestMissionRunner {
       );
     }
     const workItem = await this.missions.getWorkItem(input.missionId, input.workItemId);
-    const filesChanged = workItem.allowedFiles ?? [];
-    const isPrimaryArtifact = filesChanged.length === Object.keys(PRIMARY_VERIFIED_DELIVERY_FILES).length &&
-      filesChanged.every((file) => Object.prototype.hasOwnProperty.call(PRIMARY_VERIFIED_DELIVERY_FILES, file));
-    const diffOutput = isPrimaryArtifact
-      ? Object.entries(PRIMARY_VERIFIED_DELIVERY_PATCHES).map(([file, patch]) =>
-          `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n${patch}`
-        ).join("\n")
-      : filesChanged.map((file) =>
+    const allowedFiles = workItem.allowedFiles ?? [];
+    const isPrimaryFixture = allowedFiles.length === Object.keys(PRIMARY_VERIFIED_DELIVERY_FILES).length &&
+      allowedFiles.every((file) => Object.prototype.hasOwnProperty.call(PRIMARY_VERIFIED_DELIVERY_FILES, file));
+    const deliveryArtifact = this.proofArtifact ?? (isPrimaryFixture
+      ? PRIMARY_VERIFIED_DELIVERY_ARTIFACT
+      : undefined);
+    const filesChanged = deliveryArtifact === undefined
+      ? allowedFiles
+      : Object.keys(deliveryArtifact.files);
+    const diffOutput = deliveryArtifact === undefined
+      ? filesChanged.map((file) =>
           `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1 +1,2 @@\n before\n+after`
+        ).join("\n")
+      : Object.entries(deliveryArtifact.patches).map(([file, patch]) =>
+          `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n${patch}`
         ).join("\n");
+    const finalFileContents = deliveryArtifact?.files ?? Object.fromEntries(
+      filesChanged.map((file) => [file, "before\nafter\n"]),
+    );
+    const parsedPatches = deliveryArtifact?.patches ?? Object.fromEntries(
+      filesChanged.map((file) => [file, "@@ -1 +1,2 @@\n before\n+after"]),
+    );
+    const status = await this.missions.addEvidence(input.missionId, {
+      workItemId: input.workItemId,
+      kind: "file_change",
+      result: "passed",
+      source: "sandbox",
+      summary: "Independent proof measured the complete final workspace status.",
+      details: JSON.stringify({
+        proof_mode: this.proofMode,
+        complete_changed_files: true,
+        command: "git status --porcelain=v1 -z --untracked-files=all",
+        exit_code: 0,
+        changed_files: filesChanged,
+        sandbox_id: "test-sandbox-durable",
+      }),
+      executionOrigin: origin,
+    });
     const diff = await this.missions.addEvidence(input.missionId, {
       workItemId: input.workItemId,
       kind: "diff_summary",
@@ -257,11 +288,19 @@ class TestMissionRunner {
         command: "git diff",
         output: diffOutput,
         changed_files: filesChanged,
-        ...(isPrimaryArtifact
+        parsed_patches: parsedPatches,
+        final_file_contents: finalFileContents,
+        final_file_content_commands: Object.keys(finalFileContents).sort().map((file) => ({
+          file,
+          command: `cat ${PRIMARY_SANDBOX_REPOSITORY_ROOT}/${file}`,
+        })),
+        baseline_sha: deliveryArtifact?.baselineSha,
+        sandbox_id: "test-sandbox-durable",
+        ...(deliveryArtifact !== undefined
           ? {
               provenance_kind: "implementation_artifact",
-              artifact_hash: PRIMARY_VERIFIED_DELIVERY_ARTIFACT.contentHash,
-              delivery_artifact: PRIMARY_VERIFIED_DELIVERY_ARTIFACT,
+              artifact_hash: deliveryArtifact.contentHash,
+              delivery_artifact: deliveryArtifact,
             }
           : {}),
       }),
@@ -278,6 +317,7 @@ class TestMissionRunner {
         command: "npm run typecheck",
         exit_code: 0,
         output: "typecheck passed",
+        sandbox_id: "test-sandbox-durable",
       }),
       executionOrigin: origin,
     });
@@ -292,6 +332,7 @@ class TestMissionRunner {
         command: PRIMARY_VERIFICATION_COMMAND,
         exit_code: 0,
         output: "all tests passed",
+        sandbox_id: "test-sandbox-durable",
       }),
       executionOrigin: origin,
     });
@@ -302,11 +343,11 @@ class TestMissionRunner {
         { name: "typecheck", command: "npm run typecheck", result: "passed", required: true, evidenceIds: [typecheck.id], exitCode: 0 },
         { name: "test", command: PRIMARY_VERIFICATION_COMMAND, result: "passed", required: true, evidenceIds: [tests.id], exitCode: 0 },
       ],
-      evidenceIds: [diff.id, typecheck.id, tests.id],
+      evidenceIds: [status.id, diff.id, typecheck.id, tests.id],
       decisions: [],
       openQuestions: [],
       executionOrigin: origin,
-      ...(isPrimaryArtifact ? { deliveryArtifact: PRIMARY_VERIFIED_DELIVERY_ARTIFACT } : {}),
+      ...(deliveryArtifact === undefined ? {} : { deliveryArtifact }),
     };
   }
 
@@ -501,6 +542,27 @@ function testApp(repository = new InMemoryMissionRepository(), options = {}) {
   };
 }
 
+function dynamicProofArtifact(variant) {
+  const files = {
+    "src/index.ts": `export const deliveryVariant = "${variant}";\n`,
+    "test/index.test.js": `assert.equal(deliveryVariant, "${variant}");\n`,
+  };
+  const patches = {
+    "src/index.ts": `@@ -1 +1 @@\n-export const deliveryVariant = "baseline";\n+${files["src/index.ts"].trimEnd()}`,
+    "test/index.test.js": `@@ -1 +1 @@\n-assert.equal(deliveryVariant, "baseline");\n+${files["test/index.test.js"].trimEnd()}`,
+  };
+  return {
+    baselineSha: PRIMARY_VERIFIED_DELIVERY_ARTIFACT.baselineSha,
+    files,
+    patches,
+    contentHash: verifiedDeliveryArtifactHash(
+      PRIMARY_VERIFIED_DELIVERY_ARTIFACT.baselineSha,
+      files,
+      patches,
+    ),
+  };
+}
+
 async function listenOnIsolatedSocket(server) {
   const directory = await mkdtemp(path.join(os.tmpdir(), "trueforge-proofboard-node-http-"));
   const socketPath = path.join(directory, "mission.sock");
@@ -587,7 +649,9 @@ async function reachDeliveryApproval(app) {
   await authorizeTicket(app, implementTicket.id);
   await app.request("/api/mission/run", { method: "POST" });
   const provedResponse = await app.request("/api/mission/run", { method: "POST" });
-  assert.equal(provedResponse.status, 200);
+  if (provedResponse.status !== 200) {
+    throw new Error(`Proof response ${provedResponse.status}: ${await provedResponse.text()}`);
+  }
   const proved = await json(provedResponse);
   const approval = proved.mission.approvals.find((item) => item.decision === "pending");
   assert.ok(approval, "A passed current attempt should create a pending delivery approval.");
@@ -1043,6 +1107,45 @@ test("run mission performs deterministic proof and independent review after codi
   assert.equal(state.evidence.some((item) =>
     item.workItemId === implementTicket.id && item.source === "sandbox" && item.attempt === 1
   ), true);
+});
+
+test("two different proof artifacts independently reach approval and delivery", async () => {
+  const fixtureSnapshot = {
+    files: structuredClone(PRIMARY_VERIFIED_DELIVERY_FILES),
+    patches: structuredClone(PRIMARY_VERIFIED_DELIVERY_PATCHES),
+    artifact: structuredClone(PRIMARY_VERIFIED_DELIVERY_ARTIFACT),
+  };
+  const artifacts = [dynamicProofArtifact("alpha"), dynamicProofArtifact("beta")];
+  const deliveredHashes = [];
+
+  for (const [index, artifact] of artifacts.entries()) {
+    const headSha = index === 0
+      ? "91aa2a62b3714f699204cb0d5c440fcb7f0a09e1"
+      : "92bb2a62b3714f699204cb0d5c440fcb7f0a09e1";
+    const { app, runner, missions } = testApp(new InMemoryMissionRepository(), {
+      proofArtifact: artifact,
+      deliveryHeadPatches: artifact.patches,
+      deliveryHeadSha: headSha,
+    });
+    const { approval } = await reachDeliveryApproval(app);
+    assert.equal(approval.executionContext.artifactHash, artifact.contentHash);
+    assert.deepEqual(runner.deliveryCalls.requested[0].target.artifact, artifact);
+
+    const delivered = await decideDelivery(app, approval, "approved");
+    assert.equal(delivered.mission.mission.status, "delivered");
+    assert.equal(runner.deliveryCalls.protectedOperations, 1);
+    const state = await missions.getState();
+    const publishedEvidence = state.evidence.find((item) =>
+      JSON.parse(item.details ?? "{}").provenance_kind === "delivery_head"
+    );
+    assert.equal(JSON.parse(publishedEvidence.details).artifact_hash, artifact.contentHash);
+    deliveredHashes.push(artifact.contentHash);
+  }
+
+  assert.notEqual(deliveredHashes[0], deliveredHashes[1]);
+  assert.deepEqual(PRIMARY_VERIFIED_DELIVERY_FILES, fixtureSnapshot.files);
+  assert.deepEqual(PRIMARY_VERIFIED_DELIVERY_PATCHES, fixtureSnapshot.patches);
+  assert.deepEqual(PRIMARY_VERIFIED_DELIVERY_ARTIFACT, fixtureSnapshot.artifact);
 });
 
 test("proof infrastructure failure retries Proving without another coding turn", async () => {

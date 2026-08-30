@@ -23,6 +23,7 @@ import {
   createDaytonaSandboxExecutor,
   DaytonaSandboxExecutionError,
   resolveDaytonaSandboxId,
+  verifiedDeliveryArtifactHash,
 } from "../dist/index.js";
 
 const LOCKED_FIXTURE_SHA = "590aa8a6d72c580f61fc1b19d33e9876bc0feb9b";
@@ -3478,6 +3479,8 @@ test("independent implementation proof measures final facts after normal agentic
     `git -C ${repositoryRoot} merge-base --is-ancestor ${LOCKED_FIXTURE_SHA} HEAD`,
     `git -C ${repositoryRoot} status --porcelain=v1 -z --untracked-files=all`,
     `git -C ${repositoryRoot} diff --no-ext-diff --binary ${LOCKED_FIXTURE_SHA} --`,
+    `cat ${repositoryRoot}/src/index.ts`,
+    `cat ${repositoryRoot}/test/index.test.js`,
     `npm --prefix ${repositoryRoot} run typecheck`,
     `npm --prefix ${repositoryRoot} test`,
   ];
@@ -3499,6 +3502,8 @@ test("independent implementation proof measures final facts after normal agentic
       " before",
       "+after",
     ].join("\n"),
+    "before\nafter\n",
+    "before\nafter\n",
     "typecheck passed\n",
     "tests passed\n",
   ];
@@ -3572,6 +3577,104 @@ test("independent implementation proof measures final facts after normal agentic
   assert.equal(handoff.result, "done");
   assert.deepEqual(context.actualFilesChanged, proof.filesChanged);
   assert.equal(context.evidence.every((evidence) => evidence.source === "sandbox"), true);
+});
+
+test("direct sandbox proof derives distinct artifacts from distinct final file contents", async () => {
+  const repositoryRoot = PRIMARY_SANDBOX_REPOSITORY_ROOT;
+  const fixtureSnapshot = {
+    files: structuredClone(PRIMARY_VERIFIED_DELIVERY_FILES),
+    patches: structuredClone(PRIMARY_VERIFIED_DELIVERY_PATCHES),
+    artifact: structuredClone(PRIMARY_VERIFIED_DELIVERY_ARTIFACT),
+  };
+  const hashes = [];
+
+  for (const [index, variant] of ["alpha", "beta"].entries()) {
+    const files = {
+      "src/index.ts": `export const deliveryVariant = "${variant}";\n`,
+      "test/index.test.js": `assert.equal(deliveryVariant, "${variant}");\n`,
+    };
+    const patches = {
+      "src/index.ts": `@@ -1 +1 @@\n-export const deliveryVariant = "baseline";\n+export const deliveryVariant = "${variant}";`,
+      "test/index.test.js": `@@ -1 +1 @@\n-assert.equal(deliveryVariant, "baseline");\n+assert.equal(deliveryVariant, "${variant}");`,
+    };
+    const diffOutput = Object.entries(patches).map(([file, patch]) =>
+      `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n${patch}`
+    ).join("\n");
+    const commands = [
+      `git -C ${repositoryRoot} config --get remote.origin.url`,
+      `git -C ${repositoryRoot} merge-base --is-ancestor ${LOCKED_FIXTURE_SHA} HEAD`,
+      `git -C ${repositoryRoot} status --porcelain=v1 -z --untracked-files=all`,
+      `git -C ${repositoryRoot} diff --no-ext-diff --binary ${LOCKED_FIXTURE_SHA} --`,
+      `cat ${repositoryRoot}/src/index.ts`,
+      `cat ${repositoryRoot}/test/index.test.js`,
+      `npm --prefix ${repositoryRoot} run typecheck`,
+      `npm --prefix ${repositoryRoot} test`,
+    ];
+    const outputs = [
+      "https://github.com/mtamburrano/proofboard-demo-fixture.git\n",
+      "",
+      " M src/index.ts\u0000 M test/index.test.js\u0000",
+      diffOutput,
+      files["src/index.ts"],
+      files["test/index.test.js"],
+      "typecheck passed\n",
+      "tests passed\n",
+    ];
+    const { client, calls } = fakeClient();
+    const sandboxExecutor = fakeSandboxExecutor(
+      commands,
+      outputs,
+      `sandbox-dynamic-${index}`,
+    );
+    const missions = new MissionService(new InMemoryMissionRepository());
+    const runner = new TrueForgeMissionRunner(missions, client, {
+      model: "openai/gpt-5-4-mini",
+      dynamicSubAgents: true,
+      sandboxExecutor,
+    });
+    const mission = await runner.createMission({
+      id: `mission-dynamic-proof-${variant}`,
+      objective: "Derive a delivery artifact from current sandbox facts.",
+      repository: {
+        owner: "mtamburrano",
+        name: "proofboard-demo-fixture",
+        ref: LOCKED_FIXTURE_SHA,
+      },
+    });
+    const workItem = await missions.addWorkItem(mission.id, {
+      id: `work-dynamic-proof-${variant}`,
+      title: "Measure the current implementation",
+      purpose: "Capture the exact bounded implementation artifact.",
+      acceptanceCriteria: ["The artifact contains the measured files and contents."],
+      assignedRole: "implementer",
+      requiredChecks: ["typecheck", "test"],
+      allowedFiles: ["src/index.ts", "test/index.test.js"],
+      status: "ready",
+    });
+    await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
+    await missions.attachTrueforgeTurn(mission.id, `turn-dynamic-proof-${variant}`);
+    await missions.attachTrueforgeSandbox(mission.id, `sandbox-dynamic-${index}`);
+
+    const proof = await runner.proveImplementation({
+      missionId: mission.id,
+      workItemId: workItem.id,
+    });
+    const expectedHash = verifiedDeliveryArtifactHash(LOCKED_FIXTURE_SHA, files, patches);
+    assert.deepEqual(proof.deliveryArtifact, {
+      baselineSha: LOCKED_FIXTURE_SHA,
+      files,
+      patches,
+      contentHash: expectedHash,
+    });
+    assert.deepEqual(proof.filesChanged, ["src/index.ts", "test/index.test.js"]);
+    assert.equal(calls.turns.length, 0);
+    hashes.push(expectedHash);
+  }
+
+  assert.notEqual(hashes[0], hashes[1]);
+  assert.deepEqual(PRIMARY_VERIFIED_DELIVERY_FILES, fixtureSnapshot.files);
+  assert.deepEqual(PRIMARY_VERIFIED_DELIVERY_PATCHES, fixtureSnapshot.patches);
+  assert.deepEqual(PRIMARY_VERIFIED_DELIVERY_ARTIFACT, fixtureSnapshot.artifact);
 });
 
 test("independent implementation proof rejects out-of-scope final changes before checks", async () => {

@@ -47,7 +47,6 @@ import {
 import { parseContentDiffEvidence } from "../diff.js";
 import {
   PRIMARY_DELIVERY_FIXTURE,
-  PRIMARY_VERIFIED_DELIVERY_ARTIFACT,
   PRIMARY_VERIFIED_DELIVERY_FILES,
   PRIMARY_VERIFIED_DELIVERY_PATCHES,
   verifiedDeliveryArtifactHash,
@@ -639,12 +638,13 @@ class MissionController {
       if (queued.status === "proving") {
         await this.executeProofAndReview(queued);
       } else if (queued.status === "awaiting_approval") {
-        const approval = (await this.missions.getState()).approvals
+        const state = await this.missions.getState();
+        const approval = state.approvals
           .filter((item) =>
             item.missionId === PRIMARY_MISSION_ID &&
             item.workItemId === queued.id &&
             item.attempt === queued.attempt &&
-            isPrimaryDeliveryApproval(item),
+            isPrimaryDeliveryApproval(item, state),
           )
           .at(-1);
         if (approval?.decision === "approved") {
@@ -1095,7 +1095,7 @@ class MissionController {
     }
     const activeRequest = state.approvals.find((approval) =>
       approval.missionId === PRIMARY_MISSION_ID &&
-      isPrimaryDeliveryApproval(approval) &&
+      isPrimaryDeliveryApproval(approval, state) &&
       ["pending", "approved"].includes(approval.decision) &&
       Date.parse(approval.expiresAt) > Date.now(),
     );
@@ -1134,7 +1134,12 @@ class MissionController {
       throw new MissionControlError("The primary mission is missing from durable state.");
     }
     requireBaselineRepositoryProof(mission, repositoryProof);
-    const deliveryArtifact = primaryDeliveryArtifactFromProof(proofEvidence);
+    const deliveryArtifact = primaryDeliveryArtifactFromProof(proofEvidence, {
+      mission,
+      workItem: implementation,
+      handoff,
+      review,
+    });
     const deliveryTarget: PullRequestDeliveryTarget = {
       ...PRIMARY_DELIVERY_TARGET,
       artifact: deliveryArtifact,
@@ -1155,7 +1160,8 @@ class MissionController {
       pending.target.head !== deliveryTarget.head ||
       pending.target.title !== deliveryTarget.title ||
       pending.target.body !== deliveryTarget.body ||
-      pending.target.artifact?.contentHash !== deliveryArtifact.contentHash ||
+      pending.target.artifact === undefined ||
+      !sameDeliveryArtifact(pending.target.artifact, deliveryArtifact) ||
       pending.toolName !== "push_files"
     ) {
       throw new MissionControlError(
@@ -1331,7 +1337,7 @@ class MissionController {
         item.missionId === PRIMARY_MISSION_ID &&
         item.workItemId === workItem.id &&
         item.attempt === workItem.attempt &&
-        isPrimaryDeliveryApproval(item),
+        isPrimaryDeliveryApproval(item, state),
       )
       .at(-1);
     if (approval === undefined || approval.decision !== "approved") {
@@ -1904,8 +1910,16 @@ function requireDeliveryHeadProof(
   }
 }
 
+interface DeliveryArtifactProofContext {
+  mission?: Mission;
+  workItem?: WorkItem;
+  handoff?: Handoff;
+  review?: Review;
+}
+
 function primaryDeliveryArtifactFromProof(
   proofEvidence: Array<Evidence | undefined>,
+  context: DeliveryArtifactProofContext = {},
 ): DeliveryArtifact {
   const candidate = proofEvidence
     .map((evidence) => evidence === undefined ? undefined : { evidence, details: evidenceDetails(evidence) })
@@ -1922,28 +1936,112 @@ function primaryDeliveryArtifactFromProof(
       "Delivery approval requires the exact artifact established by deterministic sandbox proof.",
     );
   }
-  const files = stringRecord(artifactValue.files);
-  const patches = stringRecord(artifactValue.patches);
+  const files = boundedStringRecord(artifactValue.files);
+  const patches = boundedStringRecord(artifactValue.patches);
   const artifact: DeliveryArtifact = {
     baselineSha: typeof artifactValue.baselineSha === "string" ? artifactValue.baselineSha : "",
     files: files ?? {},
     patches: patches ?? {},
     contentHash: typeof artifactValue.contentHash === "string" ? artifactValue.contentHash : "",
   };
+  const changedFiles = stringArray(details?.changed_files);
+  const parsedPatches = boundedStringRecord(details?.parsed_patches);
+  const finalFileContents = boundedStringRecord(details?.final_file_contents);
+  const statusEvidence = proofEvidence.find((evidence) =>
+    evidence?.kind === "file_change" && evidenceDetails(evidence)?.complete_changed_files === true
+  );
+  const statusDetails = statusEvidence === undefined ? null : evidenceDetails(statusEvidence);
+  const statusFiles = stringArray(statusDetails?.changed_files);
+  const finalFileContentCommands = finalFileContentCommandRecord(details?.final_file_content_commands);
+  const expectedBaselineSha = context.mission?.repository?.ref;
+  const allowedFiles = context.workItem?.allowedFiles;
+  const attempt = context.workItem?.attempts.at(-1);
+  const expectedSessionId = attempt?.claim.trueforgeSessionId;
+  const expectedSandboxId = attempt?.claim.trueforgeSandboxId;
+  const requiredCheckNames = context.workItem === undefined
+    ? []
+    : uniqueStrings(["typecheck", "test", ...(context.workItem.requiredChecks ?? [])]);
+  const checkEvidenceComplete = requiredCheckNames.every((name) =>
+    proofEvidence.some((evidence) => {
+      if (evidence === undefined || evidence.source !== "sandbox" || evidence.result !== "passed") {
+        return false;
+      }
+      const checkDetails = evidenceDetails(evidence);
+      return evidence.kind === (name === "typecheck" ? "typecheck_result" : "test_result") &&
+        checkDetails?.proof_mode === IMPLEMENTATION_PROOF_MODE &&
+        checkDetails.exit_code === 0 &&
+        checkDetails.sandbox_id === expectedSandboxId &&
+        evidence.executionOrigin?.kind === "sandbox" &&
+        evidence.executionOrigin.sessionId === expectedSessionId;
+    })
+  );
+  const proofEvidenceCorrelated = expectedSessionId !== undefined &&
+    expectedSandboxId !== undefined &&
+    proofEvidence.every((evidence) => {
+      if (evidence === undefined || !isDirectImplementationProofEvidence(evidence)) {
+        return false;
+      }
+      const proofDetails = evidenceDetails(evidence);
+      return evidence.missionId === context.mission?.id &&
+        (context.workItem === undefined || evidence.workItemId === context.workItem.id) &&
+        (context.workItem === undefined || evidence.attempt === context.workItem.attempt) &&
+        proofDetails?.sandbox_id === expectedSandboxId &&
+        evidence.executionOrigin?.sessionId === expectedSessionId;
+    });
+  const reviewAccepted = context.review === undefined ||
+    (context.review.outcome === "accepted" &&
+      context.review.attempt === context.workItem?.attempt &&
+      context.handoff !== undefined &&
+      context.review.handoffId === context.handoff.id);
+  const handoffCorrelated = context.handoff === undefined ||
+    (context.handoff.result === "done" &&
+      context.handoff.attempt === context.workItem?.attempt &&
+      context.handoff.evidenceIds?.includes(candidate?.evidence.id ?? "") === true);
   if (
-    artifact.baselineSha !== PRIMARY_VERIFIED_DELIVERY_ARTIFACT.baselineSha ||
-    artifact.contentHash !== PRIMARY_VERIFIED_DELIVERY_ARTIFACT.contentHash ||
-    !sameStringRecord(artifact.files, PRIMARY_VERIFIED_DELIVERY_FILES) ||
-    !sameStringRecord(artifact.patches, PRIMARY_VERIFIED_DELIVERY_PATCHES) ||
+    !/^[0-9a-f]{40}$/i.test(artifact.baselineSha) ||
+    context.mission === undefined ||
+    expectedBaselineSha === undefined ||
+    artifact.baselineSha !== expectedBaselineSha ||
+    context.workItem === undefined ||
+    allowedFiles === undefined ||
+    allowedFiles.length === 0 ||
+    attempt === undefined ||
+    expectedSessionId === undefined ||
+    expectedSandboxId === undefined ||
+    context.handoff === undefined ||
+    context.review === undefined ||
+    changedFiles === null ||
+    statusFiles === null ||
+    parsedPatches === null ||
+    finalFileContents === null ||
+    finalFileContentCommands === null ||
+    !sameStringSet(changedFiles, Object.keys(artifact.files)) ||
+    !sameStringSet(statusFiles, Object.keys(artifact.files)) ||
+    !sameStringSet(Object.keys(artifact.files), Object.keys(artifact.patches)) ||
+    !sameStringRecord(parsedPatches, artifact.patches) ||
+    !sameStringRecord(finalFileContents, artifact.files) ||
+    !sameStringRecord(
+      finalFileContentCommands,
+      Object.fromEntries(Object.keys(artifact.files).map((file) => [
+        file,
+        `cat ${PRIMARY_SANDBOX_REPOSITORY_ROOT}/${file}`,
+      ])),
+    ) ||
+    Object.keys(artifact.files).some((file) => !allowedFiles.includes(file)) ||
     artifact.contentHash !== verifiedDeliveryArtifactHash(
       artifact.baselineSha,
       artifact.files,
       artifact.patches,
     ) ||
-    details?.artifact_hash !== artifact.contentHash
+    details?.artifact_hash !== artifact.contentHash ||
+    details?.baseline_sha !== artifact.baselineSha ||
+    !proofEvidenceCorrelated ||
+    !checkEvidenceComplete ||
+    !reviewAccepted ||
+    !handoffCorrelated
   ) {
     throw new MissionControlError(
-      "Delivery approval rejected an artifact that does not match the current deterministic sandbox proof.",
+      "Delivery approval rejected an artifact that does not match the current deterministic sandbox proof, scope, checks, attempt, or accepted review.",
     );
   }
   return artifact;
@@ -1963,6 +2061,55 @@ function stringRecord(value: unknown): Record<string, string> | null {
   return result;
 }
 
+function boundedStringRecord(value: unknown): Record<string, string> | null {
+  const result = stringRecord(value);
+  if (result === null || Object.keys(result).length > 8) {
+    return null;
+  }
+  return Object.values(result).some((item) => item.length > 20_000)
+    ? null
+    : result;
+}
+
+function uniqueStrings(values: readonly string[]): string[] {
+  return [...new Set(values.map((value) => value.trim()).filter((value) => value.length > 0))];
+}
+
+function stringArray(value: unknown): string[] | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  const result = value.filter((item): item is string => typeof item === "string");
+  return result.length === value.length && result.every((item) => item.length > 0)
+    ? result
+    : null;
+}
+
+function finalFileContentCommandRecord(
+  value: unknown,
+): Record<string, string> | null {
+  if (!Array.isArray(value)) {
+    return null;
+  }
+  const result: Record<string, string> = {};
+  for (const item of value) {
+    if (!isRecord(item) || typeof item.file !== "string" || typeof item.command !== "string" || result[item.file] !== undefined) {
+      return null;
+    }
+    result[item.file] = item.command;
+  }
+  return result;
+}
+
+function sameStringSet(left: readonly string[], right: readonly string[]): boolean {
+  const leftSet = [...new Set(left)].sort();
+  const rightSet = [...new Set(right)].sort();
+  return left.length === leftSet.length &&
+    right.length === rightSet.length &&
+    leftSet.length === rightSet.length &&
+    leftSet.every((item, index) => item === rightSet[index]);
+}
+
 function sameStringRecord(
   left: Readonly<Record<string, string>>,
   right: Readonly<Record<string, string>>,
@@ -1973,6 +2120,16 @@ function sameStringRecord(
     leftEntries.every(([key, value], index) =>
       key === rightEntries[index]?.[0] && value === rightEntries[index]?.[1]
     );
+}
+
+function sameDeliveryArtifact(
+  left: DeliveryArtifact,
+  right: DeliveryArtifact,
+): boolean {
+  return left.baselineSha === right.baselineSha &&
+    left.contentHash === right.contentHash &&
+    sameStringRecord(left.files, right.files) &&
+    sameStringRecord(left.patches, right.patches);
 }
 
 function deliveryHeadProofFromResult(
@@ -1992,6 +2149,59 @@ function deliveryHeadProofFromResult(
     throw new MissionControlError("Delivery-head inspection evidence is not durable mission proof.");
   }
   return { evidence, headSha: result.commitSha };
+}
+
+function deliveryArtifactProofContext(
+  state: MissionState,
+  approval: Approval,
+): DeliveryArtifactProofContext {
+  const mission = state.missions.find((item) => item.id === approval.missionId);
+  const workItem = approval.workItemId === undefined
+    ? undefined
+    : state.workItems.find((item) =>
+        item.id === approval.workItemId && item.missionId === approval.missionId
+      );
+  const handoff = workItem === undefined
+    ? undefined
+    : state.handoffs
+        .filter((item) =>
+          item.id === approval.handoffId &&
+          item.missionId === approval.missionId &&
+          item.workItemId === workItem.id
+        )
+        .at(-1);
+  const review = workItem === undefined
+    ? undefined
+    : state.reviews
+        .filter((item) =>
+          item.id === approval.reviewId &&
+          item.missionId === approval.missionId &&
+          item.workItemId === workItem.id
+        )
+        .at(-1);
+  const context: DeliveryArtifactProofContext = {};
+  if (mission !== undefined) {
+    context.mission = mission;
+  }
+  if (workItem !== undefined) {
+    context.workItem = workItem;
+  }
+  if (handoff !== undefined) {
+    context.handoff = handoff;
+  }
+  if (review !== undefined) {
+    context.review = review;
+  }
+  return context;
+}
+
+function deliveryArtifactProofEvidence(
+  state: MissionState,
+  approval: Approval,
+): Array<Evidence | undefined> {
+  const context = deliveryArtifactProofContext(state, approval);
+  const evidenceIds = context.handoff?.evidenceIds ?? approval.evidenceIds;
+  return evidenceIds.map((evidenceId) => state.evidence.find((item) => item.id === evidenceId));
 }
 
 function requireApprovalRepositoryProof(
@@ -2015,7 +2225,8 @@ function requireApprovalRepositoryProof(
   requireBaselineRepositoryProof(mission, baselineEvidence);
   if (context.artifactHash !== undefined) {
     const artifact = primaryDeliveryArtifactFromProof(
-      approval.evidenceIds.map((evidenceId) => state.evidence.find((item) => item.id === evidenceId)),
+      deliveryArtifactProofEvidence(state, approval),
+      deliveryArtifactProofContext(state, approval),
     );
     if (artifact.contentHash !== context.artifactHash) {
       throw new MissionControlError(
@@ -2075,6 +2286,12 @@ function requireCurrentDeliveryApprovalCorrelation(
   if (approval.executionContext?.artifactHash !== undefined) {
     const artifact = primaryDeliveryArtifactFromProof(
       proofEvidenceIds.map((evidenceId) => state.evidence.find((item) => item.id === evidenceId)),
+      {
+        ...deliveryArtifactProofContext(state, approval),
+        workItem,
+        handoff,
+        review,
+      },
     );
     if (artifact.contentHash !== approval.executionContext.artifactHash) {
       throw new MissionControlError(
@@ -2083,7 +2300,7 @@ function requireCurrentDeliveryApprovalCorrelation(
     }
   }
   if (
-    !isPrimaryDeliveryApproval(approval) ||
+    !isPrimaryDeliveryApproval(approval, state) ||
     approval.workItemId !== workItem.id ||
     approval.attempt !== workItem.attempt ||
     (workItem.status !== "awaiting_approval" && workItem.status !== "delivering") ||
@@ -2244,7 +2461,7 @@ function deliveryApprovalFromState(
   state: MissionState,
 ): TrueForgeDeliveryApproval {
   const context = approval.executionContext;
-  if (!isPrimaryDeliveryApproval(approval) || context === undefined) {
+  if (!isPrimaryDeliveryApproval(approval, state) || context === undefined) {
     throw new MissionControlError(
       "The persisted approval is not correlated to the exact fixture pull request action.",
     );
@@ -2252,7 +2469,8 @@ function deliveryApprovalFromState(
   const artifact = context.artifactHash === undefined
     ? undefined
     : primaryDeliveryArtifactFromProof(
-        approval.evidenceIds.map((evidenceId) => state.evidence.find((item) => item.id === evidenceId)),
+        deliveryArtifactProofEvidence(state, approval),
+        deliveryArtifactProofContext(state, approval),
       );
   if (artifact !== undefined && artifact.contentHash !== context.artifactHash) {
     throw new MissionControlError(
@@ -2300,17 +2518,15 @@ function deliveryAttemptTarget(
   return result;
 }
 
-function isPrimaryDeliveryApproval(approval: Approval): boolean {
+function isPrimaryDeliveryApproval(
+  approval: Approval,
+  state: MissionState,
+): boolean {
   const context = approval.executionContext;
   if (context === undefined) {
     return false;
   }
   const isArtifactApproval = context.artifactHash !== undefined;
-  if (
-    isArtifactApproval && context.artifactHash !== PRIMARY_VERIFIED_DELIVERY_ARTIFACT.contentHash
-  ) {
-    return false;
-  }
   if (
     !isArtifactApproval &&
     (context.headSha === undefined ||
@@ -2319,10 +2535,33 @@ function isPrimaryDeliveryApproval(approval: Approval): boolean {
   ) {
     return false;
   }
+  let artifact: DeliveryArtifact | undefined;
+  if (isArtifactApproval) {
+    const proofContext = deliveryArtifactProofContext(state, approval);
+    if (
+      proofContext.mission === undefined ||
+      proofContext.workItem === undefined ||
+      proofContext.handoff === undefined ||
+      proofContext.review === undefined
+    ) {
+      return false;
+    }
+    try {
+      artifact = primaryDeliveryArtifactFromProof(
+        deliveryArtifactProofEvidence(state, approval),
+        proofContext,
+      );
+    } catch {
+      return false;
+    }
+    if (artifact.contentHash !== context.artifactHash) {
+      return false;
+    }
+  }
   const target: PullRequestDeliveryTarget = {
     ...PRIMARY_DELIVERY_TARGET,
     ...(context.headSha === undefined ? {} : { headSha: context.headSha }),
-    ...(isArtifactApproval ? { artifact: PRIMARY_VERIFIED_DELIVERY_ARTIFACT } : {}),
+    ...(artifact === undefined ? {} : { artifact }),
   };
   return (
     approval.actionType === PRIMARY_CONSEQUENTIAL_ACTION &&

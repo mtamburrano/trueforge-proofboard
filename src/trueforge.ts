@@ -34,8 +34,6 @@ import {
 } from "./diff.js";
 import {
   PRIMARY_DELIVERY_FIXTURE,
-  PRIMARY_VERIFIED_DELIVERY_ARTIFACT,
-  PRIMARY_VERIFIED_DELIVERY_FILES,
   PRIMARY_VERIFIED_DELIVERY_PATCHES,
   verifiedDeliveryArtifactHash,
   PRIMARY_SANDBOX_REPOSITORY_ROOT,
@@ -220,6 +218,7 @@ const DELEGATED_WORKSPACE_DELTA_INTENT =
   "Capture the coordinator-owned current work-item and cumulative mission workspace deltas after delegated implementation.";
 const MAX_COORDINATOR_EXEC_INTENT_LENGTH = 1_200;
 const MAX_IMPLEMENTATION_PROOF_OUTPUT_LENGTH = 2_000_000;
+const MAX_DELIVERY_ARTIFACT_FILE_CONTENT_LENGTH = 20_000;
 export const IMPLEMENTATION_PROOF_MODE = "application_direct_sandbox" as const;
 export const MAX_COORDINATOR_ZERO_TOOL_RETRIES = 2;
 const PULL_REQUEST_READ_TOOL_NAME = "pull_request_read";
@@ -1460,6 +1459,36 @@ export class TrueForgeMissionRunner {
         );
       }
 
+      const finalFileContentMeasurements: Array<{
+        file: string;
+        command: string;
+        measurement: IndependentSandboxMeasurement;
+      }> = [];
+      for (const file of [...filesChanged].sort()) {
+        const command = implementationFinalFileContentCommand(repositoryRoot, file);
+        if (command === null) {
+          throw new TrueForgeIntegrationError(
+            "prove implementation",
+            `Independent proof could not build a bounded final-content command for ${file}.`,
+          );
+        }
+        finalFileContentMeasurements.push({
+          file,
+          command,
+          measurement: await measure(command),
+        });
+      }
+      const finalFileContents: Record<string, string> = {};
+      for (const { file, measurement } of finalFileContentMeasurements) {
+        if (measurement.verified.stdout.length > MAX_DELIVERY_ARTIFACT_FILE_CONTENT_LENGTH) {
+          throw new TrueForgeIntegrationError(
+            "prove implementation",
+            `Independent proof found final content for ${file} above the ${MAX_DELIVERY_ARTIFACT_FILE_CONTENT_LENGTH}-character artifact bound.`,
+          );
+        }
+        finalFileContents[file] = measurement.verified.stdout;
+      }
+
       const checkMeasurements: Array<{
         name: string;
         command: string;
@@ -1534,11 +1563,15 @@ export class TrueForgeMissionRunner {
         executionOrigin: sandboxMeasurementOrigin(status),
       });
       const diffSummary = summarizeOutput(diff.verified.stdout);
+      const parsedPatches = parseGitDiffPatches(diff.verified.stdout);
       const deliveryArtifact = verifiedDeliveryArtifactFromProof(
         mission,
         baselineSha,
+        allowedFiles,
+        filesChanged,
         diffFiles,
-        diff.verified.stdout,
+        parsedPatches,
+        finalFileContents,
       );
       const diffEvidence = await this.missions.addEvidence(mission.id, {
         workItemId: workItem.id,
@@ -1552,6 +1585,12 @@ export class TrueForgeMissionRunner {
           exit_code: diff.verified.exitCode,
           output: diffSummary,
           changed_files: diffFiles,
+          parsed_patches: parsedPatches ?? {},
+          final_file_contents: finalFileContents,
+          final_file_content_commands: finalFileContentMeasurements.map(({ file, command }) => ({
+            file,
+            command,
+          })),
           output_truncated: diff.verified.stdout.trim().length > 4_000,
           baseline_sha: baselineSha,
           sandbox_id: diff.verified.sandboxId,
@@ -2065,13 +2104,20 @@ export class TrueForgeMissionRunner {
     targetInput: PullRequestDeliveryTarget,
   ): Promise<TrueForgeDeliveryApproval> {
     const target = validatePullRequestDeliveryTarget(targetInput);
+    const mission = await this.missions.getMission(missionId);
     const serverName = requiredString(
       this.config.mcpServerName ?? "github",
       "MCP server name",
       "request pull request approval",
     );
     if (target.artifact !== undefined) {
-      requireVerifiedDeliveryArtifact(target, "request pull request approval");
+      if (mission.repository?.ref === undefined) {
+        throw new TrueForgeIntegrationError(
+          "request pull request approval",
+          "Artifact delivery requires the mission's pinned repository baseline.",
+        );
+      }
+      requireVerifiedDeliveryArtifact(target, "request pull request approval", mission.repository.ref);
       ensureDeliveryMcpConfigured(this.config, serverName, true);
     } else {
       requireVerifiedDeliveryHeadSha(target, "request pull request approval");
@@ -2111,7 +2157,13 @@ export class TrueForgeMissionRunner {
     }
     ensureDeliveryMcpConfigured(this.config, pending.serverName, pending.toolName === DELIVERY_PUBLICATION_TOOL_NAME);
     if (pending.toolName === DELIVERY_PUBLICATION_TOOL_NAME) {
-      return this.resolveVerifiedArtifactDelivery(missionId, pending, decision, workItemId);
+      return this.resolveVerifiedArtifactDelivery(
+        missionId,
+        pending,
+        decision,
+        workItemId,
+        mission.repository?.ref,
+      );
     }
     if (decision === "approved") {
       // Branch refs are mutable. Re-read the exact ref immediately before allowing the protected call.
@@ -2207,7 +2259,13 @@ export class TrueForgeMissionRunner {
     }
     ensureDeliveryMcpConfigured(this.config, pending.serverName, pending.toolName === DELIVERY_PUBLICATION_TOOL_NAME);
     if (pending.toolName === DELIVERY_PUBLICATION_TOOL_NAME) {
-      return this.reconcileVerifiedArtifactDelivery(missionId, pending, workItemId, knownPullRequest);
+      return this.reconcileVerifiedArtifactDelivery(
+        missionId,
+        pending,
+        workItemId,
+        knownPullRequest,
+        mission.repository?.ref,
+      );
     }
 
     let pullRequest: ParsedPullRequestCreation;
@@ -2319,9 +2377,20 @@ export class TrueForgeMissionRunner {
     pending: TrueForgeDeliveryApproval,
     decision: "approved" | "rejected" | "cancelled",
     workItemId?: string,
+    expectedBaselineSha?: string,
   ): Promise<TrueForgePullRequestResult | null> {
     const target = validatePullRequestDeliveryTarget(pending.target);
-    const artifact = requireVerifiedDeliveryArtifact(target, "resolve pull request approval");
+    if (expectedBaselineSha === undefined) {
+      throw new TrueForgeIntegrationError(
+        "resolve pull request approval",
+        "Artifact delivery requires the mission's pinned repository baseline.",
+      );
+    }
+    const artifact = requireVerifiedDeliveryArtifact(
+      target,
+      "resolve pull request approval",
+      expectedBaselineSha,
+    );
     const execution = await this.resumeNativeDeliveryApproval(
       missionId,
       pending,
@@ -2385,9 +2454,20 @@ export class TrueForgeMissionRunner {
     pending: TrueForgeDeliveryApproval,
     workItemId?: string,
     knownPullRequest?: PullRequestReference,
+    expectedBaselineSha?: string,
   ): Promise<TrueForgePullRequestResult | null> {
     const target = validatePullRequestDeliveryTarget(pending.target);
-    const artifact = requireVerifiedDeliveryArtifact(target, "reconcile pull request approval");
+    if (expectedBaselineSha === undefined) {
+      throw new TrueForgeIntegrationError(
+        "reconcile pull request approval",
+        "Artifact delivery requires the mission's pinned repository baseline.",
+      );
+    }
+    const artifact = requireVerifiedDeliveryArtifact(
+      target,
+      "reconcile pull request approval",
+      expectedBaselineSha,
+    );
     const branch = await this.inspectDeliveryHead({
       missionId,
       target,
@@ -4351,6 +4431,23 @@ function implementationCheckCommand(repositoryRoot: string, name: string): strin
   return null;
 }
 
+function implementationFinalFileContentCommand(
+  repositoryRoot: string,
+  file: string,
+): string | null {
+  if (
+    repositoryRoot !== PRIMARY_SANDBOX_REPOSITORY_ROOT ||
+    file.length === 0 ||
+    file.length > 500 ||
+    !/^[A-Za-z0-9._/-]+$/.test(file) ||
+    file.startsWith("/") ||
+    file.split("/").some((segment) => segment.length === 0 || segment === "." || segment === "..")
+  ) {
+    return null;
+  }
+  return `cat ${repositoryRoot}/${file}`;
+}
+
 function sandboxMeasurementOrigin(measurement: IndependentSandboxMeasurement): ExecutionOrigin {
   const origin: ExecutionOrigin = {
     kind: "sandbox",
@@ -4513,11 +4610,13 @@ function validatePullRequestDeliveryTarget(
 function requireVerifiedDeliveryArtifact(
   target: PullRequestDeliveryTarget,
   operation: string,
+  expectedBaselineSha?: string,
 ): DeliveryArtifact {
   const artifact = target.artifact;
   if (
     artifact === undefined ||
-    artifact.baselineSha !== PRIMARY_DELIVERY_FIXTURE.baselineSha ||
+    !/^[0-9a-f]{40}$/i.test(artifact.baselineSha) ||
+    (expectedBaselineSha !== undefined && artifact.baselineSha !== expectedBaselineSha) ||
     Object.keys(artifact.files).length === 0 ||
     Object.keys(artifact.files).length !== Object.keys(artifact.patches).length ||
     Object.keys(artifact.files).some((file) => artifact.patches[file] === undefined) ||
@@ -4602,36 +4701,39 @@ function parseGitDiffPatches(
 function verifiedDeliveryArtifactFromProof(
   mission: Mission,
   baselineSha: string,
+  allowedFiles: readonly string[],
   filesChanged: readonly string[],
-  diffOutput: string,
+  diffFiles: readonly string[],
+  parsedPatches: Readonly<Record<string, string>> | null,
+  finalFileContents: Readonly<Record<string, string>>,
 ): DeliveryArtifact | undefined {
   if (
-    mission.repository?.owner !== PRIMARY_DELIVERY_FIXTURE.owner ||
-    mission.repository.name !== PRIMARY_DELIVERY_FIXTURE.repository ||
-    mission.repository.ref !== PRIMARY_DELIVERY_FIXTURE.baselineRef ||
-    baselineSha !== PRIMARY_DELIVERY_FIXTURE.baselineSha ||
-    !sameFileSet(filesChanged, Object.keys(PRIMARY_VERIFIED_DELIVERY_FILES))
+    mission.repository?.ref !== baselineSha ||
+    filesChanged.length !== uniqueStrings([...filesChanged]).length ||
+    !sameFileSet(filesChanged, diffFiles) ||
+    parsedPatches === null ||
+    !sameFileSet(filesChanged, Object.keys(parsedPatches)) ||
+    !sameFileSet(filesChanged, Object.keys(finalFileContents)) ||
+    filesChanged.some((file) => !allowedFiles.includes(file)) ||
+    Object.values(parsedPatches).some((patch) => patch.length === 0 || patch.length > 20_000) ||
+    Object.values(finalFileContents).some((content) =>
+      content.length > MAX_DELIVERY_ARTIFACT_FILE_CONTENT_LENGTH
+    )
   ) {
     return undefined;
   }
-  const patches = parseGitDiffPatches(diffOutput);
-  if (patches === null || !deliveryPatchesMatch(patches)) {
-    return undefined;
-  }
+  const files = Object.fromEntries(
+    Object.entries(finalFileContents).sort(([left], [right]) => left.localeCompare(right)),
+  );
+  const patches = Object.fromEntries(
+    Object.entries(parsedPatches).sort(([left], [right]) => left.localeCompare(right)),
+  );
   const contentHash = verifiedDeliveryArtifactHash(
     baselineSha,
-    PRIMARY_VERIFIED_DELIVERY_FILES,
-    PRIMARY_VERIFIED_DELIVERY_PATCHES,
+    files,
+    patches,
   );
-  if (contentHash !== PRIMARY_VERIFIED_DELIVERY_ARTIFACT.contentHash) {
-    return undefined;
-  }
-  return {
-    baselineSha,
-    files: PRIMARY_VERIFIED_DELIVERY_FILES,
-    patches: PRIMARY_VERIFIED_DELIVERY_PATCHES,
-    contentHash,
-  };
+  return { baselineSha, files, patches, contentHash };
 }
 
 function pullRequestArguments(
@@ -4925,10 +5027,11 @@ function buildDeliveryHeadInspectionInstruction(
   target: PullRequestDeliveryTarget,
   serverName: string,
 ): string {
+  const baselineSha = target.artifact?.baselineSha ?? PRIMARY_DELIVERY_FIXTURE.baselineSha;
   return [
     `Use the configured MCP server ${serverName}.`,
     `Use get_commit with this exact JSON object: ${JSON.stringify(deliveryHeadArguments(target))}.`,
-    `The returned commit must differ from baseline ${PRIMARY_DELIVERY_FIXTURE.baselineSha} and contain the verified delivery patches.`,
+    `The returned commit must differ from baseline ${baselineSha} and contain the verified delivery patches.`,
     "Make no other MCP calls during this turn. If a completed turn emits no tool call, the bounded coordinator may repeat this exact operation; any emitted tool call must use these exact arguments.",
     "Use the MCP response as the only source of delivery-head facts; do not mutate the repository.",
     "Stop after the read.",
@@ -6398,7 +6501,11 @@ function verifyDeliveryHeadInspection(
         : "Delivery-head get_commit MCP returned no valid commit result.",
     );
   }
-  const verifiedPayload = parseVerifiedDeliveryHeadObject(responseValue, expectedPatches);
+  const verifiedPayload = parseVerifiedDeliveryHeadObject(
+    responseValue,
+    expectedPatches,
+    target.artifact?.baselineSha,
+  );
   if (verifiedPayload === null) {
     return inspectionFailure(
       "Delivery head must differ from the unchanged baseline and exactly match the approved implementation artifact.",
@@ -6427,6 +6534,7 @@ function verifyDeliveryHeadInspection(
 function parseVerifiedDeliveryHeadObject(
   value: Record<string, unknown>,
   expectedPatches: Readonly<Record<string, string>> = PRIMARY_VERIFIED_DELIVERY_PATCHES,
+  expectedBaselineSha: string = PRIMARY_DELIVERY_FIXTURE.baselineSha,
 ): { commitSha: string; patches: Readonly<Record<string, string>> } | null {
   const commitSha = stringOrNull(value.sha);
   const files = commitFileEntries(value.files);
@@ -6434,7 +6542,7 @@ function parseVerifiedDeliveryHeadObject(
   if (
     commitSha === null ||
     !/^[0-9a-f]{40}$/i.test(commitSha) ||
-    commitSha === PRIMARY_DELIVERY_FIXTURE.baselineSha ||
+    commitSha === expectedBaselineSha ||
     files === null ||
     files.length !== expectedEntries.length
   ) {
