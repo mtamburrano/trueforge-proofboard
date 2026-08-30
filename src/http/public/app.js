@@ -251,7 +251,7 @@ function effectiveStatus(ticket) {
 }
 
 function columnForStatus(status) {
-  return status === "blocked" ? "changes_requested" : status;
+  return status;
 }
 
 function ticketEvidence(ticket, view) {
@@ -384,90 +384,6 @@ function renderExecutionOrigin(origin) {
   return `<details class="provenance-details"><summary>Show execution provenance</summary><dl class="provenance-meta"><div><dt>Origin</dt><dd>${escapeHtml(origin.kind)}</dd></div><div><dt>Session</dt><dd><code>${escapeHtml(origin.sessionId)}</code></dd></div>${origin.turnId ? `<div><dt>Turn</dt><dd><code>${escapeHtml(origin.turnId)}</code></dd></div>` : ""}${origin.threadId ? `<div><dt>Thread</dt><dd><code>${escapeHtml(origin.threadId)}</code></dd></div>` : ""}${origin.toolCallId ? `<div><dt>Tool call</dt><dd><code>${escapeHtml(origin.toolCallId)}</code></dd></div>` : ""}</dl></details>`;
 }
 
-function provenanceCapabilities(view) {
-  const tickets = ticketsForView(view);
-  const execution = view.mission.execution ?? {};
-  const primary = implementationTicket(view);
-  const binding = primary ? runtimeBinding(primary, view) : null;
-  const activities = view.activity ?? [];
-  const evidence = view.evidence ?? [];
-  const capabilities = [];
-  if (execution.connected || binding?.session !== "Not connected") {
-    capabilities.push({
-      id: "trueforge-runtime",
-      label: "TrueForge model / session",
-      detail: `${binding?.model ?? execution.model ?? "Configured model"} · ${binding?.session ?? "Session not connected"}`,
-    });
-  }
-  const mcpCount = evidence.filter((item) => item.source === "mcp").length;
-  if (mcpCount > 0 || activities.some((item) => item.category === "repository")) {
-    capabilities.push({
-      id: "github-mcp",
-      label: evidence.some((item) => item.metadata?.server === "github") ? "GitHub MCP reads" : "Repository MCP reads",
-      detail: `${mcpCount} persisted repository fact${mcpCount === 1 ? "" : "s"}`,
-    });
-  }
-  const sandboxCount = evidence.filter((item) => item.source === "sandbox").length;
-  if (sandboxCount > 0 || execution.sandboxId || tickets.some((ticket) => currentClaim(ticket)?.trueforgeSandboxId)) {
-    capabilities.push({
-      id: "daytona-sandbox",
-      label: "Daytona sandbox work",
-      detail: `${sandboxCount} measured sandbox record${sandboxCount === 1 ? "" : "s"} · ${binding?.sandbox ?? execution.sandboxId ?? "persisted binding"}`,
-    });
-  }
-  const delegation = tickets.find((ticket) => ticket.delegation !== undefined) ??
-    (activities.some((item) => item.category === "narration") ? primary : undefined);
-  if (delegation) {
-    capabilities.push({
-      id: "subagent",
-      label: "Subagent delegation",
-      detail: delegation.delegation ? `${delegation.delegation.status} · ${delegation.delegation.threadId}` : "Activity recorded",
-    });
-  }
-  if (execution.resumed || activities.some((item) => item.category === "session" && /resum|recover|reconnect/i.test(item.summary))) {
-    capabilities.push({
-      id: "recovery",
-      label: "Reconnect / recovery",
-      detail: "Durable session state was resumed",
-    });
-  }
-  const pendingApprovals = (view.approvals ?? []).filter((approval) => approval.decision === "pending").length;
-  if ((view.approvals ?? []).length > 0) {
-    capabilities.push({
-      id: "approval",
-      label: "Protected approval checkpoint",
-      detail: pendingApprovals > 0 ? "Awaiting the second human gate" : "Decision persisted",
-    });
-  }
-  if ((view.delivery ?? []).length > 0) {
-    capabilities.push({
-      id: "delivery",
-      label: "Delivery read-back",
-      detail: `${view.delivery.length} protected result${view.delivery.length === 1 ? "" : "s"} recorded`,
-    });
-  }
-  if (sandboxCount > 0) {
-    capabilities.push({
-      id: "proof-board",
-      label: "Proof Board verification",
-      detail: `${sandboxCount} deterministic sandbox result${sandboxCount === 1 ? "" : "s"}`,
-    });
-  }
-  return capabilities;
-}
-
-function renderProvenanceTrail(view) {
-  const capabilities = provenanceCapabilities(view);
-  const primary = implementationTicket(view);
-  const detailGrid = capabilities.length === 0
-    ? `<p class="provenance-empty">No live execution capabilities have been recorded yet.</p>`
-    : `<div class="provenance-detail-grid">${capabilities.map((capability) => `<div><dt>${escapeHtml(capability.label)}</dt><dd>${escapeHtml(capability.detail)}</dd></div>`).join("")}</div>${primary ? `<div class="provenance-runtime">${renderRuntimeFacts(primary, view)}</div>` : ""}`;
-  const visibleTrail = capabilities.length
-    ? `<ul class="provenance-list">${capabilities.map((capability) => `<li data-capability="${escapeHtml(capability.id)}"><strong>${escapeHtml(capability.label)}</strong><span>${escapeHtml(capability.detail)}</span></li>`).join("")}</ul>`
-    : `<p class="provenance-empty">No live execution capabilities have been recorded yet.</p>`;
-  return `<section class="provenance-strip panel" aria-labelledby="provenance-title"><div class="provenance-heading"><div><p class="section-kicker">Run provenance</p><h2 id="provenance-title">Real execution trail</h2></div><p class="section-note">Only capabilities with durable activity or proof records appear.</p></div>${visibleTrail}<details class="provenance-details"><summary>Expand structured provenance</summary>${detailGrid}</details></section>`;
-}
-
 function hasUnresolvedDependency(ticket, view) {
   return ticket.dependsOn.some((dependencyId) => {
     const dependency = ticketById(view, dependencyId);
@@ -520,6 +436,13 @@ function renderQueueFlow(view) {
   }).join("")}</ol></section>`;
 }
 
+function renderBlockedSummary(view) {
+  const blockedTickets = ticketsForView(view).filter((ticket) => effectiveStatus(ticket) === "blocked");
+  if (blockedTickets.length === 0) return "";
+  const ticketLinks = blockedTickets.map((ticket) => `<button class="compact-action blocked-ticket-link" type="button" data-ticket-open="${escapeHtml(ticket.id)}">Open ${escapeHtml(ticket.title)}</button>`).join("");
+  return `<aside class="blocked-summary" role="status" aria-labelledby="blocked-summary-title"><div class="blocked-summary-copy"><strong id="blocked-summary-title">Pipeline blocked</strong><span>${blockedTickets.length} ticket${blockedTickets.length === 1 ? " is" : "s are"} stopped by an infrastructure or pipeline failure. No code rework is authorized from this state.</span></div><div class="blocked-ticket-list" aria-label="Blocked tickets">${ticketLinks}</div></aside>`;
+}
+
 function renderMission(view) {
   currentView = view;
   const tickets = ticketsForView(view);
@@ -537,7 +460,7 @@ function renderMission(view) {
   });
   const authorized = tickets.filter((ticket) => ticket.executionAuthorization !== undefined).length;
   const blocked = tickets.filter((ticket) => effectiveStatus(ticket) === "blocked").length;
-  const repair = Math.max(0, counts.changes_requested - blocked);
+  const repair = counts.changes_requested;
   const running = runCoordinator?.isRunning() ?? false;
   const terminal = ["delivered", "failed"].includes(view.mission.status);
   const canRun = canStartMission(view);
@@ -546,15 +469,16 @@ function renderMission(view) {
   const runHint = !canRun && !running && !terminal
     ? primaryTicket?.status === "changes_requested"
       ? "Inspect the durable findings, then move Changes Requested to Ready to authorize bounded rework."
+      : primaryTicket?.status === "blocked"
+        ? "Pipeline blocked. Inspect the diagnostic record; no code rework is authorized from this state."
       : "Move the primary ticket from Backlog to Ready to authorize TrueForge."
     : "Execution starts only after the human queue decision.";
   app.innerHTML = `
     <section class="queue-hero panel" aria-labelledby="mission-objective"><div class="queue-hero-copy"><div class="mission-title-row"><p class="eyebrow">Proof Board · primary delivery contract</p>${chip(view.mission.status)}</div><h1 id="mission-objective" class="mission-objective">${escapeHtml(view.mission.objective)}</h1><p class="queue-thesis">Queue work. Prove facts. Approve the exact delivery.</p><p class="mission-meta">${renderRepositoryFacts(view)}<span class="fact"><span>TrueForge</span> <strong>${view.mission.execution.connected ? "Session connected" : "Waiting"}</strong></span><span class="fact"><span>State revision</span> <strong>${escapeHtml(view.revision)}</strong></span></p></div><div class="mission-actions"><p class="action-kicker">Primary queue action</p><button id="run-mission" class="primary-action" type="button" ${runDisabled ? "disabled" : ""} ${running ? 'aria-busy="true"' : ""}>${escapeHtml(running ? "TrueForge is working…" : canRun ? "Start TrueForge execution" : "Authorize execution first")}</button><p class="run-hint">${escapeHtml(runHint)}</p></div></section>
     <section class="metrics-strip queue-metrics" aria-label="Proof Board summary"><div class="metric"><span class="metric-label">Tickets</span><span class="metric-value">${tickets.length}</span></div><div class="metric"><span class="metric-label">Ready / authorized</span><span class="metric-value good">${counts.ready} / ${authorized}</span></div><div class="metric"><span class="metric-label">Verified done</span><span class="metric-value good">${counts.done}</span></div><div class="metric"><span class="metric-label">Blocked / repair</span><span class="metric-value ${blocked + repair ? "bad" : ""}">${blocked + repair}</span></div><div class="metric"><span class="metric-label">Evidence records</span><span class="metric-value">${view.evidence.length}</span></div></section>
     ${renderQueueFlow(view)}
-    ${renderProvenanceTrail(view)}
-    <section class="board-section" aria-labelledby="board-title"><header class="board-heading"><div><p class="section-kicker">Durable work queue</p><h2 id="board-title">Queue → pipeline → delivery</h2><p id="board-description" class="section-note">Backlog ↔ Ready authorizes work. Changes Requested → Ready authorizes bounded rework. In Progress → Proving → Awaiting Approval → Delivering → Done is system-owned progression.</p></div><div class="board-legend"><span class="legend-item"><span class="legend-dot legend-dot-human"></span>Human decision</span><span class="legend-item"><span class="legend-dot legend-dot-system"></span>System-owned</span><span class="revision-label">Revision ${escapeHtml(view.revision)}</span></div></header>${blocked ? `<div class="blocked-summary" role="status"><strong>${blocked} ticket${blocked === 1 ? "" : "s"} blocked.</strong> Open the card for the concrete failure fact before retrying.</div>` : ""}<div class="ticket-board-wrap"><section class="ticket-board" data-revision="${escapeHtml(view.revision)}" aria-describedby="board-description" aria-label="Work queue statuses">${BOARD_COLUMNS.map((column) => renderBoardColumn(column, view, counts[column.id])).join("")}</section></div></section>
-    ${renderApprovalCheckpoint(view)}
+    <section class="board-section" aria-labelledby="board-title"><header class="board-heading"><div><p class="section-kicker">Durable work queue</p><h2 id="board-title">Queue → pipeline → delivery</h2><p id="board-description" class="section-note">Backlog ↔ Ready authorizes work. Changes Requested → Ready authorizes bounded rework. In Progress → Proving → Awaiting Approval → Delivering → Done is system-owned progression.</p></div><div class="board-legend"><span class="legend-item"><span class="legend-dot legend-dot-human"></span>Human decision</span><span class="legend-item"><span class="legend-dot legend-dot-system"></span>System-owned</span><span class="revision-label">Revision ${escapeHtml(view.revision)}</span></div></header>${renderBlockedSummary(view)}<div class="ticket-board-wrap"><section class="ticket-board" data-revision="${escapeHtml(view.revision)}" aria-describedby="board-description" aria-label="Work queue statuses">${BOARD_COLUMNS.map((column) => renderBoardColumn(column, view, counts[column.id])).join("")}</section></div></section>
+    ${renderDeliveryApprovalContext(view)}
     <section class="section-heading operations-heading"><div><p class="section-kicker">Durable operational record</p><h2>Activity and proof</h2></div><p class="section-note"><span class="proof-boundary">Runtime activity · Proof Board verification</span></p></section><section class="operations-grid"><article class="operations-panel panel" aria-labelledby="activity-heading"><header class="operations-panel-header"><div><p class="section-kicker">Runtime provenance</p><h2 id="activity-heading">Activity</h2></div><span class="badge">${view.activity.length}</span></header>${renderActivity(view.activity)}</article><article class="operations-panel panel" aria-labelledby="evidence-heading"><header class="operations-panel-header"><div><p class="section-kicker">Proof Board verification</p><h2 id="evidence-heading">Measured evidence</h2></div><span class="badge">Repository + sandbox</span></header>${renderEvidence(view.evidence)}</article></section>${renderDiagnostics(view)}${selectedTicketId === null ? "" : renderTicketDrawer(ticketById(view, selectedTicketId), view)}
     `;
   bindMissionInteractions(view);
@@ -679,11 +603,29 @@ function renderTicketSignal(ticket, view, status) {
   return `<p class="ticket-signal">${escapeHtml(humanLabel(status))}</p>`;
 }
 
-function renderApprovalCheckpoint(view) {
+function renderDeliveryApprovalContext(view) {
   const approval = deliveryApproval(view);
   const delivery = deliveryResult(view);
-  const authorized = ticketsForView(view).some((ticket) => ticket.executionAuthorization !== undefined);
-  return `<section class="checkpoint-grid" aria-label="Two human authorization gates"><article class="checkpoint-panel panel checkpoint-queue-gate"><div class="checkpoint-heading"><div><p class="section-kicker">Gate 1 · Queue authorization</p><h2>Backlog → Ready</h2></div>${chip(approval ? approval.decision : authorized ? "approved" : "backlog")}</div><p>Moving a ticket into Ready is the explicit authorization for autonomous execution. After claim, lifecycle movement belongs to the pipeline.</p><p class="checkpoint-note">${authorized ? "Authorization is recorded with the ticket and survives reconnect." : "No ticket has been authorized yet."}</p></article><article class="checkpoint-panel panel checkpoint-delivery-gate" aria-labelledby="approval-checkpoint-title"><div class="checkpoint-heading"><div><p class="section-kicker">Gate 2 · Consequential delivery</p><h2 id="approval-checkpoint-title">${approval ? escapeHtml(approval.action) : "Awaiting Approval"}</h2></div>${approval ? chip(approval.decision) : "<span class=\"badge gate-badge\">Not requested</span>"}</div>${approval ? renderApprovalBody(approval) : "<p class=\"checkpoint-action\"><strong>No delivery action requested.</strong> Verified work will surface the exact repository, base, head, and expected effect here before any remote mutation.</p>"}${delivery ? renderDeliveryBody(delivery) : ""}</article></section>`;
+  if (!approval && !delivery) return "";
+  const context = approval?.executionContext;
+  const target = context
+    ? `${context.repositoryOwner}/${context.repositoryName} · ${context.base} → ${context.head}`
+    : approval?.target ?? "Verified repository action";
+  const verifiedHead = context?.headSha ? ` · verified head ${shortRef(context.headSha)}` : "";
+  const title = approval?.action ?? "Delivery read-back";
+  const status = approval ? chip(approval.decision) : "<span class=\"badge\">Delivered</span>";
+  const message = approval?.decision === "pending"
+    ? "Review the exact delivery target and verified artifact before protected delivery."
+    : approval?.decision === "approved"
+      ? "Approval recorded; protected delivery is in progress."
+      : delivery
+        ? "Protected delivery completed and read-back is recorded."
+        : `Delivery ${approval?.decision ?? "decision"} recorded; no protected repository operation was executed.`;
+  return `<section class="delivery-approval-context panel" aria-labelledby="delivery-approval-context-title"><header class="approval-context-heading"><div><p class="section-kicker">Delivery approval</p><h2 id="delivery-approval-context-title">${escapeHtml(title)}</h2></div>${status}</header><p class="approval-context-target"><span>Exact delivery</span><strong>${escapeHtml(target)}${escapeHtml(verifiedHead)}</strong></p><p class="approval-context-message">${escapeHtml(message)}</p>${approval?.decision === "pending" ? renderApprovalActions(approval) : ""}${delivery ? renderDeliveryBody(delivery) : ""}</section>`;
+}
+
+function renderApprovalActions(approval) {
+  return `<div class="approval-actions" aria-label="Delivery approval decision"><button class="primary-action compact-action" type="button" data-approval-id="${escapeHtml(approval.id)}" data-approval-decision="approved">Approve exact action</button><button class="compact-action" type="button" data-approval-id="${escapeHtml(approval.id)}" data-approval-decision="rejected">Reject</button><button class="compact-action" type="button" data-approval-id="${escapeHtml(approval.id)}" data-approval-decision="cancelled">Cancel</button></div>`;
 }
 
 function renderApprovalBody(approval) {
@@ -703,7 +645,7 @@ function renderApprovalBody(approval) {
     approval.trueforgeSandboxId ? `sandbox ${shortRef(approval.trueforgeSandboxId)}` : "",
     approval.executionContext?.headSha ? `head ${shortRef(approval.executionContext.headSha)}` : "",
   ].filter(Boolean).join(" · ");
-  return `<div class="approval-facts" data-provenance-surface="control-plane"><p><span>Action</span><strong>${escapeHtml(approval.action)}</strong></p><p><span>Repository</span><strong>${escapeHtml(repository)}</strong></p><p><span>Base → head</span><strong>${escapeHtml(baseHead)}</strong></p><p><span>Verified artifact</span><strong><code>${escapeHtml(verifiedArtifact)}</code></strong></p><p><span>Expected effect</span><strong>${escapeHtml(approval.expectedEffect)}</strong></p><p><span>Why safe</span><strong>${escapeHtml(approval.rationale)}</strong></p><p><span>Diff context</span><strong>${approval.evidenceIds?.length ?? 0} correlated proof record${approval.evidenceIds?.length === 1 ? "" : "s"}; delivery is pinned to the verified head.</strong></p></div>${correlation ? `<p class="runtime-correlation"><strong>Correlated artifact:</strong> ${escapeHtml(correlation)}</p>` : ""}${context ? `<p class="runtime-correlation"><strong>TrueForge provenance:</strong> session ${escapeHtml(shortRef(context.sessionId))} · turn ${escapeHtml(shortRef(context.turnId))} · call ${escapeHtml(shortRef(context.toolCallId))}</p>` : ""}${approval.decision === "pending" ? `<p class="approval-gate-note"><strong>Second human gate:</strong> approve this exact verified action to begin protected delivery.</p><div class="approval-actions" aria-label="Delivery approval decision"><button class="primary-action compact-action" type="button" data-approval-id="${escapeHtml(approval.id)}" data-approval-decision="approved">Approve exact action</button><button class="compact-action" type="button" data-approval-id="${escapeHtml(approval.id)}" data-approval-decision="rejected">Reject</button><button class="compact-action" type="button" data-approval-id="${escapeHtml(approval.id)}" data-approval-decision="cancelled">Cancel</button></div>` : ""}${approval.decision === "approved" ? `<p class="approval-outcome">Approved. Waiting for correlated remote result evidence while protected delivery runs; it is not Done until the exact result is verified.</p>` : ""}${approval.decision === "rejected" ? `<p class="approval-outcome">Rejected. The protected repository operation was not executed.</p>` : ""}${approval.decision === "cancelled" ? `<p class="approval-outcome">Cancelled. The protected repository operation was not executed.</p>` : ""}`;
+  return `<div class="approval-facts" data-provenance-surface="control-plane"><p><span>Action</span><strong>${escapeHtml(approval.action)}</strong></p><p><span>Repository</span><strong>${escapeHtml(repository)}</strong></p><p><span>Base → head</span><strong>${escapeHtml(baseHead)}</strong></p><p><span>Verified artifact</span><strong><code>${escapeHtml(verifiedArtifact)}</code></strong></p><p><span>Expected effect</span><strong>${escapeHtml(approval.expectedEffect)}</strong></p><p><span>Why safe</span><strong>${escapeHtml(approval.rationale)}</strong></p><p><span>Diff context</span><strong>${approval.evidenceIds?.length ?? 0} correlated proof record${approval.evidenceIds?.length === 1 ? "" : "s"}; delivery is pinned to the verified head.</strong></p></div>${correlation ? `<p class="runtime-correlation"><strong>Correlated artifact:</strong> ${escapeHtml(correlation)}</p>` : ""}${context ? `<p class="runtime-correlation"><strong>TrueForge provenance:</strong> session ${escapeHtml(shortRef(context.sessionId))} · turn ${escapeHtml(shortRef(context.turnId))} · call ${escapeHtml(shortRef(context.toolCallId))}</p>` : ""}${approval.decision === "pending" ? `<p class="approval-gate-note"><strong>Second human gate:</strong> approve this exact verified action to begin protected delivery.</p>${renderApprovalActions(approval)}` : ""}${approval.decision === "approved" ? `<p class="approval-outcome">Approved. Waiting for correlated remote result evidence while protected delivery runs; it is not Done until the exact result is verified.</p>` : ""}${approval.decision === "rejected" ? `<p class="approval-outcome">Rejected. The protected repository operation was not executed.</p>` : ""}${approval.decision === "cancelled" ? `<p class="approval-outcome">Cancelled. The protected repository operation was not executed.</p>` : ""}`;
 }
 
 function renderDeliveryBody(delivery) {
@@ -732,6 +674,7 @@ function renderTicketDrawer(ticket, view) {
 
 function renderReworkContext(ticket, status) {
   const findings = requestedChanges(ticket);
+  if (status === "blocked") return "";
   if (findings.length === 0 && status !== "changes_requested" && !reworkAuthorizationReady(ticket)) return "";
   const message = status === "changes_requested"
     ? `Review the durable findings below, then move this ticket to Ready to authorize bounded attempt ${(ticket.attempt ?? 0) + 1}.`
@@ -757,7 +700,7 @@ function renderDrawerAuthorization(ticket, view) {
   if (status === "awaiting_approval") return `<p><strong>Second human gate: protected delivery approval.</strong> Deterministic proof and independent review are complete for attempt ${escapeHtml(ticket.attempt || "—")}. Review the exact target and approve it below; refresh and reconnect cannot authorize delivery.</p>`;
   if (status === "delivering") return `<p><strong>Delivery authorized.</strong> ${approval?.decidedBy ? `Approved by ${escapeHtml(approval.decidedBy)} at ${escapeHtml(formatTime(approval.decidedAt))}. ` : ""}The protected action and read-back are in progress. The ticket becomes Done only after the repository, base, head, and full head SHA match the approved artifact.</p>`;
   if (status === "done") return `<p><strong>Delivery verified.</strong> The ticket is Done because the protected result was read back and correlated to the approved attempt.</p>`;
-  if (status === "blocked") return `<p><strong>Pipeline stopped.</strong> This ticket cannot be revived by refresh, retry, or stale approval. Inspect the durable finding and authorize a new bounded rework cycle if the queue permits it.</p>`;
+  if (status === "blocked") return `<p><strong>Pipeline blocked.</strong> This ticket stopped on an infrastructure or pipeline failure. Inspect the diagnostic record; no code-rework authorization is available from this state.</p>`;
   if (ticket.executionAuthorization) return `<p>${reworkAuthorizationReady(ticket) ? "Bounded rework is authorized" : "Authorized"} by <strong>${escapeHtml(ticket.executionAuthorization.authorizedBy)}</strong> at ${escapeHtml(formatTime(ticket.executionAuthorization.authorizedAt))}. This authorization remains attached after reconnect.</p>${reworkAuthorizationReady(ticket) ? `<p class="drawer-rework-note">The prior findings remain visible below and will be supplied to the next attempt.</p>` : ""}${canHumanMove(ticket, "backlog", view) ? `<button class="compact-action ticket-transition" type="button" data-ticket-transition="${escapeHtml(ticket.id)}" data-target-status="backlog">Return to Backlog</button>` : ""}`;
   if (ticket.status === "backlog") return `<p>This ticket is waiting for a human decision. Moving it to Ready authorizes TrueForge to claim and execute it.</p><button class="primary-action compact-action ticket-transition" type="button" data-ticket-transition="${escapeHtml(ticket.id)}" data-target-status="ready">Authorize execution</button>`;
   return `<p>Authorization details are not available for this ticket state.</p>`;

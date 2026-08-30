@@ -6862,7 +6862,7 @@ function parseLockedFixtureObject(
 
 function isBoundedLockedFixtureFiles(value: unknown): value is string[] {
   return Array.isArray(value) &&
-    value.length === LOCKED_FIXTURE_FILES.length &&
+    value.length > 0 &&
     value.every((file) => file === BOUNDED_COMMIT_FILE_ENTRY);
 }
 

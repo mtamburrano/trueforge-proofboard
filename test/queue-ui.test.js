@@ -56,11 +56,14 @@ test("Proof Board UI explains the queue mental model and elevates the primary co
   assert.match(appScript, /Changes Requested → Ready/);
   assert.match(appScript, /Awaiting Approval → Delivering → Done/);
   assert.match(appScript, /data-primary-ticket="\$\{isPrimary\}"/);
-  assert.match(appScript, /Gate 1 · Queue authorization/);
-  assert.match(appScript, /Gate 2 · Consequential delivery/);
+  assert.match(appScript, /function renderDeliveryApprovalContext/);
+  assert.doesNotMatch(appScript, /Gate 1 · Queue authorization/);
+  assert.doesNotMatch(appScript, /Gate 2 · Consequential delivery/);
+  assert.doesNotMatch(appScript, /renderApprovalCheckpoint/);
   assert.match(styleSheet, /\.queue-flow\s*\{/);
   assert.match(styleSheet, /\.ticket-card\.primary-ticket\s*\{/);
-  assert.match(styleSheet, /\.checkpoint-delivery-gate\s*\{/);
+  assert.match(styleSheet, /\.delivery-approval-context\s*\{/);
+  assert.doesNotMatch(styleSheet, /\.checkpoint-grid\s*\{/);
 });
 
 test("Proof Board UI keeps durable polling, drawer, activity, proof, and approval affordances", () => {
@@ -79,13 +82,9 @@ test("Proof Board UI keeps durable polling, drawer, activity, proof, and approva
   assert.match(appScript, /Agent activity/);
   assert.match(appScript, /Measured proof/);
   assert.match(appScript, /Model/);
-  assert.match(appScript, /Real execution trail/);
-  assert.match(appScript, /GitHub MCP reads/);
-  assert.match(appScript, /Daytona sandbox work/);
-  assert.match(appScript, /Subagent delegation/);
-  assert.match(appScript, /Reconnect \/ recovery/);
-  assert.match(appScript, /Protected approval checkpoint/);
-  assert.match(appScript, /Delivery read-back/);
+  assert.doesNotMatch(appScript, /Run provenance/);
+  assert.doesNotMatch(appScript, /Real execution trail/);
+  assert.doesNotMatch(appScript, /renderProvenanceTrail/);
   assert.match(appScript, /Show execution provenance/);
   assert.match(appScript, /Proof Board verification owns deterministic status/);
   assert.match(appScript, /verified head SHA/);
@@ -104,8 +103,85 @@ test("Proof Board UI keeps durable polling, drawer, activity, proof, and approva
   assert.match(styleSheet, /\.drawer-rework/);
   assert.match(styleSheet, /\.runtime-facts/);
   assert.match(styleSheet, /\.proof-check-list/);
-  assert.match(styleSheet, /\.provenance-strip/);
+  assert.match(styleSheet, /\.provenance-details/);
+  assert.doesNotMatch(styleSheet, /\.provenance-strip\s*\{/);
   assert.match(styleSheet, /\.activity-details/);
+});
+
+test("delivery approval is absent until a real approval exists and stays compact when it does", () => {
+  const renderSource = appScript.slice(
+    appScript.indexOf("function escapeHtml"),
+    appScript.indexOf("function bindMissionInteractions"),
+  );
+  const { renderDeliveryApprovalContext } = vm.runInNewContext(`${renderSource}\n({ renderDeliveryApprovalContext })`, {
+    labels: { pending: "Pending approval" },
+  });
+  const baseView = {
+    tickets: [{ id: "ticket-delivery", assignedRole: "implementer", status: "awaiting_approval", attempt: 1 }],
+    approvals: [],
+    delivery: [],
+  };
+
+  assert.equal(renderDeliveryApprovalContext(baseView), "");
+
+  const approvalMarkup = renderDeliveryApprovalContext({
+    ...baseView,
+    approvals: [{
+      id: "approval-delivery",
+      decision: "pending",
+      action: "Create pull request",
+      target: "example/proof-board@main",
+      workItemId: "ticket-delivery",
+      attempt: 1,
+      executionContext: {
+        repositoryOwner: "example",
+        repositoryName: "proof-board",
+        base: "main",
+        head: "verified-delivery",
+        headSha: "0123456789abcdef",
+      },
+    }],
+  });
+
+  assert.match(approvalMarkup, /delivery-approval-context/);
+  assert.match(approvalMarkup, /example\/proof-board · main → verified-delivery/);
+  assert.match(approvalMarkup, /Approve exact action/);
+  assert.doesNotMatch(approvalMarkup, /checkpoint-grid|Gate 1|Gate 2/);
+});
+
+test("blocked infrastructure state stays outside rework and remains reachable from the board", () => {
+  const renderSource = appScript.slice(
+    appScript.indexOf("function escapeHtml"),
+    appScript.indexOf("function bindMissionInteractions"),
+  );
+  const { columnForStatus, renderBlockedSummary, renderDrawerAuthorization } = vm.runInNewContext(
+    `${renderSource}\n({ columnForStatus, renderBlockedSummary, renderDrawerAuthorization })`,
+    { labels: {} },
+  );
+  const ticket = {
+    id: "ticket-blocked",
+    title: "Infrastructure failure",
+    status: "blocked",
+    dependsOn: [],
+    attempts: [],
+  };
+  const view = { tickets: [ticket], approvals: [], delivery: [] };
+  const summaryMarkup = renderBlockedSummary(view);
+  const authorizationMarkup = renderDrawerAuthorization(ticket, view);
+
+  assert.equal(columnForStatus("blocked"), "blocked");
+  assert.match(summaryMarkup, /Pipeline blocked/);
+  assert.match(summaryMarkup, /data-ticket-open="ticket-blocked"/);
+  assert.doesNotMatch(summaryMarkup, /Changes Requested|data-target-status="ready"/);
+  assert.match(authorizationMarkup, /Pipeline blocked/);
+  assert.doesNotMatch(authorizationMarkup, /data-ticket-transition|Authorize bounded rework|next bounded pass/);
+});
+
+test("the eight-state board keeps desktop columns reachable through horizontal navigation", () => {
+  assert.match(styleSheet, /\.ticket-board-wrap\s*\{[^}]*overflow-x: auto/);
+  assert.match(styleSheet, /\.ticket-board\s*\{[^}]*grid-template-columns: repeat\(8, minmax\(220px, 1fr\)\)/);
+  assert.match(styleSheet, /min-width: 1816px/);
+  assert.match(styleSheet, /\.ticket-board\s*\{ display: flex; min-width: max-content; min-height: 0; \}/);
 });
 
 test("repeated null-mission polling preserves the mounted intake draft and focus", async () => {

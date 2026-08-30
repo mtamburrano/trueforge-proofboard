@@ -2729,12 +2729,12 @@ test("locked fixture inspection accepts the pinned Todo baseline commit shape", 
   assert.deepEqual(details.patches, LOCKED_FIXTURE_PATCHES);
 });
 
-test("locked fixture inspection accepts the real bounded commit file shape", async () => {
+test("locked fixture inspection accepts the real three-entry bounded commit file shape", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, {
     responseContent: JSON.stringify({
       sha: LOCKED_FIXTURE_SHA,
-      files: ["[bounded]", "[bounded]"],
+      files: ["[bounded]", "[bounded]", "[bounded]"],
     }),
   }));
   const runner = new TrueForgeMissionRunner(missions, client, {
@@ -2762,7 +2762,7 @@ test("locked fixture inspection accepts the real bounded commit file shape", asy
 });
 
 test("bounded locked fixture reads still reject a wrong SHA or uncorrelated response", async () => {
-  const boundedFiles = ["[bounded]", "[bounded]"];
+  const boundedFiles = ["[bounded]", "[bounded]", "[bounded]"];
   const cases = [
     {
       label: "wrong SHA",
