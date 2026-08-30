@@ -1,8 +1,8 @@
 export const PRIMARY_DELIVERY_FIXTURE = {
   owner: "mtamburrano",
   repository: "proofboard-demo-fixture",
-  baselineRef: "acdbbde12203edeee099313a4636ff8c25a83e24",
-  baselineSha: "acdbbde12203edeee099313a4636ff8c25a83e24",
+  baselineRef: "88e53b07691d5ed3d327f5d47179e99c64e672af",
+  baselineSha: "88e53b07691d5ed3d327f5d47179e99c64e672af",
   base: "main",
   head: "proofboard-verified-delivery",
 } as const;

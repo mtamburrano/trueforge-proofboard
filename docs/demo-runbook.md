@@ -67,7 +67,7 @@ It checks:
   sandbox ID verifies that the direct credential reaches the authenticated API
   boundary; a 404 is the expected non-mutating response and a 401 fails closed;
 - the exact fixture `mtamburrano/proofboard-demo-fixture` at pinned baseline
-  `acdbbde12203edeee099313a4636ff8c25a83e24`;
+  `88e53b07691d5ed3d327f5d47179e99c64e672af`;
 - the absence of the owned delivery branch
   `proofboard-verified-delivery`; and
 - the absence of an open owned pull request from that branch into `main`.

@@ -26,11 +26,11 @@ import {
   verifiedDeliveryArtifactHash,
 } from "../dist/index.js";
 
-const LOCKED_FIXTURE_SHA = "acdbbde12203edeee099313a4636ff8c25a83e24";
+const LOCKED_FIXTURE_SHA = "88e53b07691d5ed3d327f5d47179e99c64e672af";
 const LOCKED_FIXTURE_REF = LOCKED_FIXTURE_SHA;
 const VERIFIED_DELIVERY_HEAD_SHA = "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1";
 const SANDBOX_VERIFICATION_INTENT = "Run the requested verification command in the sandbox.";
-const LOCKED_FIXTURE_PATCHES = {
+const LEGACY_LOCKED_FIXTURE_PATCHES = {
   "src/index.ts": [
     "@@ -0,0 +1,11 @@",
     "+export const productName = \"TrueForge Proof Board\" as const;",
@@ -66,6 +66,83 @@ const LOCKED_FIXTURE_PATCHES = {
     "+    \"TrueForge Proof Board: Verified autonomous software delivery — Plan → Execute → Prove → Approve\",",
     "+  );",
     "+});",
+  ].join("\n"),
+};
+
+const LOCKED_FIXTURE_PATCHES = {
+  "src/index.ts": [
+    "@@ -1,11 +1,17 @@",
+    "-export const productName = \"TrueForge Proof Board\" as const;",
+    "-",
+    "-export const productThesis = \"Verified autonomous software delivery\" as const;",
+    "-",
+    "-export const deliveryStages = [\"Plan\", \"Execute\", \"Prove\", \"Approve\"] as const;",
+    "-",
+    "-export type DeliveryStage = (typeof deliveryStages)[number];",
+    "+export interface Todo {",
+    "+  id: number;",
+    "+  title: string;",
+    "+  completed: boolean;",
+    "+}",
+    " ",
+    "-export function getProductSummary(): string {",
+    "-  return `${productName}: ${productThesis} — ${deliveryStages.join(\" → \")}`;",
+    "+export function createTodo(id: number, title: string): Todo {",
+    "+  return {",
+    "+    id,",
+    "+    title,",
+    "+    completed: false,",
+    "+  };",
+    "+}",
+    "+",
+    "+export function getOpenTodos(todos: readonly Todo[]): Todo[] {",
+    "+  return todos.filter((todo) => !todo.completed);",
+    "+}",
+    "\\ No newline at end of file",
+  ].join("\n"),
+  "test/index.test.js": [
+    "@@ -1,19 +1,25 @@",
+    " import assert from \"node:assert/strict\";",
+    " import test from \"node:test\";",
+    " ",
+    "-import {",
+    "-  deliveryStages,",
+    "-  getProductSummary,",
+    "-  productName,",
+    "-  productThesis,",
+    "-} from \"../dist/index.js\";",
+    "+import { createTodo, getOpenTodos } from \"../dist/index.js\";",
+    " ",
+    "-test(\"exports the product identity and delivery thesis\", () => {",
+    "-  assert.equal(productName, \"TrueForge Proof Board\");",
+    "-  assert.equal(productThesis, \"Verified autonomous software delivery\");",
+    "-  assert.deepEqual(deliveryStages, [\"Plan\", \"Execute\", \"Prove\", \"Approve\"]);",
+    "-  assert.equal(",
+    "-    getProductSummary(),",
+    "-    \"TrueForge Proof Board: Verified autonomous software delivery — Plan → Execute → Prove → Approve\",",
+    "-  );",
+    "-});",
+    "+test(\"createTodo creates an open todo\", () => {",
+    "+  assert.deepEqual(createTodo(1, \"Ship the demo\"), {",
+    "+    id: 1,",
+    "+    title: \"Ship the demo\",",
+    "+    completed: false,",
+    "+  });",
+    "+});",
+    "+",
+    "+test(\"getOpenTodos returns only incomplete todos\", () => {",
+    "+  const todos = [",
+    "+    createTodo(1, \"Write tests\"),",
+    "+    { ...createTodo(2, \"Record demo\"), completed: true },",
+    "+    createTodo(3, \"Submit project\"),",
+    "+  ];",
+    "+",
+    "+  assert.deepEqual(",
+    "+    getOpenTodos(todos).map((todo) => todo.id),",
+    "+    [1, 3],",
+    "+  );",
+    "+});",
+    "\\ No newline at end of file",
   ].join("\n"),
 };
 
@@ -2607,7 +2684,7 @@ test("repository inspection proves the MCP call and returned file resource", asy
   assert.equal(state.missions[0].status, "draft");
 });
 
-test("locked fixture inspection proves direct TrueForge get_commit content and expected patches", async () => {
+test("locked fixture inspection accepts the pinned Todo baseline commit shape", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client, calls } = fakeClient(lockedCommitEvents);
   const runner = new TrueForgeMissionRunner(missions, client, {
@@ -2647,6 +2724,37 @@ test("locked fixture inspection proves direct TrueForge get_commit content and e
   });
   assert.equal(details.commit_sha, LOCKED_FIXTURE_SHA);
   assert.deepEqual(details.patches, LOCKED_FIXTURE_PATCHES);
+});
+
+test("locked fixture inspection rejects the old Proof Board fixture shape", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, {
+    patches: LEGACY_LOCKED_FIXTURE_PATCHES,
+  }));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-4-mini",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-mcp-legacy-fixture-rejected",
+    objective: "Reject the old repository fixture shape",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  await assert.rejects(
+    runner.inspectRepository({ missionId: mission.id }),
+    /get_commit MCP response did not contain the pinned SHA and expected file patches/,
+  );
+  const state = await missions.getState();
+  assert.equal(state.missions[0].status, "blocked");
+  assert.equal(
+    state.evidence.some((item) => item.source === "mcp" && item.result === "passed"),
+    false,
+  );
 });
 
 test("locked fixture inspection accepts safe page-one pagination after an iteration-limit stop", async () => {

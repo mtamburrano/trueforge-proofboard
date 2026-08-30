@@ -146,7 +146,7 @@ record remains available across those outcomes.
 
 For the deterministic delivery fixture, `inspectRepository` first proves the
 immutable `mtamburrano/proofboard-demo-fixture` baseline at commit
-`acdbbde12203edeee099313a4636ff8c25a83e24`. After implementation, deterministic
+`88e53b07691d5ed3d327f5d47179e99c64e672af`. After implementation, deterministic
 sandbox proof and accepted semantic review bind approval to the exact current
 artifact: its baseline, two files, contents, and patches. No delivery-branch
 read or remote mutation occurs before the human gate. After approval, the
