@@ -45,6 +45,7 @@ import {
   WorkGraphPlanner,
   IMPLEMENTATION_ARTIFACT_CAPTURE_MODE,
   IMPLEMENTATION_PROOF_MODE,
+  implementationFinalFileContentCommand,
 } from "../trueforge.js";
 import { parseContentDiffEvidence } from "../diff.js";
 import {
@@ -2163,13 +2164,7 @@ function primaryDeliveryArtifactFromProof(
     !sameStringSet(Object.keys(artifact.files), Object.keys(artifact.patches)) ||
     !sameStringRecord(parsedPatches, artifact.patches) ||
     !sameStringRecord(finalFileContents, artifact.files) ||
-    !sameStringRecord(
-      finalFileContentCommands,
-      Object.fromEntries(Object.keys(artifact.files).map((file) => [
-        file,
-        `cat ${PRIMARY_SANDBOX_REPOSITORY_ROOT}/${file}`,
-      ])),
-    ) ||
+    !sameStringRecord(finalFileContentCommands, expectedFinalFileContentCommands(artifact.files)) ||
     Object.keys(artifact.files).some((file) => !allowedFiles.includes(file)) ||
     artifact.contentHash !== verifiedDeliveryArtifactHash(
       artifact.baselineSha,
@@ -2188,6 +2183,15 @@ function primaryDeliveryArtifactFromProof(
     );
   }
   return artifact;
+}
+
+function expectedFinalFileContentCommands(
+  files: Readonly<Record<string, string>>,
+): Record<string, string> {
+  return Object.fromEntries(Object.keys(files).map((file) => [
+    file,
+    implementationFinalFileContentCommand(PRIMARY_SANDBOX_REPOSITORY_ROOT, file) ?? "",
+  ]));
 }
 
 function stringRecord(value: unknown): Record<string, string> | null {

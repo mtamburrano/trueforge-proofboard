@@ -19,16 +19,18 @@ import {
   ReviewContext,
   TRUEFORGE_ROOT_THREAD_ID,
   DeliveryArtifact,
+  isSafeRepositoryRelativeFilePath,
   missionTransitions,
   validateWorkGraph,
 } from "./domain.js";
 import {
   buildDelegatedWorkspaceDeltaCommand,
   changedFilesFromDiff,
-  completeChangedFilesFromCommand,
+  completeChangedFileStatusesFromCommand,
   DELEGATED_WORKSPACE_TREE_SNAPSHOT_COMMAND,
   parseDelegatedWorkspaceDeltaOutput,
   parseDelegatedWorkspaceTreeSnapshotOutput,
+  parseDiffHeader,
   isContentDiffCommand,
   isContentDiffOutput,
 } from "./diff.js";
@@ -1451,11 +1453,29 @@ export class TrueForgeMissionRunner {
         "status --porcelain=v1 -z --untracked-files=all",
       );
       const status = await measure(statusCommand);
-      const statusFiles = completeChangedFilesFromCommand(status.verified.stdout, statusCommand);
-      if (statusFiles === null) {
+      const statusEntries = completeChangedFileStatusesFromCommand(
+        status.verified.stdout,
+        statusCommand,
+      );
+      if (statusEntries === null) {
         throw new TrueForgeIntegrationError(
           "capture implementation artifact",
           "Sandbox artifact capture could not parse the complete changed-file status.",
+        );
+      }
+      const statusFiles = statusEntries.map(({ file }) => file);
+      const deletedFiles = statusEntries
+        .filter(({ status: fileStatus }) => fileStatus.includes("D"))
+        .map(({ file }) => file);
+      if (deletedFiles.length > 0) {
+        throw new TrueForgeIntegrationError(
+          "capture implementation artifact",
+          `Sandbox artifact capture rejected unsupported deleted files before final-content capture: ${deletedFiles.join(", ")}. The push_files publication contract accepts file contents only.`,
+          {
+            failureClass: "implementation",
+            failureCategory: "verification",
+            retryable: false,
+          },
         );
       }
 
@@ -1464,14 +1484,11 @@ export class TrueForgeMissionRunner {
         `diff --no-ext-diff --binary ${baselineSha} --`,
       );
       const diff = await measure(diffCommand);
-      const diffFiles = changedFilesFromDiff(diff.verified.stdout, diffCommand);
-      if (!isContentDiffOutput(diff.verified.stdout) || diffFiles.length === 0) {
-        throw new TrueForgeIntegrationError(
-          "capture implementation artifact",
-          "Sandbox artifact capture found no content-bearing diff from the pinned baseline.",
-        );
-      }
-      const filesChanged = uniqueStrings([...diffFiles, ...statusFiles]);
+      const baselineDiffFiles = changedFilesFromDiff(diff.verified.stdout, diffCommand);
+      const untrackedFiles = statusEntries
+        .filter(({ status: fileStatus }) => fileStatus === "??")
+        .map(({ file }) => file);
+      const filesChanged = uniqueStrings([...baselineDiffFiles, ...statusFiles]);
       const outOfScopeFiles = filesChanged.filter((file) => !allowedFiles.includes(file));
       if (outOfScopeFiles.length > 0) {
         throw new TrueForgeIntegrationError(
@@ -1506,7 +1523,31 @@ export class TrueForgeMissionRunner {
         finalFileContents[file] = measurement.verified.stdout;
       }
 
-      const parsedPatches = parseGitDiffPatches(diff.verified.stdout);
+      const generatedNewFilePatches: Record<string, string> = {};
+      const generatedNewFileDiffs: string[] = [];
+      for (const file of untrackedFiles) {
+        const content = finalFileContents[file];
+        if (content === undefined) {
+          throw new TrueForgeIntegrationError(
+            "capture implementation artifact",
+            `Sandbox artifact capture could not associate measured final content with new file ${file}.`,
+          );
+        }
+        generatedNewFilePatches[file] = generatedNewFilePatch(content);
+        generatedNewFileDiffs.push(generatedNewFileDiff(file, content));
+      }
+      const diffOutput = appendGeneratedDiffs(diff.verified.stdout, generatedNewFileDiffs);
+      const diffFiles = uniqueStrings([...baselineDiffFiles, ...untrackedFiles]);
+      if (!isContentDiffOutput(diffOutput) || diffFiles.length === 0) {
+        throw new TrueForgeIntegrationError(
+          "capture implementation artifact",
+          "Sandbox artifact capture found no content-bearing diff from the pinned baseline.",
+        );
+      }
+      const parsedPatches = mergeParsedGitDiffPatches(
+        parseGitDiffPatches(diff.verified.stdout),
+        generatedNewFilePatches,
+      );
       const deliveryArtifact = verifiedDeliveryArtifactFromProof(
         mission,
         baselineSha,
@@ -1559,7 +1600,7 @@ export class TrueForgeMissionRunner {
         }),
         executionOrigin: sandboxMeasurementOrigin(status),
       });
-      const diffSummary = summarizeOutput(diff.verified.stdout);
+      const diffSummary = summarizeOutput(diffOutput);
       const diffEvidence = await this.missions.addEvidence(mission.id, {
         workItemId: workItem.id,
         kind: "diff_summary",
@@ -1578,7 +1619,7 @@ export class TrueForgeMissionRunner {
             file,
             command,
           })),
-          output_truncated: diff.verified.stdout.trim().length > 4_000,
+          output_truncated: diffOutput.trim().length > 4_000,
           baseline_sha: baselineSha,
           sandbox_id: diff.verified.sandboxId,
           sandbox_lifecycle: diff.verified.sandboxLifecycle,
@@ -1720,14 +1761,29 @@ export class TrueForgeMissionRunner {
         "status --porcelain=v1 -z --untracked-files=all",
       );
       const status = await measure(statusCommand);
-      const statusFiles = completeChangedFilesFromCommand(
+      const statusEntries = completeChangedFileStatusesFromCommand(
         status.verified.stdout,
         statusCommand,
       );
-      if (statusFiles === null) {
+      if (statusEntries === null) {
         throw new TrueForgeIntegrationError(
           "prove implementation",
           "Independent proof could not parse the complete changed-file measurement.",
+        );
+      }
+      const statusFiles = statusEntries.map(({ file }) => file);
+      const deletedFiles = statusEntries
+        .filter(({ status: fileStatus }) => fileStatus.includes("D"))
+        .map(({ file }) => file);
+      if (deletedFiles.length > 0) {
+        throw new TrueForgeIntegrationError(
+          "prove implementation",
+          `Independent proof rejected unsupported deleted files before final-content capture: ${deletedFiles.join(", ")}. The push_files publication contract accepts file contents only.`,
+          {
+            failureClass: "implementation",
+            failureCategory: "verification",
+            retryable: false,
+          },
         );
       }
 
@@ -1736,14 +1792,11 @@ export class TrueForgeMissionRunner {
         `diff --no-ext-diff --binary ${baselineSha} --`,
       );
       const diff = await measure(diffCommand);
-      const diffFiles = changedFilesFromDiff(diff.verified.stdout, diffCommand);
-      if (!isContentDiffOutput(diff.verified.stdout) || diffFiles.length === 0) {
-        throw new TrueForgeIntegrationError(
-          "prove implementation",
-          "Independent proof found no content-bearing diff from the pinned baseline.",
-        );
-      }
-      const filesChanged = uniqueStrings([...diffFiles, ...statusFiles]);
+      const baselineDiffFiles = changedFilesFromDiff(diff.verified.stdout, diffCommand);
+      const untrackedFiles = statusEntries
+        .filter(({ status: fileStatus }) => fileStatus === "??")
+        .map(({ file }) => file);
+      const filesChanged = uniqueStrings([...baselineDiffFiles, ...statusFiles]);
       const outOfScopeFiles = filesChanged.filter((file) => !allowedFiles.includes(file));
       if (outOfScopeFiles.length > 0) {
         throw new TrueForgeIntegrationError(
@@ -1780,6 +1833,28 @@ export class TrueForgeMissionRunner {
           );
         }
         finalFileContents[file] = measurement.verified.stdout;
+      }
+
+      const generatedNewFilePatches: Record<string, string> = {};
+      const generatedNewFileDiffs: string[] = [];
+      for (const file of untrackedFiles) {
+        const content = finalFileContents[file];
+        if (content === undefined) {
+          throw new TrueForgeIntegrationError(
+            "prove implementation",
+            `Independent proof could not associate measured final content with new file ${file}.`,
+          );
+        }
+        generatedNewFilePatches[file] = generatedNewFilePatch(content);
+        generatedNewFileDiffs.push(generatedNewFileDiff(file, content));
+      }
+      const diffOutput = appendGeneratedDiffs(diff.verified.stdout, generatedNewFileDiffs);
+      const diffFiles = uniqueStrings([...baselineDiffFiles, ...untrackedFiles]);
+      if (!isContentDiffOutput(diffOutput) || diffFiles.length === 0) {
+        throw new TrueForgeIntegrationError(
+          "prove implementation",
+          "Independent proof found no content-bearing diff from the pinned baseline.",
+        );
       }
 
       const checkMeasurements: Array<{
@@ -1855,8 +1930,11 @@ export class TrueForgeMissionRunner {
         }),
         executionOrigin: sandboxMeasurementOrigin(status),
       });
-      const diffSummary = summarizeOutput(diff.verified.stdout);
-      const parsedPatches = parseGitDiffPatches(diff.verified.stdout);
+      const diffSummary = summarizeOutput(diffOutput);
+      const parsedPatches = mergeParsedGitDiffPatches(
+        parseGitDiffPatches(diff.verified.stdout),
+        generatedNewFilePatches,
+      );
       const deliveryArtifact = verifiedDeliveryArtifactFromProof(
         mission,
         baselineSha,
@@ -1884,7 +1962,7 @@ export class TrueForgeMissionRunner {
             file,
             command,
           })),
-          output_truncated: diff.verified.stdout.trim().length > 4_000,
+          output_truncated: diffOutput.trim().length > 4_000,
           baseline_sha: baselineSha,
           sandbox_id: diff.verified.sandboxId,
           sandbox_lifecycle: diff.verified.sandboxLifecycle,
@@ -4777,21 +4855,21 @@ function implementationCheckCommand(repositoryRoot: string, name: string): strin
   return null;
 }
 
-function implementationFinalFileContentCommand(
+export function implementationFinalFileContentCommand(
   repositoryRoot: string,
   file: string,
 ): string | null {
   if (
     repositoryRoot !== PRIMARY_SANDBOX_REPOSITORY_ROOT ||
-    file.length === 0 ||
-    file.length > 500 ||
-    !/^[A-Za-z0-9._/-]+$/.test(file) ||
-    file.startsWith("/") ||
-    file.split("/").some((segment) => segment.length === 0 || segment === "." || segment === "..")
+    !isSafeRepositoryRelativeFilePath(file)
   ) {
     return null;
   }
-  return `cat ${repositoryRoot}/${file}`;
+  const path = `${repositoryRoot}/${file}`;
+  const shellPath = /^[A-Za-z0-9._/-]+$/.test(path)
+    ? path
+    : `'${path.replaceAll("'", "'\\''")}'`;
+  return `cat ${shellPath}`;
 }
 
 function sandboxMeasurementOrigin(measurement: IndependentSandboxMeasurement): ExecutionOrigin {
@@ -5025,9 +5103,17 @@ function parseGitDiffPatches(
     if (start === undefined) {
       return null;
     }
-    const header = lines[start]?.match(/^diff --git a\/(.+) b\/(.+)$/);
-    const filename = header?.[1];
-    if (header === null || header === undefined || filename === undefined || header[2] !== filename) {
+    const header = parseDiffHeader(lines[start] ?? "");
+    const filename = header === null
+      ? undefined
+      : header.after === "/dev/null"
+        ? header.before
+        : header.after;
+    if (
+      header === null ||
+      filename === undefined ||
+      header.before !== header.after
+    ) {
       return null;
     }
     const segment = lines.slice(start + 1, end);
@@ -5042,6 +5128,70 @@ function parseGitDiffPatches(
     patches[filename] = patch;
   }
   return patches;
+}
+
+function generatedNewFilePatch(content: string): string {
+  const normalizedContent = content.replace(/\r\n/g, "\n");
+  const contentLines = normalizedContent.length === 0
+    ? []
+    : normalizedContent.endsWith("\n")
+      ? normalizedContent.slice(0, -1).split("\n")
+      : normalizedContent.split("\n");
+  const newFileRange = contentLines.length === 0
+    ? "+0,0"
+    : contentLines.length === 1
+      ? "+1"
+      : `+1,${contentLines.length}`;
+  const patchLines = [
+    `@@ -0,0 ${newFileRange} @@`,
+    ...contentLines.map((line) => `+${line}`),
+  ];
+  if (normalizedContent.length > 0 && !normalizedContent.endsWith("\n")) {
+    patchLines.push("\\ No newline at end of file");
+  }
+  return patchLines.join("\n");
+}
+
+function generatedNewFileDiff(file: string, content: string): string {
+  const before = formatGitDiffPath("a", file);
+  const after = formatGitDiffPath("b", file);
+  return [
+    `diff --git ${before} ${after}`,
+    "new file mode 100644",
+    "--- /dev/null",
+    `+++ ${after}`,
+    generatedNewFilePatch(content),
+  ].join("\n");
+}
+
+function formatGitDiffPath(prefix: "a" | "b", file: string): string {
+  const path = `${prefix}/${file}`;
+  return /^[A-Za-z0-9._/-]+$/.test(path) ? path : JSON.stringify(path);
+}
+
+function appendGeneratedDiffs(
+  measuredDiff: string,
+  generatedDiffs: readonly string[],
+): string {
+  if (generatedDiffs.length === 0) {
+    return measuredDiff;
+  }
+  const measured = measuredDiff.replace(/\n+$/, "");
+  return [measured, ...generatedDiffs].filter((part) => part.length > 0).join("\n");
+}
+
+function mergeParsedGitDiffPatches(
+  measuredPatches: Readonly<Record<string, string>> | null,
+  generatedPatches: Readonly<Record<string, string>>,
+): Record<string, string> | null {
+  const merged: Record<string, string> = { ...(measuredPatches ?? {}) };
+  for (const [file, patch] of Object.entries(generatedPatches)) {
+    if (merged[file] !== undefined) {
+      return null;
+    }
+    merged[file] = patch;
+  }
+  return Object.keys(merged).length === 0 ? null : merged;
 }
 
 function verifiedDeliveryArtifactFromProof(

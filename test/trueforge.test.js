@@ -4387,6 +4387,207 @@ test("independent implementation proof measures final facts after normal agentic
   assert.equal(context.evidence.every((evidence) => evidence.source === "sandbox"), true);
 });
 
+test("same-sandbox artifact capture builds a content-bearing artifact for a scoped untracked file", async () => {
+  const repositoryRoot = PRIMARY_SANDBOX_REPOSITORY_ROOT;
+  const file = "docs/notes/naïve draft.txt";
+  const content = "A newly captured proof file.\n";
+  const commands = [
+    `git -C ${repositoryRoot} config --get remote.origin.url`,
+    `git -C ${repositoryRoot} status --porcelain=v1 -z --untracked-files=all`,
+    `git -C ${repositoryRoot} diff --no-ext-diff --binary ${LOCKED_FIXTURE_SHA} --`,
+    `cat '${repositoryRoot}/${file}'`,
+  ];
+  const outputs = [
+    "https://github.com/mtamburrano/proofboard-demo-fixture.git\n",
+    `?? ${file}\u0000`,
+    "",
+    content,
+  ];
+  const { client, calls } = fakeClient();
+  const sandboxExecutor = fakeSandboxExecutor(commands, outputs, "sandbox-untracked-proof");
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-4-mini",
+    sandboxExecutor,
+  });
+  const mission = await runner.createMission({
+    id: "mission-untracked-artifact",
+    objective: "Capture a scoped newly created file.",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_SHA,
+    },
+  });
+  const workItem = await missions.addWorkItem(mission.id, {
+    id: "work-untracked-artifact",
+    title: "Capture the new proof file",
+    purpose: "Keep a newly created file inside the approved scope.",
+    acceptanceCriteria: ["The new file is represented by final content and a content-bearing patch."],
+    assignedRole: "implementer",
+    requiredChecks: ["typecheck", "test"],
+    allowedFiles: [file],
+    status: "backlog",
+  });
+  await missions.attachTrueforgeSession(mission.id, "session-untracked-artifact");
+  await missions.attachTrueforgeTurn(mission.id, "turn-untracked-artifact");
+  await missions.attachTrueforgeSandbox(mission.id, "sandbox-untracked-proof");
+  await missions.authorizeWorkItem(mission.id, workItem.id, { actor: "test-operator" });
+  await missions.claimReadyWorkItem(mission.id, workItem.id, {
+    owner: "test-worker",
+    trueforgeSessionId: "session-untracked-artifact",
+    trueforgeSandboxId: "sandbox-untracked-proof",
+  });
+
+  const proof = await runner.captureImplementationArtifact({
+    missionId: mission.id,
+    workItemId: workItem.id,
+  });
+
+  assert.deepEqual(proof.filesChanged, [file]);
+  assert.equal(proof.deliveryArtifact.files[file], content);
+  assert.match(proof.deliveryArtifact.patches[file], /\+A newly captured proof file\./);
+  assert.match(proof.diffSummary, /diff --git "a\/docs\/notes\/naïve draft\.txt"/);
+  assert.equal(sandboxExecutor.calls.length, commands.length);
+  assert.deepEqual(sandboxExecutor.calls.map((call) => call.command), commands);
+  assert.equal(calls.turns.length, 0);
+});
+
+test("independent implementation proof rejects deletion before final-content capture", async () => {
+  const repositoryRoot = PRIMARY_SANDBOX_REPOSITORY_ROOT;
+  const commands = [
+    `git -C ${repositoryRoot} config --get remote.origin.url`,
+    `git -C ${repositoryRoot} merge-base --is-ancestor ${LOCKED_FIXTURE_SHA} HEAD`,
+    `git -C ${repositoryRoot} status --porcelain=v1 -z --untracked-files=all`,
+  ];
+  const outputs = [
+    "https://github.com/mtamburrano/proofboard-demo-fixture.git\n",
+    "",
+    " D src/index.ts\u0000",
+  ];
+  const { client, calls } = fakeClient();
+  const sandboxExecutor = fakeSandboxExecutor(commands, outputs, "sandbox-deletion-proof");
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-4-mini",
+    sandboxExecutor,
+  });
+  const mission = await runner.createMission({
+    id: "mission-deletion-artifact",
+    objective: "Reject an unsupported deleted file.",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_SHA,
+    },
+  });
+  const workItem = await missions.addWorkItem(mission.id, {
+    id: "work-deletion-artifact",
+    title: "Reject deleted publication content",
+    purpose: "Do not represent unsupported deletion as a captured file.",
+    acceptanceCriteria: ["Deletion is rejected before final-content capture."],
+    assignedRole: "implementer",
+    requiredChecks: ["typecheck", "test"],
+    allowedFiles: ["src/index.ts"],
+    status: "ready",
+  });
+  await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
+  await missions.attachTrueforgeTurn(mission.id, "turn-deletion-artifact");
+  await missions.attachTrueforgeSandbox(mission.id, "sandbox-deletion-proof");
+
+  await assert.rejects(
+    runner.proveImplementation({ missionId: mission.id, workItemId: workItem.id }),
+    (error) => error instanceof TrueForgeIntegrationError &&
+      error.retryable === false &&
+      error.failureClass === "implementation" &&
+      error.failureCategory === "verification" &&
+      /unsupported deleted files before final-content capture/.test(error.message),
+  );
+  assert.equal(calls.turns.length, 0);
+  assert.deepEqual(sandboxExecutor.calls.map((call) => call.command), commands);
+  const state = await missions.getState();
+  const failure = state.evidence.find((evidence) => evidence.result === "failed");
+  assert.ok(failure);
+  const details = JSON.parse(failure.details);
+  assert.equal(details.failure_class, "implementation");
+  assert.equal(details.retryable, false);
+  assert.equal(details.measurements.length, commands.length);
+  assert.equal(details.measurements.some((measurement) => measurement.command.startsWith("cat ")), false);
+});
+
+test("independent implementation proof captures a safe space-and-Unicode path", async () => {
+  const repositoryRoot = PRIMARY_SANDBOX_REPOSITORY_ROOT;
+  const file = "docs/notes/café menu.txt";
+  const content = "before\nafter\n";
+  const gitQuotedFile = "docs/notes/caf\\303\\251 menu.txt";
+  const diffOutput = [
+    `diff --git "a/${gitQuotedFile}" "b/${gitQuotedFile}"`,
+    `--- "a/${gitQuotedFile}"`,
+    `+++ "b/${gitQuotedFile}"`,
+    "@@ -1 +1,2 @@",
+    " before",
+    "+after",
+  ].join("\n");
+  const commands = [
+    `git -C ${repositoryRoot} config --get remote.origin.url`,
+    `git -C ${repositoryRoot} merge-base --is-ancestor ${LOCKED_FIXTURE_SHA} HEAD`,
+    `git -C ${repositoryRoot} status --porcelain=v1 -z --untracked-files=all`,
+    `git -C ${repositoryRoot} diff --no-ext-diff --binary ${LOCKED_FIXTURE_SHA} --`,
+    `cat '${repositoryRoot}/${file}'`,
+    `npm --prefix ${repositoryRoot} run typecheck`,
+    `npm --prefix ${repositoryRoot} test`,
+  ];
+  const outputs = [
+    "https://github.com/mtamburrano/proofboard-demo-fixture.git\n",
+    "",
+    ` M ${file}\u0000`,
+    diffOutput,
+    content,
+    "typecheck passed\n",
+    "tests passed\n",
+  ];
+  const { client, calls } = fakeClient();
+  const sandboxExecutor = fakeSandboxExecutor(commands, outputs, "sandbox-safe-path-proof");
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-4-mini",
+    sandboxExecutor,
+  });
+  const mission = await runner.createMission({
+    id: "mission-safe-path-artifact",
+    objective: "Capture a safe repository path with spaces and Unicode.",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_SHA,
+    },
+  });
+  const workItem = await missions.addWorkItem(mission.id, {
+    id: "work-safe-path-artifact",
+    title: "Capture the safe path",
+    purpose: "Keep a valid repository-relative path shell-safe during capture.",
+    acceptanceCriteria: ["The final content command accepts the approved path."],
+    assignedRole: "implementer",
+    requiredChecks: ["typecheck", "test"],
+    allowedFiles: [file],
+    status: "ready",
+  });
+  await missions.transitionWorkItem(mission.id, workItem.id, "in_progress");
+  await missions.attachTrueforgeTurn(mission.id, "turn-safe-path-artifact");
+  await missions.attachTrueforgeSandbox(mission.id, "sandbox-safe-path-proof");
+
+  const proof = await runner.proveImplementation({
+    missionId: mission.id,
+    workItemId: workItem.id,
+  });
+
+  assert.deepEqual(proof.filesChanged, [file]);
+  assert.equal(proof.deliveryArtifact.files[file], content);
+  assert.equal(sandboxExecutor.calls[4]?.command, `cat '${repositoryRoot}/${file}'`);
+  assert.equal(proof.deliveryArtifact.patches[file], "@@ -1 +1,2 @@\n before\n+after");
+  assert.equal(calls.turns.length, 0);
+});
+
 test("direct sandbox proof derives distinct artifacts from distinct final file contents", async () => {
   const repositoryRoot = PRIMARY_SANDBOX_REPOSITORY_ROOT;
   const fixtureSnapshot = {

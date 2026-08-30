@@ -805,27 +805,29 @@ function boundedString(value: unknown, label: string, maxLength: number): string
   return value;
 }
 
+export function isSafeRepositoryRelativeFilePath(file: string): boolean {
+  return file.length > 0 &&
+    !file.startsWith("/") &&
+    !file.startsWith("\\") &&
+    !/^[A-Za-z]:[\\/]/.test(file) &&
+    !file.includes("\\") &&
+    file.length <= 500 &&
+    !/[\u0000-\u001f\u007f]/.test(file) &&
+    !file.includes("*") &&
+    !file.includes("?") &&
+    !file.includes("[") &&
+    !file.includes("]") &&
+    !/[;|&$`(){}<>"']/.test(file) &&
+    file.split("/").every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
+}
+
 function filePathArray(
   value: unknown,
   label: string,
 ): string[] {
   const files = stringArray(value, label, MAX_WORK_ITEM_ALLOWED_FILES);
   for (const file of files) {
-    if (
-      file.startsWith("/") ||
-      file.startsWith("\\") ||
-      /^[A-Za-z]:[\\/]/.test(file) ||
-      file.includes("\\") ||
-      file.length > 500 ||
-      file.includes("\u0000") ||
-      /[\u0000-\u001f\u007f]/.test(file) ||
-      file.includes("*") ||
-      file.includes("?") ||
-      file.includes("[") ||
-      file.includes("]") ||
-      /[;|&$`(){}<>"']/.test(file) ||
-      file.split("/").some((segment) => segment.length === 0 || segment === "." || segment === "..")
-    ) {
+    if (!isSafeRepositoryRelativeFilePath(file)) {
       return fail(
         "invalid_input",
         `${label} must contain safe repository-relative file paths without traversal or shell wildcards.`,
