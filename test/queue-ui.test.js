@@ -95,6 +95,13 @@ test("Proof Board UI keeps durable polling, drawer, activity, proof, and approva
   assert.match(styleSheet, /\.activity-details/);
 });
 
+test("Proof Board UI uses the returned mission state for run feedback", () => {
+  assert.match(appScript, /const payload = await runCoordinator\.run\(\)/);
+  assert.match(appScript, /MissionRunState\.describeRunOutcome\(payload\?\.mission \?\? currentView\)/);
+  assert.doesNotMatch(appScript, /TrueForge run completed with durable verification evidence/);
+  assert.match(styleSheet, /\.toast-warning\s*\{/);
+});
+
 test("Agent activity excludes deterministic proof and control-plane activity", () => {
   const runtimeSource = appScript.slice(
     appScript.indexOf("function ticketActivity"),

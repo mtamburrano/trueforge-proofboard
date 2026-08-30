@@ -18,6 +18,7 @@ import {
   WorkItem,
   ReviewContext,
   TRUEFORGE_ROOT_THREAD_ID,
+  DeliveryArtifact,
   missionTransitions,
   validateWorkGraph,
 } from "./domain.js";
@@ -33,7 +34,10 @@ import {
 } from "./diff.js";
 import {
   PRIMARY_DELIVERY_FIXTURE,
+  PRIMARY_VERIFIED_DELIVERY_ARTIFACT,
+  PRIMARY_VERIFIED_DELIVERY_FILES,
   PRIMARY_VERIFIED_DELIVERY_PATCHES,
+  verifiedDeliveryArtifactHash,
   PRIMARY_SANDBOX_REPOSITORY_ROOT,
 } from "./fixture.js";
 
@@ -51,10 +55,18 @@ export interface SandboxCommandExecutionRequest {
   timeoutSeconds?: number;
 }
 
+export interface SandboxLifecycleObservation {
+  initialState: string;
+  finalState: string;
+  action: "none" | "start" | "wait_until_started";
+  recovered: boolean;
+}
+
 export interface SandboxCommandExecutionResult {
   sandboxId?: string;
   exitCode: number;
   stdout: string;
+  sandboxLifecycle?: SandboxLifecycleObservation;
 }
 
 export interface SandboxCommandExecutor {
@@ -211,6 +223,8 @@ const MAX_IMPLEMENTATION_PROOF_OUTPUT_LENGTH = 2_000_000;
 export const IMPLEMENTATION_PROOF_MODE = "application_direct_sandbox" as const;
 export const MAX_COORDINATOR_ZERO_TOOL_RETRIES = 2;
 const PULL_REQUEST_READ_TOOL_NAME = "pull_request_read";
+const DELIVERY_PUBLICATION_TOOL_NAME = "push_files";
+const DELIVERY_PUBLICATION_MESSAGE = "Publish the verified Proof Board delivery artifact";
 
 /**
  * Keep enough room for a bounded coding turn while reserving a finite upper
@@ -634,6 +648,7 @@ export interface PullRequestDeliveryTarget {
   base: string;
   head: string;
   headSha?: string;
+  artifact?: DeliveryArtifact;
   title: string;
   body: string;
 }
@@ -644,7 +659,7 @@ export interface TrueForgeDeliveryApproval {
   threadId: string;
   toolCallId: string;
   serverName: string;
-  toolName: "create_pull_request";
+  toolName: "create_pull_request" | "push_files";
   target: PullRequestDeliveryTarget;
 }
 
@@ -671,6 +686,7 @@ export interface DeliveryHeadInspectionInput {
   missionId: string;
   target: PullRequestDeliveryTarget;
   workItemId?: string;
+  previousTurnId?: string;
   mcpServerName?: string;
 }
 
@@ -811,6 +827,7 @@ export interface ImplementationHandoffDraft {
   openQuestions: string[];
   evidenceIds: string[];
   executionOrigin: ExecutionOrigin;
+  deliveryArtifact?: DeliveryArtifact;
 }
 
 interface RuntimeEvidence {
@@ -912,6 +929,7 @@ interface IndependentSandboxExecution {
   toolCallId?: string;
   observedExecCount: number;
   sandboxId: string;
+  sandboxLifecycle?: SandboxLifecycleObservation;
 }
 
 interface ImplementationProofMeasurement {
@@ -920,6 +938,7 @@ interface ImplementationProofMeasurement {
   exitCode?: number;
   output?: string;
   sandboxId?: string;
+  sandboxLifecycle?: SandboxLifecycleObservation;
   error?: string;
 }
 
@@ -1101,7 +1120,12 @@ function defaultRepositoryMcpServer(
       "get_commit",
       ...(config.deliveryToolName === undefined
         ? []
-        : [config.deliveryToolName, PULL_REQUEST_READ_TOOL_NAME, "search_pull_requests"]),
+        : [
+            config.deliveryToolName,
+            DELIVERY_PUBLICATION_TOOL_NAME,
+            PULL_REQUEST_READ_TOOL_NAME,
+            "search_pull_requests",
+          ]),
     ]),
   ];
   const server: TrueForgeApi.McpServer = {
@@ -1110,7 +1134,7 @@ function defaultRepositoryMcpServer(
     preloadTools: toolNames,
   };
   if (config.deliveryToolName !== undefined) {
-    server.requireApprovalForTools = [config.deliveryToolName];
+    server.requireApprovalForTools = [config.deliveryToolName, DELIVERY_PUBLICATION_TOOL_NAME];
   }
   return server;
 }
@@ -1357,6 +1381,9 @@ export class TrueForgeMissionRunner {
             exitCode: measurement.verified.exitCode,
             output: measurement.verified.outputSummary,
             sandboxId: measurement.verified.sandboxId,
+            ...(measurement.verified.sandboxLifecycle === undefined
+              ? {}
+              : { sandboxLifecycle: measurement.verified.sandboxLifecycle }),
           });
           recorded = true;
           if (measurement.verified.exitCode !== 0) {
@@ -1460,15 +1487,16 @@ export class TrueForgeMissionRunner {
         result: "passed",
         source: "sandbox",
         summary: `Independent proof verified repository ${expectedRepository} at ${repositoryRoot}.`,
-        details: JSON.stringify({
-          proof_mode: IMPLEMENTATION_PROOF_MODE,
-          command: remoteCommand,
+          details: JSON.stringify({
+            proof_mode: IMPLEMENTATION_PROOF_MODE,
+            command: remoteCommand,
           repository: expectedRepository,
           repository_root: repositoryRoot,
-          remote_url: remote.verified.stdout.trim(),
-          exit_code: remote.verified.exitCode,
-          sandbox_id: remote.verified.sandboxId,
-        }),
+            remote_url: remote.verified.stdout.trim(),
+            exit_code: remote.verified.exitCode,
+            sandbox_id: remote.verified.sandboxId,
+            sandbox_lifecycle: remote.verified.sandboxLifecycle,
+          }),
         executionOrigin: sandboxMeasurementOrigin(remote),
       });
       const ancestryEvidence = await this.missions.addEvidence(mission.id, {
@@ -1483,6 +1511,7 @@ export class TrueForgeMissionRunner {
           baseline_sha: baselineSha,
           exit_code: ancestry.verified.exitCode,
           sandbox_id: ancestry.verified.sandboxId,
+          sandbox_lifecycle: ancestry.verified.sandboxLifecycle,
         }),
         executionOrigin: sandboxMeasurementOrigin(ancestry),
       });
@@ -1500,10 +1529,17 @@ export class TrueForgeMissionRunner {
           output: status.verified.stdout,
           changed_files: statusFiles,
           sandbox_id: status.verified.sandboxId,
+          sandbox_lifecycle: status.verified.sandboxLifecycle,
         }),
         executionOrigin: sandboxMeasurementOrigin(status),
       });
       const diffSummary = summarizeOutput(diff.verified.stdout);
+      const deliveryArtifact = verifiedDeliveryArtifactFromProof(
+        mission,
+        baselineSha,
+        diffFiles,
+        diff.verified.stdout,
+      );
       const diffEvidence = await this.missions.addEvidence(mission.id, {
         workItemId: workItem.id,
         kind: "diff_summary",
@@ -1519,6 +1555,14 @@ export class TrueForgeMissionRunner {
           output_truncated: diff.verified.stdout.trim().length > 4_000,
           baseline_sha: baselineSha,
           sandbox_id: diff.verified.sandboxId,
+          sandbox_lifecycle: diff.verified.sandboxLifecycle,
+          ...(deliveryArtifact === undefined
+            ? {}
+            : {
+                provenance_kind: "implementation_artifact",
+                artifact_hash: deliveryArtifact.contentHash,
+                delivery_artifact: deliveryArtifact,
+              }),
         }),
         executionOrigin: sandboxMeasurementOrigin(diff),
       });
@@ -1537,6 +1581,7 @@ export class TrueForgeMissionRunner {
             exit_code: measurement.verified.exitCode,
             output: measurement.verified.outputSummary,
             sandbox_id: measurement.verified.sandboxId,
+            sandbox_lifecycle: measurement.verified.sandboxLifecycle,
           }),
           executionOrigin: sandboxMeasurementOrigin(measurement),
         });
@@ -1564,6 +1609,7 @@ export class TrueForgeMissionRunner {
           diffEvidence.id,
           ...checkEvidenceIds,
         ],
+        ...(deliveryArtifact === undefined ? {} : { deliveryArtifact }),
         executionOrigin: {
           kind: "sandbox",
           sessionId: remote.sessionId,
@@ -1694,6 +1740,9 @@ export class TrueForgeMissionRunner {
         outputSummary: summarizeOutput(stdout),
         observedExecCount: 1,
         sandboxId,
+        ...(execution.sandboxLifecycle === undefined
+          ? {}
+          : { sandboxLifecycle: execution.sandboxLifecycle }),
       },
     };
   }
@@ -2016,16 +2065,23 @@ export class TrueForgeMissionRunner {
     targetInput: PullRequestDeliveryTarget,
   ): Promise<TrueForgeDeliveryApproval> {
     const target = validatePullRequestDeliveryTarget(targetInput);
-    requireVerifiedDeliveryHeadSha(target, "request pull request approval");
     const serverName = requiredString(
       this.config.mcpServerName ?? "github",
       "MCP server name",
       "request pull request approval",
     );
-    ensureDeliveryMcpConfigured(this.config, serverName);
+    if (target.artifact !== undefined) {
+      requireVerifiedDeliveryArtifact(target, "request pull request approval");
+      ensureDeliveryMcpConfigured(this.config, serverName, true);
+    } else {
+      requireVerifiedDeliveryHeadSha(target, "request pull request approval");
+      ensureDeliveryMcpConfigured(this.config, serverName, false);
+    }
     const execution = await this.executeTurn(
       missionId,
-      buildPullRequestDeliveryInstruction(serverName, target),
+      target.artifact === undefined
+        ? buildPullRequestDeliveryInstruction(serverName, target)
+        : buildDeliveryPublicationInstruction(serverName, target),
       {},
     );
     return pendingDeliveryApprovalFromEvents(
@@ -2034,6 +2090,7 @@ export class TrueForgeMissionRunner {
       execution.turnId,
       serverName,
       target,
+      target.artifact === undefined ? "create_pull_request" : DELIVERY_PUBLICATION_TOOL_NAME,
     );
   }
 
@@ -2052,7 +2109,10 @@ export class TrueForgeMissionRunner {
         "The pending approval is not correlated to the mission TrueForge session.",
       );
     }
-    ensureDeliveryMcpConfigured(this.config, pending.serverName);
+    ensureDeliveryMcpConfigured(this.config, pending.serverName, pending.toolName === DELIVERY_PUBLICATION_TOOL_NAME);
+    if (pending.toolName === DELIVERY_PUBLICATION_TOOL_NAME) {
+      return this.resolveVerifiedArtifactDelivery(missionId, pending, decision, workItemId);
+    }
     if (decision === "approved") {
       // Branch refs are mutable. Re-read the exact ref immediately before allowing the protected call.
       await this.revalidateApprovedDeliveryHead(missionId, target);
@@ -2145,7 +2205,10 @@ export class TrueForgeMissionRunner {
         "The pending approval is not correlated to the mission TrueForge session.",
       );
     }
-    ensureDeliveryMcpConfigured(this.config, pending.serverName);
+    ensureDeliveryMcpConfigured(this.config, pending.serverName, pending.toolName === DELIVERY_PUBLICATION_TOOL_NAME);
+    if (pending.toolName === DELIVERY_PUBLICATION_TOOL_NAME) {
+      return this.reconcileVerifiedArtifactDelivery(missionId, pending, workItemId, knownPullRequest);
+    }
 
     let pullRequest: ParsedPullRequestCreation;
     let previousTurnId = pending.turnId;
@@ -2249,6 +2312,315 @@ export class TrueForgeMissionRunner {
       threadId: pending.threadId,
       toolCallId: pending.toolCallId,
     };
+  }
+
+  private async resolveVerifiedArtifactDelivery(
+    missionId: string,
+    pending: TrueForgeDeliveryApproval,
+    decision: "approved" | "rejected" | "cancelled",
+    workItemId?: string,
+  ): Promise<TrueForgePullRequestResult | null> {
+    const target = validatePullRequestDeliveryTarget(pending.target);
+    const artifact = requireVerifiedDeliveryArtifact(target, "resolve pull request approval");
+    const execution = await this.resumeNativeDeliveryApproval(
+      missionId,
+      pending,
+      decision,
+      "resolve pull request approval",
+    );
+    const response = toolResponseForCall(execution.rawEvents, pending.toolCallId, pending.threadId);
+    if (decision !== "approved") {
+      if (response !== undefined) {
+        throw new TrueForgeIntegrationError(
+          "resolve pull request approval",
+          "TrueForge advanced the protected publication boundary after the action was denied.",
+        );
+      }
+      return null;
+    }
+    if (response?.type !== "tool.response") {
+      throw new TrueForgeIntegrationError(
+        "resolve pull request approval",
+        "The approved push_files tool call returned no structured response.",
+      );
+    }
+    const publishedHeadSha = parsePublishedArtifactResponse(response, target);
+    if (publishedHeadSha === null) {
+      throw new TrueForgeIntegrationError(
+        "resolve pull request approval",
+        "The approved push_files response did not identify a changed published commit.",
+      );
+    }
+    const publishedTarget: PullRequestDeliveryTarget = {
+      ...target,
+      headSha: publishedHeadSha,
+    };
+    const inspection = await this.inspectDeliveryHead({
+      missionId,
+      target: publishedTarget,
+      ...(workItemId === undefined ? {} : { workItemId }),
+      previousTurnId: execution.turnId,
+      mcpServerName: pending.serverName,
+    });
+    if (
+      inspection.commitSha !== publishedHeadSha ||
+      !deliveryPatchesMatch(inspection.patches, artifact.patches)
+    ) {
+      throw new TrueForgeIntegrationError(
+        "resolve pull request approval",
+        "The independently read published branch does not match the approved sandbox artifact; the pull request was not created.",
+      );
+    }
+    return this.createPullRequestAfterPublishedArtifact(
+      missionId,
+      pending,
+      publishedTarget,
+      inspection.turnId,
+      workItemId,
+    );
+  }
+
+  private async reconcileVerifiedArtifactDelivery(
+    missionId: string,
+    pending: TrueForgeDeliveryApproval,
+    workItemId?: string,
+    knownPullRequest?: PullRequestReference,
+  ): Promise<TrueForgePullRequestResult | null> {
+    const target = validatePullRequestDeliveryTarget(pending.target);
+    const artifact = requireVerifiedDeliveryArtifact(target, "reconcile pull request approval");
+    const branch = await this.inspectDeliveryHead({
+      missionId,
+      target,
+      ...(workItemId === undefined ? {} : { workItemId }),
+      previousTurnId: pending.turnId,
+      mcpServerName: pending.serverName,
+    });
+    const publishedHeadSha = branch.commitSha;
+    if (publishedHeadSha === undefined) {
+      throw new TrueForgeIntegrationError(
+        "reconcile pull request approval",
+        "Read-only reconciliation did not identify the published delivery branch head.",
+      );
+    }
+    const publishedTarget: PullRequestDeliveryTarget = {
+      ...target,
+      headSha: publishedHeadSha,
+    };
+    if (!deliveryPatchesMatch(branch.patches, artifact.patches)) {
+      throw new TrueForgeIntegrationError(
+        "reconcile pull request approval",
+        "Read-only reconciliation found a published branch whose diff does not match the approved sandbox artifact.",
+      );
+    }
+
+    let pullRequest: ParsedPullRequestCreation | undefined;
+    let previousTurnId = branch.turnId;
+    if (knownPullRequest !== undefined) {
+      const known = canonicalPullRequestUrl(knownPullRequest.url, publishedTarget);
+      if (
+        known === null ||
+        known.number !== knownPullRequest.number ||
+        knownPullRequest.repositoryOwner !== publishedTarget.owner ||
+        knownPullRequest.repositoryName !== publishedTarget.repo ||
+        knownPullRequest.base !== publishedTarget.base ||
+        knownPullRequest.head !== publishedTarget.head ||
+        knownPullRequest.headSha !== publishedHeadSha
+      ) {
+        throw new TrueForgeIntegrationError(
+          "reconcile pull request approval",
+          "The persisted delivery result does not match the independently verified published artifact.",
+        );
+      }
+      pullRequest = known;
+    } else {
+      const execution = await this.executeTurn(
+        missionId,
+        buildPullRequestReconciliationInstruction(pending.serverName, publishedTarget),
+        { previousTurnId: branch.turnId },
+      );
+      previousTurnId = execution.turnId;
+      requireCompletedTurn(
+        execution.rawEvents,
+        "reconcile pull request approval",
+        "pull request reconciliation",
+      );
+      const initialization = execution.rawEvents.find((event) => event.type === "mcp.initialize");
+      const initializedServers = initialization === undefined
+        ? undefined
+        : recordValue(initialization).mcpServers;
+      if (
+        !Array.isArray(initializedServers) ||
+        !initializedServers.some((server) => isRecord(server) && server.name === pending.serverName)
+      ) {
+        throw new TrueForgeIntegrationError(
+          "reconcile pull request approval",
+          `MCP server ${pending.serverName} was not initialized for read-only pull request reconciliation.`,
+        );
+      }
+      const calls = observedToolCalls(execution.rawEvents);
+      const searchCalls = calls.filter((call) =>
+        call.name === "search_pull_requests" &&
+        isRecord(call.arguments) &&
+        argumentsExactlyMatch(call.arguments, pullRequestSearchArguments(publishedTarget))
+      );
+      if (calls.length !== 1 || searchCalls.length !== 1) {
+        throw new TrueForgeIntegrationError(
+          "reconcile pull request approval",
+          "Pull request reconciliation must contain exactly one canonical read-only search_pull_requests call and no other tool calls.",
+        );
+      }
+      const searchCall = searchCalls[0];
+      if (searchCall === undefined) {
+        throw new TrueForgeIntegrationError(
+          "reconcile pull request approval",
+          "The pull request reconciliation search call was not recorded.",
+        );
+      }
+      const response = toolResponseForCall(
+        execution.rawEvents,
+        searchCall.id,
+        searchCall.threadId ?? undefined,
+      );
+      if (response?.type !== "tool.response") {
+        throw new TrueForgeIntegrationError(
+          "reconcile pull request approval",
+          "The pull request reconciliation search returned no structured response.",
+        );
+      }
+      const candidates = parsePullRequestReconciliationResponse(response, publishedTarget);
+      if (candidates.length > 1) {
+        throw new TrueForgeIntegrationError(
+          "reconcile pull request approval",
+          "More than one pull request matched the exact approved delivery during reconciliation.",
+        );
+      }
+      pullRequest = candidates[0];
+    }
+
+    if (pullRequest === undefined) {
+      return this.createPullRequestAfterPublishedArtifact(
+        missionId,
+        pending,
+        publishedTarget,
+        previousTurnId,
+        workItemId,
+      );
+    }
+    const readback = await this.verifyCreatedPullRequest(
+      missionId,
+      publishedTarget,
+      pullRequest,
+      pending.serverName,
+      previousTurnId,
+      workItemId,
+    );
+    return {
+      ...pullRequest,
+      headSha: readback.headSha,
+      sessionId: pending.sessionId,
+      turnId: previousTurnId,
+      threadId: pending.threadId,
+      toolCallId: pending.toolCallId,
+    };
+  }
+
+  private async createPullRequestAfterPublishedArtifact(
+    missionId: string,
+    approval: TrueForgeDeliveryApproval,
+    target: PullRequestDeliveryTarget,
+    previousTurnId: string,
+    workItemId?: string,
+  ): Promise<TrueForgePullRequestResult> {
+    const pending = await this.requestPullRequestCreationApproval(
+      missionId,
+      target,
+      approval.serverName,
+      previousTurnId,
+    );
+    const execution = await this.resumeNativeDeliveryApproval(
+      missionId,
+      pending,
+      "approved",
+      "create pull request after artifact publication",
+    );
+    const response = toolResponseForCall(execution.rawEvents, pending.toolCallId, pending.threadId);
+    if (response?.type !== "tool.response") {
+      throw new TrueForgeIntegrationError(
+        "create pull request after artifact publication",
+        "The approved create_pull_request tool call returned no structured response.",
+      );
+    }
+    const pullRequest = parsePullRequestDeliveryResponse(response, target);
+    if (pullRequest === null) {
+      throw new TrueForgeIntegrationError(
+        "create pull request after artifact publication",
+        "The create_pull_request response did not prove the expected pull request result.",
+      );
+    }
+    const readback = await this.verifyCreatedPullRequest(
+      missionId,
+      target,
+      pullRequest,
+      approval.serverName,
+      execution.turnId,
+      workItemId,
+    );
+    return {
+      ...pullRequest,
+      headSha: readback.headSha,
+      sessionId: approval.sessionId,
+      turnId: execution.turnId,
+      threadId: approval.threadId,
+      toolCallId: approval.toolCallId,
+    };
+  }
+
+  private async requestPullRequestCreationApproval(
+    missionId: string,
+    target: PullRequestDeliveryTarget,
+    serverName: string,
+    previousTurnId: string,
+  ): Promise<TrueForgeDeliveryApproval> {
+    const execution = await this.executeTurn(
+      missionId,
+      buildPullRequestDeliveryInstruction(serverName, target),
+      { previousTurnId },
+    );
+    return pendingDeliveryApprovalFromEvents(
+      execution.rawEvents,
+      execution.sessionId,
+      execution.turnId,
+      serverName,
+      target,
+      "create_pull_request",
+    );
+  }
+
+  private async resumeNativeDeliveryApproval(
+    missionId: string,
+    pending: TrueForgeDeliveryApproval,
+    decision: "approved" | "rejected" | "cancelled",
+    operation: string,
+  ): Promise<InternalTurnResult> {
+    const input: TrueForgeApi.UserToolApprovalEvent = {
+      type: "user.tool_approval",
+      threadId: pending.threadId,
+      toolCallId: pending.toolCallId,
+      approval: decision === "approved"
+        ? { status: "allow" }
+        : {
+            status: "deny",
+            reason: decision === "cancelled"
+              ? "The operator cancelled this delivery action."
+              : "The operator rejected this delivery action.",
+          },
+    };
+    const execution = await this.executeTurn(missionId, "", {
+      previousTurnId: pending.turnId,
+      input: [input],
+    });
+    requireCompletedTurn(execution.rawEvents, operation, "delivery approval");
+    return execution;
   }
 
   private async verifyCreatedPullRequest(
@@ -2608,6 +2980,7 @@ export class TrueForgeMissionRunner {
         mission.id,
         buildDeliveryHeadInspectionInstruction(target, mcpServerName),
         {
+          ...(input.previousTurnId === undefined ? {} : { previousTurnId: input.previousTurnId }),
           coordinatorToolSurface: "repository-read",
           coordinatorPhase: "repository-read",
           coordinatorMcpServerName: mcpServerName,
@@ -2618,6 +2991,7 @@ export class TrueForgeMissionRunner {
         execution.rawEvents,
         target,
         mcpServerName,
+        target.artifact?.patches,
       );
       const evidence = await this.missions.addEvidence(mission.id, {
         ...(input.workItemId === undefined ? {} : { workItemId: input.workItemId }),
@@ -2633,11 +3007,14 @@ export class TrueForgeMissionRunner {
           repository_owner: target.owner,
           repository_name: target.repo,
           requested_ref: target.head,
-          baseline_sha: PRIMARY_DELIVERY_FIXTURE.baselineSha,
+          baseline_sha: target.artifact?.baselineSha ?? PRIMARY_DELIVERY_FIXTURE.baselineSha,
           uri: verified.resourceUri,
           commit_sha: verified.commitSha,
           patches: verified.patches,
           content_hash: verified.contentHash,
+          ...(target.artifact === undefined
+            ? {}
+            : { artifact_hash: target.artifact.contentHash }),
         }),
         executionOrigin: {
           kind: "mcp",
@@ -4073,6 +4450,7 @@ function ensureRepositoryMcpConfigured(
 function ensureDeliveryMcpConfigured(
   config: TrueForgeMissionConfig,
   serverName: string,
+  requirePublication: boolean,
 ): void {
   const toolName = config.deliveryToolName ?? "create_pull_request";
   if (toolName !== "create_pull_request") {
@@ -4085,17 +4463,28 @@ function ensureDeliveryMcpConfigured(
   const server = servers.find((candidate) => candidate.name === serverName);
   const enabledTools = server?.enableTools ?? [];
   const approvalTools = server?.requireApprovalForTools ?? [];
+  const requiredPublicationTools = requirePublication
+    ? [DELIVERY_PUBLICATION_TOOL_NAME]
+    : [];
   if (
     server === undefined ||
     (!enabledTools.includes(toolName) && !enabledTools.includes("@all")) ||
     (!enabledTools.includes("get_commit") && !enabledTools.includes("@all")) ||
     (!enabledTools.includes(PULL_REQUEST_READ_TOOL_NAME) && !enabledTools.includes("@all")) ||
     (!enabledTools.includes("search_pull_requests") && !enabledTools.includes("@all")) ||
-    (!approvalTools.includes(toolName) && !approvalTools.includes("@all"))
+    (!approvalTools.includes(toolName) && !approvalTools.includes("@all")) ||
+    requiredPublicationTools.some((requiredTool) =>
+      !enabledTools.includes(requiredTool) && !enabledTools.includes("@all")
+    ) ||
+    requiredPublicationTools.some((requiredTool) =>
+      !approvalTools.includes(requiredTool) && !approvalTools.includes("@all")
+    )
   ) {
     throw new TrueForgeIntegrationError(
       "request pull request approval",
-      `MCP server ${serverName} must expose ${toolName}, get_commit, ${PULL_REQUEST_READ_TOOL_NAME}, and search_pull_requests, and require native approval for ${toolName}.`,
+      requirePublication
+        ? `MCP server ${serverName} must expose ${toolName}, ${DELIVERY_PUBLICATION_TOOL_NAME}, get_commit, ${PULL_REQUEST_READ_TOOL_NAME}, and search_pull_requests, and require native approval for both delivery writes.`
+        : `MCP server ${serverName} must expose ${toolName}, get_commit, ${PULL_REQUEST_READ_TOOL_NAME}, and search_pull_requests, and require native approval for ${toolName}.`,
     );
   }
 }
@@ -4115,7 +4504,35 @@ function validatePullRequestDeliveryTarget(
   if (input.headSha !== undefined) {
     target.headSha = requiredString(input.headSha, "verified pull request head SHA", operation);
   }
+  if (input.artifact !== undefined) {
+    target.artifact = input.artifact;
+  }
   return target;
+}
+
+function requireVerifiedDeliveryArtifact(
+  target: PullRequestDeliveryTarget,
+  operation: string,
+): DeliveryArtifact {
+  const artifact = target.artifact;
+  if (
+    artifact === undefined ||
+    artifact.baselineSha !== PRIMARY_DELIVERY_FIXTURE.baselineSha ||
+    Object.keys(artifact.files).length === 0 ||
+    Object.keys(artifact.files).length !== Object.keys(artifact.patches).length ||
+    Object.keys(artifact.files).some((file) => artifact.patches[file] === undefined) ||
+    artifact.contentHash !== verifiedDeliveryArtifactHash(
+      artifact.baselineSha,
+      artifact.files,
+      artifact.patches,
+    )
+  ) {
+    throw new TrueForgeIntegrationError(
+      operation,
+      "The delivery action requires the exact artifact established by deterministic sandbox proof.",
+    );
+  }
+  return artifact;
 }
 
 function requireVerifiedDeliveryHeadSha(
@@ -4138,11 +4555,83 @@ function requireVerifiedDeliveryHeadSha(
 
 function deliveryPatchesMatch(
   patches: Readonly<Record<string, string>> | undefined,
+  expected: Readonly<Record<string, string>> = PRIMARY_VERIFIED_DELIVERY_PATCHES,
 ): boolean {
-  const expectedEntries = Object.entries(PRIMARY_VERIFIED_DELIVERY_PATCHES);
+  const expectedEntries = Object.entries(expected);
   return patches !== undefined &&
     Object.keys(patches).length === expectedEntries.length &&
     expectedEntries.every(([filename, patch]) => patches[filename] === patch);
+}
+
+function parseGitDiffPatches(
+  output: string,
+): Record<string, string> | null {
+  const lines = output.replace(/\r\n/g, "\n").split("\n");
+  const starts = lines
+    .map((line, index) => line.startsWith("diff --git ") ? index : -1)
+    .filter((index) => index >= 0);
+  if (starts.length === 0) {
+    return null;
+  }
+  const patches: Record<string, string> = {};
+  for (let index = 0; index < starts.length; index += 1) {
+    const start = starts[index];
+    const end = starts[index + 1] ?? lines.length;
+    if (start === undefined) {
+      return null;
+    }
+    const header = lines[start]?.match(/^diff --git a\/(.+) b\/(.+)$/);
+    const filename = header?.[1];
+    if (header === null || header === undefined || filename === undefined || header[2] !== filename) {
+      return null;
+    }
+    const segment = lines.slice(start + 1, end);
+    const hunkIndex = segment.findIndex((line) => line.startsWith("@@ "));
+    if (hunkIndex < 0) {
+      return null;
+    }
+    const patch = segment.slice(hunkIndex).join("\n").replace(/\n+$/, "");
+    if (patch.length === 0 || patches[filename] !== undefined) {
+      return null;
+    }
+    patches[filename] = patch;
+  }
+  return patches;
+}
+
+function verifiedDeliveryArtifactFromProof(
+  mission: Mission,
+  baselineSha: string,
+  filesChanged: readonly string[],
+  diffOutput: string,
+): DeliveryArtifact | undefined {
+  if (
+    mission.repository?.owner !== PRIMARY_DELIVERY_FIXTURE.owner ||
+    mission.repository.name !== PRIMARY_DELIVERY_FIXTURE.repository ||
+    mission.repository.ref !== PRIMARY_DELIVERY_FIXTURE.baselineRef ||
+    baselineSha !== PRIMARY_DELIVERY_FIXTURE.baselineSha ||
+    !sameFileSet(filesChanged, Object.keys(PRIMARY_VERIFIED_DELIVERY_FILES))
+  ) {
+    return undefined;
+  }
+  const patches = parseGitDiffPatches(diffOutput);
+  if (patches === null || !deliveryPatchesMatch(patches)) {
+    return undefined;
+  }
+  const contentHash = verifiedDeliveryArtifactHash(
+    baselineSha,
+    PRIMARY_VERIFIED_DELIVERY_FILES,
+    PRIMARY_VERIFIED_DELIVERY_PATCHES,
+  );
+  if (contentHash !== PRIMARY_VERIFIED_DELIVERY_ARTIFACT.contentHash) {
+    return undefined;
+  }
+  return {
+    baselineSha,
+    files: PRIMARY_VERIFIED_DELIVERY_FILES,
+    patches: PRIMARY_VERIFIED_DELIVERY_PATCHES,
+    contentHash,
+  };
 }
 
 function pullRequestArguments(
@@ -4195,6 +4684,36 @@ function buildPullRequestDeliveryInstruction(
   ].join(" ");
 }
 
+function deliveryPublicationArguments(
+  target: PullRequestDeliveryTarget,
+): Record<string, unknown> {
+  const artifact = requireVerifiedDeliveryArtifact(target, "request pull request approval");
+  return {
+    owner: target.owner,
+    repo: target.repo,
+    branch: target.head,
+    files: Object.entries(artifact.files)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([path, content]) => ({ path, content })),
+    message: DELIVERY_PUBLICATION_MESSAGE,
+  };
+}
+
+function buildDeliveryPublicationInstruction(
+  serverName: string,
+  target: PullRequestDeliveryTarget,
+): string {
+  const artifact = requireVerifiedDeliveryArtifact(target, "request pull request approval");
+  return [
+    `Use the configured MCP server ${serverName}.`,
+    `Call ${DELIVERY_PUBLICATION_TOOL_NAME} exactly once with this JSON object: ${JSON.stringify(deliveryPublicationArguments(target))}.`,
+    `Publish only the exact files and contents from sandbox proof artifact ${artifact.contentHash}, based on ${artifact.baselineSha}.`,
+    "Do not call create_pull_request or any other write or destructive tool in this turn.",
+    "Stop at TrueForge's native tool approval boundary and wait for the correlated human delivery approval.",
+    "Do not claim that the branch was published until the approved tool call returns its commit SHA.",
+  ].join(" ");
+}
+
 function buildPullRequestReadbackInstruction(
   serverName: string,
   target: PullRequestDeliveryTarget,
@@ -4228,6 +4747,7 @@ function pendingDeliveryApprovalFromEvents(
   turnId: string,
   serverName: string,
   target: PullRequestDeliveryTarget,
+  expectedToolName: "create_pull_request" | "push_files" = "create_pull_request",
 ): TrueForgeDeliveryApproval {
   const doneEvents = events.filter((event) => event.type === "turn.done");
   const done = doneEvents.at(-1);
@@ -4276,21 +4796,28 @@ function pendingDeliveryApprovalFromEvents(
   }
   const calls = observedToolCalls(events).filter((call) =>
     call.id === callRef.id &&
-    call.name === "create_pull_request" &&
+    call.name === expectedToolName &&
     call.threadId === approvalEvent.threadId &&
     isRecord(call.arguments) &&
-    argumentsExactlyMatch(call.arguments, pullRequestArguments(target))
+    argumentsExactlyMatch(
+      call.arguments,
+      expectedToolName === DELIVERY_PUBLICATION_TOOL_NAME
+        ? deliveryPublicationArguments(target)
+        : pullRequestArguments(target),
+    )
   );
   if (calls.length !== 1) {
     throw new TrueForgeIntegrationError(
       "request pull request approval",
-      "The paused tool call did not exactly match the requested repository/base/head delivery effect.",
+      expectedToolName === DELIVERY_PUBLICATION_TOOL_NAME
+        ? "The paused push_files call did not exactly match the proof-bound branch publication artifact."
+        : "The paused tool call did not exactly match the requested repository/base/head delivery effect.",
     );
   }
   if (toolResponseForCall(events, callRef.id, approvalEvent.threadId) !== undefined) {
     throw new TrueForgeIntegrationError(
       "request pull request approval",
-      "The protected create_pull_request call returned before human approval.",
+      `The protected ${expectedToolName} call returned before human approval.`,
     );
   }
   return {
@@ -4299,7 +4826,7 @@ function pendingDeliveryApprovalFromEvents(
     threadId: approvalEvent.threadId,
     toolCallId: callRef.id,
     serverName,
-    toolName: "create_pull_request",
+    toolName: expectedToolName,
     target: { ...target },
   };
 }
@@ -4314,6 +4841,16 @@ function validatePendingDeliveryApproval(
   requiredString(pending.threadId, "approval thread id", operation);
   requiredString(pending.toolCallId, "approval tool call id", operation);
   requiredString(pending.serverName, "approval MCP server", operation);
+  if (pending.toolName === DELIVERY_PUBLICATION_TOOL_NAME) {
+    requireVerifiedDeliveryArtifact(target, operation);
+    if (!argumentsExactlyMatch(deliveryPublicationArguments(pending.target), deliveryPublicationArguments(target))) {
+      throw new TrueForgeIntegrationError(
+        operation,
+        "The pending approval does not identify the exact proof-bound branch publication artifact.",
+      );
+    }
+    return;
+  }
   requireVerifiedDeliveryHeadSha(target, operation);
   if (
     pending.toolName !== "create_pull_request" ||
@@ -4986,6 +5523,33 @@ interface ParsedPullRequestReadback extends ParsedPullRequestCreation {
   base: string;
   head: string;
   headSha: string;
+}
+
+function parsePublishedArtifactResponse(
+  event: TrueForgeApi.TurnStreamingEvent,
+  target: PullRequestDeliveryTarget,
+): string | null {
+  const artifact = requireVerifiedDeliveryArtifact(target, "resolve pull request approval");
+  const responseValue = parseMaybeJson(recordValue(event).content);
+  if (isRecord(responseValue) && responseValue.isError === true) {
+    return null;
+  }
+  for (const candidate of responseValueCandidates(responseValue)) {
+    if (!isRecord(candidate)) {
+      continue;
+    }
+    const nestedCommit = isRecord(candidate.commit) ? candidate.commit : undefined;
+    const rawSha = nestedCommit?.sha ?? nestedCommit?.commitSha ?? nestedCommit?.commit_sha ??
+      candidate.sha ?? candidate.commitSha ?? candidate.commit_sha;
+    if (
+      typeof rawSha === "string" &&
+      /^[0-9a-f]{40}$/i.test(rawSha) &&
+      rawSha !== artifact.baselineSha
+    ) {
+      return rawSha;
+    }
+  }
+  return null;
 }
 
 function parsePullRequestDeliveryResponse(
@@ -5788,6 +6352,7 @@ function verifyDeliveryHeadInspection(
   events: TrueForgeApi.TurnStreamingEvent[],
   target: PullRequestDeliveryTarget,
   serverName: string,
+  expectedPatches: Readonly<Record<string, string>> = PRIMARY_VERIFIED_DELIVERY_PATCHES,
 ): VerifiedRepositoryCommit {
   const initialization = events.find((event) => event.type === "mcp.initialize");
   const initializedServers = initialization === undefined
@@ -5826,12 +6391,17 @@ function verifyDeliveryHeadInspection(
   }
   const responseValue = parseMaybeJson(recordValue(response).content);
   if (!isRecord(responseValue) || responseValue.isError === true) {
-    return inspectionFailure("Delivery-head get_commit MCP returned no valid commit result.");
+    const serialized = JSON.stringify(responseValue);
+    return inspectionFailure(
+      /404|not found|does not exist|missing|unknown ref/i.test(serialized)
+        ? "The delivery branch ref was not found during read-only reconciliation; no delivery mutation was replayed."
+        : "Delivery-head get_commit MCP returned no valid commit result.",
+    );
   }
-  const verifiedPayload = parseVerifiedDeliveryHeadObject(responseValue);
+  const verifiedPayload = parseVerifiedDeliveryHeadObject(responseValue, expectedPatches);
   if (verifiedPayload === null) {
     return inspectionFailure(
-      "Delivery head must differ from the baseline and exactly match the verified implementation patches.",
+      "Delivery head must differ from the unchanged baseline and exactly match the approved implementation artifact.",
     );
   }
   requireCompletedTurn(events, "inspect delivery head", "inspection", {
@@ -5856,10 +6426,11 @@ function verifyDeliveryHeadInspection(
 
 function parseVerifiedDeliveryHeadObject(
   value: Record<string, unknown>,
+  expectedPatches: Readonly<Record<string, string>> = PRIMARY_VERIFIED_DELIVERY_PATCHES,
 ): { commitSha: string; patches: Readonly<Record<string, string>> } | null {
   const commitSha = stringOrNull(value.sha);
   const files = commitFileEntries(value.files);
-  const expectedEntries = Object.entries(PRIMARY_VERIFIED_DELIVERY_PATCHES);
+  const expectedEntries = Object.entries(expectedPatches);
   if (
     commitSha === null ||
     !/^[0-9a-f]{40}$/i.test(commitSha) ||
@@ -5894,8 +6465,30 @@ function argumentsExactlyMatch(
   return (
     actualKeys.length === expectedKeys.length &&
     actualKeys.every((key, index) => key === expectedKeys[index]) &&
-    Object.entries(expected).every(([key, value]) => actual[key] === value)
+    Object.entries(expected).every(([key, value]) => exactJsonValueMatch(actual[key], value))
   );
+}
+
+function exactJsonValueMatch(actual: unknown, expected: unknown): boolean {
+  if (actual === expected) {
+    return true;
+  }
+  if (Array.isArray(actual) || Array.isArray(expected)) {
+    return Array.isArray(actual) && Array.isArray(expected) &&
+      actual.length === expected.length &&
+      actual.every((value, index) => exactJsonValueMatch(value, expected[index]));
+  }
+  if (isRecord(actual) || isRecord(expected)) {
+    if (!isRecord(actual) || !isRecord(expected)) {
+      return false;
+    }
+    const actualKeys = Object.keys(actual).sort();
+    const expectedKeys = Object.keys(expected).sort();
+    return actualKeys.length === expectedKeys.length &&
+      actualKeys.every((key, index) => key === expectedKeys[index]) &&
+      expectedKeys.every((key) => exactJsonValueMatch(actual[key], expected[key]));
+  }
+  return false;
 }
 
 function lockedFixtureArgumentsMatch(

@@ -103,3 +103,44 @@ export const PRIMARY_VERIFIED_DELIVERY_PATCHES = {
     "+});",
   ].join("\n"),
 } as const;
+
+export interface VerifiedDeliveryArtifact {
+  baselineSha: string;
+  files: Readonly<Record<string, string>>;
+  patches: Readonly<Record<string, string>>;
+  contentHash: string;
+}
+
+/**
+ * A compact deterministic digest for the exact files and diff approved for
+ * the locked demo fixture. This is intentionally local and does not require a
+ * provider or a remote repository read.
+ */
+export function verifiedDeliveryArtifactHash(
+  baselineSha: string,
+  files: Readonly<Record<string, string>>,
+  patches: Readonly<Record<string, string>>,
+): string {
+  const canonical = JSON.stringify({
+    baselineSha,
+    files: Object.fromEntries(Object.entries(files).sort(([left], [right]) => left.localeCompare(right))),
+    patches: Object.fromEntries(Object.entries(patches).sort(([left], [right]) => left.localeCompare(right))),
+  });
+  let hash = 2166136261;
+  for (const character of canonical) {
+    hash ^= character.codePointAt(0) as number;
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+export const PRIMARY_VERIFIED_DELIVERY_ARTIFACT: VerifiedDeliveryArtifact = {
+  baselineSha: PRIMARY_DELIVERY_FIXTURE.baselineSha,
+  files: PRIMARY_VERIFIED_DELIVERY_FILES,
+  patches: PRIMARY_VERIFIED_DELIVERY_PATCHES,
+  contentHash: verifiedDeliveryArtifactHash(
+    PRIMARY_DELIVERY_FIXTURE.baselineSha,
+    PRIMARY_VERIFIED_DELIVERY_FILES,
+    PRIMARY_VERIFIED_DELIVERY_PATCHES,
+  ),
+};

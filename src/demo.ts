@@ -34,6 +34,7 @@ export const DEMO_PREFLIGHT_MAX_READ_CALLS = 9;
 export const DEMO_PREFLIGHT_REQUIRED_MCP_TOOLS = [
   "get_file_contents",
   "get_commit",
+  "push_files",
   "create_pull_request",
   "pull_request_read",
   "search_pull_requests",

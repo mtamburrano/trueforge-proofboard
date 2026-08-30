@@ -220,3 +220,38 @@ test("run coordinator rejects malformed revisions during reconnect", async () =>
   assert.equal(coordinator.latestRevision(), null);
   assert.deepEqual(rendered, []);
 });
+
+test("run outcome feedback follows the authoritative queue state", async () => {
+  const { describeRunOutcome } = await loadRunState();
+  const ticket = (status) => ({
+    id: "implementation-ticket",
+    assignedRole: "implementer",
+    status,
+  });
+
+  const execution = describeRunOutcome({
+    tickets: [ticket("proving")],
+    progress: { verification: "not_started" },
+  });
+  assert.equal(execution.kind, "success");
+  assert.match(execution.message, /implementation step/);
+  assert.match(execution.message, /deterministic proof is next/);
+
+  const retryableProof = describeRunOutcome({
+    tickets: [ticket("proving")],
+    progress: { verification: "failed" },
+  });
+  assert.equal(retryableProof.kind, "warning");
+  assert.match(retryableProof.message, /retryable proof infrastructure failure/);
+  assert.match(retryableProof.message, /durable failed evidence/);
+  assert.match(retryableProof.message, /remains in Proving/);
+  assert.doesNotMatch(retryableProof.message, /Changes Requested|implementation failed/i);
+
+  const verifiedProof = describeRunOutcome({
+    tickets: [ticket("awaiting_approval")],
+    progress: { verification: "passed" },
+  });
+  assert.equal(verifiedProof.kind, "success");
+  assert.match(verifiedProof.message, /independent review passed/);
+  assert.match(verifiedProof.message, /approve the exact delivery/);
+});

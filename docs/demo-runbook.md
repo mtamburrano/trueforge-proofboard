@@ -58,7 +58,7 @@ It checks:
 - TrueForge reachability through `server.getCapabilities()` and the configured
   model through `models.list()`;
 - the configured GitHub MCP server's authorization and the complete tool
-  surface required by the demo: `get_file_contents`, `get_commit`,
+  surface required by the demo: `get_file_contents`, `get_commit`, `push_files`,
   `create_pull_request`, `pull_request_read`, and `search_pull_requests`;
 - the TrueForge sandbox settings projection, requiring a `daytona` provider in
   `ready` status without provisioning or executing anything, plus the
@@ -121,10 +121,11 @@ run with the smoke dry-run or with fixture text.
    and record the operational retry reason rather than silently retrying.
 5. For one separate PR-producing rehearsal, start from a fresh reset and a
    passing preflight. Review the exact repository, base, delivery branch,
-   verified head SHA, expected effect, and proof records in the second human
-   gate. Approve once through Mission Control, then confirm the real pull
-   request and its read-back. `Done` is valid only after that correlated
-   read-back.
+   artifact baseline/files/patches, expected effect, and proof records in the
+   second human gate. Approve once through Mission Control. TrueForge then
+   publishes the exact approved artifact with `push_files`, independently reads
+   the branch back with `get_commit`, and only then creates and reads the one
+   pull request. `Done` is valid only after that correlated read-back.
 6. Clean up only the branch and pull request created by that explicitly
    authorized rehearsal, using an operator-approved GitHub action. Never
    delete or close an artifact that predated the run; the preflight's stale

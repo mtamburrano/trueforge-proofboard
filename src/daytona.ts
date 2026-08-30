@@ -5,10 +5,12 @@ import { Daytona } from "@daytona/sdk";
 import type {
   SandboxCommandExecutionRequest,
   SandboxCommandExecutor,
+  SandboxLifecycleObservation,
 } from "./trueforge.js";
 
 export const DAYTONA_SANDBOX_REFERENCE_PREFIX = "v1:daytona:";
 export const DEFAULT_DAYTONA_COMMAND_TIMEOUT_SECONDS = 600;
+export const DEFAULT_DAYTONA_SANDBOX_START_TIMEOUT_SECONDS = 60;
 const DEFAULT_DAYTONA_REQUEST_TIMEOUT_BUFFER_SECONDS = 30;
 const MAX_DAYTONA_RESULT_LENGTH = 2_000_000;
 
@@ -32,6 +34,10 @@ export interface DaytonaSandboxClient {
   get(sandboxIdOrName: string): Promise<{
     id: string;
     name: string;
+    state?: string;
+    start?: (timeout?: number) => Promise<void>;
+    waitUntilStarted?: (timeout?: number) => Promise<void>;
+    refreshData?: () => Promise<void>;
     process: DaytonaSandboxProcess;
   }>;
 }
@@ -59,6 +65,7 @@ export interface DaytonaSandboxExecutorOptions {
   apiUrl?: string;
   commandTimeoutSeconds?: number;
   requestTimeoutMs?: number;
+  sandboxStartTimeoutSeconds?: number;
   /** Injectable supported-client surface used by tests; production uses Daytona. */
   daytona?: DaytonaSandboxClient;
 }
@@ -167,6 +174,10 @@ export function createDaytonaSandboxExecutor(
       (commandTimeoutSeconds + DEFAULT_DAYTONA_REQUEST_TIMEOUT_BUFFER_SECONDS) * 1_000,
     "Daytona request timeout",
   );
+  const sandboxStartTimeoutSeconds = positiveInteger(
+    options.sandboxStartTimeoutSeconds ?? DEFAULT_DAYTONA_SANDBOX_START_TIMEOUT_SECONDS,
+    "Daytona sandbox start timeout",
+  );
   const daytona = options.daytona ?? createDaytonaClient(options, requestTimeoutMs);
 
   return {
@@ -206,6 +217,11 @@ export function createDaytonaSandboxExecutor(
         );
       }
 
+      const sandboxLifecycle = await ensureDaytonaSandboxReady(
+        sandbox,
+        sandboxStartTimeoutSeconds,
+      );
+
       let response: unknown;
       try {
         response = await sandbox.process.executeCommand(
@@ -243,9 +259,94 @@ export function createDaytonaSandboxExecutor(
         sandboxId: persistedReference,
         exitCode: response.exitCode,
         stdout: response.result,
+        sandboxLifecycle,
       };
     },
   };
+}
+
+async function ensureDaytonaSandboxReady(
+  sandbox: {
+    state?: string;
+    start?: (timeout?: number) => Promise<void>;
+    waitUntilStarted?: (timeout?: number) => Promise<void>;
+    refreshData?: () => Promise<void>;
+  },
+  timeoutSeconds: number,
+): Promise<SandboxLifecycleObservation> {
+  const initialState = sandboxState(sandbox.state);
+  if (initialState === "started") {
+    return {
+      initialState,
+      finalState: initialState,
+      action: "none",
+      recovered: false,
+    };
+  }
+
+  const action = initialState === "starting" ||
+      initialState === "restoring" ||
+      initialState === "resuming"
+    ? "wait_until_started"
+    : "start";
+  try {
+    if (action === "wait_until_started") {
+      if (sandbox.waitUntilStarted === undefined) {
+        throw new DaytonaSandboxExecutionError(
+          `Daytona sandbox is ${initialState} but does not expose a supported readiness wait.`,
+          "configuration",
+        );
+      }
+      await sandbox.waitUntilStarted(timeoutSeconds);
+    } else {
+      if (!isStartableDaytonaState(initialState) || sandbox.start === undefined) {
+        throw new DaytonaSandboxExecutionError(
+          `Daytona sandbox is ${initialState} and cannot be resumed through the supported lifecycle API.`,
+          "configuration",
+        );
+      }
+      await sandbox.start(timeoutSeconds);
+    }
+    if (sandbox.refreshData !== undefined) {
+      await sandbox.refreshData();
+    }
+  } catch (error) {
+    if (error instanceof DaytonaSandboxExecutionError) {
+      throw error;
+    }
+    throw daytonaExecutionError(
+      `Daytona could not restore the persisted sandbox from ${initialState} state`,
+      error,
+    );
+  }
+
+  const finalState = sandboxState(sandbox.state);
+  if (finalState !== "started") {
+    throw new DaytonaSandboxExecutionError(
+      `Daytona sandbox lifecycle recovery returned ${finalState} instead of started.`,
+      "transport",
+    );
+  }
+  return {
+    initialState,
+    finalState,
+    action,
+    recovered: true,
+  };
+}
+
+function isStartableDaytonaState(state: string): boolean {
+  return state === "stopped" || state === "archived" || state === "paused";
+}
+
+function sandboxState(value: unknown): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new DaytonaSandboxExecutionError(
+      "Daytona returned no authoritative lifecycle state for the persisted sandbox.",
+      "transport",
+    );
+  }
+  return value.trim().toLowerCase();
 }
 
 function createDaytonaClient(

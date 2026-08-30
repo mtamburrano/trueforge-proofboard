@@ -146,12 +146,13 @@ record remains available across those outcomes.
 
 For the deterministic delivery fixture, `inspectRepository` first proves the
 immutable `mtamburrano/proofboard-demo-fixture` baseline at commit
-`590aa8a6d72c580f61fc1b19d33e9876bc0feb9b`. After implementation and sandbox
-verification, a separate read-only `get_commit` call resolves head
-`proofboard-verified-delivery`. Delivery approval is available only when that head
-has a different commit identity and its exact patches match the verified
-`src/index.ts` and `test/index.test.js` change. The observed head SHA is bound into
-the approval and delivery records. Ordinary repository reads remain fail-closed
+`590aa8a6d72c580f61fc1b19d33e9876bc0feb9b`. After implementation, deterministic
+sandbox proof and accepted semantic review bind approval to the exact current
+artifact: its baseline, two files, contents, and patches. No delivery-branch
+read or remote mutation occurs before the human gate. After approval, the
+artifact is published through the protected `push_files` MCP call, independently
+read back with `get_commit`, and only then used for `create_pull_request` and its
+`pull_request_read` verification. Ordinary repository reads remain fail-closed
 for other targets.
 
 Configure the TrueForge model, GitHub MCP connector, and sandbox provider in the

@@ -11,6 +11,8 @@ import {
   JsonMissionRepository,
   MissionService,
   PRIMARY_DELIVERY_FIXTURE,
+  PRIMARY_VERIFIED_DELIVERY_ARTIFACT,
+  PRIMARY_VERIFIED_DELIVERY_FILES,
   PRIMARY_VERIFIED_DELIVERY_PATCHES,
   PRIMARY_MISSION_ID,
   PRIMARY_MISSION_OBJECTIVE,
@@ -235,9 +237,15 @@ class TestMissionRunner {
     }
     const workItem = await this.missions.getWorkItem(input.missionId, input.workItemId);
     const filesChanged = workItem.allowedFiles ?? [];
-    const diffOutput = filesChanged.map((file) =>
-      `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1 +1,2 @@\n before\n+after`
-    ).join("\n");
+    const isPrimaryArtifact = filesChanged.length === Object.keys(PRIMARY_VERIFIED_DELIVERY_FILES).length &&
+      filesChanged.every((file) => Object.prototype.hasOwnProperty.call(PRIMARY_VERIFIED_DELIVERY_FILES, file));
+    const diffOutput = isPrimaryArtifact
+      ? Object.entries(PRIMARY_VERIFIED_DELIVERY_PATCHES).map(([file, patch]) =>
+          `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n${patch}`
+        ).join("\n")
+      : filesChanged.map((file) =>
+          `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1 +1,2 @@\n before\n+after`
+        ).join("\n");
     const diff = await this.missions.addEvidence(input.missionId, {
       workItemId: input.workItemId,
       kind: "diff_summary",
@@ -249,6 +257,13 @@ class TestMissionRunner {
         command: "git diff",
         output: diffOutput,
         changed_files: filesChanged,
+        ...(isPrimaryArtifact
+          ? {
+              provenance_kind: "implementation_artifact",
+              artifact_hash: PRIMARY_VERIFIED_DELIVERY_ARTIFACT.contentHash,
+              delivery_artifact: PRIMARY_VERIFIED_DELIVERY_ARTIFACT,
+            }
+          : {}),
       }),
       executionOrigin: origin,
     });
@@ -291,6 +306,7 @@ class TestMissionRunner {
       decisions: [],
       openQuestions: [],
       executionOrigin: origin,
+      ...(isPrimaryArtifact ? { deliveryArtifact: PRIMARY_VERIFIED_DELIVERY_ARTIFACT } : {}),
     };
   }
 
@@ -346,13 +362,14 @@ class TestMissionRunner {
 
   async requestPullRequestApproval(missionId, target) {
     this.deliveryCalls.requested.push({ missionId, target });
+    const artifactDelivery = target.artifact !== undefined;
     return {
       sessionId: "test-session-durable",
       turnId: "test-delivery-approval-turn",
       threadId: "test-delivery-thread",
-      toolCallId: "test-create-pull-request-call",
+      toolCallId: artifactDelivery ? "test-push-files-call" : "test-create-pull-request-call",
       serverName: "github",
-      toolName: "create_pull_request",
+      toolName: artifactDelivery ? "push_files" : "create_pull_request",
       target: { ...target },
     };
   }
@@ -372,12 +389,17 @@ class TestMissionRunner {
     const result = {
       number: 73,
       url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/73",
-      headSha: pending.target.headSha,
+      headSha: pending.target.artifact === undefined
+        ? pending.target.headSha
+        : this.deliveryHeadSha,
       sessionId: pending.sessionId,
       turnId: "test-delivery-result-turn",
       threadId: pending.threadId,
       toolCallId: pending.toolCallId,
     };
+    if (pending.target.artifact !== undefined) {
+      await this.recordPublishedArtifactReadback(missionId, pending, workItemId);
+    }
     await this.missions.addEvidence(missionId, {
       ...(workItemId === undefined ? {} : { workItemId }),
       kind: "tool_result",
@@ -411,15 +433,60 @@ class TestMissionRunner {
     if (this.reconciliationResult === null) {
       return null;
     }
+    if (pending.target.artifact !== undefined) {
+      await this.recordPublishedArtifactReadback(missionId, pending, workItemId);
+    }
     return {
       number: 73,
       url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/73",
-      headSha: pending.target.headSha,
+      headSha: pending.target.artifact === undefined
+        ? pending.target.headSha
+        : this.deliveryHeadSha,
       sessionId: pending.sessionId,
       turnId: "test-reconciliation-turn",
       threadId: pending.threadId,
       toolCallId: pending.toolCallId,
     };
+  }
+
+  async recordPublishedArtifactReadback(missionId, pending, workItemId) {
+    const artifact = pending.target.artifact;
+    if (artifact === undefined) {
+      return;
+    }
+    await this.missions.addEvidence(missionId, {
+      ...(workItemId === undefined ? {} : { workItemId }),
+      kind: "tool_result",
+      result: "passed",
+      source: "mcp",
+      summary: `MCP verified published artifact at ${this.deliveryHeadSha}.`,
+      details: JSON.stringify({
+        server: "github",
+        tool: "get_commit",
+        provenance_kind: "delivery_head",
+        arguments: {
+          owner: pending.target.owner,
+          repo: pending.target.repo,
+          sha: pending.target.head,
+          detail: "full_patch",
+          perPage: 100,
+        },
+        repository_owner: pending.target.owner,
+        repository_name: pending.target.repo,
+        requested_ref: pending.target.head,
+        baseline_sha: artifact.baselineSha,
+        uri: `repo://${pending.target.owner}/${pending.target.repo}/sha/${this.deliveryHeadSha}`,
+        commit_sha: this.deliveryHeadSha,
+        patches: artifact.patches,
+        artifact_hash: artifact.contentHash,
+        content_hash: "verified-published-artifact-content-hash",
+      }),
+      executionOrigin: {
+        kind: "mcp",
+        sessionId: pending.sessionId,
+        turnId: "test-delivery-head-turn",
+      },
+    });
   }
 }
 
@@ -963,9 +1030,9 @@ test("run mission performs deterministic proof and independent review after codi
   assert.equal(proved.mission.approvals.length, 1);
   assert.equal(proved.mission.approvals[0].workItemId, implementTicket.id);
   assert.equal(proved.mission.approvals[0].attempt, 1);
-  assert.deepEqual(runner.operationLog, ["inspect", "execute", "prove", "head-inspect"]);
+  assert.deepEqual(runner.operationLog, ["inspect", "execute", "prove"]);
   assert.equal(runner.calls.sandbox, 1);
-  assert.equal(runner.calls.headInspect, 1);
+  assert.equal(runner.calls.headInspect, 0);
 
   const state = await missions.getState();
   assert.equal(state.handoffs.length, 1);
@@ -1111,7 +1178,7 @@ test("proof findings require human reauthorization and reuse the same execution 
   assert.equal(reworkComplete.mission.approvals.length, 1);
   assert.equal(reworkComplete.mission.approvals[0].attempt, 2);
   assert.equal(runner.calls.sandbox, 2);
-  assert.equal(runner.calls.headInspect, 1);
+  assert.equal(runner.calls.headInspect, 0);
 
   const state = await missions.getState();
   assert.equal(state.handoffs.length, 1);
@@ -1337,7 +1404,7 @@ test("a reconnect reconciles a durable delivery intent without replaying create_
       repositoryName: context.repositoryName,
       base: context.base,
       head: context.head,
-      headSha: context.headSha,
+      artifact: PRIMARY_VERIFIED_DELIVERY_ARTIFACT,
       title: context.title,
       body: context.body,
     },
@@ -1384,7 +1451,7 @@ test("a missing reconciled pull request fails closed without replaying the prote
       repositoryName: context.repositoryName,
       base: context.base,
       head: context.head,
-      headSha: context.headSha,
+      artifact: PRIMARY_VERIFIED_DELIVERY_ARTIFACT,
       title: context.title,
       body: context.body,
     },
@@ -1507,6 +1574,38 @@ test("a restart resumes from persisted pull-request read-back without repeating 
     kind: "tool_result",
     result: "passed",
     source: "mcp",
+    summary: "MCP verified the published artifact before the controller restarted.",
+    details: JSON.stringify({
+      server: "github",
+      tool: "get_commit",
+      provenance_kind: "delivery_head",
+      arguments: {
+        owner: context.repositoryOwner,
+        repo: context.repositoryName,
+        sha: context.head,
+        detail: "full_patch",
+        perPage: 100,
+      },
+      repository_owner: context.repositoryOwner,
+      repository_name: context.repositoryName,
+      requested_ref: context.head,
+      baseline_sha: PRIMARY_VERIFIED_DELIVERY_ARTIFACT.baselineSha,
+      uri: `repo://${context.repositoryOwner}/${context.repositoryName}/sha/8bb22a62b3714f699204cb0d5c440fcb7f0a09e1`,
+      commit_sha: "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1",
+      patches: PRIMARY_VERIFIED_DELIVERY_ARTIFACT.patches,
+      artifact_hash: PRIMARY_VERIFIED_DELIVERY_ARTIFACT.contentHash,
+    }),
+    executionOrigin: {
+      kind: "mcp",
+      sessionId: context.sessionId,
+      turnId: "restart-delivery-head-turn",
+    },
+  });
+  await first.missions.addEvidence(PRIMARY_MISSION_ID, {
+    workItemId: implementTicket.id,
+    kind: "tool_result",
+    result: "passed",
+    source: "mcp",
     summary: "MCP verified the pull request before the controller restarted.",
     details: JSON.stringify({
       server: "github",
@@ -1515,7 +1614,7 @@ test("a restart resumes from persisted pull-request read-back without repeating 
       repository_name: context.repositoryName,
       base: context.base,
       head: context.head,
-      head_sha: context.headSha,
+      head_sha: "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1",
       pull_request_number: 73,
       pull_request_url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/73",
     }),

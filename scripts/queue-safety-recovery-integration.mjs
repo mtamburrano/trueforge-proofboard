@@ -11,6 +11,8 @@ import {
   PRIMARY_DELIVERY_FIXTURE,
   PRIMARY_DELIVERY_TARGET,
   PRIMARY_MISSION_ID,
+  PRIMARY_VERIFIED_DELIVERY_ARTIFACT,
+  PRIMARY_VERIFIED_DELIVERY_FILES,
   PRIMARY_VERIFIED_DELIVERY_PATCHES,
   PRIMARY_VERIFICATION_COMMAND,
   TrueForgeIntegrationError,
@@ -218,9 +220,15 @@ class QueueSafetyRunner {
 
     const workItem = await this.missions.getWorkItem(input.missionId, input.workItemId);
     const filesChanged = workItem.allowedFiles ?? [];
-    const diffOutput = filesChanged.map((file) =>
-      `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1 +1,2 @@\n before\n+after`
-    ).join("\n");
+    const isPrimaryArtifact = filesChanged.length === Object.keys(PRIMARY_VERIFIED_DELIVERY_FILES).length &&
+      filesChanged.every((file) => Object.prototype.hasOwnProperty.call(PRIMARY_VERIFIED_DELIVERY_FILES, file));
+    const diffOutput = isPrimaryArtifact
+      ? Object.entries(PRIMARY_VERIFIED_DELIVERY_PATCHES).map(([file, patch]) =>
+          `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n${patch}`
+        ).join("\n")
+      : filesChanged.map((file) =>
+          `diff --git a/${file} b/${file}\n--- a/${file}\n+++ b/${file}\n@@ -1 +1,2 @@\n before\n+after`
+        ).join("\n");
     const diff = await this.missions.addEvidence(input.missionId, {
       workItemId: input.workItemId,
       kind: "diff_summary",
@@ -232,6 +240,13 @@ class QueueSafetyRunner {
         command: "git diff -- src/index.ts test/index.test.js",
         output: diffOutput,
         changed_files: filesChanged,
+        ...(isPrimaryArtifact
+          ? {
+              provenance_kind: "implementation_artifact",
+              artifact_hash: PRIMARY_VERIFIED_DELIVERY_ARTIFACT.contentHash,
+              delivery_artifact: PRIMARY_VERIFIED_DELIVERY_ARTIFACT,
+            }
+          : {}),
       }),
       executionOrigin: proofOrigin,
     });
@@ -287,6 +302,7 @@ class QueueSafetyRunner {
       evidenceIds: [diff.id, typecheck.id, tests.id],
       decisions: [],
       openQuestions: [],
+      ...(isPrimaryArtifact ? { deliveryArtifact: PRIMARY_VERIFIED_DELIVERY_ARTIFACT } : {}),
       executionOrigin: proofOrigin,
     };
   }
@@ -342,13 +358,14 @@ class QueueSafetyRunner {
 
   async requestPullRequestApproval(missionId, target) {
     this.shared.calls.requestedApprovals += 1;
+    const artifactDelivery = target.artifact !== undefined;
     return {
       sessionId: SESSION_ID,
       turnId: "queue-safety-approval-turn",
       threadId: "queue-safety-approval-thread",
-      toolCallId: "queue-safety-create-pr-call",
+      toolCallId: artifactDelivery ? "queue-safety-push-files-call" : "queue-safety-create-pr-call",
       serverName: "github",
-      toolName: "create_pull_request",
+      toolName: artifactDelivery ? "push_files" : "create_pull_request",
       target: { ...target },
     };
   }
@@ -381,6 +398,9 @@ class QueueSafetyRunner {
       threadId: pending.threadId,
       toolCallId: pending.toolCallId,
     };
+    if (pending.target.artifact !== undefined) {
+      await this.recordPublishedArtifactReadback(missionId, pending, workItemId);
+    }
     await this.missions.addEvidence(missionId, {
       workItemId,
       kind: "tool_result",
@@ -407,6 +427,47 @@ class QueueSafetyRunner {
       },
     });
     return result;
+  }
+
+  async recordPublishedArtifactReadback(missionId, pending, workItemId) {
+    const artifact = pending.target.artifact;
+    if (artifact === undefined) {
+      return;
+    }
+    const publishedHeadSha = this.shared.deliveryHeadShaSequence[0] ?? DELIVERY_HEAD_SHA;
+    await this.missions.addEvidence(missionId, {
+      workItemId,
+      kind: "tool_result",
+      result: "passed",
+      source: "mcp",
+      summary: `The published artifact branch was independently read back at ${publishedHeadSha}.`,
+      details: JSON.stringify({
+        server: "github",
+        tool: "get_commit",
+        provenance_kind: "delivery_head",
+        arguments: {
+          owner: pending.target.owner,
+          repo: pending.target.repo,
+          sha: pending.target.head,
+          detail: "full_patch",
+          perPage: 100,
+        },
+        repository_owner: pending.target.owner,
+        repository_name: pending.target.repo,
+        requested_ref: pending.target.head,
+        baseline_sha: artifact.baselineSha,
+        uri: `repo://${pending.target.owner}/${pending.target.repo}/sha/${publishedHeadSha}`,
+        commit_sha: publishedHeadSha,
+        patches: artifact.patches,
+        artifact_hash: artifact.contentHash,
+        content_hash: "queue-safety-published-artifact-content",
+      }),
+      executionOrigin: {
+        kind: "mcp",
+        sessionId: pending.sessionId,
+        turnId: "queue-safety-published-artifact-turn",
+      },
+    });
   }
 }
 
@@ -952,7 +1013,7 @@ async function runReadbackMismatchScenario(directory) {
   const prepared = await preparePendingApproval(fixture.app);
   const result = await decide(fixture.app, prepared.approval, "approved");
   assert.equal(result.response.status, 502);
-  assert.match(result.payload.message, /head does not match|delivery/i);
+  assert.match(result.payload.message, /head does not match|published branch|delivery/i);
   assert.equal(result.payload.mission.mission.status, "blocked");
   assert.equal(ticketFor(result.payload.mission, "implementer").status, "blocked");
   assert.equal(result.payload.mission.delivery.length, 0);

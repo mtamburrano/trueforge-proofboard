@@ -931,9 +931,10 @@ async function runMission(event) {
     return;
   }
   try {
-    await runCoordinator.run();
+    const payload = await runCoordinator.run();
     setConnection("connected", "State persisted");
-    showMessage("success", "TrueForge run completed with durable verification evidence.");
+    const feedback = MissionRunState.describeRunOutcome(payload?.mission ?? currentView);
+    showMessage(feedback.kind, feedback.message);
   } catch (error) {
     setConnection("failed", "Run failed closed");
     showMessage("error", error.message);

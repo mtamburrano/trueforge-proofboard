@@ -7,6 +7,8 @@ import {
   InMemoryMissionRepository,
   MAX_TRUEFORGE_ITERATION_LIMIT,
   MissionService,
+  PRIMARY_VERIFIED_DELIVERY_ARTIFACT,
+  PRIMARY_VERIFIED_DELIVERY_FILES,
   PRIMARY_VERIFIED_DELIVERY_PATCHES,
   PRIMARY_SANDBOX_REPOSITORY_ROOT,
   SANDBOX_SETUP_EXEC_LIMIT,
@@ -611,6 +613,245 @@ function deliveryApprovalEvents(turnId, target, readbackOptions = {}) {
     });
   }
   throw new Error(`Unexpected delivery turn ${turnId}.`);
+}
+
+const ARTIFACT_DELIVERY_MESSAGE = "Publish the verified Proof Board delivery artifact";
+
+function artifactDeliveryTarget({ headSha, artifact = PRIMARY_VERIFIED_DELIVERY_ARTIFACT } = {}) {
+  return {
+    owner: "mtamburrano",
+    repo: "proofboard-demo-fixture",
+    base: "main",
+    head: "proofboard-verified-delivery",
+    ...(headSha === undefined ? {} : { headSha }),
+    artifact,
+    title: "Verified fixture delivery",
+    body: "Verified fixture delivery body.",
+  };
+}
+
+function artifactPublicationArguments(target) {
+  return {
+    owner: target.owner,
+    repo: target.repo,
+    branch: target.head,
+    files: Object.entries(target.artifact.files)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([path, content]) => ({ path, content })),
+    message: ARTIFACT_DELIVERY_MESSAGE,
+  };
+}
+
+function artifactApprovalEvents(
+  turnId,
+  target,
+  {
+    publishedHeadSha = VERIFIED_DELIVERY_HEAD_SHA,
+    deliveryHeadPatches = PRIMARY_VERIFIED_DELIVERY_PATCHES,
+    deliveryHeadResponseContent,
+    searchItems = [],
+  } = {},
+) {
+  if (turnId === "turn-1") {
+    const toolArguments = artifactPublicationArguments(target);
+    const approval = {
+      type: "tool.approval_required",
+      id: "approval-artifact-publication",
+      createdAt: "2026-08-29T08:00:02.000Z",
+      threadId: "thread-artifact-delivery",
+      toolCalls: [{ id: "call-push-files", sourceEventId: "message-push-files" }],
+    };
+    return [
+      {
+        type: "turn.created",
+        id: "turn-created-artifact-publication",
+        createdAt: "2026-08-29T08:00:00.000Z",
+        turnId,
+        threadId: null,
+      },
+      {
+        type: "mcp.initialize",
+        id: "mcp-artifact-publication",
+        createdAt: "2026-08-29T08:00:00.500Z",
+        threadId: "thread-artifact-delivery",
+        mcpServers: [{ name: "github" }],
+      },
+      {
+        type: "model.message",
+        id: "message-push-files",
+        createdAt: "2026-08-29T08:00:01.000Z",
+        threadId: "thread-artifact-delivery",
+        toolCalls: [{
+          id: "call-push-files",
+          function: { name: "push_files", arguments: JSON.stringify(toolArguments) },
+        }],
+      },
+      approval,
+      {
+        type: "turn.done",
+        id: "turn-paused-artifact-publication",
+        createdAt: "2026-08-29T08:00:03.000Z",
+        threadId: null,
+        state: { status: "done", requiredActions: [approval] },
+      },
+    ];
+  }
+  if (turnId === "turn-2") {
+    return [
+      {
+        type: "turn.created",
+        id: "turn-created-push-files-result",
+        createdAt: "2026-08-29T08:01:00.000Z",
+        turnId,
+        threadId: null,
+      },
+      {
+        type: "tool.response",
+        id: "response-push-files",
+        createdAt: "2026-08-29T08:01:01.000Z",
+        threadId: "thread-artifact-delivery",
+        toolCallId: "call-push-files",
+        content: JSON.stringify({
+          isError: false,
+          structuredContent: { commit: { sha: publishedHeadSha } },
+        }),
+      },
+      {
+        type: "turn.done",
+        id: "turn-done-push-files-result",
+        createdAt: "2026-08-29T08:01:02.000Z",
+        threadId: null,
+        state: { status: "done", requiredActions: [] },
+      },
+    ];
+  }
+  if (turnId === "turn-3") {
+    return lockedCommitEvents(turnId, {
+      argumentsValue: {
+        owner: target.owner,
+        repo: target.repo,
+        sha: target.head,
+        detail: "full_patch",
+        perPage: 100,
+      },
+      sha: publishedHeadSha,
+      patches: deliveryHeadPatches,
+      ...(deliveryHeadResponseContent === undefined ? {} : { responseContent: deliveryHeadResponseContent }),
+    });
+  }
+  if (turnId === "turn-4") {
+    const toolArguments = {
+      owner: target.owner,
+      repo: target.repo,
+      base: target.base,
+      head: target.head,
+      title: target.title,
+      body: target.body,
+    };
+    const approval = {
+      type: "tool.approval_required",
+      id: "approval-artifact-pr",
+      createdAt: "2026-08-29T08:03:02.000Z",
+      threadId: "thread-artifact-pr",
+      toolCalls: [{ id: "call-create-artifact-pr", sourceEventId: "message-create-artifact-pr" }],
+    };
+    return [
+      {
+        type: "turn.created",
+        id: "turn-created-artifact-pr",
+        createdAt: "2026-08-29T08:03:00.000Z",
+        turnId,
+        threadId: null,
+      },
+      {
+        type: "mcp.initialize",
+        id: "mcp-artifact-pr",
+        createdAt: "2026-08-29T08:03:00.500Z",
+        threadId: "thread-artifact-pr",
+        mcpServers: [{ name: "github" }],
+      },
+      {
+        type: "model.message",
+        id: "message-create-artifact-pr",
+        createdAt: "2026-08-29T08:03:01.000Z",
+        threadId: "thread-artifact-pr",
+        toolCalls: [{
+          id: "call-create-artifact-pr",
+          function: {
+            name: "create_pull_request",
+            arguments: JSON.stringify(toolArguments),
+          },
+        }],
+      },
+      approval,
+      {
+        type: "turn.done",
+        id: "turn-paused-artifact-pr",
+        createdAt: "2026-08-29T08:03:03.000Z",
+        threadId: null,
+        state: { status: "done", requiredActions: [approval] },
+      },
+    ];
+  }
+  if (turnId === "turn-5") {
+    return [
+      {
+        type: "turn.created",
+        id: "turn-created-artifact-pr-result",
+        createdAt: "2026-08-29T08:04:00.000Z",
+        turnId,
+        threadId: null,
+      },
+      {
+        type: "tool.response",
+        id: "response-artifact-pr",
+        createdAt: "2026-08-29T08:04:01.000Z",
+        threadId: "thread-artifact-pr",
+        toolCallId: "call-create-artifact-pr",
+        content: JSON.stringify({
+          isError: false,
+          structuredContent: {
+            id: "PR_kwDOArtifact42",
+            url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/42",
+          },
+        }),
+      },
+      {
+        type: "turn.done",
+        id: "turn-done-artifact-pr-result",
+        createdAt: "2026-08-29T08:04:02.000Z",
+        threadId: null,
+        state: { status: "done", requiredActions: [] },
+      },
+    ];
+  }
+  if (turnId === "turn-6") {
+    return pullRequestReadbackEvents(turnId, {
+      owner: target.owner,
+      repo: target.repo,
+      base: target.base,
+      head: target.head,
+      headSha: publishedHeadSha,
+    });
+  }
+  if (turnId === "turn-7") {
+    return pullRequestSearchEvents(turnId, searchItems);
+  }
+  throw new Error(`Unexpected artifact delivery turn ${turnId}.`);
+}
+
+function artifactDeliveryConfig() {
+  return {
+    model: "openai/gpt-5-4-mini",
+    mcpServerName: "github",
+    deliveryToolName: "create_pull_request",
+    mcpServers: [{
+      name: "github",
+      enableTools: ["push_files", "create_pull_request", "get_commit", "pull_request_read", "search_pull_requests"],
+      preloadTools: ["push_files", "create_pull_request", "get_commit", "pull_request_read", "search_pull_requests"],
+      requireApprovalForTools: ["push_files", "create_pull_request"],
+    }],
+  };
 }
 
 function sandboxEvents(
@@ -1776,6 +2017,211 @@ test("pull request delivery pauses one exact TrueForge tool call and resumes onl
   assert.equal(calls.turns.length, 4);
 });
 
+test("verified artifact delivery pauses the exact push_files publication call", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const target = artifactDeliveryTarget();
+  const { client, calls } = fakeClient((turnId) => artifactApprovalEvents(turnId, target));
+  const runner = new TrueForgeMissionRunner(missions, client, artifactDeliveryConfig());
+  const mission = await runner.createMission({
+    id: "mission-artifact-delivery-approval",
+    objective: "Publish only the verified sandbox artifact",
+    repository: {
+      owner: target.owner,
+      name: target.repo,
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  const pending = await runner.requestPullRequestApproval(mission.id, target);
+
+  assert.deepEqual(pending, {
+    sessionId: "session-created",
+    turnId: "turn-1",
+    threadId: "thread-artifact-delivery",
+    toolCallId: "call-push-files",
+    serverName: "github",
+    toolName: "push_files",
+    target,
+  });
+  const publicationMessage = calls.turns[0].events.find((event) =>
+    event.type === "model.message"
+  );
+  assert.ok(publicationMessage);
+  assert.deepEqual(
+    JSON.parse(publicationMessage.toolCalls[0].function.arguments),
+    artifactPublicationArguments(target),
+  );
+  assert.equal(
+    calls.turns[0].events.some((event) => event.type === "tool.response"),
+    false,
+  );
+  assert.equal(calls.turns.length, 1);
+});
+
+test("approved artifact delivery publishes, independently reads back, then creates and reads the PR", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const target = artifactDeliveryTarget();
+  const { client, calls } = fakeClient((turnId) => artifactApprovalEvents(turnId, target));
+  const runner = new TrueForgeMissionRunner(missions, client, artifactDeliveryConfig());
+  const mission = await runner.createMission({
+    id: "mission-artifact-delivery-approved",
+    objective: "Publish and review the verified sandbox artifact",
+    repository: {
+      owner: target.owner,
+      name: target.repo,
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+  const pending = await runner.requestPullRequestApproval(mission.id, target);
+
+  const delivered = await runner.resolvePullRequestApproval(mission.id, pending, "approved");
+
+  assert.deepEqual(delivered, {
+    number: 42,
+    url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/42",
+    headSha: VERIFIED_DELIVERY_HEAD_SHA,
+    sessionId: "session-created",
+    turnId: "turn-5",
+    threadId: "thread-artifact-delivery",
+    toolCallId: "call-push-files",
+  });
+  assert.equal(calls.turns.length, 6);
+  assert.deepEqual(
+    calls.turns.map((turn) => turn.request.previousTurnId),
+    [undefined, "turn-1", "turn-2", "turn-3", "turn-4", "turn-5"],
+  );
+  assert.equal(calls.turns[1].request.input[0].approval.status, "allow");
+  assert.match(calls.turns[2].request.input[0].content, /get_commit with this exact JSON object/);
+  assert.match(calls.turns[3].request.input[0].content, /create_pull_request exactly once/);
+  assert.match(calls.turns[5].request.input[0].content, /pull_request_read exactly once/);
+  const toolNames = calls.turns.flatMap((turn) => turn.events)
+    .filter((event) => event.type === "model.message" || event.type === "model.message.delta")
+    .flatMap((event) => event.toolCalls ?? [])
+    .map((call) => call.function?.name)
+    .filter((name) => name !== undefined);
+  assert.deepEqual(toolNames, ["push_files", "get_commit", "create_pull_request", "pull_request_read"]);
+  assert.equal(
+    calls.turns[2].events.some((event) => event.type === "tool.response"),
+    true,
+  );
+  const state = await missions.getState();
+  const branchEvidence = state.evidence.find((item) =>
+    item.summary === `MCP verified changed delivery head ${target.head} at ${VERIFIED_DELIVERY_HEAD_SHA}.`
+  );
+  assert.ok(branchEvidence);
+  assert.equal(JSON.parse(branchEvidence.details).artifact_hash, target.artifact.contentHash);
+});
+
+test("artifact delivery fails closed on a mismatched or missing published branch", async () => {
+  const mismatchedPatches = { ...PRIMARY_VERIFIED_DELIVERY_PATCHES };
+  mismatchedPatches["src/index.ts"] += "\n+// unexpected remote change";
+  for (const [label, options, expected] of [
+    [
+      "mismatch",
+      { deliveryHeadPatches: mismatchedPatches },
+      /approved sandbox artifact|exactly match/i,
+    ],
+    [
+      "missing-ref",
+      {
+        deliveryHeadResponseContent: JSON.stringify({
+          isError: true,
+          content: [{ type: "text", text: "404 Not Found: ref does not exist" }],
+        }),
+      },
+      /branch ref was not found|no delivery mutation was replayed/i,
+    ],
+  ]) {
+    const missions = new MissionService(new InMemoryMissionRepository());
+    const target = artifactDeliveryTarget();
+    const { client, calls } = fakeClient((turnId) =>
+      artifactApprovalEvents(turnId, target, options)
+    );
+    const runner = new TrueForgeMissionRunner(missions, client, artifactDeliveryConfig());
+    const mission = await runner.createMission({
+      id: `mission-artifact-delivery-${label}`,
+      objective: "Reject an unverified published artifact",
+      repository: {
+        owner: target.owner,
+        name: target.repo,
+        ref: LOCKED_FIXTURE_REF,
+      },
+    });
+    const pending = await runner.requestPullRequestApproval(mission.id, target);
+
+    await assert.rejects(
+      runner.resolvePullRequestApproval(mission.id, pending, "approved"),
+      expected,
+      label,
+    );
+    assert.equal(calls.turns.length, 3, label);
+    assert.equal(
+      calls.turns.some((turn) => turn.events.some((event) =>
+        (event.type === "model.message" || event.type === "model.message.delta") &&
+        (event.toolCalls ?? []).some((call) => call.function?.name === "create_pull_request")
+      )),
+      false,
+      label,
+    );
+  }
+});
+
+test("artifact reconnect reconciles read-only before creating a PR and never republishes", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const target = artifactDeliveryTarget();
+  const { client, calls } = fakeClient((turnId) => {
+    if (turnId === "turn-2") {
+      return lockedCommitEvents(turnId, {
+        argumentsValue: {
+          owner: target.owner,
+          repo: target.repo,
+          sha: target.head,
+          detail: "full_patch",
+          perPage: 100,
+        },
+        sha: VERIFIED_DELIVERY_HEAD_SHA,
+        patches: PRIMARY_VERIFIED_DELIVERY_PATCHES,
+      });
+    }
+    if (turnId === "turn-3") {
+      return pullRequestSearchEvents(turnId, []);
+    }
+    return artifactApprovalEvents(turnId, target);
+  });
+  const runner = new TrueForgeMissionRunner(missions, client, artifactDeliveryConfig());
+  const mission = await runner.createMission({
+    id: "mission-artifact-delivery-reconnect",
+    objective: "Reconcile an interrupted exact artifact delivery",
+    repository: {
+      owner: target.owner,
+      name: target.repo,
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+  const pending = await runner.requestPullRequestApproval(mission.id, target);
+
+  const result = await runner.reconcilePullRequestApproval(mission.id, pending);
+
+  assert.deepEqual(result, {
+    number: 42,
+    url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/42",
+    headSha: VERIFIED_DELIVERY_HEAD_SHA,
+    sessionId: "session-created",
+    turnId: "turn-5",
+    threadId: "thread-artifact-delivery",
+    toolCallId: "call-push-files",
+  });
+  assert.equal(calls.turns.length, 6);
+  assert.match(calls.turns[1].request.input[0].content, /get_commit with this exact JSON object/);
+  assert.match(calls.turns[2].request.input[0].content, /search_pull_requests exactly once/);
+  assert.match(calls.turns[3].request.input[0].content, /create_pull_request exactly once/);
+  const republished = calls.turns.slice(1).some((turn) => turn.events.some((event) =>
+    (event.type === "model.message" || event.type === "model.message.delta") &&
+    (event.toolCalls ?? []).some((call) => call.function?.name === "push_files")
+  ));
+  assert.equal(republished, false);
+});
+
 test("reconciliation searches read-only and verifies one exact approved pull request", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
   const target = {
@@ -2635,7 +3081,7 @@ test("delivery-head inspection rejects the unchanged baseline and mismatched con
 
     await assert.rejects(
       runner.inspectDeliveryHead({ missionId: mission.id, target }),
-      /Delivery head must differ from the baseline and exactly match the verified implementation patches/,
+      /Delivery head must differ from the unchanged baseline and exactly match the approved implementation artifact/,
       fixture.label,
     );
     assert.equal((await missions.getMission(mission.id)).status, "blocked");
@@ -3208,6 +3654,7 @@ test("direct Daytona proof execution resolves the exact persisted sandbox throug
       return {
         id: "7c5f11d4-b1aa-46e5-a7e6-2fef4d0c7e4b",
         name: locator,
+        state: "started",
         process: {
           async executeCommand(command, cwd, env, timeout) {
             executeRequests.push({ command, cwd, env, timeout });
@@ -3239,7 +3686,99 @@ test("direct Daytona proof execution resolves the exact persisted sandbox throug
     sandboxId: persistedReference,
     exitCode: 0,
     stdout: "proof output\n",
+    sandboxLifecycle: {
+      initialState: "started",
+      finalState: "started",
+      action: "none",
+      recovered: false,
+    },
   });
+});
+
+test("direct Daytona proof starts the exact archived sandbox in place before execution", async () => {
+  const locator = "default.115d7785-8a05-4476-9347-03d08469b69a";
+  const persistedReference = `v1:daytona:${locator}`;
+  const getRequests = [];
+  const startRequests = [];
+  const executeRequests = [];
+  let state = "archived";
+  const executor = createDaytonaSandboxExecutor({
+    sandboxStartTimeoutSeconds: 23,
+    daytona: {
+      async get(sandboxLocator) {
+        getRequests.push(sandboxLocator);
+        return {
+          id: "7c5f11d4-b1aa-46e5-a7e6-2fef4d0c7e4b",
+          name: locator,
+          get state() {
+            return state;
+          },
+          async start(timeout) {
+            startRequests.push(timeout);
+            state = "started";
+          },
+          process: {
+            async executeCommand(command) {
+              executeRequests.push(command);
+              return { exitCode: 0, result: "archived workspace recovered\n" };
+            },
+          },
+        };
+      },
+    },
+  });
+
+  const result = await executor.execute({
+    sandboxId: persistedReference,
+    command: "git status --porcelain=v1",
+  });
+
+  assert.deepEqual(getRequests, [locator]);
+  assert.deepEqual(startRequests, [23]);
+  assert.deepEqual(executeRequests, ["git status --porcelain=v1"]);
+  assert.deepEqual(result.sandboxLifecycle, {
+    initialState: "archived",
+    finalState: "started",
+    action: "start",
+    recovered: true,
+  });
+});
+
+test("direct Daytona proof fails closed when archived recovery is not ready", async () => {
+  const locator = "default.115d7785-8a05-4476-9347-03d08469b69a";
+  const persistedReference = `v1:daytona:${locator}`;
+  let executeCalls = 0;
+  let startCalls = 0;
+  const executor = createDaytonaSandboxExecutor({
+    daytona: {
+      async get() {
+        return {
+          id: "7c5f11d4-b1aa-46e5-a7e6-2fef4d0c7e4b",
+          name: locator,
+          state: "archived",
+          async start() {
+            startCalls += 1;
+          },
+          process: {
+            async executeCommand() {
+              executeCalls += 1;
+              return { exitCode: 0, result: "must not execute" };
+            },
+          },
+        };
+      },
+    },
+  });
+
+  await assert.rejects(
+    executor.execute({ sandboxId: persistedReference, command: "true" }),
+    (error) => error instanceof DaytonaSandboxExecutionError &&
+      error.retryable === true &&
+      error.failureCategory === "transport" &&
+      /instead of started/.test(error.message),
+  );
+  assert.equal(startCalls, 1);
+  assert.equal(executeCalls, 0);
 });
 
 test("direct Daytona proof rejects a sandbox whose name does not match the persisted locator", async () => {

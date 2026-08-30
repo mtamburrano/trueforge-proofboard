@@ -8,6 +8,7 @@ import {
 } from "../diagnostics.js";
 import {
   Approval,
+  DeliveryArtifact,
   DeliveryAttemptTarget,
   Evidence,
   Handoff,
@@ -46,8 +47,10 @@ import {
 import { parseContentDiffEvidence } from "../diff.js";
 import {
   PRIMARY_DELIVERY_FIXTURE,
+  PRIMARY_VERIFIED_DELIVERY_ARTIFACT,
   PRIMARY_VERIFIED_DELIVERY_FILES,
   PRIMARY_VERIFIED_DELIVERY_PATCHES,
+  verifiedDeliveryArtifactHash,
   PRIMARY_SANDBOX_REPOSITORY_ROOT,
 } from "../fixture.js";
 
@@ -1131,24 +1134,13 @@ class MissionController {
       throw new MissionControlError("The primary mission is missing from durable state.");
     }
     requireBaselineRepositoryProof(mission, repositoryProof);
-    const deliveryHeadResult = await this.runner.inspectDeliveryHead({
-      missionId: PRIMARY_MISSION_ID,
-      target: PRIMARY_DELIVERY_TARGET,
-      workItemId: implementation.id,
-    });
-    const deliveryState = await this.missions.getState();
-    const { evidence: deliveryHeadProof, headSha } = deliveryHeadProofFromResult(
-      deliveryHeadResult,
-      deliveryState,
-    );
+    const deliveryArtifact = primaryDeliveryArtifactFromProof(proofEvidence);
     const deliveryTarget: PullRequestDeliveryTarget = {
       ...PRIMARY_DELIVERY_TARGET,
-      headSha,
+      artifact: deliveryArtifact,
     };
-    requireDeliveryHeadProof(deliveryHeadProof, deliveryTarget);
     const evidenceIds = [...new Set([
       repositoryProof.id,
-      deliveryHeadProof.id,
       ...proofEvidenceIds,
       reviewEvidence.id,
     ])];
@@ -1163,10 +1155,11 @@ class MissionController {
       pending.target.head !== deliveryTarget.head ||
       pending.target.title !== deliveryTarget.title ||
       pending.target.body !== deliveryTarget.body ||
-      pending.target.headSha !== deliveryTarget.headSha
+      pending.target.artifact?.contentHash !== deliveryArtifact.contentHash ||
+      pending.toolName !== "push_files"
     ) {
       throw new MissionControlError(
-        "TrueForge returned a delivery approval for an artifact different from the verified head.",
+        "TrueForge returned a delivery approval for an artifact different from the verified sandbox proof.",
       );
     }
     const target = pullRequestApprovalTarget(deliveryTarget);
@@ -1247,12 +1240,12 @@ class MissionController {
       review,
     );
     requireApprovalRepositoryProof(state, approval);
-    const pending = deliveryApprovalFromState(approval);
+    const pending = deliveryApprovalFromState(approval, state);
     const approvedHeadSha = pending.target.headSha;
-    if (approvedHeadSha === undefined) {
+    if (pending.toolName === "create_pull_request" && approvedHeadSha === undefined) {
       throw new MissionControlError("The approved delivery has no verified head identity.");
     }
-    if (decision === "approved") {
+    if (decision === "approved" && pending.toolName === "create_pull_request") {
       await this.revalidatePrimaryDeliveryHead(pending.target, implementation.id);
     }
     const decisionState = await this.missions.getState();
@@ -1366,9 +1359,9 @@ class MissionController {
       review,
     );
     requireApprovalRepositoryProof(state, approval);
-    const pending = deliveryApprovalFromState(approval);
+    const pending = deliveryApprovalFromState(approval, state);
     const approvedHeadSha = pending.target.headSha;
-    if (approvedHeadSha === undefined) {
+    if (pending.toolName === "create_pull_request" && approvedHeadSha === undefined) {
       throw new MissionControlError("The approved delivery has no verified head identity.");
     }
     try {
@@ -1401,7 +1394,7 @@ class MissionController {
     approval: Approval,
     pending: TrueForgeDeliveryApproval,
     workItem: WorkItem,
-    approvedHeadSha: string,
+    approvedHeadSha?: string,
   ): Promise<MissionView> {
     const deliveryAttemptRecord = await this.missions.recordDeliveryAttempt(
       PRIMARY_MISSION_ID,
@@ -1456,9 +1449,18 @@ class MissionController {
     if (result === null) {
       throw new MissionControlError("Approved delivery returned no pull request result.");
     }
-    if (result.headSha !== approvedHeadSha) {
+    if (approvedHeadSha !== undefined && result.headSha !== approvedHeadSha) {
       throw new MissionControlError(
         "The delivered pull request head does not match the SHA approved by the operator.",
+      );
+    }
+    if (pending.target.artifact !== undefined) {
+      requirePublishedArtifactReadback(
+        await this.missions.getState(),
+        approval,
+        workItem,
+        pending.target.artifact,
+        result.headSha,
       );
     }
     const deliveryExecutionOrigin = {
@@ -1744,12 +1746,18 @@ class MissionController {
 
 function pullRequestApprovalTarget(target: PullRequestDeliveryTarget): string {
   const verifiedHead = target.headSha === undefined ? target.head : `${target.head}@${target.headSha}`;
-  return `${target.owner}/${target.repo} base=${target.base} head=${verifiedHead}`;
+  const artifact = target.artifact === undefined
+    ? ""
+    : ` artifact=${target.artifact.contentHash} baseline=${target.artifact.baselineSha} files=${Object.keys(target.artifact.files).sort().join(",")}`;
+  return `${target.owner}/${target.repo} base=${target.base} head=${verifiedHead}${artifact}`;
 }
 
 function pullRequestExpectedEffect(target: PullRequestDeliveryTarget): string {
   const verifiedHead = target.headSha === undefined ? target.head : `${target.head} at ${target.headSha}`;
-  return `Open one pull request in ${target.owner}/${target.repo} from verified head ${verifiedHead} into ${target.base}; do not merge or mutate any other repository state.`;
+  if (target.artifact === undefined) {
+    return `Open one pull request in ${target.owner}/${target.repo} from verified head ${verifiedHead} into ${target.base}; do not merge or mutate any other repository state.`;
+  }
+  return `Publish exactly verified sandbox artifact ${target.artifact.contentHash} from baseline ${target.artifact.baselineSha} to ${target.owner}/${target.repo} branch ${target.head}, then open one pull request from verified head ${verifiedHead} into ${target.base}; do not merge or mutate any other repository state.`;
 }
 
 function approvalExecutionContext(
@@ -1771,6 +1779,9 @@ function approvalExecutionContext(
   };
   if (pending.target.headSha !== undefined) {
     context.headSha = pending.target.headSha;
+  }
+  if (pending.target.artifact !== undefined) {
+    context.artifactHash = pending.target.artifact.contentHash;
   }
   return context;
 }
@@ -1893,6 +1904,77 @@ function requireDeliveryHeadProof(
   }
 }
 
+function primaryDeliveryArtifactFromProof(
+  proofEvidence: Array<Evidence | undefined>,
+): DeliveryArtifact {
+  const candidate = proofEvidence
+    .map((evidence) => evidence === undefined ? undefined : { evidence, details: evidenceDetails(evidence) })
+    .find((item) =>
+      item?.evidence.source === "sandbox" &&
+      item.evidence.result === "passed" &&
+      item.details?.proof_mode === IMPLEMENTATION_PROOF_MODE &&
+      item.details.provenance_kind === "implementation_artifact"
+    );
+  const details = candidate?.details;
+  const artifactValue = details?.delivery_artifact;
+  if (!isRecord(artifactValue)) {
+    throw new MissionControlError(
+      "Delivery approval requires the exact artifact established by deterministic sandbox proof.",
+    );
+  }
+  const files = stringRecord(artifactValue.files);
+  const patches = stringRecord(artifactValue.patches);
+  const artifact: DeliveryArtifact = {
+    baselineSha: typeof artifactValue.baselineSha === "string" ? artifactValue.baselineSha : "",
+    files: files ?? {},
+    patches: patches ?? {},
+    contentHash: typeof artifactValue.contentHash === "string" ? artifactValue.contentHash : "",
+  };
+  if (
+    artifact.baselineSha !== PRIMARY_VERIFIED_DELIVERY_ARTIFACT.baselineSha ||
+    artifact.contentHash !== PRIMARY_VERIFIED_DELIVERY_ARTIFACT.contentHash ||
+    !sameStringRecord(artifact.files, PRIMARY_VERIFIED_DELIVERY_FILES) ||
+    !sameStringRecord(artifact.patches, PRIMARY_VERIFIED_DELIVERY_PATCHES) ||
+    artifact.contentHash !== verifiedDeliveryArtifactHash(
+      artifact.baselineSha,
+      artifact.files,
+      artifact.patches,
+    ) ||
+    details?.artifact_hash !== artifact.contentHash
+  ) {
+    throw new MissionControlError(
+      "Delivery approval rejected an artifact that does not match the current deterministic sandbox proof.",
+    );
+  }
+  return artifact;
+}
+
+function stringRecord(value: unknown): Record<string, string> | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const result: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item !== "string") {
+      return null;
+    }
+    result[key] = item;
+  }
+  return result;
+}
+
+function sameStringRecord(
+  left: Readonly<Record<string, string>>,
+  right: Readonly<Record<string, string>>,
+): boolean {
+  const leftEntries = Object.entries(left).sort(([a], [b]) => a.localeCompare(b));
+  const rightEntries = Object.entries(right).sort(([a], [b]) => a.localeCompare(b));
+  return leftEntries.length === rightEntries.length &&
+    leftEntries.every(([key, value], index) =>
+      key === rightEntries[index]?.[0] && value === rightEntries[index]?.[1]
+    );
+}
+
 function deliveryHeadProofFromResult(
   result: unknown,
   state: MissionState,
@@ -1924,6 +2006,24 @@ function requireApprovalRepositoryProof(
     item.result === "passed" &&
     evidenceDetails(item)?.provenance_kind === "baseline"
   );
+  const context = approval.executionContext;
+  if (mission === undefined || baselineEvidence === undefined || context === undefined) {
+    throw new MissionControlError(
+      "Delivery approval requires separate baseline and current-attempt artifact provenance.",
+    );
+  }
+  requireBaselineRepositoryProof(mission, baselineEvidence);
+  if (context.artifactHash !== undefined) {
+    const artifact = primaryDeliveryArtifactFromProof(
+      approval.evidenceIds.map((evidenceId) => state.evidence.find((item) => item.id === evidenceId)),
+    );
+    if (artifact.contentHash !== context.artifactHash) {
+      throw new MissionControlError(
+        "Delivery approval is not bound to the exact deterministic sandbox artifact.",
+      );
+    }
+    return;
+  }
   const headEvidence = state.evidence.find((item) =>
     approval.evidenceIds.includes(item.id) &&
     item.missionId === approval.missionId &&
@@ -1931,13 +2031,11 @@ function requireApprovalRepositoryProof(
     item.result === "passed" &&
     evidenceDetails(item)?.provenance_kind === "delivery_head"
   );
-  const context = approval.executionContext;
-  if (mission === undefined || baselineEvidence === undefined || headEvidence === undefined || context?.headSha === undefined) {
+  if (headEvidence === undefined || context.headSha === undefined) {
     throw new MissionControlError(
       "Delivery approval requires separate baseline and verified delivery-head provenance.",
     );
   }
-  requireBaselineRepositoryProof(mission, baselineEvidence);
   requireDeliveryHeadProof(headEvidence, {
     owner: context.repositoryOwner,
     repo: context.repositoryName,
@@ -1973,6 +2071,16 @@ function requireCurrentDeliveryApprovalCorrelation(
     throw new MissionControlError(
       `The delivery approval is stale; the current attempt has an unresolved ${currentFinding.source} finding.`,
     );
+  }
+  if (approval.executionContext?.artifactHash !== undefined) {
+    const artifact = primaryDeliveryArtifactFromProof(
+      proofEvidenceIds.map((evidenceId) => state.evidence.find((item) => item.id === evidenceId)),
+    );
+    if (artifact.contentHash !== approval.executionContext.artifactHash) {
+      throw new MissionControlError(
+        "The delivery approval is stale or does not match the current proven implementation artifact.",
+      );
+    }
   }
   if (
     !isPrimaryDeliveryApproval(approval) ||
@@ -2022,7 +2130,29 @@ function persistedPullRequestReadback(
   workItem: WorkItem,
 ): TrueForgePullRequestResult | null {
   const context = approval.executionContext;
-  if (context?.headSha === undefined) {
+  if (context === undefined) {
+    return null;
+  }
+  const publishedArtifactEvidence = context.artifactHash === undefined
+    ? undefined
+    : [...state.evidence].reverse().find((item) => {
+        const details = evidenceDetails(item);
+        return item.missionId === approval.missionId &&
+          item.workItemId === workItem.id &&
+          item.attempt === workItem.attempt &&
+          item.source === "mcp" &&
+          item.result === "passed" &&
+          details !== null &&
+          details.provenance_kind === "delivery_head" &&
+          details.artifact_hash === context.artifactHash &&
+          typeof details.commit_sha === "string" &&
+          /^[0-9a-f]{40}$/i.test(details.commit_sha);
+      });
+  const expectedHeadSha = context.headSha ??
+    (publishedArtifactEvidence === undefined
+      ? undefined
+      : evidenceDetails(publishedArtifactEvidence)?.commit_sha as string | undefined);
+  if (expectedHeadSha === undefined) {
     return null;
   }
   const expectedUrlPrefix = `https://github.com/${context.repositoryOwner}/${context.repositoryName}/pull/`;
@@ -2038,7 +2168,7 @@ function persistedPullRequestReadback(
       details.repository_name === context.repositoryName &&
       details.base === context.base &&
       details.head === context.head &&
-      details.head_sha === context.headSha &&
+      details.head_sha === expectedHeadSha &&
       typeof details.pull_request_number === "number" &&
       Number.isInteger(details.pull_request_number) &&
       details.pull_request_number > 0 &&
@@ -2059,7 +2189,7 @@ function persistedPullRequestReadback(
   return {
     number,
     url,
-    headSha: context.headSha,
+    headSha: expectedHeadSha,
     sessionId: context.sessionId,
     turnId: evidence.executionOrigin?.turnId ?? context.turnId,
     threadId: context.threadId,
@@ -2067,59 +2197,138 @@ function persistedPullRequestReadback(
   };
 }
 
-function deliveryApprovalFromState(approval: Approval): TrueForgeDeliveryApproval {
+function requirePublishedArtifactReadback(
+  state: MissionState,
+  approval: Approval,
+  workItem: WorkItem,
+  artifact: DeliveryArtifact,
+  headSha: string,
+): void {
+  const evidence = [...state.evidence].reverse().find((item) => {
+    const details = evidenceDetails(item);
+    const argumentsValue = details?.arguments;
+    return item.missionId === approval.missionId &&
+      item.workItemId === workItem.id &&
+      item.attempt === workItem.attempt &&
+      item.source === "mcp" &&
+      item.result === "passed" &&
+      details !== null &&
+      details.tool === "get_commit" &&
+      details.provenance_kind === "delivery_head" &&
+      details.artifact_hash === artifact.contentHash &&
+      details.repository_owner === PRIMARY_DELIVERY_TARGET.owner &&
+      details.repository_name === PRIMARY_DELIVERY_TARGET.repo &&
+      details.requested_ref === PRIMARY_DELIVERY_TARGET.head &&
+      details.baseline_sha === artifact.baselineSha &&
+      details.commit_sha === headSha &&
+      details.uri === `repo://${PRIMARY_DELIVERY_TARGET.owner}/${PRIMARY_DELIVERY_TARGET.repo}/sha/${headSha}` &&
+      isRecord(argumentsValue) &&
+      argumentsValue.owner === PRIMARY_DELIVERY_TARGET.owner &&
+      argumentsValue.repo === PRIMARY_DELIVERY_TARGET.repo &&
+      argumentsValue.sha === PRIMARY_DELIVERY_TARGET.head &&
+      argumentsValue.detail === "full_patch" &&
+      sameStringRecord(
+        stringRecord(details.patches) ?? {},
+        artifact.patches,
+      );
+  });
+  if (evidence === undefined) {
+    throw new MissionControlError(
+      "The published branch was not independently read back as the exact approved sandbox artifact.",
+    );
+  }
+}
+
+function deliveryApprovalFromState(
+  approval: Approval,
+  state: MissionState,
+): TrueForgeDeliveryApproval {
   const context = approval.executionContext;
-  if (!isPrimaryDeliveryApproval(approval) || context?.headSha === undefined) {
+  if (!isPrimaryDeliveryApproval(approval) || context === undefined) {
     throw new MissionControlError(
       "The persisted approval is not correlated to the exact fixture pull request action.",
     );
   }
+  const artifact = context.artifactHash === undefined
+    ? undefined
+    : primaryDeliveryArtifactFromProof(
+        approval.evidenceIds.map((evidenceId) => state.evidence.find((item) => item.id === evidenceId)),
+      );
+  if (artifact !== undefined && artifact.contentHash !== context.artifactHash) {
+    throw new MissionControlError(
+      "The persisted approval is not correlated to the exact deterministic sandbox artifact.",
+    );
+  }
+  const target: PullRequestDeliveryTarget = {
+    ...PRIMARY_DELIVERY_TARGET,
+    ...(context.headSha === undefined ? {} : { headSha: context.headSha }),
+    ...(artifact === undefined ? {} : { artifact }),
+  };
   return {
     sessionId: context.sessionId,
     turnId: context.turnId,
     threadId: context.threadId,
     toolCallId: context.toolCallId,
     serverName: context.serverName,
-    toolName: "create_pull_request",
-    target: { ...PRIMARY_DELIVERY_TARGET, headSha: context.headSha },
+    toolName: context.toolName === "push_files" ? "push_files" : "create_pull_request",
+    target,
   };
 }
 
 function deliveryAttemptTarget(
   target: PullRequestDeliveryTarget,
 ): DeliveryAttemptTarget {
-  if (target.headSha === undefined) {
+  if (target.headSha === undefined && target.artifact === undefined) {
     throw new MissionControlError(
-      "The durable delivery attempt requires a verified pull request head SHA.",
+      "The durable delivery attempt requires a verified remote head SHA or proof-bound artifact.",
     );
   }
-  return {
+  const result: DeliveryAttemptTarget = {
     repositoryOwner: target.owner,
     repositoryName: target.repo,
     base: target.base,
     head: target.head,
-    headSha: target.headSha,
     title: target.title,
     body: target.body,
   };
+  if (target.headSha !== undefined) {
+    result.headSha = target.headSha;
+  }
+  if (target.artifact !== undefined) {
+    result.artifact = target.artifact;
+  }
+  return result;
 }
 
 function isPrimaryDeliveryApproval(approval: Approval): boolean {
   const context = approval.executionContext;
+  if (context === undefined) {
+    return false;
+  }
+  const isArtifactApproval = context.artifactHash !== undefined;
   if (
-    context === undefined ||
-    context.headSha === undefined ||
-    !/^[0-9a-f]{40}$/i.test(context.headSha) ||
-    context.headSha === PRIMARY_DELIVERY_FIXTURE.baselineSha
+    isArtifactApproval && context.artifactHash !== PRIMARY_VERIFIED_DELIVERY_ARTIFACT.contentHash
   ) {
     return false;
   }
-  const target = { ...PRIMARY_DELIVERY_TARGET, headSha: context.headSha };
+  if (
+    !isArtifactApproval &&
+    (context.headSha === undefined ||
+      !/^[0-9a-f]{40}$/i.test(context.headSha) ||
+      context.headSha === PRIMARY_DELIVERY_FIXTURE.baselineSha)
+  ) {
+    return false;
+  }
+  const target: PullRequestDeliveryTarget = {
+    ...PRIMARY_DELIVERY_TARGET,
+    ...(context.headSha === undefined ? {} : { headSha: context.headSha }),
+    ...(isArtifactApproval ? { artifact: PRIMARY_VERIFIED_DELIVERY_ARTIFACT } : {}),
+  };
   return (
     approval.actionType === PRIMARY_CONSEQUENTIAL_ACTION &&
     approval.target === pullRequestApprovalTarget(target) &&
     approval.expectedEffect === pullRequestExpectedEffect(target) &&
-    context.toolName === PRIMARY_CONSEQUENTIAL_ACTION &&
+    context.toolName === (isArtifactApproval ? "push_files" : PRIMARY_CONSEQUENTIAL_ACTION) &&
     context.repositoryOwner === PRIMARY_DELIVERY_TARGET.owner &&
     context.repositoryName === PRIMARY_DELIVERY_TARGET.repo &&
     context.base === PRIMARY_DELIVERY_TARGET.base &&

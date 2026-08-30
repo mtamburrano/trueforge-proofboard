@@ -454,6 +454,7 @@ export interface ApprovalExecutionContext {
   base: string;
   head: string;
   headSha?: string;
+  artifactHash?: string;
   title: string;
   body: string;
 }
@@ -491,9 +492,18 @@ export interface DeliveryAttemptTarget {
   repositoryName: string;
   base: string;
   head: string;
-  headSha: string;
+  headSha?: string;
+  artifact?: DeliveryArtifact;
   title: string;
   body: string;
+}
+
+/** Exact sandbox artifact bound to a pending delivery approval. */
+export interface DeliveryArtifact {
+  baselineSha: string;
+  files: Readonly<Record<string, string>>;
+  patches: Readonly<Record<string, string>>;
+  contentHash: string;
 }
 
 /** Durable intent and, once available, result for one approved remote mutation. */
@@ -783,6 +793,16 @@ function optionalStringArray(
   maxItems = 200,
 ): string[] | undefined {
   return value === undefined ? undefined : stringArray(value, label, maxItems);
+}
+
+function boundedString(value: unknown, label: string, maxLength: number): string {
+  if (typeof value !== "string") {
+    return fail("invalid_input", `${label} must be a string.`);
+  }
+  if (value.length > maxLength) {
+    return fail("invalid_input", `${label} must be ${maxLength} characters or fewer.`);
+  }
+  return value;
 }
 
 function filePathArray(
@@ -1659,6 +1679,9 @@ function validateApprovalExecutionContext(
   if (context.headSha !== undefined) {
     result.headSha = requiredString(context.headSha, `${label}.headSha`, 500);
   }
+  if (context.artifactHash !== undefined) {
+    result.artifactHash = requiredString(context.artifactHash, `${label}.artifactHash`, 200);
+  }
   return result;
 }
 
@@ -1775,18 +1798,64 @@ function validateDeliveryAttemptTarget(
   label: string,
 ): DeliveryAttemptTarget {
   const target = objectValue(value, label);
-  const headSha = requiredString(target.headSha, `${label}.headSha`, 500);
-  if (!/^[0-9a-f]{40}$/i.test(headSha)) {
+  const headSha = target.headSha === undefined
+    ? undefined
+    : requiredString(target.headSha, `${label}.headSha`, 500);
+  if (headSha !== undefined && !/^[0-9a-f]{40}$/i.test(headSha)) {
     return fail("invalid_input", `${label}.headSha must be a 40-character hexadecimal SHA.`);
   }
-  return {
+  const artifact = target.artifact === undefined
+    ? undefined
+    : validateDeliveryArtifact(target.artifact, `${label}.artifact`);
+  if (headSha === undefined && artifact === undefined) {
+    return fail(
+      "invalid_input",
+      `${label} must identify either a verified remote head SHA or a proof-bound delivery artifact.`,
+    );
+  }
+  const result: DeliveryAttemptTarget = {
     repositoryOwner: requiredString(target.repositoryOwner, `${label}.repositoryOwner`, 200),
     repositoryName: requiredString(target.repositoryName, `${label}.repositoryName`, 200),
     base: requiredString(target.base, `${label}.base`, 500),
     head: requiredString(target.head, `${label}.head`, 500),
-    headSha,
     title: requiredString(target.title, `${label}.title`, 500),
     body: requiredString(target.body, `${label}.body`, 4_000),
+  };
+  if (headSha !== undefined) {
+    result.headSha = headSha;
+  }
+  if (artifact !== undefined) {
+    result.artifact = artifact;
+  }
+  return result;
+}
+
+function validateDeliveryArtifact(value: unknown, label: string): DeliveryArtifact {
+  const artifact = objectValue(value, label);
+  const rawFiles = objectValue(artifact.files, `${label}.files`);
+  const rawPatches = objectValue(artifact.patches, `${label}.patches`);
+  const fileNames = filePathArray(Object.keys(rawFiles), `${label}.files`);
+  const patchNames = filePathArray(Object.keys(rawPatches), `${label}.patches`);
+  if (fileNames.length === 0 || fileNames.length !== patchNames.length ||
+      fileNames.some((file) => !patchNames.includes(file))) {
+    return fail(
+      "invalid_input",
+      `${label}.files and ${label}.patches must identify the same non-empty files.`,
+    );
+  }
+  const files: Record<string, string> = {};
+  for (const file of [...fileNames].sort()) {
+    files[file] = boundedString(rawFiles[file], `${label}.files.${file}`, 20_000);
+  }
+  const patches: Record<string, string> = {};
+  for (const file of [...patchNames].sort()) {
+    patches[file] = boundedString(rawPatches[file], `${label}.patches.${file}`, 20_000);
+  }
+  return {
+    baselineSha: requiredString(artifact.baselineSha, `${label}.baselineSha`, 500),
+    files,
+    patches,
+    contentHash: requiredString(artifact.contentHash, `${label}.contentHash`, 200),
   };
 }
 
@@ -2189,13 +2258,15 @@ export function validateMissionState(value: unknown): MissionState {
       }
       if (delivery.pullRequest !== undefined && delivery.executionOrigin !== undefined) {
         const context = approval.executionContext;
+        const artifactApproval = context?.artifactHash !== undefined;
         if (
           context === undefined ||
+          context.toolName !== (artifactApproval ? "push_files" : PRIMARY_CONSEQUENTIAL_ACTION) ||
           context.repositoryOwner !== delivery.pullRequest.repositoryOwner ||
           context.repositoryName !== delivery.pullRequest.repositoryName ||
           context.base !== delivery.pullRequest.base ||
           context.head !== delivery.pullRequest.head ||
-          context.headSha !== delivery.pullRequest.headSha ||
+          (context.headSha !== undefined && context.headSha !== delivery.pullRequest.headSha) ||
           context.sessionId !== delivery.executionOrigin.sessionId ||
           context.threadId !== delivery.executionOrigin.threadId ||
           context.toolCallId !== delivery.executionOrigin.toolCallId
@@ -2248,12 +2319,14 @@ export function validateMissionState(value: unknown): MissionState {
     const context = approval.executionContext;
     if (
       context === undefined ||
-      context.headSha === undefined ||
+      (context.headSha === undefined && context.artifactHash === undefined) ||
       context.repositoryOwner !== deliveryAttempt.target.repositoryOwner ||
       context.repositoryName !== deliveryAttempt.target.repositoryName ||
       context.base !== deliveryAttempt.target.base ||
       context.head !== deliveryAttempt.target.head ||
-      context.headSha !== deliveryAttempt.target.headSha ||
+      (context.headSha !== undefined && context.headSha !== deliveryAttempt.target.headSha) ||
+      (context.artifactHash !== undefined &&
+        context.artifactHash !== deliveryAttempt.target.artifact?.contentHash) ||
       context.title !== deliveryAttempt.target.title ||
       context.body !== deliveryAttempt.target.body
     ) {
@@ -2267,7 +2340,8 @@ export function validateMissionState(value: unknown): MissionState {
         pullRequest.repositoryName !== deliveryAttempt.target.repositoryName ||
         pullRequest.base !== deliveryAttempt.target.base ||
         pullRequest.head !== deliveryAttempt.target.head ||
-        pullRequest.headSha !== deliveryAttempt.target.headSha ||
+        (deliveryAttempt.target.headSha !== undefined &&
+          pullRequest.headSha !== deliveryAttempt.target.headSha) ||
         executionOrigin?.kind !== "mcp" ||
         executionOrigin.sessionId !== approval.executionContext?.sessionId ||
         executionOrigin.threadId !== approval.executionContext?.threadId ||
@@ -2742,7 +2816,6 @@ function ensureDeliveryAttemptMatchesApproval(
   const context = approval.executionContext;
   if (
     context === undefined ||
-    context.headSha === undefined ||
     approval.actionType !== PRIMARY_CONSEQUENTIAL_ACTION ||
     actionType !== approval.actionType ||
     expectedEffect !== approval.expectedEffect ||
@@ -2750,13 +2823,14 @@ function ensureDeliveryAttemptMatchesApproval(
     context.repositoryName !== target.repositoryName ||
     context.base !== target.base ||
     context.head !== target.head ||
-    context.headSha !== target.headSha ||
+    (context.headSha !== undefined && context.headSha !== target.headSha) ||
+    (context.artifactHash !== undefined && target.artifact?.contentHash !== context.artifactHash) ||
     context.title !== target.title ||
     context.body !== target.body
   ) {
     fail(
       "approval_blocked",
-      "The durable delivery attempt does not match the exact approved repository, base, head, SHA, or effect.",
+      "The durable delivery attempt does not match the exact approved repository, base, head, artifact, SHA, or effect.",
     );
   }
 }
@@ -2772,7 +2846,8 @@ function ensureDeliveryAttemptResultMatchesTarget(
     pullRequest.repositoryName !== deliveryAttempt.target.repositoryName ||
     pullRequest.base !== deliveryAttempt.target.base ||
     pullRequest.head !== deliveryAttempt.target.head ||
-    pullRequest.headSha !== deliveryAttempt.target.headSha ||
+    (deliveryAttempt.target.headSha !== undefined &&
+      pullRequest.headSha !== deliveryAttempt.target.headSha) ||
     executionOrigin.kind !== "mcp"
   ) {
     fail(
@@ -4908,14 +4983,15 @@ export class MissionService {
           fail("invalid_input", "Delivered pull request URL must match the delivery reference.");
         }
         const context = approvedDelivery.executionContext;
+        const artifactApproval = context?.artifactHash !== undefined;
         if (
           context === undefined ||
-          context.toolName !== PRIMARY_CONSEQUENTIAL_ACTION ||
+          context.toolName !== (artifactApproval ? "push_files" : PRIMARY_CONSEQUENTIAL_ACTION) ||
           context.repositoryOwner !== pullRequest.repositoryOwner ||
           context.repositoryName !== pullRequest.repositoryName ||
           context.base !== pullRequest.base ||
           context.head !== pullRequest.head ||
-          context.headSha !== pullRequest.headSha ||
+          (context.headSha !== undefined && context.headSha !== pullRequest.headSha) ||
           executionOrigin.kind !== "mcp" ||
           context.sessionId !== executionOrigin.sessionId ||
           context.threadId !== executionOrigin.threadId ||
