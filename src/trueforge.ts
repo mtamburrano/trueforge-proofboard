@@ -1425,6 +1425,17 @@ export class TrueForgeMissionRunner {
           });
           recorded = true;
           if (measurement.verified.exitCode !== 0) {
+            if (measurement.verified.exitCode === 127 && /^\s*npm(?:\s|$)/.test(command)) {
+              throw new TrueForgeIntegrationError(
+                "prove implementation",
+                "Independent proof could not run npm because the sandbox proof toolchain is not ready.",
+                {
+                  failureClass: "infrastructure",
+                  failureCategory: "configuration",
+                  retryable: true,
+                },
+              );
+            }
             throw new TrueForgeIntegrationError(
               "prove implementation",
               `Independent proof command exited with code ${measurement.verified.exitCode}.`,

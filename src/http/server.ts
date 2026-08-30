@@ -34,6 +34,7 @@ import {
   ImplementationHandoffDraft,
   RepositoryInspectionInput,
   RepositoryWorkGraphPlanner,
+  SandboxPreparationInput,
   PullRequestDeliveryTarget,
   SandboxVerificationInput,
   TrueForgeDeliveryApproval,
@@ -92,6 +93,7 @@ export interface MissionRunner {
     owner: string,
     expectedRevision?: number,
   ): Promise<WorkItem>;
+  prepareSandbox?(input: SandboxPreparationInput): Promise<unknown>;
   proveImplementation(input: ImplementationProofInput): Promise<ImplementationHandoffDraft>;
   runSandboxVerification(input: SandboxVerificationInput): Promise<unknown>;
   requestPullRequestApproval(
@@ -803,6 +805,9 @@ class MissionController {
 
     let handoff: ImplementationHandoffDraft;
     try {
+      if (this.runner.prepareSandbox !== undefined) {
+        await this.runner.prepareSandbox({ missionId: PRIMARY_MISSION_ID });
+      }
       handoff = await this.runner.proveImplementation({
         missionId: PRIMARY_MISSION_ID,
         workItemId: workItem.id,
@@ -3640,9 +3645,10 @@ function isRecoverableImplementationProofFailure(error: unknown): boolean {
 
 function isRetryableProofInfrastructureFailure(error: unknown): boolean {
   return error instanceof TrueForgeIntegrationError &&
-    error.retryable &&
+    (error.retryable || error.operation === "prepare sandbox") &&
     (error.operation === "prove implementation" ||
-      error.operation === "run sandbox verification");
+      error.operation === "run sandbox verification" ||
+      error.operation === "prepare sandbox");
 }
 
 function missionFailureClassification(error: unknown): {
