@@ -5043,7 +5043,7 @@ function buildLockedFixtureInspectionInstruction(
   return [
     `Use the configured MCP server ${serverName}.`,
     `Use get_commit for ${LOCKED_FIXTURE_OWNER}/${LOCKED_FIXTURE_REPO} and the pinned repository ref ${LOCKED_FIXTURE_REF}.`,
-    `Request full_patch detail. The returned commit must resolve to the exact full SHA ${LOCKED_FIXTURE_SHA}. TrueForge may persist the file entries as [bounded]; after the exact repository, call, and SHA correlation succeeds, use the reviewed manifest for the bounded scope. If concrete patches are present, they must match ${LOCKED_FIXTURE_FILES.join(" and ")} exactly.`,
+    `Request full_patch detail. The returned commit must resolve to the exact full SHA ${LOCKED_FIXTURE_SHA}. TrueForge may persist the file entries as [bounded]; after the exact repository, call, and SHA correlation succeeds, use the reviewed manifest for the bounded scope. If concrete patches are present, each reviewed patch must match its expected patch or be a non-empty prefix after normalization; visible contradictions fail closed.`,
     "Make no other MCP calls during this turn. If a completed turn emits no tool call, the bounded coordinator may repeat the read once; request formatting may vary, but every observed tool call must remain a read-only get_commit for this repository.",
     "Use the MCP response as the only source of repository facts; do not use the host filesystem, canned data, or final-answer narration.",
     "Stop after the read.",
@@ -6852,12 +6852,22 @@ function parseLockedFixtureObject(
       return null;
     }
     const patch = matchingFiles[0]?.patch;
-    if (typeof patch !== "string" || normalizeCommitPatch(patch) !== LOCKED_FIXTURE_PATCHES[filename]) {
+    if (
+      typeof patch !== "string" ||
+      !lockedFixturePatchMatches(patch, LOCKED_FIXTURE_PATCHES[filename])
+    ) {
       return null;
     }
     patches[filename] = normalizeCommitPatch(patch);
   }
   return { commitSha, patches };
+}
+
+function lockedFixturePatchMatches(observedPatch: string, expectedPatch: string): boolean {
+  const normalizedObservedPatch = normalizeCommitPatch(observedPatch);
+  const normalizedExpectedPatch = normalizeCommitPatch(expectedPatch);
+  return normalizedObservedPatch.length > 0 &&
+    normalizedExpectedPatch.startsWith(normalizedObservedPatch);
 }
 
 function isBoundedLockedFixtureFiles(value: unknown): value is string[] {

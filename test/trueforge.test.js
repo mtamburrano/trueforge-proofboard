@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
   DEFAULT_TRUEFORGE_ITERATION_LIMIT,
+  deriveWorkGraph,
   InMemoryMissionRepository,
   MAX_TRUEFORGE_ITERATION_LIMIT,
   MissionService,
@@ -148,6 +149,19 @@ const LOCKED_FIXTURE_PATCHES = {
 const LOCKED_FIXTURE_BOUNDED_PATCHES = Object.fromEntries(
   Object.keys(LOCKED_FIXTURE_PATCHES).map((filename) => [filename, "[bounded]"]),
 );
+const LOCKED_FIXTURE_LUNA_PATCHES = {
+  "README.md": [
+    "@@ -1,3 +1,3 @@",
+    " # proofboard-demo-fixture",
+    "-The original fixture description.",
+    "+The Todo fixture description.",
+  ].join("\n"),
+  "src/index.ts": LOCKED_FIXTURE_PATCHES["src/index.ts"],
+  "test/index.test.js": LOCKED_FIXTURE_PATCHES["test/index.test.js"].replace(
+    "\\ No newline at end of file",
+    "\\ No newline at end of fi",
+  ),
+};
 
 function fakeEvents(turnId = "turn-1") {
   return [
@@ -2759,6 +2773,82 @@ test("locked fixture inspection accepts the real three-entry bounded commit file
   const proof = state.evidence.find((item) => item.id === inspection.evidenceId);
   assert.ok(proof);
   assert.deepEqual(JSON.parse(proof.details).patches, LOCKED_FIXTURE_BOUNDED_PATCHES);
+});
+
+test("locked fixture inspection accepts Luna-truncated concrete commit patches", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, {
+    responseContent: JSON.stringify({
+      sha: LOCKED_FIXTURE_SHA,
+      files: Object.entries(LOCKED_FIXTURE_LUNA_PATCHES).map(([filename, patch]) => ({
+        filename,
+        patch,
+      })),
+    }),
+  }));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-6-luna",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-mcp-luna-truncated-concrete-patches",
+    objective: "Inspect the pinned repository through the live Luna transport",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  const inspection = await runner.inspectRepository({ missionId: mission.id });
+
+  assert.equal(inspection.commitSha, LOCKED_FIXTURE_SHA);
+  assert.deepEqual(inspection.patches, {
+    "src/index.ts": LOCKED_FIXTURE_PATCHES["src/index.ts"],
+    "test/index.test.js": LOCKED_FIXTURE_LUNA_PATCHES["test/index.test.js"],
+  });
+  const planned = deriveWorkGraph({ mission, inspection });
+  assert.deepEqual(planned.items[1].allowedFiles, ["src/index.ts", "test/index.test.js"]);
+  assert.equal(planned.items[1].allowedFiles.includes("README.md"), false);
+});
+
+test("locked fixture inspection rejects a contradictory visible concrete patch prefix", async () => {
+  const contradictoryPatches = {
+    ...LOCKED_FIXTURE_LUNA_PATCHES,
+    "test/index.test.js": LOCKED_FIXTURE_LUNA_PATCHES["test/index.test.js"].replace(
+      'import { createTodo, getOpenTodos } from "../dist/index.js";',
+      'import { forgedTodo } from "../dist/index.js";',
+    ),
+  };
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, {
+    responseContent: JSON.stringify({
+      sha: LOCKED_FIXTURE_SHA,
+      files: Object.entries(contradictoryPatches).map(([filename, patch]) => ({
+        filename,
+        patch,
+      })),
+    }),
+  }));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-6-luna",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-mcp-luna-contradictory-concrete-patch",
+    objective: "Reject a contradictory pinned repository patch",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  await assert.rejects(
+    runner.inspectRepository({ missionId: mission.id }),
+    /get_commit MCP response did not contain the pinned SHA and expected file patches/,
+  );
+  assert.equal((await missions.getMission(mission.id)).status, "blocked");
 });
 
 test("bounded locked fixture reads still reject a wrong SHA or uncorrelated response", async () => {
