@@ -13,6 +13,7 @@ import {
   resetDemoState,
   runDemoPreflight,
 } from "../dist/index.js";
+import { createReadOnlyGitHubAdapter } from "../scripts/demo-control.mjs";
 
 function fixedClock() {
   return new Date("2026-08-30T12:00:00.000Z");
@@ -57,7 +58,19 @@ function passingAdapters({ calls = [], branch = { exists: false }, pullRequests 
     github: {
       getCommit: async ({ owner, repository, sha }) => {
         calls.push("github.commit");
-        return { sha, repository: { full_name: `${owner}/${repository}` } };
+        return {
+          sha,
+          url: `https://api.github.com/repos/${owner}/${repository}/commits/${sha}`,
+          html_url: `https://github.com/${owner}/${repository}/commit/${sha}`,
+          commit: {
+            url: `https://api.github.com/repos/${owner}/${repository}/git/commits/${sha}`,
+            message: "fixture baseline",
+          },
+          author: null,
+          committer: null,
+          parents: [],
+          files: [],
+        };
       },
       getDeliveryBranch: async () => {
         calls.push("github.branch");
@@ -171,6 +184,43 @@ test("bounded preflight passes with deterministic read-only adapters and perform
   }
 });
 
+test("baseline preflight accepts the real GitHub REST commit shape and exact requested target", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "trueforge-proofboard-demo-preflight-commit-"));
+  try {
+    let request;
+    const adapters = passingAdapters();
+    adapters.github.getCommit = async (input) => {
+      request = input;
+      return {
+        sha: input.sha,
+        url: `https://api.github.com/repos/${input.owner}/${input.repository}/commits/${input.sha}`,
+        html_url: `https://github.com/${input.owner}/${input.repository}/commit/${input.sha}`,
+        commit: {
+          url: `https://api.github.com/repos/${input.owner}/${input.repository}/git/commits/${input.sha}`,
+          message: "fixture baseline",
+        },
+        author: null,
+        committer: null,
+        parents: [],
+        files: [],
+      };
+    };
+
+    const report = await runDemoPreflight({ config: config(directory), adapters, timeoutMs: 100 });
+    const check = report.checks.find((item) => item.id === "github-baseline");
+
+    assert.equal(report.ok, true);
+    assert.equal(check.status, "passed");
+    assert.deepEqual(request, {
+      owner: PRIMARY_DELIVERY_FIXTURE.owner,
+      repository: PRIMARY_DELIVERY_FIXTURE.repository,
+      sha: PRIMARY_DELIVERY_FIXTURE.baselineSha,
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("preflight fails closed on a stale owned branch or pull request", async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), "trueforge-proofboard-demo-preflight-stale-"));
   try {
@@ -180,6 +230,7 @@ test("preflight fails closed on a stale owned branch or pull request", async () 
         branch: { exists: true },
         pullRequests: [{
           number: 41,
+          state: "open",
           html_url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/41",
           head: {
             ref: PRIMARY_DELIVERY_FIXTURE.head,
@@ -197,6 +248,67 @@ test("preflight fails closed on a stale owned branch or pull request", async () 
     assert.equal(report.checks.every((check) => check.mutating === false), true);
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("historical closed delivery pull requests do not poison repeat preflight runs", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "trueforge-proofboard-demo-preflight-history-"));
+  try {
+    const adapters = passingAdapters({
+      pullRequests: [{
+        number: 41,
+        state: "closed",
+        closed_at: "2026-08-30T10:00:00.000Z",
+        merged_at: null,
+        html_url: "https://github.com/mtamburrano/proofboard-demo-fixture/pull/41",
+        head: {
+          ref: PRIMARY_DELIVERY_FIXTURE.head,
+          repo: { full_name: "mtamburrano/proofboard-demo-fixture" },
+        },
+        base: { ref: PRIMARY_DELIVERY_FIXTURE.base },
+      }],
+    });
+
+    const reports = await Promise.all([
+      runDemoPreflight({ config: config(directory), adapters, timeoutMs: 100 }),
+      runDemoPreflight({ config: config(directory), adapters, timeoutMs: 100 }),
+    ]);
+
+    assert.deepEqual(reports.map((report) => report.ok), [true, true]);
+    assert.deepEqual(
+      reports.map((report) => report.checks.find((check) => check.id === "delivery-pr-clean").status),
+      ["passed", "passed"],
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("live GitHub collision lookup requests open pull requests only", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestedUrl;
+  globalThis.fetch = async (url) => {
+    requestedUrl = String(url);
+    return new Response("[]", { status: 200, headers: { "content-type": "application/json" } });
+  };
+
+  try {
+    const adapter = createReadOnlyGitHubAdapter({});
+    const result = await adapter.listDeliveryPullRequests({
+      owner: PRIMARY_DELIVERY_FIXTURE.owner,
+      repository: PRIMARY_DELIVERY_FIXTURE.repository,
+      base: PRIMARY_DELIVERY_FIXTURE.base,
+      head: PRIMARY_DELIVERY_FIXTURE.head,
+    });
+
+    assert.deepEqual(result, []);
+    assert.ok(requestedUrl);
+    const parsed = new URL(requestedUrl);
+    assert.equal(parsed.searchParams.get("state"), "open");
+    assert.equal(parsed.searchParams.get("head"), `${PRIMARY_DELIVERY_FIXTURE.owner}:${PRIMARY_DELIVERY_FIXTURE.head}`);
+    assert.equal(parsed.searchParams.get("base"), PRIMARY_DELIVERY_FIXTURE.base);
+  } finally {
+    globalThis.fetch = originalFetch;
   }
 });
 

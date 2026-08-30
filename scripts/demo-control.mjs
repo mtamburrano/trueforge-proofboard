@@ -91,7 +91,7 @@ function createReadOnlyGitHubAdapter(environment) {
     },
     listDeliveryPullRequests: ({ owner, repository, base, head }) =>
       readJson(
-        `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/pulls?state=all&head=${encodeURIComponent(`${owner}:${head}`)}&base=${encodeURIComponent(base)}&per_page=10`,
+        `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/pulls?state=open&head=${encodeURIComponent(`${owner}:${head}`)}&base=${encodeURIComponent(base)}&per_page=10`,
       ),
   };
 }

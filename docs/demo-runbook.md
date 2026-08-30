@@ -67,7 +67,9 @@ It checks:
   `590aa8a6d72c580f61fc1b19d33e9876bc0feb9b`;
 - the absence of the owned delivery branch
   `proofboard-verified-delivery`; and
-- the absence of an owned pull request from that branch into `main`.
+- the absence of an open owned pull request from that branch into `main`.
+  Closed historical pull requests are ignored after their delivery branch has
+  been removed; an existing branch still remains a collision.
 
 The connector and model checks use TrueForge metadata endpoints. The exact
 baseline and stale branch/pull-request checks use bounded, read-only GitHub

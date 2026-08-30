@@ -401,7 +401,7 @@ export async function runDemoPreflight(
         }));
         const pullRequests = pullRequestPayload(payload);
         const stale = pullRequests.filter((pullRequest) =>
-          matchesOwnedDeliveryPullRequest(pullRequest, fixture),
+          isOpenPullRequest(pullRequest) && matchesOwnedDeliveryPullRequest(pullRequest, fixture),
         );
         if (stale.length > 0) {
           const labels = stale
@@ -598,15 +598,22 @@ function normalizeCommit(value: unknown): {
   }
   const repository = recordValue(value.repository) ?? recordValue(value.repo);
   const fullName = readString(repository?.full_name) ?? readString(repository?.fullName);
+  const urlIdentity = [
+    repositoryIdentityFromCommitUrl(value.url),
+    repositoryIdentityFromCommitUrl(value.html_url),
+    repositoryIdentityFromCommitUrl(recordValue(value.commit)?.url),
+  ].find((identity): identity is { owner: string; repository: string } => identity !== undefined);
   const fullNameParts = fullName?.split("/") ?? [];
   const owner = readString(value.owner) ??
     readString(recordValue(repository?.owner)?.login) ??
     readString(recordValue(repository?.owner)?.name) ??
-    (fullNameParts.length === 2 ? fullNameParts[0] : undefined);
+    (fullNameParts.length === 2 ? fullNameParts[0] : undefined) ??
+    urlIdentity?.owner;
   const name = readString(value.repositoryName) ??
     readString(value.repoName) ??
     readString(repository?.name) ??
-    (fullNameParts.length === 2 ? fullNameParts[1] : undefined);
+    (fullNameParts.length === 2 ? fullNameParts[1] : undefined) ??
+    urlIdentity?.repository;
   const sha = readString(value.sha) ??
     readString(value.commitSha) ??
     readString(value.commit_sha) ??
@@ -615,6 +622,71 @@ function normalizeCommit(value: unknown): {
     throw new Error("baseline inspection did not return a commit SHA");
   }
   return { owner, repository: name, sha };
+}
+
+function repositoryIdentityFromCommitUrl(value: unknown): {
+  owner: string;
+  repository: string;
+} | undefined {
+  const rawUrl = readString(value);
+  if (rawUrl === undefined) {
+    return undefined;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return undefined;
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    return undefined;
+  }
+
+  let segments: string[];
+  try {
+    segments = parsed.pathname
+      .split("/")
+      .filter((segment) => segment.length > 0)
+      .map((segment) => decodeURIComponent(segment));
+  } catch {
+    return undefined;
+  }
+
+  const repositoriesIndex = segments.findIndex((segment) => segment === "repos");
+  const repositoryOwner = segments[repositoriesIndex + 1];
+  const repositoryName = segments[repositoriesIndex + 2];
+  if (repositoryOwner !== undefined && repositoryName !== undefined) {
+    return {
+      owner: repositoryOwner,
+      repository: repositoryName,
+    };
+  }
+
+  const commitIndex = segments.findIndex((segment) => segment === "commit");
+  const commitOwner = segments[commitIndex - 2];
+  const commitRepository = segments[commitIndex - 1];
+  if (commitOwner !== undefined && commitRepository !== undefined) {
+    return {
+      owner: commitOwner,
+      repository: commitRepository,
+    };
+  }
+  return undefined;
+}
+
+function isOpenPullRequest(pullRequest: Record<string, unknown>): boolean {
+  const state = readString(pullRequest.state)?.toLowerCase();
+  if (state !== undefined) {
+    return state === "open";
+  }
+
+  const closedAt = pullRequest.closed_at ?? pullRequest.closedAt;
+  if (closedAt !== undefined && closedAt !== null) {
+    return false;
+  }
+  const mergedAt = pullRequest.merged_at ?? pullRequest.mergedAt;
+  return mergedAt === undefined || mergedAt === null;
 }
 
 function matchesOwnedDeliveryPullRequest(
