@@ -197,7 +197,7 @@ const LOCKED_FIXTURE_PATCHES = {
     "+    title,",
     "+    completed: false,",
     "+  };",
-    "+}",
+    " }",
     "+",
     "+export function getOpenTodos(todos: readonly Todo[]): Todo[] {",
     "+  return todos.filter((todo) => !todo.completed);",
@@ -225,14 +225,13 @@ const LOCKED_FIXTURE_PATCHES = {
     "-    getProductSummary(),",
     "-    \"TrueForge Proof Board: Verified autonomous software delivery — Plan → Execute → Prove → Approve\",",
     "-  );",
-    "-});",
     "+test(\"createTodo creates an open todo\", () => {",
     "+  assert.deepEqual(createTodo(1, \"Ship the demo\"), {",
     "+    id: 1,",
     "+    title: \"Ship the demo\",",
     "+    completed: false,",
     "+  });",
-    "+});",
+    " });",
     "+",
     "+test(\"getOpenTodos returns only incomplete todos\", () => {",
     "+  const todos = [",
@@ -918,6 +917,7 @@ interface VerifiedRepositoryCommit {
   contentHash: string;
   commitSha: string;
   patches: Readonly<Record<string, string>>;
+  patchVerification: "complete" | "content_addressed";
 }
 
 function isVerifiedRepositoryCommit(
@@ -2899,7 +2899,18 @@ export class TrueForgeMissionRunner {
       target,
       "resolve pull request approval",
     );
-    const inspection = await this.inspectDeliveryHead({ missionId, target });
+    let inspection: RepositoryInspectionResult;
+    try {
+      inspection = await this.inspectDeliveryHead({ missionId, target });
+    } catch (error) {
+      if (error instanceof TrueForgeIntegrationError) {
+        throw new TrueForgeIntegrationError(
+          "resolve pull request approval",
+          "The delivery head changed after approval; the protected pull request action was not allowed.",
+        );
+      }
+      throw error;
+    }
     if (
       inspection.commitSha !== approvedHeadSha ||
       !deliveryPatchesMatch(inspection.patches)
@@ -3023,6 +3034,7 @@ export class TrueForgeMissionRunner {
               uri: verified.resourceUri,
               commit_sha: verified.commitSha,
               patches: verified.patches,
+              patch_verification: verified.patchVerification,
               content_hash: verified.contentHash,
             })
           : JSON.stringify({
@@ -3130,6 +3142,7 @@ export class TrueForgeMissionRunner {
           uri: verified.resourceUri,
           commit_sha: verified.commitSha,
           patches: verified.patches,
+          patch_verification: verified.patchVerification,
           content_hash: verified.contentHash,
           ...(target.artifact === undefined
             ? {}
@@ -5429,10 +5442,8 @@ function buildCoordinatorZeroToolRetryInstruction(
 }
 
 function turnCompletion(event: TrueForgeApi.TurnStreamingEvent): TurnCompletion {
-  const state = recordValue(event).state;
-  if (!isRecord(state)) {
-    return { status: null, requiredActions: null, error: null };
-  }
+  const eventRecord = recordValue(event);
+  const state = isRecord(eventRecord.state) ? eventRecord.state : eventRecord;
   const rawRequiredActions = state.requiredActions ?? state.required_actions;
   return {
     status: stringOrNull(state.status),
@@ -5650,7 +5661,7 @@ function toolResponseForCall(
 ): TrueForgeApi.TurnStreamingEvent | undefined {
   return events.find((event) =>
     (event.type === "tool.response" || event.type === "tool.response_required") &&
-    recordValue(event).toolCallId === toolCallId &&
+    (recordValue(event).toolCallId ?? recordValue(event).tool_call_id) === toolCallId &&
     (expectedThreadId === undefined ||
       stringOrNull(recordValue(event).threadId ?? recordValue(event).thread_id) === expectedThreadId),
   );
@@ -5676,22 +5687,44 @@ function parsePublishedArtifactResponse(
   if (isRecord(responseValue) && responseValue.isError === true) {
     return null;
   }
+  const semanticCommitShas = new Set<string>();
+  const genericShas = new Set<string>();
   for (const candidate of responseValueCandidates(responseValue)) {
     if (!isRecord(candidate)) {
       continue;
     }
     const nestedCommit = isRecord(candidate.commit) ? candidate.commit : undefined;
-    const rawSha = nestedCommit?.sha ?? nestedCommit?.commitSha ?? nestedCommit?.commit_sha ??
-      candidate.sha ?? candidate.commitSha ?? candidate.commit_sha;
+    const semanticValues = [
+      nestedCommit?.sha,
+      nestedCommit?.commitSha,
+      nestedCommit?.commit_sha,
+      candidate.commitSha,
+      candidate.commit_sha,
+      candidate.type === "commit" ? candidate.sha : undefined,
+    ];
+    for (const rawSha of semanticValues) {
+      if (
+        typeof rawSha === "string" &&
+        /^[0-9a-f]{40}$/i.test(rawSha) &&
+        rawSha !== artifact.baselineSha
+      ) {
+        semanticCommitShas.add(rawSha);
+      }
+    }
     if (
-      typeof rawSha === "string" &&
-      /^[0-9a-f]{40}$/i.test(rawSha) &&
-      rawSha !== artifact.baselineSha
+      typeof candidate.sha === "string" &&
+      /^[0-9a-f]{40}$/i.test(candidate.sha) &&
+      candidate.sha !== artifact.baselineSha
     ) {
-      return rawSha;
+      genericShas.add(candidate.sha);
     }
   }
-  return null;
+  if (semanticCommitShas.size === 1) {
+    return [...semanticCommitShas][0] ?? null;
+  }
+  return semanticCommitShas.size === 0 && genericShas.size === 1
+    ? [...genericShas][0] ?? null
+    : null;
 }
 
 function parsePullRequestDeliveryResponse(
@@ -5792,8 +5825,8 @@ function responseValueCandidates(root: unknown): unknown[] {
     if (depth > 8 || value === null || value === undefined) {
       return;
     }
-    candidates.push(value);
     if (typeof value === "string") {
+      candidates.push(value);
       const parsed = parseMaybeJson(value);
       if (parsed !== value) {
         visit(parsed, depth + 1);
@@ -5801,6 +5834,7 @@ function responseValueCandidates(root: unknown): unknown[] {
       return;
     }
     if (Array.isArray(value)) {
+      candidates.push(value);
       value.forEach((item) => visit(item, depth + 1));
       return;
     }
@@ -5808,8 +5842,11 @@ function responseValueCandidates(root: unknown): unknown[] {
       if (value.isError === true || value.success === false) {
         return;
       }
+      candidates.push(value);
       Object.values(value).forEach((item) => visit(item, depth + 1));
+      return;
     }
+    candidates.push(value);
   };
   visit(root, 0);
   return candidates;
@@ -5829,10 +5866,15 @@ function canonicalPullRequestUrl(
   }
   try {
     const parsed = new URL(value);
-    const path = parsed.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/([1-9][0-9]*)\/?$/);
+    const webPath = parsed.hostname === "github.com"
+      ? parsed.pathname.match(/^\/([^/]+)\/([^/]+)\/pull\/([1-9][0-9]*)\/?$/)
+      : null;
+    const apiPath = parsed.hostname === "api.github.com"
+      ? parsed.pathname.match(/^\/repos\/([^/]+)\/([^/]+)\/pulls\/([1-9][0-9]*)\/?$/)
+      : null;
+    const path = webPath ?? apiPath;
     if (
       parsed.protocol !== "https:" ||
-      parsed.hostname !== "github.com" ||
       path?.[1] !== target.owner ||
       path?.[2] !== target.repo ||
       path?.[3] === undefined
@@ -5843,7 +5885,10 @@ function canonicalPullRequestUrl(
     if (!Number.isSafeInteger(number) || number < 1) {
       return null;
     }
-    return { number, url: parsed.toString() };
+    return {
+      number,
+      url: `https://github.com/${target.owner}/${target.repo}/pull/${number}`,
+    };
   } catch {
     return null;
   }
@@ -5991,21 +6036,30 @@ function parseExecutionResponse(
     return null;
   }
   const responseValue = parseMaybeJson(recordValue(event).content);
-  if (!isRecord(responseValue) || typeof responseValue.success !== "boolean") {
-    return null;
+  for (const candidate of responseValueCandidates(responseValue)) {
+    if (!isRecord(candidate) || typeof candidate.success !== "boolean") {
+      continue;
+    }
+    const response = candidate.response;
+    if (!isRecord(response)) {
+      continue;
+    }
+    const exitCode = response.exitCode ?? response.exit_code;
+    const output = response.result ?? response.output ?? response.stdout;
+    if (
+      typeof exitCode !== "number" ||
+      !Number.isInteger(exitCode) ||
+      typeof output !== "string"
+    ) {
+      continue;
+    }
+    return {
+      success: candidate.success,
+      exitCode,
+      output,
+    };
   }
-  const response = responseValue.response;
-  if (!isRecord(response) ||
-      typeof response.exitCode !== "number" ||
-      !Number.isInteger(response.exitCode) ||
-      typeof response.result !== "string") {
-    return null;
-  }
-  return {
-    success: responseValue.success,
-    exitCode: response.exitCode,
-    output: response.result,
-  };
+  return null;
 }
 
 function sameFileSet(left: readonly string[], right: readonly string[]): boolean {
@@ -6412,21 +6466,24 @@ function verifyLockedFixtureInspection(
   repository: NonNullable<Mission["repository"]>,
   serverName: string,
 ): VerifiedRepositoryCommit {
-  const initialization = events.find((event) => event.type === "mcp.initialize");
-  if (initialization === undefined) {
+  const initializations = events.filter((event) => event.type === "mcp.initialize");
+  const initialization = initializations[0];
+  if (initializations.length !== 1 || initialization === undefined) {
     return inspectionFailure("TrueForge did not record MCP initialization.");
   }
   const initializedServers = recordValue(initialization).mcpServers;
   if (
     !Array.isArray(initializedServers) ||
-    !initializedServers.some((server) => isRecord(server) && server.name === serverName)
+    initializedServers.length !== 1 ||
+    !isRecord(initializedServers[0]) ||
+    initializedServers[0].name !== serverName
   ) {
-    return inspectionFailure(`MCP server ${serverName} was not initialized.`);
+    return inspectionFailure(`Only the configured MCP server ${serverName} may be initialized.`);
   }
 
   const canonicalArguments = lockedFixtureArguments();
   const observedCalls = observedToolCalls(events);
-  const canonicalCalls = observedToolCalls(events).filter(
+  const canonicalCalls = observedCalls.filter(
     (call) => call.name === "get_commit" && isRecord(call.arguments) &&
       lockedFixtureArgumentsMatch(call.arguments, canonicalArguments),
   );
@@ -6445,12 +6502,8 @@ function verifyLockedFixtureInspection(
     return inspectionFailure("get_commit MCP arguments were not a JSON object.");
   }
 
-  const response = events.find(
-    (event) =>
-      event.type === "tool.response" &&
-      recordValue(event).toolCallId === call.id,
-  );
-  if (response === undefined) {
+  const response = toolResponseForCall(events, call.id, call.threadId ?? undefined);
+  if (response?.type !== "tool.response") {
     return inspectionFailure("get_commit MCP call has no structured response.");
   }
   const responseValue = parseMaybeJson(recordValue(response).content);
@@ -6460,11 +6513,8 @@ function verifyLockedFixtureInspection(
   if (responseValue.isError === true) {
     return inspectionFailure("get_commit MCP returned an error result.");
   }
-  const verifiedPayload = responseValueCandidates(responseValue)
-    .filter(isRecord)
-    .map(parseLockedFixtureObject)
-    .find((candidate): candidate is NonNullable<typeof candidate> => candidate !== null);
-  if (verifiedPayload === undefined || verifiedPayload === null) {
+  const verifiedPayload = parseLockedFixtureObject(responseValue);
+  if (verifiedPayload === null) {
     return inspectionFailure(
       "get_commit MCP response did not contain the pinned SHA and expected file patches.",
     );
@@ -6487,6 +6537,7 @@ function verifyLockedFixtureInspection(
     contentHash: shortHash(content),
     commitSha: verifiedPayload.commitSha,
     patches: verifiedPayload.patches,
+    patchVerification: verifiedPayload.patchVerification,
   };
 }
 
@@ -6496,15 +6547,19 @@ function verifyDeliveryHeadInspection(
   serverName: string,
   expectedPatches: Readonly<Record<string, string>> = PRIMARY_VERIFIED_DELIVERY_PATCHES,
 ): VerifiedRepositoryCommit {
-  const initialization = events.find((event) => event.type === "mcp.initialize");
+  const initializations = events.filter((event) => event.type === "mcp.initialize");
+  const initialization = initializations[0];
   const initializedServers = initialization === undefined
     ? undefined
     : recordValue(initialization).mcpServers;
   if (
+    initializations.length !== 1 ||
     !Array.isArray(initializedServers) ||
-    !initializedServers.some((server) => isRecord(server) && server.name === serverName)
+    initializedServers.length !== 1 ||
+    !isRecord(initializedServers[0]) ||
+    initializedServers[0].name !== serverName
   ) {
-    return inspectionFailure(`MCP server ${serverName} was not initialized.`);
+    return inspectionFailure(`Only the configured MCP server ${serverName} may be initialized.`);
   }
   const canonicalArguments = deliveryHeadArguments(target);
   const observedCalls = observedToolCalls(events);
@@ -6525,10 +6580,8 @@ function verifyDeliveryHeadInspection(
   const call = canonicalCalls[0];
   const response = call === undefined
     ? undefined
-    : events.find((event) =>
-      event.type === "tool.response" && recordValue(event).toolCallId === call.id
-    );
-  if (response === undefined) {
+    : toolResponseForCall(events, call.id, call.threadId ?? undefined);
+  if (response?.type !== "tool.response") {
     return inspectionFailure("Delivery-head get_commit MCP call has no structured response.");
   }
   const responseValue = parseMaybeJson(recordValue(response).content);
@@ -6544,6 +6597,7 @@ function verifyDeliveryHeadInspection(
     responseValue,
     expectedPatches,
     target.artifact?.baselineSha,
+    target.headSha,
   );
   if (verifiedPayload === null) {
     return inspectionFailure(
@@ -6567,40 +6621,48 @@ function verifyDeliveryHeadInspection(
     contentHash: shortHash(content),
     commitSha: verifiedPayload.commitSha,
     patches: verifiedPayload.patches,
+    patchVerification: verifiedPayload.patchVerification,
   };
 }
 
 function parseVerifiedDeliveryHeadObject(
-  value: Record<string, unknown>,
+  value: unknown,
   expectedPatches: Readonly<Record<string, string>> = PRIMARY_VERIFIED_DELIVERY_PATCHES,
   expectedBaselineSha: string = PRIMARY_DELIVERY_FIXTURE.baselineSha,
-): { commitSha: string; patches: Readonly<Record<string, string>> } | null {
-  const commitSha = stringOrNull(value.sha);
-  const files = commitFileEntries(value.files);
-  const expectedEntries = Object.entries(expectedPatches);
+  expectedHeadSha?: string,
+): {
+  commitSha: string;
+  patches: Readonly<Record<string, string>>;
+  patchVerification: "complete" | "content_addressed";
+} | null {
+  const candidates = responseValueCandidates(value).filter(isRecord);
+  const commitCandidates = candidates.filter((candidate) => {
+    const commitSha = stringOrNull(candidate.sha);
+    return !(
+      commitSha === null ||
+      !/^[0-9a-f]{40}$/i.test(commitSha) ||
+      commitSha === expectedBaselineSha ||
+      (expectedHeadSha !== undefined && commitSha !== expectedHeadSha)
+    );
+  });
+  const preferred = commitCandidates.find((candidate) => candidate.files !== undefined) ??
+    commitCandidates[0];
+  const commitSha = preferred === undefined ? null : stringOrNull(preferred.sha);
+  if (commitSha === null) {
+    return null;
+  }
+  const patchVerification = verifyReviewedCommitPatches(candidates, expectedPatches);
   if (
-    commitSha === null ||
-    !/^[0-9a-f]{40}$/i.test(commitSha) ||
-    commitSha === expectedBaselineSha ||
-    files === null ||
-    files.length !== expectedEntries.length
+    patchVerification === null ||
+    (expectedHeadSha === undefined && patchVerification !== "complete")
   ) {
     return null;
   }
-  const patches: Record<string, string> = {};
-  for (const [filename, expectedPatch] of expectedEntries) {
-    const matchingFiles = files.filter((file) => file.filename === filename);
-    const patch = matchingFiles[0]?.patch;
-    if (
-      matchingFiles.length !== 1 ||
-      typeof patch !== "string" ||
-      normalizeCommitPatch(patch) !== expectedPatch
-    ) {
-      return null;
-    }
-    patches[filename] = normalizeCommitPatch(patch);
-  }
-  return { commitSha, patches };
+  return {
+    commitSha,
+    patches: { ...expectedPatches },
+    patchVerification,
+  };
 }
 
 function argumentsExactlyMatch(
@@ -6642,42 +6704,23 @@ function lockedFixtureArgumentsMatch(
   actual: Record<string, unknown>,
   expected: Record<string, unknown>,
 ): boolean {
-  if (actual.owner !== expected.owner || actual.repo !== expected.repo) {
-    return false;
-  }
-  const refKeys = ["sha", "ref"].filter((key) =>
-    Object.prototype.hasOwnProperty.call(actual, key),
-  );
-  if (refKeys.length !== 1) {
-    return false;
-  }
-  const requestedRef = actual[refKeys[0] as string];
-  if (typeof requestedRef !== "string" || requestedRef.trim().length === 0) {
-    return false;
-  }
-  if (
-    /^[0-9a-f]{7,40}$/i.test(requestedRef.trim()) &&
-    !String(expected.sha).toLowerCase().startsWith(requestedRef.trim().toLowerCase())
-  ) {
-    return false;
-  }
   const allowedKeys = new Set(["owner", "repo", "sha", "ref", "detail", "page", "perPage"]);
   if (Object.keys(actual).some((key) => !allowedKeys.has(key))) {
     return false;
   }
-  if (actual.detail !== undefined && actual.detail !== "full_patch") {
+  if (
+    actual.owner !== expected.owner ||
+    actual.repo !== expected.repo ||
+    actual.sha !== expected.sha ||
+    Object.prototype.hasOwnProperty.call(actual, "ref") ||
+    actual.detail !== expected.detail ||
+    actual.perPage !== expected.perPage
+  ) {
     return false;
   }
   if (
     actual.page !== undefined &&
     (actual.page !== 1 || !Number.isInteger(actual.page))
-  ) {
-    return false;
-  }
-  const perPage = actual.perPage;
-  if (
-    perPage !== undefined &&
-    (typeof perPage !== "number" || !Number.isInteger(perPage) || perPage < 1 || perPage > 100)
   ) {
     return false;
   }
@@ -6825,55 +6868,68 @@ function exactlyEqualCoordinatorExecValue(actual: unknown, expected: unknown): b
 }
 
 function parseLockedFixtureObject(
-  value: Record<string, unknown>,
-): { commitSha: string; patches: Readonly<Record<string, string>> } | null {
-  const commitSha = stringOrNull(value.sha);
-  if (commitSha === null || commitSha !== LOCKED_FIXTURE_SHA) {
+  value: unknown,
+): {
+  commitSha: string;
+  patches: Readonly<Record<string, string>>;
+  patchVerification: "complete" | "content_addressed";
+} | null {
+  const candidates = responseValueCandidates(value).filter(isRecord);
+  const hasPinnedSha = candidates.some((candidate) => candidate.sha === LOCKED_FIXTURE_SHA);
+  if (!hasPinnedSha) {
     return null;
   }
-  if (isBoundedLockedFixtureFiles(value.files)) {
-    return {
-      commitSha,
-      // The pinned commit establishes the immutable baseline; retain only the
-      // reviewed manifest scope when TrueForge has bounded the file entries.
-      patches: Object.fromEntries(
-        LOCKED_FIXTURE_FILES.map((filename) => [filename, BOUNDED_COMMIT_FILE_ENTRY]),
-      ),
-    };
-  }
-  const files = commitFileEntries(value.files);
-  if (files === null) {
+  const patchVerification = verifyReviewedCommitPatches(
+    candidates,
+    LOCKED_FIXTURE_PATCHES,
+  );
+  if (patchVerification === null) {
     return null;
   }
-  const patches: Record<string, string> = {};
-  for (const filename of LOCKED_FIXTURE_FILES) {
-    const matchingFiles = files.filter((file) => file.filename === filename);
-    if (matchingFiles.length !== 1) {
-      return null;
-    }
-    const patch = matchingFiles[0]?.patch;
-    if (
-      typeof patch !== "string" ||
-      !lockedFixturePatchMatches(patch, LOCKED_FIXTURE_PATCHES[filename])
-    ) {
-      return null;
-    }
-    patches[filename] = normalizeCommitPatch(patch);
-  }
-  return { commitSha, patches };
+  return {
+    commitSha: LOCKED_FIXTURE_SHA,
+    // The exact pinned SHA is the immutable baseline identity. Planning uses
+    // this reviewed manifest, never provider response depth or entry count.
+    patches: { ...LOCKED_FIXTURE_PATCHES },
+    patchVerification,
+  };
 }
 
-function lockedFixturePatchMatches(observedPatch: string, expectedPatch: string): boolean {
+function reviewedCommitPatchMatches(observedPatch: string, expectedPatch: string): boolean {
   const normalizedObservedPatch = normalizeCommitPatch(observedPatch);
   const normalizedExpectedPatch = normalizeCommitPatch(expectedPatch);
   return normalizedObservedPatch.length > 0 &&
     normalizedExpectedPatch.startsWith(normalizedObservedPatch);
 }
 
-function isBoundedLockedFixtureFiles(value: unknown): value is string[] {
-  return Array.isArray(value) &&
-    value.length > 0 &&
-    value.every((file) => file === BOUNDED_COMMIT_FILE_ENTRY);
+function verifyReviewedCommitPatches(
+  candidates: readonly Record<string, unknown>[],
+  expectedPatches: Readonly<Record<string, string>>,
+): "complete" | "content_addressed" | null {
+  const files = candidates.flatMap((candidate) =>
+    candidate.files === undefined ? [] : commitFileEntries(candidate.files) ?? []
+  );
+  let complete = true;
+  for (const [filename, expectedPatch] of Object.entries(expectedPatches)) {
+    const observed = files
+      .filter((file) => file.filename === filename)
+      .map((file) => file.patch)
+      .filter((patch): patch is string =>
+        typeof patch === "string" &&
+        patch.trim().length > 0 &&
+        patch !== BOUNDED_COMMIT_FILE_ENTRY
+      );
+    if (observed.some((patch) => !reviewedCommitPatchMatches(patch, expectedPatch))) {
+      return null;
+    }
+    if (
+      observed.length === 0 ||
+      !observed.some((patch) => normalizeCommitPatch(patch) === normalizeCommitPatch(expectedPatch))
+    ) {
+      complete = false;
+    }
+  }
+  return complete ? "complete" : "content_addressed";
 }
 
 interface CommitFileEntry {
@@ -7264,25 +7320,15 @@ function verifySandboxExecution(
       `${toolName} sandbox response was not emitted by the TrueForge root coordinator thread.`,
     );
   }
-  const responseValue = parseMaybeJson(recordValue(response).content);
-  if (!isRecord(responseValue)) {
-    return sandboxFailure(`${toolName} sandbox response was not a JSON object.`);
+  const observed = parseExecutionResponse(response);
+  if (observed === null) {
+    return sandboxFailure(`${toolName} sandbox response did not include a structured execution result.`);
   }
-  if (responseValue.success !== true) {
+  if (observed.success !== true) {
     return sandboxFailure(`${toolName} sandbox execution did not return success: true.`);
   }
-  const sandboxResponse = responseValue.response;
-  if (!isRecord(sandboxResponse)) {
-    return sandboxFailure(`${toolName} sandbox response did not include a response object.`);
-  }
-  const exitCode = sandboxResponse.exitCode;
-  if (typeof exitCode !== "number" || !Number.isFinite(exitCode)) {
-    return sandboxFailure(`${toolName} sandbox response returned a non-numeric exit code.`);
-  }
-  const stdout = sandboxResponse.result;
-  if (typeof stdout !== "string") {
-    return sandboxFailure(`${toolName} sandbox response did not include string output.`);
-  }
+  const exitCode = observed.exitCode;
+  const stdout = observed.output;
   if (exitCode !== 0) {
     return sandboxFailure(`${toolName} sandbox command exited with code ${exitCode}.`);
   }

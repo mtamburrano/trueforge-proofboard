@@ -207,7 +207,7 @@ export function createDaytonaSandboxExecutor(
         typeof sandbox.id !== "string" ||
         sandbox.id.trim().length === 0 ||
         typeof sandbox.name !== "string" ||
-        sandbox.name !== locator ||
+        (sandbox.id !== locator && sandbox.name !== locator) ||
         !isRecord(sandbox.process) ||
         typeof sandbox.process.executeCommand !== "function"
       ) {
