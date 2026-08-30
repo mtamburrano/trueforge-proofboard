@@ -172,6 +172,7 @@ const LOCKED_FIXTURE_REPO = PRIMARY_DELIVERY_FIXTURE.repository;
 const LOCKED_FIXTURE_REF = PRIMARY_DELIVERY_FIXTURE.baselineRef;
 const LOCKED_FIXTURE_SHA = PRIMARY_DELIVERY_FIXTURE.baselineSha;
 const LOCKED_FIXTURE_FILES = ["src/index.ts", "test/index.test.js"] as const;
+const BOUNDED_COMMIT_FILE_ENTRY = "[bounded]";
 const LOCKED_FIXTURE_PATCHES = {
   "src/index.ts": [
     "@@ -1,11 +1,17 @@",
@@ -5042,7 +5043,7 @@ function buildLockedFixtureInspectionInstruction(
   return [
     `Use the configured MCP server ${serverName}.`,
     `Use get_commit for ${LOCKED_FIXTURE_OWNER}/${LOCKED_FIXTURE_REPO} and the pinned repository ref ${LOCKED_FIXTURE_REF}.`,
-    `Request full_patch detail. The returned commit must resolve to the exact full SHA ${LOCKED_FIXTURE_SHA} and include the exact patches for ${LOCKED_FIXTURE_FILES.join(" and ")}.`,
+    `Request full_patch detail. The returned commit must resolve to the exact full SHA ${LOCKED_FIXTURE_SHA}. TrueForge may persist the file entries as [bounded]; after the exact repository, call, and SHA correlation succeeds, use the reviewed manifest for the bounded scope. If concrete patches are present, they must match ${LOCKED_FIXTURE_FILES.join(" and ")} exactly.`,
     "Make no other MCP calls during this turn. If a completed turn emits no tool call, the bounded coordinator may repeat the read once; request formatting may vary, but every observed tool call must remain a read-only get_commit for this repository.",
     "Use the MCP response as the only source of repository facts; do not use the host filesystem, canned data, or final-answer narration.",
     "Stop after the read.",
@@ -6827,8 +6828,21 @@ function parseLockedFixtureObject(
   value: Record<string, unknown>,
 ): { commitSha: string; patches: Readonly<Record<string, string>> } | null {
   const commitSha = stringOrNull(value.sha);
+  if (commitSha === null || commitSha !== LOCKED_FIXTURE_SHA) {
+    return null;
+  }
+  if (isBoundedLockedFixtureFiles(value.files)) {
+    return {
+      commitSha,
+      // The pinned commit establishes the immutable baseline; retain only the
+      // reviewed manifest scope when TrueForge has bounded the file entries.
+      patches: Object.fromEntries(
+        LOCKED_FIXTURE_FILES.map((filename) => [filename, BOUNDED_COMMIT_FILE_ENTRY]),
+      ),
+    };
+  }
   const files = commitFileEntries(value.files);
-  if (commitSha === null || files === null) {
+  if (files === null) {
     return null;
   }
   const patches: Record<string, string> = {};
@@ -6843,10 +6857,13 @@ function parseLockedFixtureObject(
     }
     patches[filename] = normalizeCommitPatch(patch);
   }
-  if (commitSha !== LOCKED_FIXTURE_SHA) {
-    return null;
-  }
   return { commitSha, patches };
+}
+
+function isBoundedLockedFixtureFiles(value: unknown): value is string[] {
+  return Array.isArray(value) &&
+    value.length === LOCKED_FIXTURE_FILES.length &&
+    value.every((file) => file === BOUNDED_COMMIT_FILE_ENTRY);
 }
 
 interface CommitFileEntry {

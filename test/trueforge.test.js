@@ -145,6 +145,9 @@ const LOCKED_FIXTURE_PATCHES = {
     "\\ No newline at end of file",
   ].join("\n"),
 };
+const LOCKED_FIXTURE_BOUNDED_PATCHES = Object.fromEntries(
+  Object.keys(LOCKED_FIXTURE_PATCHES).map((filename) => [filename, "[bounded]"]),
+);
 
 function fakeEvents(turnId = "turn-1") {
   return [
@@ -2724,6 +2727,83 @@ test("locked fixture inspection accepts the pinned Todo baseline commit shape", 
   });
   assert.equal(details.commit_sha, LOCKED_FIXTURE_SHA);
   assert.deepEqual(details.patches, LOCKED_FIXTURE_PATCHES);
+});
+
+test("locked fixture inspection accepts the real bounded commit file shape", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, {
+    responseContent: JSON.stringify({
+      sha: LOCKED_FIXTURE_SHA,
+      files: ["[bounded]", "[bounded]"],
+    }),
+  }));
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-4-mini",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-mcp-bounded-file-shape",
+    objective: "Accept the pinned repository read with bounded file entries",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  const inspection = await runner.inspectRepository({ missionId: mission.id });
+
+  assert.equal(inspection.commitSha, LOCKED_FIXTURE_SHA);
+  assert.deepEqual(inspection.patches, LOCKED_FIXTURE_BOUNDED_PATCHES);
+  const state = await missions.getState();
+  const proof = state.evidence.find((item) => item.id === inspection.evidenceId);
+  assert.ok(proof);
+  assert.deepEqual(JSON.parse(proof.details).patches, LOCKED_FIXTURE_BOUNDED_PATCHES);
+});
+
+test("bounded locked fixture reads still reject a wrong SHA or uncorrelated response", async () => {
+  const boundedFiles = ["[bounded]", "[bounded]"];
+  const cases = [
+    {
+      label: "wrong SHA",
+      options: {
+        responseContent: JSON.stringify({
+          sha: "0000000000000000000000000000000000000000",
+          files: boundedFiles,
+        }),
+      },
+      error: /get_commit MCP response did not contain the pinned SHA and expected file patches/,
+    },
+    {
+      label: "uncorrelated response",
+      options: {
+        responseCallId: "different-call",
+        responseContent: JSON.stringify({ sha: LOCKED_FIXTURE_SHA, files: boundedFiles }),
+      },
+      error: /get_commit MCP call has no structured response/,
+    },
+  ];
+
+  for (const fixture of cases) {
+    const missions = new MissionService(new InMemoryMissionRepository());
+    const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, fixture.options));
+    const runner = new TrueForgeMissionRunner(missions, client, {
+      model: "openai/gpt-5-4-mini",
+      mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+    });
+    const mission = await runner.createMission({
+      id: `mission-mcp-bounded-${fixture.label.replaceAll(" ", "-")}`,
+      objective: `Reject a bounded repository read with ${fixture.label}`,
+      repository: {
+        owner: "mtamburrano",
+        name: "proofboard-demo-fixture",
+        ref: LOCKED_FIXTURE_REF,
+      },
+    });
+
+    await assert.rejects(runner.inspectRepository({ missionId: mission.id }), fixture.error, fixture.label);
+    assert.equal((await missions.getMission(mission.id)).status, "blocked", fixture.label);
+  }
 });
 
 test("locked fixture inspection rejects the old Proof Board fixture shape", async () => {

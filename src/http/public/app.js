@@ -156,6 +156,7 @@ function clearMessage() {
 }
 
 function renderEmpty(intake) {
+  if (currentView === null && document.querySelector("#mission-intake-form") !== null) return;
   currentView = null;
   selectedTicketId = null;
   if (intake !== undefined) intakeConfig = intake;

@@ -108,6 +108,116 @@ test("Proof Board UI keeps durable polling, drawer, activity, proof, and approva
   assert.match(styleSheet, /\.activity-details/);
 });
 
+test("repeated null-mission polling preserves the mounted intake draft and focus", async () => {
+  const renderStart = appScript.indexOf("function escapeHtml");
+  const escapeEnd = appScript.indexOf("function semanticClass");
+  const renderEnd = appScript.indexOf("function ticketsForView");
+  const pollStart = appScript.indexOf("async function pollMission");
+  const pollEnd = appScript.indexOf("function startMissionPolling");
+  assert.ok(renderStart >= 0 && escapeEnd > renderStart && renderEnd > escapeEnd);
+  assert.ok(pollStart >= 0 && pollEnd > pollStart);
+
+  let mountedForm = null;
+  let renderCount = 0;
+  let pollCount = 0;
+  const document = {
+    hidden: false,
+    activeElement: null,
+    querySelector(selector) {
+      if (selector === "#mission-intake-form") return mountedForm;
+      if (selector === "#mission-objective") return mountedForm?.objective ?? null;
+      if (selector === "#use-demo-mission") return mountedForm?.demoButton ?? null;
+      return null;
+    },
+  };
+  const app = {
+    set innerHTML(markup) {
+      renderCount += 1;
+      const objective = {
+        value: "",
+        focus() {
+          document.activeElement = this;
+        },
+      };
+      const demoButton = {
+        listeners: new Map(),
+        addEventListener(type, listener) {
+          this.listeners.set(type, listener);
+        },
+        click() {
+          this.listeners.get("click")?.({ currentTarget: this });
+        },
+      };
+      mountedForm = {
+        objective,
+        demoButton,
+        listeners: new Map(),
+        querySelector(selector) {
+          if (selector === "#mission-objective") return this.objective;
+          if (selector === "#use-demo-mission") return this.demoButton;
+          return null;
+        },
+        addEventListener(type, listener) {
+          this.listeners.set(type, listener);
+        },
+      };
+    },
+  };
+  const context = {
+    app,
+    document,
+    DEFAULT_DEMO_OBJECTIVE: "Add support for marking a todo as completed.",
+    currentView: null,
+    selectedTicketId: null,
+    intakeConfig: null,
+    boardDragInProgress: false,
+    pollInFlight: false,
+    runCoordinator: { isRunning: () => false, accept() {} },
+    connectionState: { classList: { contains: () => false } },
+    createMission() {},
+    setConnection() {},
+    showMessage() {},
+    api: async () => {
+      pollCount += 1;
+      return {
+        mission: null,
+        intake: {
+          demoObjective: "Add support for marking a todo as completed.",
+          repository: { owner: "example", name: "todos", ref: "baseline" },
+        },
+      };
+    },
+  };
+  vm.runInNewContext(
+    appScript.slice(renderStart, escapeEnd) +
+      appScript.slice(appScript.indexOf("function renderEmpty"), renderEnd) +
+      "\n" + appScript.slice(pollStart, pollEnd),
+    context,
+  );
+
+  context.renderEmpty();
+  const form = mountedForm;
+  const objective = form.objective;
+  objective.value = "Keep this draft while the server is still empty.";
+  objective.focus();
+
+  await context.pollMission();
+  await context.pollMission();
+  assert.equal(pollCount, 2);
+  assert.equal(renderCount, 1);
+  assert.equal(mountedForm, form);
+  assert.equal(objective.value, "Keep this draft while the server is still empty.");
+  assert.equal(document.activeElement, objective);
+
+  form.demoButton.click();
+  await context.pollMission();
+  await context.pollMission();
+  assert.equal(renderCount, 1);
+  assert.equal(mountedForm, form);
+  assert.equal(objective.value, context.DEFAULT_DEMO_OBJECTIVE);
+  assert.equal(document.activeElement, objective);
+});
+
 test("Proof Board UI uses the returned mission state for run feedback", () => {
   assert.match(appScript, /const payload = await runCoordinator\.run\(\)/);
   assert.match(appScript, /MissionRunState\.describeRunOutcome\(payload\?\.mission \?\? currentView\)/);
