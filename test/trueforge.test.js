@@ -341,6 +341,7 @@ function lockedCommitEvents(
     responseContent,
     responseCallId = "call-commit",
     attempts,
+    discoveryCalls = [],
     turnState = { status: "done", requiredActions: [] },
   } = {},
 ) {
@@ -352,6 +353,47 @@ function lockedCommitEvents(
     responseContent,
     responseCallId,
   }];
+  const discoveryEvents = discoveryCalls.flatMap((discovery, index) => {
+    const discoveryArguments = JSON.stringify(discovery.argumentsValue ?? {});
+    const argumentSplit = Math.ceil(discoveryArguments.length / 2);
+    const callId = discovery.callId ?? `call-discovery-${index + 1}`;
+    return [
+      {
+        type: "model.message.delta",
+        id: `event-discovery-${index + 1}`,
+        createdAt: "2026-08-26T16:00:01.500Z",
+        threadId: "thread-1",
+        toolCalls: [{
+          index: index + 100,
+          id: callId,
+          function: {
+            name: discovery.name,
+            arguments: discoveryArguments.slice(0, argumentSplit),
+          },
+        }],
+      },
+      {
+        type: "model.message.delta",
+        id: `event-discovery-${index + 1}-arguments`,
+        createdAt: "2026-08-26T16:00:01.750Z",
+        threadId: "thread-1",
+        toolCalls: [{
+          index: index + 100,
+          function: {
+            arguments: discoveryArguments.slice(argumentSplit),
+          },
+        }],
+      },
+      {
+        type: "tool.response",
+        id: `event-discovery-response-${index + 1}`,
+        createdAt: "2026-08-26T16:00:01.900Z",
+        threadId: "thread-1",
+        toolCallId: discovery.responseCallId ?? callId,
+        content: discovery.responseContent ?? JSON.stringify({ isError: false, structuredContent: {} }),
+      },
+    ];
+  });
   const attemptEvents = commitAttempts.flatMap((attempt, index) => {
     const commitArguments = JSON.stringify(attempt.argumentsValue);
     const argumentSplit = Math.ceil(commitArguments.length / 2);
@@ -414,6 +456,7 @@ function lockedCommitEvents(
       threadId: "thread-1",
       mcpServers: [{ name: "github" }],
     },
+    ...discoveryEvents,
     ...attemptEvents,
     {
       type: "turn.done",
@@ -1083,7 +1126,7 @@ function fakeClient(eventFactory = fakeEvents, { passAgentSpec = false } = {}) {
         const turnCall = { sessionId, request, agentSpec: activeAgentSpec, events: [] };
         calls.turns.push(turnCall);
         const events = passAgentSpec
-          ? eventFactory(turnId, activeAgentSpec)
+          ? eventFactory(turnId, activeAgentSpec, calls.turns.length)
           : eventFactory(turnId);
         turnCall.events = events;
         return fakeStream(events);
@@ -1277,8 +1320,8 @@ test("runner creates a TrueForge session and maps safe runtime evidence", async 
 
 test("runner provisions a missing Debian 12 sandbox toolchain before delegated work", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
-  const { client, calls } = fakeClient((turnId, agentSpec) =>
-    agentSpec?.config?.iterationLimit === SANDBOX_SETUP_ITERATION_LIMIT
+  const { client, calls } = fakeClient((turnId, agentSpec, turnNumber) =>
+    turnNumber === 1
       ? sandboxSetupEvents(turnId)
       : sandboxToolchainProofEvents(turnId),
   { passAgentSpec: true });
@@ -1338,8 +1381,8 @@ test("bounded sandbox setup accepts a paraphrased exec intent before exact proof
   const missions = new MissionService(new InMemoryMissionRepository());
   const paraphrasedIntent =
     "Provision the sandbox runtime and confirm it is usable before delegated work.";
-  const { client, calls } = fakeClient((turnId, agentSpec) => {
-    if (agentSpec?.config?.iterationLimit === SANDBOX_SETUP_ITERATION_LIMIT) {
+  const { client, calls } = fakeClient((turnId, agentSpec, turnNumber) => {
+    if (turnNumber === 1) {
       assert.equal(agentSpec?.model?.params?.parallel_tool_calls, false);
       return sandboxSetupEvents(turnId, {
         intents: [paraphrasedIntent, paraphrasedIntent],
@@ -1384,8 +1427,8 @@ test("bounded sandbox setup accepts a paraphrased exec intent before exact proof
 
 test("sandbox proof failure blocks without a corrective repair turn and restores the normal agent", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
-  const { client, calls } = fakeClient((turnId, agentSpec) => {
-    if (agentSpec?.config?.iterationLimit === SANDBOX_SETUP_ITERATION_LIMIT) {
+  const { client, calls } = fakeClient((turnId, agentSpec, turnNumber) => {
+    if (turnNumber === 1) {
       return sandboxSetupEvents(turnId);
     }
     return sandboxToolchainProofEvents(turnId, { nodeVersion: "v18.20.4" });
@@ -1469,8 +1512,8 @@ test("bounded setup accepts its four-exec maximum with a separate completion ite
     { length: SANDBOX_SETUP_EXEC_LIMIT },
     (_, index) => `echo setup-${index + 1}`,
   );
-  const { client, calls } = fakeClient((turnId, agentSpec) => {
-    if (agentSpec?.config?.iterationLimit === SANDBOX_SETUP_ITERATION_LIMIT) {
+  const { client, calls } = fakeClient((turnId, agentSpec, turnNumber) => {
+    if (turnNumber === 1) {
       return sandboxSetupEvents(turnId, {
         commands: setupCommands,
         exitCodes: [1, 0, 0, 0],
@@ -1511,8 +1554,8 @@ test("Debian 12 setup guidance recovers from stock Node 18 before independent pr
     "curl -fsSL https://deb.nodesource.com/setup_22.x | bash -",
     "node --version && npm --version",
   ];
-  const { client, calls } = fakeClient((turnId, agentSpec) =>
-    agentSpec?.config?.iterationLimit === SANDBOX_SETUP_ITERATION_LIMIT
+  const { client, calls } = fakeClient((turnId, agentSpec, turnNumber) =>
+    turnNumber === 1
       ? sandboxSetupEvents(turnId, {
           commands: setupCommands,
           exitCodes: [0, 0, 0, 0],
@@ -1576,8 +1619,8 @@ test("coordinator sandbox readiness and verification require root main call and 
 
   for (const [index, fixture] of cases.entries()) {
     const missions = new MissionService(new InMemoryMissionRepository());
-    const { client } = fakeClient((turnId, agentSpec) => fixture.operation === "readiness"
-      ? agentSpec?.config?.iterationLimit === SANDBOX_SETUP_ITERATION_LIMIT
+    const { client } = fakeClient((turnId, agentSpec, turnNumber) => fixture.operation === "readiness"
+      ? turnNumber === 1
         ? sandboxSetupEvents(turnId, fixture.options)
         : sandboxToolchainProofEvents(turnId)
       : sandboxEvents(turnId, 0, [], fixture.options),
@@ -1671,7 +1714,7 @@ test("coordinator sandbox turns are runtime-bounded and stop cleanly after the c
   assert.equal(state.missions[0].trueforgeSessionId, "session-created");
   assert.equal(state.missions[0].trueforgeSandboxId, "sandbox-1");
   const completionEvidence = state.evidence.find((item) =>
-    item.summary.includes("one-iteration sandbox proof boundary"),
+    item.summary.includes("5-iteration sandbox proof boundary"),
   );
   assert.ok(completionEvidence);
   assert.equal(completionEvidence.result, "informational");
@@ -1691,6 +1734,18 @@ test("mission agent specs use a bounded non-twelve default iteration limit", () 
     () => buildMissionAgentSpec({ model: "openai/gpt-5-4-mini", iterationLimit: MAX_TRUEFORGE_ITERATION_LIMIT + 1 }),
     /between 1 and 1024/,
   );
+});
+
+test("final demo coordinator surfaces share a five-iteration bound", () => {
+  assert.equal(COORDINATOR_TRUEFORGE_ITERATION_LIMIT, 5);
+  const config = { model: "openai/gpt-5-4-mini" };
+  for (const surface of ["repository-read", "sandbox-exec", "review"]) {
+    assert.equal(
+      buildCoordinatorAgentSpec(config, surface).config.iterationLimit,
+      COORDINATOR_TRUEFORGE_ITERATION_LIMIT,
+      surface,
+    );
+  }
 });
 
 test("deterministic coordinator policy supports exactly four models without inert tool forcing", () => {
@@ -2824,6 +2879,53 @@ test("locked fixture inspection accepts the pinned Todo baseline commit shape", 
   assert.deepEqual(details.patches, LOCKED_FIXTURE_PATCHES);
 });
 
+test("locked fixture inspection accepts schema discovery before canonical get_commit", async () => {
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client, calls } = fakeClient((turnId, agentSpec) => {
+    assert.equal(agentSpec?.config?.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
+    return lockedCommitEvents(turnId, {
+      discoveryCalls: [{
+        name: "get_tool_output_schema",
+        argumentsValue: {
+          mcp_server: "github",
+          tool_name: "get_commit",
+        },
+      }],
+    });
+  }, { passAgentSpec: true });
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-6-luna",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-mcp-schema-before-commit",
+    objective: "Inspect the pinned repository after harmless MCP schema discovery",
+    repository: {
+      owner: "mtamburrano",
+      name: "proofboard-demo-fixture",
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  const inspection = await runner.inspectRepository({ missionId: mission.id });
+
+  assert.equal(inspection.commitSha, LOCKED_FIXTURE_SHA);
+  assert.deepEqual(inspection.patches, LOCKED_FIXTURE_PATCHES);
+  assert.deepEqual(
+    calls.turns[0].events
+      .filter((event) => event.type === "model.message.delta")
+      .flatMap((event) => event.toolCalls ?? [])
+      .map((call) => call.function?.name)
+      .filter((name) => name !== undefined),
+    ["get_tool_output_schema", "get_commit"],
+  );
+  assert.deepEqual(calls.turns[0].agentSpec.mcpServers, [{
+    name: "github",
+    enableTools: ["get_commit"],
+    preload: true,
+  }]);
+});
+
 test("locked fixture inspection accepts the real three-entry bounded commit file shape", async () => {
   const missions = new MissionService(new InMemoryMissionRepository());
   const { client } = fakeClient((turnId) => lockedCommitEvents(turnId, {
@@ -3578,6 +3680,66 @@ test("delivery-head inspection accepts a changed commit with the verified implem
   assert.equal(details.commit_sha, headSha);
 });
 
+test("delivery-head inspection accepts schema discovery before canonical get_commit", async () => {
+  const headSha = "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1";
+  const target = {
+    owner: "mtamburrano",
+    repo: "proofboard-demo-fixture",
+    base: "main",
+    head: "proofboard-verified-delivery",
+    title: "Verified fixture delivery",
+    body: "Verified fixture delivery body.",
+  };
+  const missions = new MissionService(new InMemoryMissionRepository());
+  const { client, calls } = fakeClient((turnId, agentSpec) => {
+    assert.equal(agentSpec?.config?.iterationLimit, COORDINATOR_TRUEFORGE_ITERATION_LIMIT);
+    return lockedCommitEvents(turnId, {
+      discoveryCalls: [{
+        name: "get_tool_output_schema",
+        argumentsValue: {
+          mcp_server: "github",
+          tool_name: "get_commit",
+        },
+      }],
+      argumentsValue: {
+        owner: target.owner,
+        repo: target.repo,
+        sha: target.head,
+        detail: "full_patch",
+        perPage: 100,
+      },
+      sha: headSha,
+      patches: PRIMARY_VERIFIED_DELIVERY_PATCHES,
+    });
+  }, { passAgentSpec: true });
+  const runner = new TrueForgeMissionRunner(missions, client, {
+    model: "openai/gpt-5-6-luna",
+    mcpServers: [{ name: "github", enableTools: ["get_commit"] }],
+  });
+  const mission = await runner.createMission({
+    id: "mission-delivery-head-schema-before-commit",
+    objective: "Verify the delivery head after harmless MCP schema discovery",
+    repository: {
+      owner: target.owner,
+      name: target.repo,
+      ref: LOCKED_FIXTURE_REF,
+    },
+  });
+
+  const inspection = await runner.inspectDeliveryHead({ missionId: mission.id, target });
+
+  assert.equal(inspection.commitSha, headSha);
+  assert.deepEqual(inspection.patches, PRIMARY_VERIFIED_DELIVERY_PATCHES);
+  assert.deepEqual(
+    calls.turns[0].events
+      .filter((event) => event.type === "model.message.delta")
+      .flatMap((event) => event.toolCalls ?? [])
+      .map((call) => call.function?.name)
+      .filter((name) => name !== undefined),
+    ["get_tool_output_schema", "get_commit"],
+  );
+});
+
 test("delivery-head inspection accepts wrapped truncated patches only for the exact push_files SHA", async () => {
   const headSha = "8bb22a62b3714f699204cb0d5c440fcb7f0a09e1";
   const target = artifactDeliveryTarget({ headSha });
@@ -3782,7 +3944,7 @@ test("locked fixture inspection rejects a corrective retry after a non-canonical
 
   await assert.rejects(
     runner.inspectRepository({ missionId: mission.id }),
-    /Expected exactly one canonical get_commit MCP call, found 2/,
+    /unsupported non-canonical tool call: get_commit/,
   );
   const state = await missions.getState();
   assert.equal(state.missions[0].status, "blocked");

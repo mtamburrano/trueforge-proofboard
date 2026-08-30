@@ -269,8 +269,8 @@ const DELIVERY_PUBLICATION_MESSAGE = "Publish the verified Proof Board delivery 
  */
 export const DEFAULT_TRUEFORGE_ITERATION_LIMIT = 64;
 export const MAX_TRUEFORGE_ITERATION_LIMIT = 1_024;
-/** Deterministic coordinator operations get one model iteration and one tool call. */
-export const COORDINATOR_TRUEFORGE_ITERATION_LIMIT = 1;
+/** Deterministic coordinator operations get a bounded five-iteration budget. */
+export const COORDINATOR_TRUEFORGE_ITERATION_LIMIT = 5;
 /** Setup may observe and correct a failed sandbox command, but remains finite. */
 export const SANDBOX_SETUP_EXEC_LIMIT = 4;
 /** Compatibility alias for callers that name the setup bound as a count. */
@@ -2357,10 +2357,22 @@ export class TrueForgeMissionRunner {
         isRecord(call.arguments) &&
         argumentsExactlyMatch(call.arguments, pullRequestSearchArguments(target))
       );
-      if (calls.length !== 1 || searchCalls.length !== 1) {
+      if (searchCalls.length !== 1) {
         throw new TrueForgeIntegrationError(
           "reconcile pull request approval",
-          "Pull request reconciliation must contain exactly one canonical read-only search_pull_requests call and no other tool calls.",
+          "Pull request reconciliation must contain exactly one canonical read-only search_pull_requests call.",
+        );
+      }
+      const unexpectedCalls = unexpectedMcpReadCalls(
+        calls,
+        searchCalls,
+        pending.serverName,
+        "search_pull_requests",
+      );
+      if (unexpectedCalls.length > 0) {
+        throw new TrueForgeIntegrationError(
+          "reconcile pull request approval",
+          `Pull request reconciliation emitted an unsupported non-canonical tool call: ${unexpectedCalls[0]?.name ?? "unknown"}.`,
         );
       }
       const searchCall = searchCalls[0];
@@ -2582,10 +2594,22 @@ export class TrueForgeMissionRunner {
         isRecord(call.arguments) &&
         argumentsExactlyMatch(call.arguments, pullRequestSearchArguments(publishedTarget))
       );
-      if (calls.length !== 1 || searchCalls.length !== 1) {
+      if (searchCalls.length !== 1) {
         throw new TrueForgeIntegrationError(
           "reconcile pull request approval",
-          "Pull request reconciliation must contain exactly one canonical read-only search_pull_requests call and no other tool calls.",
+          "Pull request reconciliation must contain exactly one canonical read-only search_pull_requests call.",
+        );
+      }
+      const unexpectedCalls = unexpectedMcpReadCalls(
+        calls,
+        searchCalls,
+        pending.serverName,
+        "search_pull_requests",
+      );
+      if (unexpectedCalls.length > 0) {
+        throw new TrueForgeIntegrationError(
+          "reconcile pull request approval",
+          `Pull request reconciliation emitted an unsupported non-canonical tool call: ${unexpectedCalls[0]?.name ?? "unknown"}.`,
         );
       }
       const searchCall = searchCalls[0];
@@ -2784,10 +2808,22 @@ export class TrueForgeMissionRunner {
           pullRequestReadArguments(target, pullRequest.number),
         )
       );
-      if (calls.length !== 1 || readCalls.length !== 1) {
+      if (readCalls.length !== 1) {
         throw new TrueForgeIntegrationError(
           "verify created pull request",
-          "The post-create read-back must contain exactly one canonical pull_request_read call and no other tool calls.",
+          "The post-create read-back must contain exactly one canonical pull_request_read call.",
+        );
+      }
+      const unexpectedCalls = unexpectedMcpReadCalls(
+        calls,
+        readCalls,
+        serverName,
+        PULL_REQUEST_READ_TOOL_NAME,
+      );
+      if (unexpectedCalls.length > 0) {
+        throw new TrueForgeIntegrationError(
+          "verify created pull request",
+          `The post-create read-back emitted an unsupported non-canonical tool call: ${unexpectedCalls[0]?.name ?? "unknown"}.`,
         );
       }
       const readCall = readCalls[0];
@@ -4875,7 +4911,7 @@ function buildPullRequestReadbackInstruction(
 ): string {
   return [
     `Use the configured MCP server ${serverName}.`,
-    `Call ${PULL_REQUEST_READ_TOOL_NAME} exactly once with this JSON object: ${JSON.stringify(pullRequestReadArguments(target, number))}.`,
+    `Call ${PULL_REQUEST_READ_TOOL_NAME} exactly once with this JSON object: ${JSON.stringify(pullRequestReadArguments(target, number))}; harmless MCP discovery/helper calls may precede this required read.`,
     "This is a read-only post-create verification; do not call any write or destructive tool.",
     `Verify that the response is pull request #${number} in ${target.owner}/${target.repo}, targeting base ${target.base} from head ${target.head}, with the approved head SHA ${target.headSha}.`,
     "Stop after the read and return the structured MCP response.",
@@ -4888,7 +4924,7 @@ function buildPullRequestReconciliationInstruction(
 ): string {
   return [
     `Use the configured MCP server ${serverName}.`,
-    `Call search_pull_requests exactly once with this JSON object: ${JSON.stringify(pullRequestSearchArguments(target))}.`,
+    `Call search_pull_requests exactly once with this JSON object: ${JSON.stringify(pullRequestSearchArguments(target))}; harmless MCP discovery/helper calls may precede this required read.`,
     "This is a read-only reconciliation after a possibly interrupted delivery; do not call create_pull_request or any other write or destructive tool.",
     `Return only pull requests that can be verified against ${target.owner}/${target.repo}, base ${target.base}, head ${target.head}, and approved head SHA ${target.headSha}; an exact read-back will verify the selected result before delivery continues.`,
     "Stop after the search and return the structured MCP response.",
@@ -5037,7 +5073,7 @@ function buildRepositoryInspectionInstruction(
   };
   return [
     `Use the configured MCP server ${serverName}.`,
-    `Call ${toolName} exactly once with this JSON object: ${JSON.stringify(argumentsValue)}.`,
+    `Call ${toolName} exactly once with this JSON object: ${JSON.stringify(argumentsValue)}; harmless MCP discovery/helper calls may precede this required domain read.`,
     "Use the MCP response as the only source of repository contents; do not use the host filesystem or canned data.",
     "Report the returned file facts and stop after the read.",
   ].join(" ");
@@ -5057,7 +5093,7 @@ function buildLockedFixtureInspectionInstruction(
     `Use the configured MCP server ${serverName}.`,
     `Use get_commit for ${LOCKED_FIXTURE_OWNER}/${LOCKED_FIXTURE_REPO} and the pinned repository ref ${LOCKED_FIXTURE_REF}.`,
     `Request full_patch detail. The returned commit must resolve to the exact full SHA ${LOCKED_FIXTURE_SHA}. TrueForge may persist the file entries as [bounded]; after the exact repository, call, and SHA correlation succeeds, use the reviewed manifest for the bounded scope. If concrete patches are present, each reviewed patch must match its expected patch or be a non-empty prefix after normalization; visible contradictions fail closed.`,
-    "Make no other MCP calls during this turn. If a completed turn emits no tool call, the bounded coordinator may repeat the read once; request formatting may vary, but every observed tool call must remain a read-only get_commit for this repository.",
+    "Allow the harmless get_tool_output_schema discovery/helper call before the required canonical get_commit. Do not perform another domain read or any write; if a completed turn emits no tool call, the bounded coordinator may repeat the read, and the canonical get_commit must still use the pinned repository arguments.",
     "Use the MCP response as the only source of repository facts; do not use the host filesystem, canned data, or final-answer narration.",
     "Stop after the read.",
   ].join(" ");
@@ -5084,7 +5120,7 @@ function buildDeliveryHeadInspectionInstruction(
     `Use the configured MCP server ${serverName}.`,
     `Use get_commit with this exact JSON object: ${JSON.stringify(deliveryHeadArguments(target))}.`,
     `The returned commit must differ from baseline ${baselineSha} and contain the verified delivery patches.`,
-    "Make no other MCP calls during this turn. If a completed turn emits no tool call, the bounded coordinator may repeat this exact operation; any emitted tool call must use these exact arguments.",
+    "Allow the harmless get_tool_output_schema discovery/helper call before the required canonical get_commit. Do not perform another domain read or any write; if a completed turn emits no tool call, the bounded coordinator may repeat this exact operation, and the canonical get_commit must still use these exact arguments.",
     "Use the MCP response as the only source of delivery-head facts; do not mutate the repository.",
     "Stop after the read.",
   ].join(" ");
@@ -5434,9 +5470,12 @@ function buildCoordinatorZeroToolRetryInstruction(
   instruction: string,
   expectedToolName: string,
 ): string {
+  const discoveryGuidance = expectedToolName === "exec"
+    ? "Keep the existing exec-only phase surface."
+    : "A harmless get_tool_output_schema discovery/helper call may precede the required domain read; do not issue another domain or write call.";
   return [
     instruction,
-    `The previous coordinator turn emitted no tool call. Repeat the exact required operation now: emit exactly one ${expectedToolName} tool call with the same required arguments, command, thread, and verifier.`,
+    `The previous coordinator turn emitted no tool call. Repeat the exact required operation now: emit the required canonical ${expectedToolName} tool call with the same required arguments, command, thread, and verifier. ${discoveryGuidance}`,
     "Do not substitute, relax, or narrate instead of the required operation.",
   ].join(" ");
 }
@@ -5476,10 +5515,20 @@ function isExpectedCoordinatorIterationStop(
     return false;
   }
   const calls = observedToolCalls(events);
-  if (calls.length !== 1 || calls[0] === undefined || calls[0].name !== expectedToolName) {
+  const expectedCalls = calls.filter((call) => call.name === expectedToolName);
+  if (expectedCalls.length !== 1 || expectedCalls[0] === undefined) {
     return false;
   }
-  const call = calls[0];
+  if (
+    expectedToolName === "exec"
+      ? calls.length !== 1
+      : calls.some((call) =>
+          call.name !== expectedToolName && call.name !== "get_tool_output_schema"
+        )
+  ) {
+    return false;
+  }
+  const call = expectedCalls[0];
   if (expectedToolName === "exec" && !isCoordinatorRootThread(call.threadId)) {
     return false;
   }
@@ -6369,6 +6418,34 @@ function lockedFixtureArguments(): Record<string, unknown> {
   };
 }
 
+type ObservedToolCall = ReturnType<typeof observedToolCalls>[number];
+
+function isHarmlessMcpDiscoveryCall(
+  call: ObservedToolCall,
+  serverName: string,
+  expectedToolName: string,
+): boolean {
+  return call.name === "get_tool_output_schema" &&
+    isRecord(call.arguments) &&
+    argumentsExactlyMatch(call.arguments, {
+      mcp_server: serverName,
+      tool_name: expectedToolName,
+    });
+}
+
+function unexpectedMcpReadCalls(
+  calls: ObservedToolCall[],
+  canonicalCalls: ObservedToolCall[],
+  serverName: string,
+  expectedToolName: string,
+): ObservedToolCall[] {
+  const canonicalCallIds = new Set(canonicalCalls.map((call) => call.id));
+  return calls.filter((call) =>
+    !canonicalCallIds.has(call.id) &&
+    !isHarmlessMcpDiscoveryCall(call, serverName, expectedToolName)
+  );
+}
+
 function verifyRepositoryInspection(
   events: TrueForgeApi.TurnStreamingEvent[],
   repository: NonNullable<Mission["repository"]>,
@@ -6390,10 +6467,22 @@ function verifyRepositoryInspection(
     return inspectionFailure(`MCP server ${serverName} was not initialized.`);
   }
 
-  const calls = observedToolCalls(events).filter((call) => call.name === toolName);
+  const observedCalls = observedToolCalls(events);
+  const calls = observedCalls.filter((call) => call.name === toolName);
   if (calls.length !== 1) {
     return inspectionFailure(
       `Expected exactly one ${toolName} MCP call, found ${calls.length}.`,
+    );
+  }
+  const unexpectedCalls = unexpectedMcpReadCalls(
+    observedCalls,
+    calls,
+    serverName,
+    toolName,
+  );
+  if (unexpectedCalls.length > 0) {
+    return inspectionFailure(
+      `${toolName} MCP emitted an unsupported non-canonical tool call: ${unexpectedCalls[0]?.name ?? "unknown"}.`,
     );
   }
   const call = calls[0];
@@ -6487,14 +6576,20 @@ function verifyLockedFixtureInspection(
     (call) => call.name === "get_commit" && isRecord(call.arguments) &&
       lockedFixtureArgumentsMatch(call.arguments, canonicalArguments),
   );
-  if (observedCalls.length !== 1) {
-    return inspectionFailure(
-      `Expected exactly one canonical get_commit MCP call, found ${observedCalls.length} observed tool calls (${canonicalCalls.length} semantically canonical).`,
-    );
-  }
   if (canonicalCalls.length !== 1) {
     return inspectionFailure(
       `Expected exactly one canonical get_commit MCP call, found ${canonicalCalls.length} semantically canonical calls; observed ${observedCalls.length} total tool call.`,
+    );
+  }
+  const unexpectedCalls = unexpectedMcpReadCalls(
+    observedCalls,
+    canonicalCalls,
+    serverName,
+    "get_commit",
+  );
+  if (unexpectedCalls.length > 0) {
+    return inspectionFailure(
+      `The locked fixture inspection emitted an unsupported non-canonical tool call: ${unexpectedCalls[0]?.name ?? "unknown"}.`,
     );
   }
   const call = canonicalCalls[0];
@@ -6567,14 +6662,20 @@ function verifyDeliveryHeadInspection(
     (call) => call.name === "get_commit" && isRecord(call.arguments) &&
       argumentsExactlyMatch(call.arguments, canonicalArguments),
   );
-  if (observedCalls.length !== 1) {
-    return inspectionFailure(
-      `Expected exactly one canonical delivery-head get_commit MCP call, found ${observedCalls.length}.`,
-    );
-  }
   if (canonicalCalls.length !== 1) {
     return inspectionFailure(
       `Expected exactly one canonical delivery-head get_commit MCP call, found ${canonicalCalls.length}.`,
+    );
+  }
+  const unexpectedCalls = unexpectedMcpReadCalls(
+    observedCalls,
+    canonicalCalls,
+    serverName,
+    "get_commit",
+  );
+  if (unexpectedCalls.length > 0) {
+    return inspectionFailure(
+      `The delivery-head inspection emitted an unsupported non-canonical tool call: ${unexpectedCalls[0]?.name ?? "unknown"}.`,
     );
   }
   const call = canonicalCalls[0];
@@ -7932,8 +8033,8 @@ function runtimeEvidence(
           kind: "tool_result",
           result: "informational",
           summary: coordinatorExpectedToolName === undefined || coordinatorExpectedToolName === "exec"
-            ? "TrueForge stopped the coordinator after the configured one-iteration sandbox proof boundary."
-            : "TrueForge stopped the coordinator after the configured one-iteration deterministic read boundary.",
+            ? `TrueForge stopped the coordinator after the configured ${COORDINATOR_TRUEFORGE_ITERATION_LIMIT}-iteration sandbox proof boundary.`
+            : `TrueForge stopped the coordinator after the configured ${COORDINATOR_TRUEFORGE_ITERATION_LIMIT}-iteration deterministic read boundary.`,
           details,
         };
       }
